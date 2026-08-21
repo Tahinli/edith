@@ -1,7 +1,7 @@
 //! The picture: what is drawn over it and what is read off it.
 
-use crate::*;
 use crate::ui::type_scale::{self, Typeset};
+use crate::*;
 use std::path::{Path, PathBuf};
 
 impl Player {
@@ -194,11 +194,11 @@ impl Player {
             self.active_fps(),
         )
         .replace(':', "-");
-        let text = match save_screenshot(bytes, size.width.0 as u32, size.height.0 as u32, &stem, &tc)
-        {
-            Ok(path) => format!("SAVED {}", path.display()),
-            Err(e) => format!("SCREENSHOT FAILED: {e}"),
-        };
+        let text =
+            match save_screenshot(bytes, size.width.0 as u32, size.height.0 as u32, &stem, &tc) {
+                Ok(path) => format!("SAVED {}", path.display()),
+                Err(e) => format!("SCREENSHOT FAILED: {e}"),
+            };
         self.notify_user(text.into());
         cx.notify();
     }

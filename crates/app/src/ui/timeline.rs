@@ -1,7 +1,7 @@
 //! The bottom region: the ruler, the lanes and the subtitle strip.
 
-use crate::*;
 use crate::ui::widgets::*;
+use crate::*;
 
 impl Player {
     /// The bottom region, full width under everything else: the timecode and
@@ -102,8 +102,12 @@ impl Player {
             true => (lanes_box - LABEL_H - 8.).max(LANE_H),
             false => lanes_box,
         };
-        let (thumb_x, thumb_w) =
-            scroll_thumb(view.bed, view.duration, view.scale.start.max(0.), view.span());
+        let (thumb_x, thumb_w) = scroll_thumb(
+            view.bed,
+            view.duration,
+            view.scale.start.max(0.),
+            view.span(),
+        );
         // Live, not a count of the lanes: the column reports where it has been
         // taken to, so the line empties itself as the last track comes up
         // instead of insisting there is still something below. The stack's own
@@ -119,8 +123,7 @@ impl Player {
         let stack = self.lanes_scroll.bounds();
         let track_h = f32::from(stack.size.height);
         let stack_max = f32::from(self.lanes_scroll.max_offset().height);
-        let (stack_y, stack_thumb_h) =
-            lanes_thumb(track_h, track_h + stack_max, track_h, scrolled);
+        let (stack_y, stack_thumb_h) = lanes_thumb(track_h, track_h + stack_max, track_h, scrolled);
         div()
             .flex_none()
             // Never more than its share of a short window: the lane column
@@ -344,8 +347,7 @@ impl Player {
                                     |this, event: &ScrollWheelEvent, window, cx| {
                                         cx.stop_propagation();
                                         let line = window.line_height();
-                                        let dy =
-                                            f32::from(event.delta.pixel_delta(line).y);
+                                        let dy = f32::from(event.delta.pixel_delta(line).y);
                                         this.lanes_wheel(dy, cx);
                                     },
                                 ))
@@ -360,15 +362,11 @@ impl Player {
                                 // else on the bed; over the strip it is
                                 // nothing, and the clip beneath must not
                                 // answer it through the strip.
-                                .on_mouse_down(
-                                    MouseButton::Right,
-                                    |_: &MouseDownEvent, _, cx| cx.stop_propagation(),
-                                )
+                                .on_mouse_down(MouseButton::Right, |_: &MouseDownEvent, _, cx| {
+                                    cx.stop_propagation()
+                                })
                                 .on_mouse_move(cx.listener(Player::drag_move))
-                                .on_mouse_up(
-                                    MouseButton::Left,
-                                    cx.listener(Player::drag_release),
-                                )
+                                .on_mouse_up(MouseButton::Left, cx.listener(Player::drag_release))
                                 .child(
                                     div()
                                         .absolute()
@@ -524,7 +522,11 @@ impl Player {
     ///
     /// `None` when there are none -- an empty heading is a section about
     /// nothing.
-    pub(crate) fn subtitle_section(&self, width: f32, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+    pub(crate) fn subtitle_section(
+        &self,
+        width: f32,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
         let tracks = self.session.as_ref()?.subtitles();
         if tracks.is_empty() {
             return None;
@@ -588,13 +590,12 @@ impl Player {
                         let carried: SharedString = title.clone().into();
                         // Named, because a × is the same glyph on every row and
                         // the tooltip is what says which track it takes off.
-                        let remove_tip: SharedString =
-                            format!(
-                                "Remove {title} from the palette — {} puts a file's subtitles \
+                        let remove_tip: SharedString = format!(
+                            "Remove {title} from the palette — {} puts a file's subtitles \
                                  back in it",
-                                add_key
-                            )
-                                .into();
+                            add_key
+                        )
+                        .into();
                         div()
                             // The *flat* index into the session's add-order
                             // list, which is what a pick is and what a save
@@ -710,13 +711,13 @@ impl Player {
                                     .rounded(px(3.))
                                     .cursor_pointer()
                                     .hover(|s| s.bg(rgb(BG_HOVER())))
-                                    .tooltip(move |_, cx| cx.new(|_| Tip(remove_tip.clone())).into())
-                                    .on_click(cx.listener(
-                                        move |this, _: &ClickEvent, _, cx| {
-                                            cx.stop_propagation();
-                                            this.remove_subtitle_track(track, cx);
-                                        },
-                                    ))
+                                    .tooltip(move |_, cx| {
+                                        cx.new(|_| Tip(remove_tip.clone())).into()
+                                    })
+                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                        cx.stop_propagation();
+                                        this.remove_subtitle_track(track, cx);
+                                    }))
                                     .child("×"),
                             )
                     })
@@ -987,8 +988,8 @@ impl Player {
             .on_drop(cx.listener(move |this, drag: &LaneDrag, _, cx| {
                 this.reorder_lane(drag.0, lane, cx);
             }))
-            .on_drag_move(cx.listener(
-                move |this, event: &DragMoveEvent<LaneDrag>, _, cx| {
+            .on_drag_move(
+                cx.listener(move |this, event: &DragMoveEvent<LaneDrag>, _, cx| {
                     // Carried off this row, the line it was promising goes with
                     // it: a cue left painted over a slot a release out here does
                     // not commit is the drag saying one thing and the drop
@@ -1000,8 +1001,8 @@ impl Player {
                         return this.forget_lane_drop(lane, cx);
                     }
                     this.preview_lane_drop(event.drag(cx).0, lane, cx);
-                },
-            ))
+                }),
+            )
             // The fixed column the ruler above is offset by as well. Full lane
             // height, so it reads as the bed continuing rather than as a chip.
             .child(
@@ -1854,20 +1855,20 @@ impl Player {
                                         zone
                                     }),
                             )
-                            // No name drawn on the box itself: the cue blocks
-                            // now fill its full height, and a label sitting
-                            // over them fights the very thing this box exists
-                            // to show. The tooltip still carries the words
-                            // (`sub_tip`), and the ghost while dragging still
-                            // names the track (`ghost`, above).
-                            // The way back off the lane is the way every other
-                            // box takes: the Delete stroke on the marked caption
-                            // and the Delete row of its own menu
-                            // ([`Player::lift_sub`]). The × that used to sit
-                            // here is gone with them -- it was drawn only where
-                            // the box was wide enough to hold it, so the one
-                            // removal a caption had was the one a zoomed-out
-                            // caption did not have.
+                        // No name drawn on the box itself: the cue blocks
+                        // now fill its full height, and a label sitting
+                        // over them fights the very thing this box exists
+                        // to show. The tooltip still carries the words
+                        // (`sub_tip`), and the ghost while dragging still
+                        // names the track (`ghost`, above).
+                        // The way back off the lane is the way every other
+                        // box takes: the Delete stroke on the marked caption
+                        // and the Delete row of its own menu
+                        // ([`Player::lift_sub`]). The × that used to sit
+                        // here is gone with them -- it was drawn only where
+                        // the box was wide enough to hold it, so the one
+                        // removal a caption had was the one a zoomed-out
+                        // caption did not have.
                     }))
                     // ...and where the words actually are inside those boxes:
                     // the cues this lane shows on *this* timeline, each its own
@@ -1932,13 +1933,18 @@ impl Player {
                                 .max(GHOST_MIN)))
                             .rounded(px(3.))
                             .border_1()
-                            .border_color(rgb(if g.refused { DROP_REFUSE() } else { FG_PRIMARY() }))
+                            .border_color(rgb(if g.refused {
+                                DROP_REFUSE()
+                            } else {
+                                FG_PRIMARY()
+                            }))
                             // The file's own swatch at a third of its weight, so
                             // the box beneath is still legible through it -- and
                             // the refusal red instead, for a lane that will not
                             // take this drop at all.
                             .bg(rgba(
-                                ((if g.refused { DROP_REFUSE() } else { g.tint }) << 8) | GHOST_ALPHA,
+                                ((if g.refused { DROP_REFUSE() } else { g.tint }) << 8)
+                                    | GHOST_ALPHA,
                             ))
                     }))
                     // What the gesture in flight is about to land on, drawn on

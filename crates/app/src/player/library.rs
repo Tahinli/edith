@@ -153,7 +153,8 @@ impl Player {
                 // in the way of a re-add starting a fresh one
                 // ([`Player::cache_media`]'s dedupe reads presence here).
                 if let Some(scan) = self.silence_bg.remove(&(path.to_path_buf(), stream)) {
-                    scan.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                    scan.cancel
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
                 }
                 // The picked row may be the one that just went, and the engine
                 // reseeks, so this owes the flag reset like every other edit.
@@ -332,7 +333,8 @@ impl Player {
         // empty (`Player::cache_media`'s spawn checks this flag before it
         // inserts).
         for scan in self.silence_bg.values() {
-            scan.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            scan.cancel
+                .store(true, std::sync::atomic::Ordering::Relaxed);
         }
         self.silence_bg.clear();
         // Every gesture in flight, dropped for `reset_after_reseek`'s reason
@@ -383,7 +385,10 @@ impl Player {
         // The timeline would otherwise keep playing under the preview -- two
         // soundtracks at once -- so it is paused here and resumed on the way
         // out only if this is what paused it ([`Player::close_preview`]).
-        self.preview_playing = self.session.as_ref().is_some_and(PlaybackSession::is_playing);
+        self.preview_playing = self
+            .session
+            .as_ref()
+            .is_some_and(PlaybackSession::is_playing);
         if let Some(session) = self.session.as_mut() {
             session.pause();
         }
@@ -396,8 +401,11 @@ impl Player {
                 session.play();
                 self.preview_session = Some(session);
                 self.notify_user(
-                    format!("PREVIEWING {} — not on the timeline; esc stops it", file_name(path))
-                        .into(),
+                    format!(
+                        "PREVIEWING {} — not on the timeline; esc stops it",
+                        file_name(path)
+                    )
+                    .into(),
                 );
             }
             Err(e) => self.notify_user(format!("PREVIEW FAILED: {e}").into()),
@@ -890,7 +898,11 @@ impl Player {
         if let Err(e) = save_proxies_pref(on) {
             let path = proxies_pref_path();
             self.notify_user(
-                format!("PROXIES DEFAULT COULD NOT BE KEPT — {} — {e}", path.display()).into(),
+                format!(
+                    "PROXIES DEFAULT COULD NOT BE KEPT — {} — {e}",
+                    path.display()
+                )
+                .into(),
             );
         }
         self.notify_user(text.into());
@@ -931,7 +943,11 @@ impl Player {
         if let Err(e) = save_auto_proxies_pref(on) {
             let path = auto_proxies_pref_path();
             self.notify_user(
-                format!("AUTO PROXIES DEFAULT COULD NOT BE KEPT — {} — {e}", path.display()).into(),
+                format!(
+                    "AUTO PROXIES DEFAULT COULD NOT BE KEPT — {} — {e}",
+                    path.display()
+                )
+                .into(),
             );
         }
         self.notify_user(text.into());
@@ -987,7 +1003,12 @@ impl Player {
     /// The export guard again, and not for the caller's sake: an export can
     /// have started during the seconds the worker was reading, and a drop
     /// during an export has always been a silent no-op.
-    pub(crate) fn take_import(&mut self, path: &std::path::Path, landed: Landed, cx: &mut Context<Self>) {
+    pub(crate) fn take_import(
+        &mut self,
+        path: &std::path::Path,
+        landed: Landed,
+        cx: &mut Context<Self>,
+    ) {
         if self.exporting().is_some() {
             return;
         }
@@ -1310,7 +1331,12 @@ impl Player {
     /// off the worker that read the file ([`read_ahead`]), like every other
     /// door's do, and what is left here is the push. The engine dedupes by
     /// (file, track), so the same `.srt` twice is one row and says so.
-    pub(crate) fn take_subtitles(&mut self, path: &std::path::Path, subs: Subs, cx: &mut Context<Self>) {
+    pub(crate) fn take_subtitles(
+        &mut self,
+        path: &std::path::Path,
+        subs: Subs,
+        cx: &mut Context<Self>,
+    ) {
         let added = self
             .session
             .as_mut()
@@ -1330,10 +1356,7 @@ impl Player {
         cx: &mut Context<Self>,
     ) {
         let text = match added {
-            Some(Ok(0)) => format!(
-                "{}'s subtitles are in the palette already",
-                file_name(path)
-            ),
+            Some(Ok(0)) => format!("{}'s subtitles are in the palette already", file_name(path)),
             // Where they are and what to do with them: the tracks are in the
             // palette and nothing is placed until one is dragged onto an S
             // track, which is the whole of what this door does.
@@ -1608,8 +1631,12 @@ impl Player {
     /// their own.
     fn recovery_offer(project_path: &Path) -> Option<PathBuf> {
         let sidecar = Self::autosave_path(project_path)?;
-        let project_mtime = std::fs::metadata(project_path).and_then(|m| m.modified()).ok()?;
-        let sidecar_mtime = std::fs::metadata(&sidecar).and_then(|m| m.modified()).ok()?;
+        let project_mtime = std::fs::metadata(project_path)
+            .and_then(|m| m.modified())
+            .ok()?;
+        let sidecar_mtime = std::fs::metadata(&sidecar)
+            .and_then(|m| m.modified())
+            .ok()?;
         (sidecar_mtime > project_mtime).then_some(sidecar)
     }
 
@@ -1650,7 +1677,11 @@ impl Player {
     /// write is not something a person can do anything about right now, and a
     /// modal over it would be worse than the risk it is guarding against.
     fn autosave_tick(&mut self, cx: &mut Context<Self>) {
-        if !Self::autosave_gate(self.autosave_armed, self.autosave_dirty, self.exporting().is_some()) {
+        if !Self::autosave_gate(
+            self.autosave_armed,
+            self.autosave_dirty,
+            self.exporting().is_some(),
+        ) {
             return;
         }
         let now = Instant::now();

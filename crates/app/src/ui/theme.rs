@@ -377,7 +377,10 @@ pub mod cool {
     /// from somewhere else than its neighbour. The *kind* is the body colour now
     /// ([`super::clip_kind`]); this is the identity stripe and the library
     /// swatch, and it only has to be four things telling each other apart.
-    pub const SOURCE_TINTS: [u32; 12] = [0x4f8fd6, 0xd69a4f, 0x4fd6a8, 0xb14fd6, 0x4f8fd6, 0xd69a4f, 0x4fd6a8, 0xb14fd6, 0x4f8fd6, 0xd69a4f, 0x4fd6a8, 0xb14fd6];
+    pub const SOURCE_TINTS: [u32; 12] = [
+        0x4f8fd6, 0xd69a4f, 0x4fd6a8, 0xb14fd6, 0x4f8fd6, 0xd69a4f, 0x4fd6a8, 0xb14fd6, 0x4f8fd6,
+        0xd69a4f, 0x4fd6a8, 0xb14fd6,
+    ];
 
     // -- feedback ---------------------------------------------------------------
     pub const STATUS_ERROR: u32 = 0xef4444;
@@ -459,7 +462,10 @@ pub mod warm {
 
     /// Warm-side identity stripes: the same four-way distinctness the cool
     /// family's are held to, in hues that belong to this ground.
-    pub const SOURCE_TINTS: [u32; 12] = [0xe08a4f, 0x4fa8d6, 0x8fc94f, 0xd67aa8, 0xe08a4f, 0x4fa8d6, 0x8fc94f, 0xd67aa8, 0xe08a4f, 0x4fa8d6, 0x8fc94f, 0xd67aa8];
+    pub const SOURCE_TINTS: [u32; 12] = [
+        0xe08a4f, 0x4fa8d6, 0x8fc94f, 0xd67aa8, 0xe08a4f, 0x4fa8d6, 0x8fc94f, 0xd67aa8, 0xe08a4f,
+        0x4fa8d6, 0x8fc94f, 0xd67aa8,
+    ];
 
     // -- feedback ---------------------------------------------------------------
     pub const STATUS_ERROR: u32 = 0xc85050;
@@ -539,7 +545,10 @@ pub mod forest {
     pub const CLIP_IMAGE: u32 = 0x1a6a6a;
     pub const CLIP_TEXT: u32 = 0x6b46c1;
 
-    pub const SOURCE_TINTS: [u32; 12] = [0x5fd68f, 0xd6a45f, 0x5fa8d6, 0xc15fd6, 0x5fd68f, 0xd6a45f, 0x5fa8d6, 0xc15fd6, 0x5fd68f, 0xd6a45f, 0x5fa8d6, 0xc15fd6];
+    pub const SOURCE_TINTS: [u32; 12] = [
+        0x5fd68f, 0xd6a45f, 0x5fa8d6, 0xc15fd6, 0x5fd68f, 0xd6a45f, 0x5fa8d6, 0xc15fd6, 0x5fd68f,
+        0xd6a45f, 0x5fa8d6, 0xc15fd6,
+    ];
 
     // -- feedback ---------------------------------------------------------------
     /// Not the accent family: a success that wore the emerald would say "this is
@@ -618,7 +627,10 @@ pub mod violet {
     /// be the same purple.
     pub const CLIP_TEXT: u32 = 0x6d3fa8;
 
-    pub const SOURCE_TINTS: [u32; 12] = [0x9b7fe8, 0xe8a97f, 0x7fc8e8, 0xe87fb4, 0x9b7fe8, 0xe8a97f, 0x7fc8e8, 0xe87fb4, 0x9b7fe8, 0xe8a97f, 0x7fc8e8, 0xe87fb4];
+    pub const SOURCE_TINTS: [u32; 12] = [
+        0x9b7fe8, 0xe8a97f, 0x7fc8e8, 0xe87fb4, 0x9b7fe8, 0xe8a97f, 0x7fc8e8, 0xe87fb4, 0x9b7fe8,
+        0xe8a97f, 0x7fc8e8, 0xe87fb4,
+    ];
 
     // -- feedback ---------------------------------------------------------------
     pub const STATUS_ERROR: u32 = 0xf87171;
@@ -691,7 +703,10 @@ pub mod rose {
     pub const CLIP_IMAGE: u32 = 0x1c6270;
     pub const CLIP_TEXT: u32 = 0x6b46c1;
 
-    pub const SOURCE_TINTS: [u32; 12] = [0xe87f97, 0x7fc8e8, 0xe8c87f, 0x9b7fe8, 0xe87f97, 0x7fc8e8, 0xe8c87f, 0x9b7fe8, 0xe87f97, 0x7fc8e8, 0xe8c87f, 0x9b7fe8];
+    pub const SOURCE_TINTS: [u32; 12] = [
+        0xe87f97, 0x7fc8e8, 0xe8c87f, 0x9b7fe8, 0xe87f97, 0x7fc8e8, 0xe8c87f, 0x9b7fe8, 0xe87f97,
+        0x7fc8e8, 0xe8c87f, 0x9b7fe8,
+    ];
 
     // -- feedback ---------------------------------------------------------------
     /// Brighter and more saturated than the accent it sits near on the wheel: on
@@ -768,7 +783,10 @@ pub mod amber {
     pub const CLIP_IMAGE: u32 = 0x1c6270;
     pub const CLIP_TEXT: u32 = 0x6b46c1;
 
-    pub const SOURCE_TINTS: [u32; 12] = [0xe8b45f, 0x5fa8e8, 0x7fd69b, 0xd68fc1, 0xe8b45f, 0x5fa8e8, 0x7fd69b, 0xd68fc1, 0xe8b45f, 0x5fa8e8, 0x7fd69b, 0xd68fc1];
+    pub const SOURCE_TINTS: [u32; 12] = [
+        0xe8b45f, 0x5fa8e8, 0x7fd69b, 0xd68fc1, 0xe8b45f, 0x5fa8e8, 0x7fd69b, 0xd68fc1, 0xe8b45f,
+        0x5fa8e8, 0x7fd69b, 0xd68fc1,
+    ];
 
     // -- feedback ---------------------------------------------------------------
     /// The warning steps to orange: amber *is* the accent here, and a warning
@@ -843,7 +861,10 @@ pub mod ocean {
     pub const CLIP_IMAGE: u32 = 0x1c6270;
     pub const CLIP_TEXT: u32 = 0x6b46c1;
 
-    pub const SOURCE_TINTS: [u32; 12] = [0x5fa8e8, 0xe8a95f, 0x5fd6a0, 0xc98fe8, 0x5fa8e8, 0xe8a95f, 0x5fd6a0, 0xc98fe8, 0x5fa8e8, 0xe8a95f, 0x5fd6a0, 0xc98fe8];
+    pub const SOURCE_TINTS: [u32; 12] = [
+        0x5fa8e8, 0xe8a95f, 0x5fd6a0, 0xc98fe8, 0x5fa8e8, 0xe8a95f, 0x5fd6a0, 0xc98fe8, 0x5fa8e8,
+        0xe8a95f, 0x5fd6a0, 0xc98fe8,
+    ];
 
     // -- feedback ---------------------------------------------------------------
     pub const STATUS_ERROR: u32 = 0xf05252;
@@ -919,7 +940,10 @@ pub mod ice {
     pub const CLIP_IMAGE: u32 = 0x1c6270;
     pub const CLIP_TEXT: u32 = 0x6b46c1;
 
-    pub const SOURCE_TINTS: [u32; 12] = [0x7fd6e8, 0xe8b47f, 0x8fd69b, 0xc79be8, 0x7fd6e8, 0xe8b47f, 0x8fd69b, 0xc79be8, 0x7fd6e8, 0xe8b47f, 0x8fd69b, 0xc79be8];
+    pub const SOURCE_TINTS: [u32; 12] = [
+        0x7fd6e8, 0xe8b47f, 0x8fd69b, 0xc79be8, 0x7fd6e8, 0xe8b47f, 0x8fd69b, 0xc79be8, 0x7fd6e8,
+        0xe8b47f, 0x8fd69b, 0xc79be8,
+    ];
 
     // -- feedback ---------------------------------------------------------------
     pub const STATUS_ERROR: u32 = 0xff6b6b;
@@ -993,7 +1017,10 @@ pub mod orchid {
     pub const CLIP_IMAGE: u32 = 0x1c6270;
     pub const CLIP_TEXT: u32 = 0x5a45b8;
 
-    pub const SOURCE_TINTS: [u32; 12] = [0xe88fd6, 0x8fc9e8, 0xe8c48f, 0x8fe8b4, 0xe88fd6, 0x8fc9e8, 0xe8c48f, 0x8fe8b4, 0xe88fd6, 0x8fc9e8, 0xe8c48f, 0x8fe8b4];
+    pub const SOURCE_TINTS: [u32; 12] = [
+        0xe88fd6, 0x8fc9e8, 0xe8c48f, 0x8fe8b4, 0xe88fd6, 0x8fc9e8, 0xe8c48f, 0x8fe8b4, 0xe88fd6,
+        0x8fc9e8, 0xe8c48f, 0x8fe8b4,
+    ];
 
     // -- feedback ---------------------------------------------------------------
     pub const STATUS_ERROR: u32 = 0xf87171;
@@ -1082,7 +1109,10 @@ pub mod nord {
 
     /// Aurora and Frost at full strength: a swatch carries no text, so these are
     /// Nord's own numbers.
-    pub const SOURCE_TINTS: [u32; 12] = [0x88c0d0, 0xd08770, 0xa3be8c, 0xb48ead, 0x88c0d0, 0xd08770, 0xa3be8c, 0xb48ead, 0x88c0d0, 0xd08770, 0xa3be8c, 0xb48ead];
+    pub const SOURCE_TINTS: [u32; 12] = [
+        0x88c0d0, 0xd08770, 0xa3be8c, 0xb48ead, 0x88c0d0, 0xd08770, 0xa3be8c, 0xb48ead, 0x88c0d0,
+        0xd08770, 0xa3be8c, 0xb48ead,
+    ];
 
     // -- feedback ---------------------------------------------------------------
     pub const STATUS_ERROR: u32 = 0xbf616a;
@@ -1164,7 +1194,10 @@ pub mod gruvbox {
     pub const CLIP_IMAGE: u32 = 0x2f6a63;
     pub const CLIP_TEXT: u32 = 0x7a4a72;
 
-    pub const SOURCE_TINTS: [u32; 12] = [0xfe8019, 0x83a598, 0xb8bb26, 0xd3869b, 0xfe8019, 0x83a598, 0xb8bb26, 0xd3869b, 0xfe8019, 0x83a598, 0xb8bb26, 0xd3869b];
+    pub const SOURCE_TINTS: [u32; 12] = [
+        0xfe8019, 0x83a598, 0xb8bb26, 0xd3869b, 0xfe8019, 0x83a598, 0xb8bb26, 0xd3869b, 0xfe8019,
+        0x83a598, 0xb8bb26, 0xd3869b,
+    ];
 
     // -- feedback ---------------------------------------------------------------
     pub const STATUS_ERROR: u32 = 0xfb4934;
@@ -1240,7 +1273,10 @@ pub mod dracula {
     pub const CLIP_TEXT: u32 = 0x6a3fb0;
 
     /// Dracula's own six, four of them: a swatch carries no text.
-    pub const SOURCE_TINTS: [u32; 12] = [0xff79c6, 0x8be9fd, 0x50fa7b, 0xffb86c, 0xff79c6, 0x8be9fd, 0x50fa7b, 0xffb86c, 0xff79c6, 0x8be9fd, 0x50fa7b, 0xffb86c];
+    pub const SOURCE_TINTS: [u32; 12] = [
+        0xff79c6, 0x8be9fd, 0x50fa7b, 0xffb86c, 0xff79c6, 0x8be9fd, 0x50fa7b, 0xffb86c, 0xff79c6,
+        0x8be9fd, 0x50fa7b, 0xffb86c,
+    ];
 
     // -- feedback ---------------------------------------------------------------
     pub const STATUS_ERROR: u32 = 0xff5555;
@@ -1342,8 +1378,8 @@ pub mod darkroom {
     // wheel with a quantized dominant hue per import; until then the index
     // is `source % 12`, which still guarantees different sources differ.
     pub const SOURCE_TINTS: [u32; 12] = [
-        0x64b5d1, 0x647ed1, 0x8064d1, 0xb664d1, 0xd164b5, 0xd1647e, 0xd18064,
-        0xd1b764, 0xb5d164, 0x7ed164, 0x64d180, 0x64d1b7,
+        0x64b5d1, 0x647ed1, 0x8064d1, 0xb664d1, 0xd164b5, 0xd1647e, 0xd18064, 0xd1b764, 0xb5d164,
+        0x7ed164, 0x64d180, 0x64d1b7,
     ];
 
     // -- feedback -------------------------------------------------------------

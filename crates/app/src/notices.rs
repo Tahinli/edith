@@ -22,7 +22,10 @@ pub(crate) const NOTICE_MIN_W: f32 = 180.;
 /// without a window: dedupe against the back, a ceiling, oldest out first --
 /// except an export's own outcome, which jumps to the front. [`Player::notify_user`]
 /// is the door every message comes through; this is what the door does.
-pub(crate) fn push_notice(notices: &mut std::collections::VecDeque<SharedString>, message: SharedString) {
+pub(crate) fn push_notice(
+    notices: &mut std::collections::VecDeque<SharedString>,
+    message: SharedString,
+) {
     // A repeat of what is already at the back is dropped -- holding a key that
     // refuses would otherwise fill the queue with one sentence, and the count on
     // the bar would be a count of how long the key was held.

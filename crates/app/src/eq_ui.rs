@@ -224,8 +224,7 @@ pub(crate) fn eq_curve(params: EqParams, sample_rate: u32) -> impl IntoElement {
                         let along = step as f32 / EQ_CURVE_STEPS as f32;
                         point(
                             o.x + s.width * along,
-                            o.y + s.height
-                                * eq_y(of.response_db(eq_freq(along), sample_rate)),
+                            o.y + s.height * eq_y(of.response_db(eq_freq(along), sample_rate)),
                         )
                     })
                     .collect()
@@ -233,11 +232,9 @@ pub(crate) fn eq_curve(params: EqParams, sample_rate: u32) -> impl IntoElement {
             // One thread per band, first, so the sum is drawn over them.
             for band in &params.bands {
                 let mut bell = PathBuilder::stroke(px(1.));
-                for (step, at) in line(&EqParams {
-                    bands: vec![*band],
-                })
-                .into_iter()
-                .enumerate()
+                for (step, at) in line(&EqParams { bands: vec![*band] })
+                    .into_iter()
+                    .enumerate()
                 {
                     match step {
                         0 => bell.move_to(at),

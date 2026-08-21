@@ -65,7 +65,11 @@ pub(crate) fn whole_take(session: &PlaybackSession, lane: Lane, idx: usize) -> b
 /// group id can mean (engine `links_are_consistent`), which is what leaves
 /// nothing for a second click to choose. `None` when no track has one, and the
 /// notice says so.
-pub(crate) fn span_partner(session: &PlaybackSession, lane: Lane, idx: usize) -> Option<(Lane, usize)> {
+pub(crate) fn span_partner(
+    session: &PlaybackSession,
+    lane: Lane,
+    idx: usize,
+) -> Option<(Lane, usize)> {
     let clip = *session.lane_clips(lane).get(idx)?;
     let matches = |other: Lane| {
         let i = session.lane_clips(other).iter().position(|c| {
@@ -138,8 +142,8 @@ impl Selection {
     }
 
     /// Whether `pick` is one of the selection's -- the question a right-click
-        /// asks before it decides whether the menu is about the selection or
-        /// about the clip under it.
+    /// asks before it decides whether the menu is about the selection or
+    /// about the clip under it.
     pub(crate) fn contains(&self, pick: (Lane, usize)) -> bool {
         self.picks.contains(&pick)
     }
@@ -187,12 +191,10 @@ pub(crate) fn caption_rate(sub: SubClip, fps: f64) -> Option<Speed> {
     // own `speed` in the same spelling: 10s of words crossing 5s of timeline
     // is 2.00x.
     let permille = (window_us / span_us * 1000.).round();
-    Some(Speed::from_permille(
-        permille.clamp(
-            f64::from(Speed::MIN.permille()),
-            f64::from(Speed::MAX.permille()),
-        ) as u16,
-    ))
+    Some(Speed::from_permille(permille.clamp(
+        f64::from(Speed::MIN.permille()),
+        f64::from(Speed::MAX.permille()),
+    ) as u16))
 }
 
 /// The scrollbar's thumb over a track `w` px wide: `(x, width)` of the box
@@ -202,12 +204,7 @@ pub(crate) fn caption_rate(sub: SubClip, fps: f64) -> Option<Speed> {
 /// narrower than [`SCROLL_THUMB_MIN`] when there is (a thumb a pixel wide is a
 /// thumb no hand can hold), and never off the track either way -- the clamp,
 /// not the caller, owns that, because a drag's samples arrive raw.
-pub(crate) fn scroll_thumb(
-    w: f32,
-    duration: f64,
-    start: f64,
-    span: f64,
-) -> (f32, f32) {
+pub(crate) fn scroll_thumb(w: f32, duration: f64, start: f64, span: f64) -> (f32, f32) {
     if w <= 0. || duration <= 0. || span >= duration {
         return (0., w.max(0.));
     }
@@ -259,7 +256,6 @@ pub(crate) fn marked(
 ) -> bool {
     picks.contains(&here) || (link.is_some() && pick_links.contains(&link))
 }
-
 
 /// Whether a clip is wide enough to be worth naming.
 pub(crate) fn show_label(w: f32) -> bool {
@@ -341,7 +337,11 @@ pub(crate) fn walk_cut(idx: usize, len: usize, forward: bool, stride: usize) -> 
         return 0;
     }
     let delta = stride.min(len - 1) as isize;
-    let at = if forward { idx as isize + delta } else { idx as isize - delta };
+    let at = if forward {
+        idx as isize + delta
+    } else {
+        idx as isize - delta
+    };
     at.clamp(0, len as isize - 1) as usize
 }
 
@@ -496,7 +496,13 @@ pub(crate) fn normalise(mut peaks: Vec<(f32, f32)>) -> Vec<(f32, f32)> {
 /// -- a clip's waveform cannot paint over its neighbour -- and every column is
 /// at least a pixel tall, so silence reads as a line through the middle rather
 /// than as a polygon with no area.
-pub(crate) fn envelope(peaks: &[(f32, f32)], from: f64, to: f64, w: f32, h: f32) -> Vec<(f32, f32, f32)> {
+pub(crate) fn envelope(
+    peaks: &[(f32, f32)],
+    from: f64,
+    to: f64,
+    w: f32,
+    h: f32,
+) -> Vec<(f32, f32, f32)> {
     if peaks.is_empty() || w <= 0. || h <= 0. {
         return Vec::new();
     }
@@ -516,13 +522,6 @@ pub(crate) fn envelope(peaks: &[(f32, f32)], from: f64, to: f64, w: f32, h: f32)
         })
         .collect()
 }
-
-
-
-
-
-
-
 
 /// Records its parent's laid-out box: gpui hands a mouse listener the window
 /// position only, and the ruler sits behind the panel's padding. Paints
@@ -642,8 +641,7 @@ pub(crate) fn snap_marks(
                 .iter()
                 .enumerate()
                 .filter(move |&(idx, clip)| {
-                    Some((lane, idx)) != skip
-                        && !(skip_link.is_some() && clip.link == skip_link)
+                    Some((lane, idx)) != skip && !(skip_link.is_some() && clip.link == skip_link)
                 })
                 .flat_map(|(_, clip)| [clip.start, clip.end()])
         })
@@ -660,7 +658,13 @@ pub(crate) fn snap_marks(
 ///
 /// `on` is the switch ([`ActionId::ToggleSnap`]): off, the gesture lands raw and
 /// draws no line at all, which is the whole point of being able to turn it off.
-pub(crate) fn snap_cue(on: bool, raw: u32, len: u32, tol: u32, marks: &[u32]) -> (u32, Option<u32>) {
+pub(crate) fn snap_cue(
+    on: bool,
+    raw: u32,
+    len: u32,
+    tol: u32,
+    marks: &[u32],
+) -> (u32, Option<u32>) {
     if !on {
         return (raw, None);
     }
@@ -699,12 +703,12 @@ pub(crate) fn lane_refuses(path: &Path, lane: Lane) -> Option<String> {
     let name = file_name(path);
     let label = lane.label();
     match lane.kind {
-        LaneKind::Video if engine::is_audio(path) => {
-            Some(format!("NOT ON {label} — {name} has no picture; drop it on an audio lane"))
-        }
-        LaneKind::Audio if engine::is_image(path) => {
-            Some(format!("NOT ON {label} — {name} is a still image; drop it on a video lane"))
-        }
+        LaneKind::Video if engine::is_audio(path) => Some(format!(
+            "NOT ON {label} — {name} has no picture; drop it on an audio lane"
+        )),
+        LaneKind::Audio if engine::is_image(path) => Some(format!(
+            "NOT ON {label} — {name} is a still image; drop it on a video lane"
+        )),
         // A subtitle lane holds words and no media at all: the refusal is here
         // rather than at the engine's door so the shadow is tinted red on the
         // way down, like every other lane a file cannot go on.

@@ -150,13 +150,11 @@ impl Player {
                         self.notify_user(format!("NOT GROUPED — {e}").into());
                     }
                 }
-                None => {
-                    self.notify_user(
-                        "NOTHING TO GROUP WITH — no clip on another track covers exactly these \
+                None => self.notify_user(
+                    "NOTHING TO GROUP WITH — no clip on another track covers exactly these \
                          frames; ctrl-click the clips to group instead"
-                            .into(),
-                    )
-                }
+                        .into(),
+                ),
             },
             (None, ..) => {}
         }
@@ -184,10 +182,12 @@ impl Player {
             // A caption carrying a group id is a member, and a member goes the
             // way its group goes -- the engine's own door decides how much of
             // that is media (and so a reseek) and how much is a lift.
-            let grouped = self
-                .session
-                .as_ref()
-                .is_some_and(|session| session.sub_lane(lane).get(idx).is_some_and(|s| s.link.is_some()));
+            let grouped = self.session.as_ref().is_some_and(|session| {
+                session
+                    .sub_lane(lane)
+                    .get(idx)
+                    .is_some_and(|s| s.link.is_some())
+            });
             match grouped {
                 true => {
                     if self
@@ -310,7 +310,14 @@ impl Player {
     /// nothing is said about it. The engine reseeks, so all this owes is the
     /// flag reset -- and the selection, whose index was that lane's own and now
     /// names a different clip there.
-    pub(crate) fn move_clip(&mut self, from: Lane, idx: usize, to: Lane, x: Pixels, cx: &mut Context<Self>) {
+    pub(crate) fn move_clip(
+        &mut self,
+        from: Lane,
+        idx: usize,
+        to: Lane,
+        x: Pixels,
+        cx: &mut Context<Self>,
+    ) {
         if self.exporting().is_some() {
             return;
         }
@@ -343,27 +350,23 @@ impl Player {
             // front-end already knows: a lane's kind, and where the clip was.
             // Everything else that could refuse (a clip that is not there)
             // cannot be dragged.
-            false if from.kind != to.kind => {
-                self.notify_user(
-                    format!(
-                        "NOT ON {} — that is a {kind} clip; drop it on a {lanes} lane",
-                        to.label()
-                    )
-                    .into(),
+            false if from.kind != to.kind => self.notify_user(
+                format!(
+                    "NOT ON {} — that is a {kind} clip; drop it on a {lanes} lane",
+                    to.label()
                 )
-            }
+                .into(),
+            ),
             // Picked up and put back down where it was: a click, and a click
             // says nothing.
             false if from == to && start == was => {}
-            false => {
-                self.notify_user(
-                    format!(
-                        "NOT MOVED — another clip already covers those frames on {}",
-                        to.label()
-                    )
-                    .into(),
+            false => self.notify_user(
+                format!(
+                    "NOT MOVED — another clip already covers those frames on {}",
+                    to.label()
                 )
-            }
+                .into(),
+            ),
         }
         cx.notify();
     }
@@ -472,7 +475,11 @@ impl Player {
     /// during the gesture -- an undo, another drop -- moves the indices gpui
     /// froze into the payload.
     pub(crate) fn dragged_sub(&self, drag: &SubDrag) -> Option<usize> {
-        live_idx(self.session.as_ref()?.sub_lane(drag.lane), drag.idx, drag.sub)
+        live_idx(
+            self.session.as_ref()?.sub_lane(drag.lane),
+            drag.idx,
+            drag.sub,
+        )
     }
 
     /// A placed caption let go at window `x` over subtitle lane `to`: it lands
@@ -604,7 +611,10 @@ impl Player {
                 lane.label(),
                 old.label()
             ),
-            None => format!("{} IS SHOWN — its captions are over the picture", lane.label()),
+            None => format!(
+                "{} IS SHOWN — its captions are over the picture",
+                lane.label()
+            ),
         };
         self.notify_user(text.into());
         cx.notify();
@@ -644,7 +654,13 @@ impl Player {
     /// over: [`Player::preview_ghost`]'s twin, refused for any lane that is not a
     /// subtitle lane -- which is the answer [`Project::move_sub`] gives at the
     /// release.
-    pub(crate) fn preview_ghost_sub(&mut self, drag: &SubDrag, to: Lane, x: Pixels, cx: &mut Context<Self>) {
+    pub(crate) fn preview_ghost_sub(
+        &mut self,
+        drag: &SubDrag,
+        to: Lane,
+        x: Pixels,
+        cx: &mut Context<Self>,
+    ) {
         let (start, _) = self.sub_drop_frame(drag.sub, x);
         let ghost = Ghost {
             lane: to,
@@ -659,7 +675,13 @@ impl Player {
     /// The same for a palette row on its way down: it lands at the frame it is
     /// let go on ([`Player::place_frame`]) and is as long as the whole track it
     /// names.
-    pub(crate) fn preview_ghost_pick(&mut self, track: usize, to: Lane, x: Pixels, cx: &mut Context<Self>) {
+    pub(crate) fn preview_ghost_pick(
+        &mut self,
+        track: usize,
+        to: Lane,
+        x: Pixels,
+        cx: &mut Context<Self>,
+    ) {
         let ghost = Ghost {
             lane: to,
             start: self.place_frame(x).0,
@@ -683,7 +705,12 @@ impl Player {
     /// the scroll clamp pins the bed's right edge to the duration, and the
     /// pointer has no pixel past it. The upgrade is to let the scroll clamp
     /// leave a screen of empty bed after the end, the way every NLE does.
-    pub(crate) fn drop_frame(&self, from: Lane, idx: usize, x: Pixels) -> Option<(u32, Option<u32>)> {
+    pub(crate) fn drop_frame(
+        &self,
+        from: Lane,
+        idx: usize,
+        x: Pixels,
+    ) -> Option<(u32, Option<u32>)> {
         let clip = self.session.as_ref()?.lane_clips(from).get(idx).copied()?;
         let marks = self.snap_targets(Some((from, idx)));
         Some(landing(
@@ -727,7 +754,13 @@ impl Player {
     /// [`Player::drop_frame`] will commit, worked out on every move of the drag,
     /// so what the eye was promised is where the release puts it. A pointer that
     /// has wandered off the bed promises nothing.
-    pub(crate) fn preview_drop(&mut self, from: Lane, idx: usize, x: Pixels, cx: &mut Context<Self>) {
+    pub(crate) fn preview_drop(
+        &mut self,
+        from: Lane,
+        idx: usize,
+        x: Pixels,
+        cx: &mut Context<Self>,
+    ) {
         let cue = self.drop_frame(from, idx, x).and_then(|(_, cue)| cue);
         self.set_cue(cue, x, cx);
     }
@@ -746,7 +779,13 @@ impl Player {
     /// are one answer -- and its own length at this zoom. A lane of the other
     /// kind refuses the drop ([`Project::move_clip`]), and the shadow says so
     /// before the release does.
-    pub(crate) fn preview_ghost(&mut self, drag: &ClipDrag, to: Lane, x: Pixels, cx: &mut Context<Self>) {
+    pub(crate) fn preview_ghost(
+        &mut self,
+        drag: &ClipDrag,
+        to: Lane,
+        x: Pixels,
+        cx: &mut Context<Self>,
+    ) {
         let ghost = self
             .dragged(drag)
             .and_then(|idx| self.drop_frame(drag.lane, idx, x))
@@ -802,7 +841,13 @@ impl Player {
     /// width -- the length the library row already reports. A file this lane
     /// cannot hold ([`lane_refuses`]) is tinted as refused, which is the answer
     /// the release would give in words.
-    pub(crate) fn preview_ghost_asset(&mut self, path: &Path, to: Lane, x: Pixels, cx: &mut Context<Self>) {
+    pub(crate) fn preview_ghost_asset(
+        &mut self,
+        path: &Path,
+        to: Lane,
+        x: Pixels,
+        cx: &mut Context<Self>,
+    ) {
         let ghost = Ghost {
             lane: to,
             start: self.place_frame(x).0,
@@ -974,7 +1019,8 @@ impl Player {
                             .get(clip.source)
                             .and_then(|entry| self.syncs.get(&entry.path))
                             .is_some_and(|keys| {
-                                keys.binary_search(&(clip.in_frame + (now - clip.start))).is_ok()
+                                keys.binary_search(&(clip.in_frame + (now - clip.start)))
+                                    .is_ok()
                             })
                 })
         })
@@ -1022,7 +1068,13 @@ impl Player {
     /// one of the clips a ctrl-click selection already holds keeps that
     /// selection, so the menu's Group is about the whole of it. A right-click
     /// anywhere else is the single mark, exactly as a left press is.
-    pub(crate) fn open_menu(&mut self, lane: Lane, idx: usize, at: Point<Pixels>, cx: &mut Context<Self>) {
+    pub(crate) fn open_menu(
+        &mut self,
+        lane: Lane,
+        idx: usize,
+        at: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
         if self.modal() {
             return;
         }
@@ -1041,7 +1093,14 @@ impl Player {
     /// Opens the same menu on the gap under the pointer instead of a clip --
     /// the empty-bench-space door to [`Player::close_gap`]. Nothing is
     /// selected: a gap owns no clip to select, unlike [`Player::open_menu`].
-    pub(crate) fn open_gap_menu(&mut self, lane: Lane, start: u32, frames: u32, at: Point<Pixels>, cx: &mut Context<Self>) {
+    pub(crate) fn open_gap_menu(
+        &mut self,
+        lane: Lane,
+        start: u32,
+        frames: u32,
+        at: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
         if self.modal() {
             return;
         }
@@ -1063,7 +1122,13 @@ impl Player {
     /// of step with each other, which no lane's own gap is worth. A take
     /// whose gap does not match on its other lane is refused in words, not
     /// silence ([`engine::Project::gap_take_scope`]).
-    pub(crate) fn close_gap(&mut self, lane: Lane, start: u32, frames: u32, cx: &mut Context<Self>) {
+    pub(crate) fn close_gap(
+        &mut self,
+        lane: Lane,
+        start: u32,
+        frames: u32,
+        cx: &mut Context<Self>,
+    ) {
         let Some(session) = self.session.as_mut() else {
             return;
         };
@@ -1268,10 +1333,7 @@ impl Player {
     /// and not with the one that would have been there unzoomed. The one
     /// question a trim, a grab and a drop all ask.
     pub(crate) fn frame_under(&self, x: Pixels) -> u32 {
-        frame_at(
-            self.scale.time_at(px_along(x, self.ruler.get())),
-            self.fps,
-        )
+        frame_at(self.scale.time_at(px_along(x, self.ruler.get())), self.fps)
     }
 
     /// The release: the whole drag reaches the engine as one edit, so it is one
@@ -1388,10 +1450,13 @@ impl Player {
             return;
         };
         self.mark_dirty();
-        let set = self.session.as_mut().is_some_and(|session| match fade.is_in {
-            true => session.set_fade_in(fade.lane, fade.idx, fade.to),
-            false => session.set_fade_out(fade.lane, fade.idx, fade.to),
-        });
+        let set = self
+            .session
+            .as_mut()
+            .is_some_and(|session| match fade.is_in {
+                true => session.set_fade_in(fade.lane, fade.idx, fade.to),
+                false => session.set_fade_out(fade.lane, fade.idx, fade.to),
+            });
         if set {
             cx.notify();
         }
@@ -1426,7 +1491,9 @@ impl Player {
             [a, b] if a.0 == b.0 && a.1.abs_diff(b.1) == 1 => Some((a.0, a.1.min(b.1))),
             _ => self.selected.anchor(),
         }) else {
-            self.notify_user("NOTHING TO CROSSFADE — select an audio clip that has a neighbour".into());
+            self.notify_user(
+                "NOTHING TO CROSSFADE — select an audio clip that has a neighbour".into(),
+            );
             cx.notify();
             return;
         };
@@ -1456,7 +1523,9 @@ impl Player {
             [a, b] if a.0 == b.0 && a.1.abs_diff(b.1) == 1 => Some((a.0, a.1.min(b.1))),
             _ => self.selected.anchor(),
         }) else {
-            self.notify_user("NOTHING TO DISSOLVE — select a video clip that has a neighbour".into());
+            self.notify_user(
+                "NOTHING TO DISSOLVE — select a video clip that has a neighbour".into(),
+            );
             cx.notify();
             return;
         };
@@ -1465,7 +1534,11 @@ impl Player {
             return;
         };
         let removing = session.transition_out_of(lane, idx) > 0;
-        let frames = if removing { 0 } else { self.fps.round().max(1.) as u32 };
+        let frames = if removing {
+            0
+        } else {
+            self.fps.round().max(1.) as u32
+        };
         if !session.set_transition_out(lane, idx, frames) {
             self.notify_user(
                 "NOTHING TO DISSOLVE — it takes two video clips sitting end to end on one lane"
@@ -1489,10 +1562,14 @@ impl Player {
         }) else {
             return clip;
         };
-        let to = self.followed(trim, (lane, idx), match trim.edge {
-            Edge::Start => clip.start,
-            Edge::End => clip.end(),
-        });
+        let to = self.followed(
+            trim,
+            (lane, idx),
+            match trim.edge {
+                Edge::Start => clip.start,
+                Edge::End => clip.end(),
+            },
+        );
         let still = self.session.as_ref().is_some_and(|session| {
             session
                 .sources()
@@ -1507,9 +1584,10 @@ impl Player {
     /// caption in the dragged group follows by the same delta, against its own
     /// walls.
     pub(crate) fn trimmed_sub(&self, lane: Lane, idx: usize, sub: SubClip) -> SubClip {
-        let Some(trim) = self.trim.filter(|t| {
-            (t.lane, t.idx) == (lane, idx) || (t.link.is_some() && t.link == sub.link)
-        }) else {
+        let Some(trim) = self
+            .trim
+            .filter(|t| (t.lane, t.idx) == (lane, idx) || (t.link.is_some() && t.link == sub.link))
+        else {
             return sub;
         };
         let to = self.followed(

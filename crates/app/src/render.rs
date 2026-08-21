@@ -9,7 +9,11 @@ use crate::*;
 /// not a card drawn over it, so it goes before a menu close or a preview
 /// close gets a look at the same key. See the call site in [`Player::render`]
 /// for the deliberate order this buys with a preview open underneath.
-pub(crate) fn escape_leaves_player_fullscreen(key: &str, ctrl: bool, player_fullscreen: bool) -> bool {
+pub(crate) fn escape_leaves_player_fullscreen(
+    key: &str,
+    ctrl: bool,
+    player_fullscreen: bool,
+) -> bool {
     key == ESCAPE && !ctrl && player_fullscreen
 }
 
@@ -99,8 +103,7 @@ impl Player {
                     // broken -- so it says what it wants instead. The window
                     // is already the drop target.
                     .or_else(|| {
-                        (self.active_session().is_none())
-                            .then(|| empty_hint().into_any_element())
+                        (self.active_session().is_none()).then(|| empty_hint().into_any_element())
                     }),
             )
             // After the picture, so the plate is drawn over it rather than
@@ -374,7 +377,11 @@ impl Render for Player {
                 // legacy "Add at playhead" button's pointer one, live only
                 // where a row is actually picked so a bare enter elsewhere
                 // keeps meaning whatever it already means below.
-                if key == "enter" && this.dock_src_active && this.selected_asset.is_some() && this.exporting().is_none() {
+                if key == "enter"
+                    && this.dock_src_active
+                    && this.selected_asset.is_some()
+                    && this.exporting().is_none()
+                {
                     if let Some((path, stream)) = this.selected_asset.clone() {
                         this.insert_source(&path, stream, None, None, cx);
                     }
@@ -657,10 +664,12 @@ impl Render for Player {
                             .flex_1()
                             .min_h(px(0.))
                             .flex()
-                            .child(self.library(
-                                self.split_px(Split::Library, window.viewport_size()),
-                                cx,
-                            ))
+                            .child(
+                                self.library(
+                                    self.split_px(Split::Library, window.viewport_size()),
+                                    cx,
+                                ),
+                            )
                             // The seams, one per pair of regions: what a hand
                             // drags to give a panel more room and its
                             // neighbour less ([`divider`]).

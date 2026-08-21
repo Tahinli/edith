@@ -12,7 +12,8 @@ pub(crate) enum LibraryTab {
     Text,
 }
 
-pub(crate) const LIBRARY_TABS: [LibraryTab; 3] = [LibraryTab::Media, LibraryTab::Audio, LibraryTab::Text];
+pub(crate) const LIBRARY_TABS: [LibraryTab; 3] =
+    [LibraryTab::Media, LibraryTab::Audio, LibraryTab::Text];
 
 impl LibraryTab {
     pub(crate) fn label(self) -> &'static str {
@@ -208,7 +209,10 @@ impl SilenceScan {
     /// when the mark actually moves -- [`Import::poll`]'s contract, over a
     /// number instead of a stage.
     pub(crate) fn poll(&mut self) -> f32 {
-        let scanned = self.progress.scanned.load(std::sync::atomic::Ordering::Relaxed);
+        let scanned = self
+            .progress
+            .scanned
+            .load(std::sync::atomic::Ordering::Relaxed);
         if scanned != self.seen {
             self.seen = scanned;
             self.since = Instant::now();
@@ -392,7 +396,12 @@ pub(crate) fn full_scan_key(path: &Path, stream: usize) -> ScanKey {
 /// numbers the on-demand scan would have. Empty past the end of what the
 /// background read has landed so far -- a scan still running answers with
 /// what it has, same as [`SilenceScan`]'s own cancel does.
-pub(crate) fn slice_whole_levels(whole: &[f32], fps: f64, in_frame: u32, out_frame: u32) -> Vec<f32> {
+pub(crate) fn slice_whole_levels(
+    whole: &[f32],
+    fps: f64,
+    in_frame: u32,
+    out_frame: u32,
+) -> Vec<f32> {
     if !(fps.is_finite() && fps > 0.) {
         return Vec::new();
     }
@@ -411,7 +420,10 @@ pub(crate) fn slice_whole_levels(whole: &[f32], fps: f64, in_frame: u32, out_fra
 /// ([`Player::cache_media`]). One function so `Player::open_silence`'s plan
 /// and `Player::scan_silences`' lookup share the one contract for what
 /// "cached" means, instead of two copies that could drift.
-pub(crate) fn silence_cached(levels: &std::collections::HashMap<ScanKey, Arc<Vec<f32>>>, key: &ScanKey) -> bool {
+pub(crate) fn silence_cached(
+    levels: &std::collections::HashMap<ScanKey, Arc<Vec<f32>>>,
+    key: &ScanKey,
+) -> bool {
     levels.contains_key(key) || levels.contains_key(&full_scan_key(&key.0, key.1))
 }
 

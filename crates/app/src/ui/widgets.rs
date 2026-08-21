@@ -13,7 +13,12 @@ pub(crate) fn waveform(peaks: Arc<Vec<(f32, f32)>>, from: f64, to: f64) -> impl 
 /// secondary foreground -- the darkroom bench's own audio clips draw their
 /// envelope in the source's ink (DESIGN §5), which the legacy timeline never
 /// needed a colour for.
-pub(crate) fn waveform_ink(peaks: Arc<Vec<(f32, f32)>>, from: f64, to: f64, ink: u32) -> impl IntoElement {
+pub(crate) fn waveform_ink(
+    peaks: Arc<Vec<(f32, f32)>>,
+    from: f64,
+    to: f64,
+    ink: u32,
+) -> impl IntoElement {
     canvas(
         |_, _, _| (),
         move |bounds, _, window, _| {
@@ -229,7 +234,11 @@ pub(crate) fn volume_slider(
                         .h_full()
                         .w(relative(volume.along()))
                         .rounded(px(2.))
-                        .bg(rgb(if volume.muted { FG_SECONDARY() } else { ACCENT_PRIMARY() })),
+                        .bg(rgb(if volume.muted {
+                            FG_SECONDARY()
+                        } else {
+                            ACCENT_PRIMARY()
+                        })),
                 ),
         )
 }
@@ -282,7 +291,10 @@ pub(crate) fn tip_may_paint(anchored_on_overlay: bool) -> bool {
 /// plate" -- canvas-on-panel, 2px radius, the room's own type
 /// (`ui::type_scale`), not a bordered box in an ad hoc size.
 fn tip_plate(text: &SharedString) -> Div {
-    let style = crate::ui::type_scale::label(crate::ui::type_scale::LABEL_ROW_PX, gpui::FontWeight::MEDIUM);
+    let style = crate::ui::type_scale::label(
+        crate::ui::type_scale::LABEL_ROW_PX,
+        gpui::FontWeight::MEDIUM,
+    );
     div()
         .px(px(8.))
         .py(px(4.))

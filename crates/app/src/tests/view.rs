@@ -221,13 +221,7 @@ fn a_rate_row_says_only_what_the_container_stated() {
     // A Matroska states no audio rate of its own: the sound is dropped from
     // the line, never drawn as "0".
     assert_eq!(
-        bitrate_detail(
-            Some(MediaBitrate {
-                audio: None,
-                ..all
-            }),
-            1
-        ),
+        bitrate_detail(Some(MediaBitrate { audio: None, ..all }), 1),
         "8.4 Mb/s · 7.9 video"
     );
     // A still, or anything that would not open: the probe answered, and the
@@ -293,7 +287,10 @@ fn a_stated_rate_never_renders_as_a_zero() {
                 .filter_map(|part| part.split(' ').next())
                 .filter_map(|n| n.parse::<f64>().ok())
             {
-                assert!(number > 0., "{small}/{big} bits a second rendered as {line:?}");
+                assert!(
+                    number > 0.,
+                    "{small}/{big} bits a second rendered as {line:?}"
+                );
             }
         }
     }
@@ -418,9 +415,7 @@ fn no_stroke_is_missing_from_the_keys_menu() {
     for (at, needle) in handler.match_indices("key == ") {
         let rest = &handler[at + needle.len()..];
         let key = match rest.strip_prefix('"') {
-            Some(literal) => {
-                literal[..literal.find('"').expect("unterminated key")].to_string()
-            }
+            Some(literal) => literal[..literal.find('"').expect("unterminated key")].to_string(),
             // A named constant: the escape the cards get out by.
             None if rest.starts_with("ESCAPE") => crate::ESCAPE.to_string(),
             None => panic!("a key compared against something this cannot read: {rest:.20}"),
@@ -589,7 +584,13 @@ fn zoom_stops_at_a_bedful_of_time_and_at_a_handful_of_frames() {
     // clamp against, and a zoom must survive the frame before the probe.
     let unpainted = View {
         bed: 0.,
-        ..test_view(Scale { pps: 4e6, start: 3. }, duration)
+        ..test_view(
+            Scale {
+                pps: 4e6,
+                start: 3.,
+            },
+            duration,
+        )
     };
     assert_eq!(unpainted.settled().pps, 4e6);
     assert_eq!(unpainted.following(19.), unpainted.scale);
@@ -622,7 +623,10 @@ fn zooming_out_reaches_the_end_of_a_timeline_however_long_it_is() {
     // window rather than against its edge.
     assert_eq!(wide.start, 0.);
     let end = wide.px_at(five_hours);
-    assert!(end < bed, "the end of the timeline is off the bed at {end} px");
+    assert!(
+        end < bed,
+        "the end of the timeline is off the bed at {end} px"
+    );
     assert!(end > bed * 0.9, "and not shrunk into a corner: {end} px");
     assert!(
         (view(wide, five_hours).span() - five_hours * ZOOM_OUT_MARGIN).abs() < 1e-6,
@@ -645,7 +649,10 @@ fn zooming_out_reaches_the_end_of_a_timeline_however_long_it_is() {
     // Whatever the length, the resting scale is nobody's content: the width
     // invariant, which a far stop measured off the content would break.
     assert_eq!(view(Scale::default(), 10.).settled(), Scale::default());
-    assert_eq!(view(Scale::default(), five_hours).settled(), Scale::default());
+    assert_eq!(
+        view(Scale::default(), five_hours).settled(),
+        Scale::default()
+    );
     // Shrinking the timeline pulls a fully zoomed out view in with it --
     // what was showing all of the timeline still shows all of it.
     let shrunk = view(wide, 1800.).settled();
@@ -764,7 +771,14 @@ fn the_view_follows_a_playhead_that_runs_off_the_bed() {
 #[test]
 fn a_scroll_during_playback_wins_until_the_head_catches_up() {
     let duration = 80.;
-    let mut scale = test_view(Scale { pps: 40., start: 0. }, duration).settled();
+    let mut scale = test_view(
+        Scale {
+            pps: 40.,
+            start: 0.,
+        },
+        duration,
+    )
+    .settled();
     // The render's arbitration, in the two lines it is there: a panned view
     // is left where the hand put it, and the pan ends where the head is
     // back on the bed.
@@ -802,7 +816,10 @@ fn a_scroll_during_playback_wins_until_the_head_catches_up() {
     assert_eq!(start, scale.start, "and it did not jump to take it");
     // ...and the next head that runs off the bed pulls the view again.
     let ran_off = frame(scale, &mut panned, start + span + 1.);
-    assert!(ran_off.start > start, "the follow follows again: {ran_off:?}");
+    assert!(
+        ran_off.start > start,
+        "the follow follows again: {ran_off:?}"
+    );
     // A paused hand is untouched by any of this: with no follow asking,
     // `shows` is the only thing the pan is ever released by.
     assert!(test_view(scale, duration).shows(scale.start));

@@ -54,7 +54,9 @@ impl Volume {
     /// cannot wrap past silence into full volume.
     pub(crate) fn step(&mut self, up: bool) {
         self.steps = if up {
-            self.steps.saturating_add(Self::KEY_STEP).min(Self::MAX_STEPS)
+            self.steps
+                .saturating_add(Self::KEY_STEP)
+                .min(Self::MAX_STEPS)
         } else {
             self.steps.saturating_sub(Self::KEY_STEP)
         };
@@ -186,7 +188,12 @@ pub(crate) fn should_resync(late: f64, last: Option<Instant>) -> bool {
 ///
 /// The press (`first`) never waits: it is the undo step the whole gesture rolls
 /// back to, so it has to be taken against the state the hand picked up.
-pub(crate) fn stash_or_write<T: Copy>(stash: &mut Option<T>, value: T, first: bool, busy: bool) -> Option<T> {
+pub(crate) fn stash_or_write<T: Copy>(
+    stash: &mut Option<T>,
+    value: T,
+    first: bool,
+    busy: bool,
+) -> Option<T> {
     match busy && !first {
         true => {
             *stash = Some(value);

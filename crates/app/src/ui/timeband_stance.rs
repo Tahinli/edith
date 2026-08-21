@@ -8,8 +8,8 @@
 //! close to the mock's ~20px reading. Every size in this module comes from
 //! `ui::type_scale` (role, not a bare `px()` literal).
 
-use crate::*;
 use crate::ui::type_scale::{self, label, mono};
+use crate::*;
 use gpui::FontWeight;
 
 thread_local! {
@@ -178,8 +178,22 @@ fn range_marks(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
         .flex()
         .items_center()
         .gap(px(4.))
-        .child(ghost("stance-mark-in", player, "I", ActionId::SetIn, false, cx))
-        .child(ghost("stance-mark-out", player, "O", ActionId::SetOut, false, cx))
+        .child(ghost(
+            "stance-mark-in",
+            player,
+            "I",
+            ActionId::SetIn,
+            false,
+            cx,
+        ))
+        .child(ghost(
+            "stance-mark-out",
+            player,
+            "O",
+            ActionId::SetOut,
+            false,
+            cx,
+        ))
         .child(ghost(
             "stance-clear-range",
             player,
@@ -241,11 +255,25 @@ fn contact_strip(player: &Player, position: f64, cx: &mut Context<Player>) -> im
                 .flat_map(|l| s.lane_clips(l).to_vec())
                 .filter_map(|clip| {
                     let source = player.sources().get(clip.source)?;
-                    let Wave::Peaks(peaks) = player.waves.get(&(source.path.clone(), source.audio_stream))?.clone() else {
+                    let Wave::Peaks(peaks) = player
+                        .waves
+                        .get(&(source.path.clone(), source.audio_stream))?
+                        .clone()
+                    else {
                         return None;
                     };
-                    let (in_f, out_f) = (f64::from(clip.in_frame) / fps, f64::from(clip.out_frame) / fps);
-                    Some((frac(clip.start), frac(clip.end()), peaks, in_f, out_f, source_tint(clip.source)))
+                    let (in_f, out_f) = (
+                        f64::from(clip.in_frame) / fps,
+                        f64::from(clip.out_frame) / fps,
+                    );
+                    Some((
+                        frac(clip.start),
+                        frac(clip.end()),
+                        peaks,
+                        in_f,
+                        out_f,
+                        source_tint(clip.source),
+                    ))
                 })
                 .collect()
         })
@@ -424,13 +452,10 @@ fn grip(id: &'static str, left: bool, top: bool) -> impl IntoElement {
                 .h(px(6.))
                 .bg(rgb(INK1())),
         )
-        .on_mouse_down(
-            MouseButton::Left,
-            move |event: &MouseDownEvent, _, cx| {
-                PAN_ANCHOR.with(|a| a.set(Some(f32::from(event.position.x))));
-                cx.stop_propagation();
-            },
-        )
+        .on_mouse_down(MouseButton::Left, move |event: &MouseDownEvent, _, cx| {
+            PAN_ANCHOR.with(|a| a.set(Some(f32::from(event.position.x))));
+            cx.stop_propagation();
+        })
 }
 
 /// The Export chip (MOCK-SPEC "Export chip", DESIGN §4): the room's single
@@ -501,7 +526,8 @@ fn volume_slider(player: &Player, cx: &mut Context<Player>) -> impl IntoElement 
         .flex()
         .items_center()
         .tooltip(|_, cx| {
-            cx.new(|_| Tip("Volume — drag to set the level; the button mutes".into())).into()
+            cx.new(|_| Tip("Volume — drag to set the level; the button mutes".into()))
+                .into()
         })
         .when(!enabled, |d| d.opacity(0.4).cursor_not_allowed())
         .when(enabled, |d| {
@@ -534,7 +560,11 @@ fn volume_slider(player: &Player, cx: &mut Context<Player>) -> impl IntoElement 
 /// The whole band, left to right per MOCK-SPEC: hero timecode, ghost
 /// transport, cut readout, the contact strip filling the rest, the Export
 /// chip at the end.
-pub(crate) fn render(player: &mut Player, position: f64, cx: &mut Context<Player>) -> impl IntoElement {
+pub(crate) fn render(
+    player: &mut Player,
+    position: f64,
+    cx: &mut Context<Player>,
+) -> impl IntoElement {
     let tc = timecode(position, player.active_fps());
     div()
         .id("stance-time-band-row")
@@ -584,7 +614,11 @@ pub(crate) fn render(player: &mut Player, position: f64, cx: &mut Context<Player
                 .child(ghost(
                     "stance-tb-play",
                     player,
-                    if player.transport().is_playing() { "❚❚" } else { "▶" },
+                    if player.transport().is_playing() {
+                        "❚❚"
+                    } else {
+                        "▶"
+                    },
                     ActionId::Play,
                     false,
                     cx,
@@ -676,7 +710,14 @@ pub(crate) fn render(player: &mut Player, position: f64, cx: &mut Context<Player
                 .flex()
                 .items_center()
                 .gap(px(6.))
-                .child(ghost("stance-tb-vol-down", player, "−", ActionId::VolumeDown, false, cx))
+                .child(ghost(
+                    "stance-tb-vol-down",
+                    player,
+                    "−",
+                    ActionId::VolumeDown,
+                    false,
+                    cx,
+                ))
                 .child(ghost(
                     "stance-tb-mute",
                     player,
@@ -690,7 +731,14 @@ pub(crate) fn render(player: &mut Player, position: f64, cx: &mut Context<Player
                     cx,
                 ))
                 .child(volume_slider(player, cx))
-                .child(ghost("stance-tb-vol-up", player, "+", ActionId::VolumeUp, false, cx)),
+                .child(ghost(
+                    "stance-tb-vol-up",
+                    player,
+                    "+",
+                    ActionId::VolumeUp,
+                    false,
+                    cx,
+                )),
         )
         .child(range_marks(player, cx))
         .child(cut_readout(player))

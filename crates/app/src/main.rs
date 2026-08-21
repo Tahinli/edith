@@ -36,9 +36,9 @@ pub(crate) use menus::*;
 pub(crate) use render::escape_leaves_player_fullscreen;
 // The Contain letterbox, shared with the subtitle picture overlay
 // (ui/preview.rs) so both draw the same fitted rect the same way.
-pub(crate) use render::letterboxed_image;
 pub(crate) use notices::*;
 pub(crate) use oracle::*;
+pub(crate) use render::letterboxed_image;
 pub(crate) use subs::*;
 pub(crate) use timeline_math::*;
 pub(crate) use transform_ui::*;
@@ -72,10 +72,10 @@ use engine::{Clip, Codec, ExportHandle, Frame, MediaBitrate, PlaybackSession};
 use gpui::{
     AnyElement, App, Application, Bounds, ClickEvent, Context, Corners, CursorStyle, Div,
     DragMoveEvent, FocusHandle, KeyDownEvent, KeyUpEvent, MouseButton, MouseDownEvent,
-    MouseExitEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point, RenderImage, ScrollDelta,
-    ScrollHandle, ScrollWheelEvent, SharedString, Size, Stateful, TextAlign, TitlebarOptions,
-    Window, WindowBounds, WindowOptions, canvas, div, point, prelude::*, px, relative, rgb, rgba,
-    size,
+    MouseExitEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point, RenderImage,
+    ScrollDelta, ScrollHandle, ScrollWheelEvent, SharedString, Size, Stateful, TextAlign,
+    TitlebarOptions, Window, WindowBounds, WindowOptions, canvas, div, point, prelude::*, px,
+    relative, rgb, rgba, size,
 };
 
 struct Player {

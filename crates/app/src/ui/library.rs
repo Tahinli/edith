@@ -1,9 +1,9 @@
 //! The media library: the left panel's rows and the menu over them.
 
-use crate::*;
-use crate::ui::widgets::*;
-use crate::ui::type_scale::Typeset;
 use crate::ui::stance::menu_floor;
+use crate::ui::type_scale::Typeset;
+use crate::ui::widgets::*;
+use crate::*;
 
 impl Player {
     /// The media library: a row per source the timeline knows, in the order
@@ -184,8 +184,11 @@ impl Player {
             let dragged = (path.clone(), stream);
             let menu_path = path.clone();
             let preview_path = path.clone();
-            let preview_tip: SharedString =
-                format!("Preview {} — plays it without touching the timeline", row.name).into();
+            let preview_tip: SharedString = format!(
+                "Preview {} — plays it without touching the timeline",
+                row.name
+            )
+            .into();
             div()
                 .id(("asset", i))
                 .flex_none()
@@ -379,55 +382,49 @@ impl Player {
             // lanes and the inspector give.
             .overflow_y_scroll()
             .child(
-                div()
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .gap(px(6.))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .flex()
-                            // Wraps rather than clipping: at the 640 px floor
-                            // this column is 128 px wide and the third tab
-                            // would hang off its edge, which is a control the
-                            // pointer cannot reach.
-                            .flex_wrap()
-                            .gap(px(2.))
-                            .children(LIBRARY_TABS.map(|tab| {
-                                let on = tab == self.library_tab;
-                                div()
-                                    .id(("library-tab", tab as usize))
-                                    .flex_none()
-                                    .h(px(HIT_MIN))
-                                    .px(px(6.))
-                                    .flex()
-                                    .items_center()
-                                    .rounded(px(3.))
-                                    .text_size(px(11.))
-                                    .text_color(rgb(match on {
-                                        true => FG_PRIMARY(),
-                                        false => FG_SECONDARY(),
-                                    }))
-                                    // One selection language everywhere: the
-                                    // same stroke a picked clip and a picked
-                                    // row wear.
-                                    .when(on, |d| {
-                                        d.bg(rgb(BG_SELECTED()))
-                                            .border_b_2()
-                                            .border_color(rgb(STROKE_SELECTED()))
-                                    })
-                                    .cursor_pointer()
-                                    .hover(|s| s.bg(rgb(BG_HOVER())))
-                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                        this.library_tab = tab;
-                                        cx.notify();
-                                    }))
-                                    .child(tab.label())
-                            })),
-                    )
-                    ,
+                div().flex_none().flex().items_center().gap(px(6.)).child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .flex()
+                        // Wraps rather than clipping: at the 640 px floor
+                        // this column is 128 px wide and the third tab
+                        // would hang off its edge, which is a control the
+                        // pointer cannot reach.
+                        .flex_wrap()
+                        .gap(px(2.))
+                        .children(LIBRARY_TABS.map(|tab| {
+                            let on = tab == self.library_tab;
+                            div()
+                                .id(("library-tab", tab as usize))
+                                .flex_none()
+                                .h(px(HIT_MIN))
+                                .px(px(6.))
+                                .flex()
+                                .items_center()
+                                .rounded(px(3.))
+                                .text_size(px(11.))
+                                .text_color(rgb(match on {
+                                    true => FG_PRIMARY(),
+                                    false => FG_SECONDARY(),
+                                }))
+                                // One selection language everywhere: the
+                                // same stroke a picked clip and a picked
+                                // row wear.
+                                .when(on, |d| {
+                                    d.bg(rgb(BG_SELECTED()))
+                                        .border_b_2()
+                                        .border_color(rgb(STROKE_SELECTED()))
+                                })
+                                .cursor_pointer()
+                                .hover(|s| s.bg(rgb(BG_HOVER())))
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    this.library_tab = tab;
+                                    cx.notify();
+                                }))
+                                .child(tab.label())
+                        })),
+                ),
             )
             // The tab says what the one full-width control is for. Text holds
             // no rows of its own ([`LibraryTab::holds`]) -- it is the tracks
@@ -466,26 +463,26 @@ impl Player {
             })
             .when(self.library_tab != LibraryTab::Text, |d| {
                 d.child(div().flex_none().child(control(
-                        "import",
-                        // Full width of the column: the way media gets in is
-                        // the one affordance of the tabs that hold media,
-                        // however narrow the window is.
-                        width - 16.,
-                        // Filled with the accent while there is nothing to work
-                        // on, because with an empty library this *is* the
-                        // primary action -- and Export, which wears the accent
-                        // the rest of the time, is dimmed until something is
-                        // imported. One live accent in the window either way.
-                        match rows.is_empty() {
-                            true => ACCENT_PRIMARY(),
-                            false => BG_RAISED(),
-                        },
-                        None,
-                        "Import",
-                        "adds a file to this list — or drop one on the window".to_string(),
-                        !exporting,
-                        cx.listener(|this, _: &ClickEvent, _, cx| this.pick_and_import(cx)),
-                    )))
+                    "import",
+                    // Full width of the column: the way media gets in is
+                    // the one affordance of the tabs that hold media,
+                    // however narrow the window is.
+                    width - 16.,
+                    // Filled with the accent while there is nothing to work
+                    // on, because with an empty library this *is* the
+                    // primary action -- and Export, which wears the accent
+                    // the rest of the time, is dimmed until something is
+                    // imported. One live accent in the window either way.
+                    match rows.is_empty() {
+                        true => ACCENT_PRIMARY(),
+                        false => BG_RAISED(),
+                    },
+                    None,
+                    "Import",
+                    "adds a file to this list — or drop one on the window".to_string(),
+                    !exporting,
+                    cx.listener(|this, _: &ClickEvent, _, cx| this.pick_and_import(cx)),
+                )))
             })
             .child(
                 div()
@@ -640,14 +637,16 @@ impl Player {
                 rows.push(
                     row(rows.len())
                         .child(label)
-                        .child(chord_style(
-                            div()
-                                .min_w(px(0.))
-                                .truncate()
-                                .text_size(px(11.))
-                                .text_color(rgb(FG_SECONDARY())),
+                        .child(
+                            chord_style(
+                                div()
+                                    .min_w(px(0.))
+                                    .truncate()
+                                    .text_size(px(11.))
+                                    .text_color(rgb(FG_SECONDARY())),
+                            )
+                            .child(value),
                         )
-                        .child(value))
                         .into_any_element(),
                 );
             }
@@ -701,7 +700,12 @@ impl Player {
         // floor clamp and the room the list sizes against are `menu_floor`'s,
         // so a menu taller than the footprint scrolls instead of climbing
         // back over the picture.
-        let (at, room) = menu_floor(menu.at, viewport, darkroom, self.split_px(Split::Bench, viewport));
+        let (at, room) = menu_floor(
+            menu.at,
+            viewport,
+            darkroom,
+            self.split_px(Split::Bench, viewport),
+        );
         let list_h = menu_rows_h(rows.len(), room);
         let (x, y) = menu_at(at, viewport, MENU_PAD * 2. + list_h);
         let full: SharedString = path.display().to_string().into();

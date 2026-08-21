@@ -9,8 +9,8 @@
 //! pointer while the very same actions still fired from the keys. One oracle,
 //! two doors -- if the key fires, the button fires.
 
-use crate::*;
 use crate::ui::widgets::*;
+use crate::*;
 
 impl Player {
     /// A toolbar button for `action`: enabled exactly when [`enable`] says the
@@ -142,8 +142,7 @@ impl Player {
                                 this.open_export(cx);
                             }
                         }),
-                    ))
-                    ,
+                    )),
             )
     }
 
@@ -216,7 +215,9 @@ impl Player {
                 "Loop",
                 "restarts from the top on reaching the end, instead of stopping",
                 ActionId::Loop,
-                cx.listener(|this, _: &ClickEvent, window, cx| this.act(ActionId::Loop, window, cx)),
+                cx.listener(|this, _: &ClickEvent, window, cx| {
+                    this.act(ActionId::Loop, window, cx)
+                }),
             ))
             // One line, one fixed width: changing digits must not push the
             // strip around, and the clock is the one number that changes
@@ -397,7 +398,9 @@ impl Player {
                         None,
                         if self.snap { "Snap on" } else { "Snap off" },
                         match self.snap {
-                            true => "drags and trims land on clip edges, the playhead and the start",
+                            true => {
+                                "drags and trims land on clip edges, the playhead and the start"
+                            }
                             false => "drags and trims land exactly where the hand leaves them",
                         },
                         ActionId::ToggleSnap,

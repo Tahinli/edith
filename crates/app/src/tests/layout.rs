@@ -102,7 +102,10 @@ fn no_colour_is_written_outside_the_theme() {
         .lines()
         .filter(|l| l.contains("rgb(0x") || l.contains("rgba(0x"))
         .collect();
-    assert!(stray.is_empty(), "colour written outside the theme: {stray:?}");
+    assert!(
+        stray.is_empty(),
+        "colour written outside the theme: {stray:?}"
+    );
 }
 
 /// The literal-grep above is blind to a hue arriving through a theme
@@ -127,7 +130,10 @@ fn an_alpha_carrying_role_never_reaches_rgb() {
             (hex.len() == 8 && !hex.ends_with("ff")).then_some(name.trim())
         })
         .collect();
-    assert!(alpha_roles.len() >= 8, "the theme's alpha-carrying roles moved; this scan is blind");
+    assert!(
+        alpha_roles.len() >= 8,
+        "the theme's alpha-carrying roles moved; this scan is blind"
+    );
 
     let source = ui_source();
     let mut misuses = Vec::new();
@@ -136,7 +142,10 @@ fn an_alpha_carrying_role_never_reaches_rgb() {
             misuses.push(*role);
         }
     }
-    assert!(misuses.is_empty(), "alpha-carrying role(s) reaching rgb() instead of rgba(): {misuses:?}");
+    assert!(
+        misuses.is_empty(),
+        "alpha-carrying role(s) reaching rgb() instead of rgba(): {misuses:?}"
+    );
 }
 
 /// "It scrolls" is not "it can be found": at the 640x360 floor the timeline
@@ -145,7 +154,6 @@ fn an_alpha_carrying_role_never_reaches_rgb() {
 /// being scrolled, or it is an instruction nobody can carry out.
 #[test]
 fn the_line_about_what_is_below_the_fold_counts_what_is_still_below_it() {
-
     // The timeline is a region and not the window: its chrome -- the
     // scrollbar strip's row included, which is the larger of the two the
     // zoom can leave in it -- and one whole lane fit the share it may take
@@ -199,7 +207,10 @@ fn a_second_message_queues_behind_the_first_instead_of_erasing_it() {
     push_notice(&mut q, "NOTHING ADDED — no video stream".into());
     push_notice(&mut q, "NOTHING ADDED — the file is not there".into());
     assert_eq!(q.len(), 2);
-    assert_eq!(q.front().map(|n: &gpui::SharedString| n.as_ref()), Some("NOTHING ADDED — no video stream"));
+    assert_eq!(
+        q.front().map(|n: &gpui::SharedString| n.as_ref()),
+        Some("NOTHING ADDED — no video stream")
+    );
 
     // A held key that refuses says its one sentence once: the count on the
     // bar is a count of messages, not of how long the key was held.
@@ -212,7 +223,10 @@ fn a_second_message_queues_behind_the_first_instead_of_erasing_it() {
         push_notice(&mut q, format!("SCAN FAILED: {i}").into());
     }
     assert_eq!(q.len(), NOTICES_MAX);
-    assert_eq!(q.back().map(|n: &gpui::SharedString| n.as_ref()), Some("SCAN FAILED: 10"));
+    assert_eq!(
+        q.back().map(|n: &gpui::SharedString| n.as_ref()),
+        Some("SCAN FAILED: 10")
+    );
 
     // Answering the bar brings the next one up, oldest first.
     let front = q.pop_front();
@@ -225,7 +239,10 @@ fn a_second_message_queues_behind_the_first_instead_of_erasing_it() {
 #[test]
 fn an_export_outcome_jumps_the_queue() {
     let mut q = std::collections::VecDeque::new();
-    push_notice(&mut q, "PROXY READY for a.mp4 — Proxies on cuts on it".into());
+    push_notice(
+        &mut q,
+        "PROXY READY for a.mp4 — Proxies on cuts on it".into(),
+    );
     push_notice(&mut q, "SUBTITLES b.srt — 1 track(s) in the palette".into());
     push_notice(&mut q, format!("{EXPORT_DONE}out.mp4").into());
     assert_eq!(q.len(), 3);
@@ -237,7 +254,10 @@ fn an_export_outcome_jumps_the_queue() {
 
     // A failed export is the same class: the outcome, whichever it was.
     let mut q = std::collections::VecDeque::new();
-    push_notice(&mut q, "PROXY READY for a.mp4 — Proxies on cuts on it".into());
+    push_notice(
+        &mut q,
+        "PROXY READY for a.mp4 — Proxies on cuts on it".into(),
+    );
     push_notice(&mut q, "EXPORT FAILED: disk full".into());
     assert_eq!(
         q.front().map(|n: &gpui::SharedString| n.as_ref()),
@@ -250,8 +270,14 @@ fn an_export_outcome_jumps_the_queue() {
 #[test]
 fn a_message_wears_the_colour_its_own_words_say() {
     assert_eq!(notice_tone("SCAN FAILED: no audio"), STATUS_ERROR());
-    assert_eq!(notice_tone(&format!("{EXPORT_DONE}out.mp4")), STATUS_SUCCESS());
-    assert_eq!(notice_tone("NOTHING DETACHED — not grouped"), STATUS_WARNING());
+    assert_eq!(
+        notice_tone(&format!("{EXPORT_DONE}out.mp4")),
+        STATUS_SUCCESS()
+    );
+    assert_eq!(
+        notice_tone("NOTHING DETACHED — not grouped"),
+        STATUS_WARNING()
+    );
     assert_eq!(notice_tone("SNAP ON"), ACCENT_PRIMARY());
 }
 
@@ -267,7 +293,12 @@ fn an_inspector_section_occludes_no_timeline() {
     // leave this rule reading a file the render is no longer in.
     let render = source_from("impl Render for Player");
     for card in [
-        "eq_card", "color_card", "speed_card", "silence_card", "mix_card", "subtitle_style_card",
+        "eq_card",
+        "color_card",
+        "speed_card",
+        "silence_card",
+        "mix_card",
+        "subtitle_style_card",
     ] {
         assert!(
             inspector.contains(&format!("self.{card}(")),
@@ -394,8 +425,8 @@ fn a_lane_row_is_a_fixed_header_and_a_bed_that_can_be_hit() {
 /// a hand can hold, and never off the ends.
 #[test]
 fn the_scroll_thumb_is_the_visible_share_at_its_own_place() {
-    use crate::scroll_thumb;
     use crate::SCROLL_THUMB_MIN;
+    use crate::scroll_thumb;
 
     // Nothing to scroll: the strip fills and says so.
     assert_eq!(scroll_thumb(400., 10., 0., 12.), (0., 400.));
@@ -469,10 +500,7 @@ fn the_scroll_strip_row_comes_and_goes_with_the_zoom() {
         // had: the region grows by the strip's row when it appears, by
         // exactly the row the lanes would otherwise lose to it.
         assert_eq!(timeline_h(2, scroll) - timeline_fixed_h(scroll), lanes_h(2));
-        assert_eq!(
-            timeline_h(6, scroll) - timeline_fixed_h(scroll),
-            lanes_h(6)
-        );
+        assert_eq!(timeline_h(6, scroll) - timeline_fixed_h(scroll), lanes_h(6));
         // ...and the floor keeps a whole lane standing under the line, on
         // either face of the zoom boundary.
         let floor = split_size(Split::Timeline, Some(0.), 2, window, scroll);
@@ -507,8 +535,8 @@ fn the_scroll_strip_row_comes_and_goes_with_the_zoom() {
 /// on the track, the time axis's own thumb turned through a right angle.
 #[test]
 fn the_lane_thumb_is_the_visible_share_of_the_stack() {
-    use crate::lanes_thumb;
     use crate::SCROLL_THUMB_MIN;
+    use crate::lanes_thumb;
 
     // Whole stack on screen: the track fills and there is nothing to scroll.
     assert_eq!(lanes_thumb(200., 104., 200., 0.), (0., 200.));
@@ -1152,7 +1180,10 @@ fn the_card_names_the_subtitle_it_leaves_off_and_counts_them_when_it_cannot() {
     // What the engine answers about the one pick that reached it, and what
     // this side knows about the row that did not.
     let named = subtitle_plan("[ASS] → embedded".to_string(), &two, &[0]);
-    assert_eq!(named, "[ASS] → embedded; [ASS] [FOR DUB] — in the palette, on no track");
+    assert_eq!(
+        named,
+        "[ASS] → embedded; [ASS] [FOR DUB] — in the palette, on no track"
+    );
     assert!(
         named.chars().count() <= SUB_PLAN_CHARS,
         "two tracks fit the value box: {named}"
@@ -1439,8 +1470,14 @@ fn a_subtitle_group_header_is_never_gated_on_window_height() {
         .find("subtitle-group-head")
         .expect("no id on the group header");
     let block = &timeline[head_at..(head_at + 2400).min(timeline.len())];
-    assert!(block.contains("sub_folded.remove"), "no fold-open path: {block}");
-    assert!(block.contains("sub_folded.insert"), "no fold-shut path: {block}");
+    assert!(
+        block.contains("sub_folded.remove"),
+        "no fold-open path: {block}"
+    );
+    assert!(
+        block.contains("sub_folded.insert"),
+        "no fold-shut path: {block}"
+    );
     assert!(
         block.contains("\"1 track\"") || block.contains("tracks"),
         "the header does not say how many tracks it holds: {block}"
@@ -1765,7 +1802,10 @@ fn a_dragged_divider_stops_before_either_panel_disappears() {
     // timeline's answer is stated for both of its faces: the timeline fits
     // the bed with nothing to scroll to, and zoomed in past that line the
     // strip's row joins the furniture.
-    assert_eq!(split_size(Split::Library, None, 2, window, false), library_w(1280.));
+    assert_eq!(
+        split_size(Split::Library, None, 2, window, false),
+        library_w(1280.)
+    );
     assert_eq!(
         split_size(Split::Inspector, None, 2, window, false),
         inspector_w(1280.)
@@ -1779,8 +1819,14 @@ fn a_dragged_divider_stops_before_either_panel_disappears() {
         timeline_h(2, true).min(720. * TIMELINE_SHARE)
     );
     // Dragged, it is what the hand asked for...
-    assert_eq!(split_size(Split::Library, Some(300.), 2, window, false), 300.);
-    assert_eq!(split_size(Split::Timeline, Some(300.), 2, window, false), 300.);
+    assert_eq!(
+        split_size(Split::Library, Some(300.), 2, window, false),
+        300.
+    );
+    assert_eq!(
+        split_size(Split::Timeline, Some(300.), 2, window, false),
+        300.
+    );
     // ...and never past either end of it.
     assert_eq!(
         split_size(Split::Library, Some(0.), 2, window, false),
@@ -1824,7 +1870,10 @@ fn a_dragged_divider_stops_before_either_panel_disappears() {
     );
     // A size dragged with one track and kept while a second arrives is raised
     // to the new floor as it is read, not silently drawn under it.
-    assert_eq!(split_size(Split::Timeline, Some(126.), 2, window, true), floor);
+    assert_eq!(
+        split_size(Split::Timeline, Some(126.), 2, window, true),
+        floor
+    );
     // And the floor still fits the share the shortest window gives the region.
     assert!(floor <= 360. * TIMELINE_SHARE, "{floor} px will not fit");
     assert_eq!(
@@ -1866,7 +1915,9 @@ fn a_dragged_divider_stops_before_either_panel_disappears() {
 #[test]
 fn the_darkroom_seams_stop_before_either_side_disappears() {
     use crate::ui::theme::INSPECTOR_MIN_W;
-    use crate::{BENCH_MIN_H, SIDE_MAX_FRAC, SPLIT_W, Split, split_bounds, split_drag_size, split_size};
+    use crate::{
+        BENCH_MIN_H, SIDE_MAX_FRAC, SPLIT_W, Split, split_bounds, split_drag_size, split_size,
+    };
     use gpui::{point, px, size};
 
     let window = size(px(1280.), px(720.));
@@ -1935,7 +1986,10 @@ fn both_default_lanes_fit_the_bench_at_its_floor() {
     // row (`layout::LEDGER_SEAM_CLEARANCE`) so the last lane's own last pixel
     // never shares a row with the ledger's border, which lands here as
     // `avail` being a touch over the two-rows-plus-gap tight fit.
-    assert!(h >= LANE_MIN_H, "the floor should give both lanes at least their own minimum ({h} < {LANE_MIN_H})");
+    assert!(
+        h >= LANE_MIN_H,
+        "the floor should give both lanes at least their own minimum ({h} < {LANE_MIN_H})"
+    );
     let content = 2. * h + ROW_GAP;
     assert!(
         content <= avail + 1e-4,
@@ -2061,7 +2115,9 @@ fn the_notice_plate_cannot_reach_the_bench_at_any_height() {
 #[test]
 fn the_notice_plate_declares_a_bounded_wrapping_text_layout() {
     let stance = src_text("ui/stance.rs");
-    let notice_start = stance.find("fn notice_plate(").expect("notice plate moved or renamed");
+    let notice_start = stance
+        .find("fn notice_plate(")
+        .expect("notice plate moved or renamed");
     let notice_end = stance[notice_start..]
         .find("\n/// Thin strip")
         .map(|end| notice_start + end)
@@ -2077,7 +2133,6 @@ fn the_notice_plate_declares_a_bounded_wrapping_text_layout() {
         "notice plate no longer explicitly requests GPUI's wrapping whitespace mode"
     );
 }
-
 
 /// A round trip through the file: what is saved is what the next load reads
 /// back, one seam touched and the other left at its default -- a scratch
@@ -2198,12 +2253,20 @@ fn the_stance_renders_its_six_regions_in_the_documented_order() {
 
     // Defined in order is not composed in order -- `render()` has to call
     // them in it too, or the geometry above is dead prose.
-    let render_body =
-        &stance[stance.find("pub(crate) fn render(").expect("the stance's entry point")..];
+    let render_body = &stance[stance
+        .find("pub(crate) fn render(")
+        .expect("the stance's entry point")..];
     // Open paren only, no close: DESIGN §12 steps 3 and 4 hand most of the
     // regions player/window state to read, so their call sites carry
     // arguments now. Order is what this asserts, not arity.
-    let calls = ["spine(", "screen(", "time_band(", "bench(", "ledger(", "dock("];
+    let calls = [
+        "spine(",
+        "screen(",
+        "time_band(",
+        "bench(",
+        "ledger(",
+        "dock(",
+    ];
     let composed: Vec<usize> = calls
         .iter()
         .map(|c| {
@@ -2320,7 +2383,10 @@ fn every_darkroom_menu_sizes_its_list_against_the_floor_room_not_the_raw_viewpor
              call -- every darkroom menu must clamp both its anchor and its \
              list room together"
         );
-        assert!(sizings > 0, "{file} no longer opens any menu -- update this guard");
+        assert!(
+            sizings > 0,
+            "{file} no longer opens any menu -- update this guard"
+        );
     }
 }
 
@@ -2338,10 +2404,19 @@ fn every_darkroom_menu_sizes_its_list_against_the_floor_room_not_the_raw_viewpor
 #[test]
 fn settings_project_and_editor_sections_open_disjoint_doors() {
     let source = src_text("ui/settings_stance.rs");
-    let project_start = source.find("fn project_section(").expect("the project section");
-    let editor_start = source.find("fn editor_section(").expect("the editor section");
-    let render_start = source.find("pub(crate) fn render(").expect("the page's render fn");
-    assert!(project_start < editor_start && editor_start < render_start, "the three fns moved; this scan is blind");
+    let project_start = source
+        .find("fn project_section(")
+        .expect("the project section");
+    let editor_start = source
+        .find("fn editor_section(")
+        .expect("the editor section");
+    let render_start = source
+        .find("pub(crate) fn render(")
+        .expect("the page's render fn");
+    assert!(
+        project_start < editor_start && editor_start < render_start,
+        "the three fns moved; this scan is blind"
+    );
     let project_body = &source[project_start..editor_start];
     let editor_body = &source[editor_start..render_start];
 
@@ -2354,7 +2429,10 @@ fn settings_project_and_editor_sections_open_disjoint_doors() {
     // every picker.
     let editor_no_theme = editor_body.replace("open_picker(Pick::Theme", "");
     for door in ["open_picker(", "open_mix("] {
-        assert!(project_body.contains(door), "PROJECT section no longer opens {door} -- update this guard");
+        assert!(
+            project_body.contains(door),
+            "PROJECT section no longer opens {door} -- update this guard"
+        );
         assert!(
             !editor_no_theme.contains(door),
             "EDITOR section opens {door}, a project-file door -- that value belongs in PROJECT, not here"
@@ -2364,8 +2442,15 @@ fn settings_project_and_editor_sections_open_disjoint_doors() {
         editor_body.contains("open_picker(Pick::Theme"),
         "the palette row left EDITOR -- it is a ~/.config preference, not a project value"
     );
-    for door in ["toggle_proxies(", "toggle_auto_proxies(", "open_subtitle_style("] {
-        assert!(editor_body.contains(door), "EDITOR section no longer opens {door} -- update this guard");
+    for door in [
+        "toggle_proxies(",
+        "toggle_auto_proxies(",
+        "open_subtitle_style(",
+    ] {
+        assert!(
+            editor_body.contains(door),
+            "EDITOR section no longer opens {door} -- update this guard"
+        );
         assert!(
             !project_body.contains(door),
             "PROJECT section opens {door}, an editor-only door -- that value belongs in EDITOR, not here"
@@ -2375,9 +2460,19 @@ fn settings_project_and_editor_sections_open_disjoint_doors() {
     // through an opener, which is the one place a config-file write (the
     // subtitle style card's Save, this window's next project load) is
     // allowed to live.
-    for path_fn in ["dock_stance::config_path", "theme::config_path", "Keymap::config_path"] {
-        assert!(!project_body.contains(path_fn), "PROJECT section touches {path_fn} directly");
-        assert!(!editor_body.contains(path_fn), "EDITOR section touches {path_fn} directly");
+    for path_fn in [
+        "dock_stance::config_path",
+        "theme::config_path",
+        "Keymap::config_path",
+    ] {
+        assert!(
+            !project_body.contains(path_fn),
+            "PROJECT section touches {path_fn} directly"
+        );
+        assert!(
+            !editor_body.contains(path_fn),
+            "EDITOR section touches {path_fn} directly"
+        );
     }
 }
 
@@ -2395,9 +2490,16 @@ fn settings_row_hints_naming_config_edith_have_a_matching_pref_pair() {
     let source = src_text("ui/settings_stance.rs");
     let library = src_text("player/library.rs");
     // (row id, the stem its pref functions are named after)
-    for (row_id, stem) in [("settings-proxies", "proxies"), ("settings-auto-proxies", "auto_proxies")] {
-        let row_start = source.find(&format!("\"{row_id}\"")).unwrap_or_else(|| panic!("{row_id} row moved or renamed -- update this guard"));
-        let row_end = source[row_start..].find(",\n        ))").map_or(source.len(), |i| row_start + i);
+    for (row_id, stem) in [
+        ("settings-proxies", "proxies"),
+        ("settings-auto-proxies", "auto_proxies"),
+    ] {
+        let row_start = source
+            .find(&format!("\"{row_id}\""))
+            .unwrap_or_else(|| panic!("{row_id} row moved or renamed -- update this guard"));
+        let row_end = source[row_start..]
+            .find(",\n        ))")
+            .map_or(source.len(), |i| row_start + i);
         let row_text = &source[row_start..row_end];
         if !row_text.contains("~/.config/edith") {
             continue;
@@ -2422,10 +2524,18 @@ fn settings_row_hints_naming_config_edith_have_a_matching_pref_pair() {
 #[test]
 fn settings_project_rows_have_no_bare_noun_placeholder() {
     let source = src_text("ui/settings_stance.rs");
-    let project_start = source.find("fn project_section(").expect("the project section");
-    let editor_start = source.find("fn editor_section(").expect("the editor section");
+    let project_start = source
+        .find("fn project_section(")
+        .expect("the project section");
+    let editor_start = source
+        .find("fn editor_section(")
+        .expect("the editor section");
     let project_body = &source[project_start..editor_start];
-    for placeholder in ["\"Size\".to_string()", "\"Rate\".to_string()", "\"HDR\".to_string()"] {
+    for placeholder in [
+        "\"Size\".to_string()",
+        "\"Rate\".to_string()",
+        "\"HDR\".to_string()",
+    ] {
         assert!(
             !project_body.contains(placeholder),
             "a PROJECT row fell back to the bare noun {placeholder} -- it reads as a value with no project open"
@@ -2442,28 +2552,50 @@ fn settings_project_rows_have_no_bare_noun_placeholder() {
 #[test]
 fn hdr_reference_rows_read_content_light_and_use_the_established_empty_state() {
     let source = src_text("ui/settings_stance.rs");
-    let project_start = source.find("fn project_section(").expect("the project section");
-    let editor_start = source.find("fn editor_section(").expect("the editor section");
+    let project_start = source
+        .find("fn project_section(")
+        .expect("the project section");
+    let editor_start = source
+        .find("fn editor_section(")
+        .expect("the editor section");
     let project_body = &source[project_start..editor_start];
 
-    assert!(project_body.contains("settings-hdr-reference"), "the HDR reference row is missing");
-    assert!(project_body.contains("settings-content-light"), "the content-light row is missing");
+    assert!(
+        project_body.contains("settings-hdr-reference"),
+        "the HDR reference row is missing"
+    );
+    assert!(
+        project_body.contains("settings-content-light"),
+        "the content-light row is missing"
+    );
 
     // Reads the real declared numbers, not an invented default or a fixed
     // string standing in for one.
     for field in ["mastering_max", "max_cll", "max_fall"] {
-        assert!(project_body.contains(field), "the HDR reference rows do not read ContentLight::{field}");
+        assert!(
+            project_body.contains(field),
+            "the HDR reference rows do not read ContentLight::{field}"
+        );
     }
 
     // No override field exists on the engine side to write one into, so the
     // row must never claim a picker/opener the way every other PROJECT row
     // does -- it is built with `row_static`, not `row`/`row_ink`.
-    assert!(project_body.contains("row_static(\n            \"settings-hdr-reference\""), "the HDR reference row must be read-only (row_static), not a picker");
-    assert!(project_body.contains("row_static(\n            \"settings-content-light\""), "the content-light row must be read-only (row_static), not a picker");
+    assert!(
+        project_body.contains("row_static(\n            \"settings-hdr-reference\""),
+        "the HDR reference row must be read-only (row_static), not a picker"
+    );
+    assert!(
+        project_body.contains("row_static(\n            \"settings-content-light\""),
+        "the content-light row must be read-only (row_static), not a picker"
+    );
 
     // The established empty state: a bare "—" reused, never a second idiom
     // ("N/A", "None", "Unknown"...) invented for the same absence.
-    assert!(project_body.contains("\"—\".to_string()"), "the HDR reference rows must reuse the page's own empty-state dash");
+    assert!(
+        project_body.contains("\"—\".to_string()"),
+        "the HDR reference rows must reuse the page's own empty-state dash"
+    );
 }
 /// The parity class this user has reported four separate times: "some
 /// options are only reachable via keyboard shortcut". A source scan (this
@@ -2558,7 +2690,9 @@ fn darkroom_bench_wires_transition_controls_and_lane_drop_cue() {
     }
 
     let lane = &bench[bench.find("fn lane_row(").expect("the lane renderer")
-        ..bench.find("pub(crate) fn render(").expect("the bench renderer")];
+        ..bench
+            .find("pub(crate) fn render(")
+            .expect("the bench renderer")];
     for needle in [
         "this.preview_lane_drop(event.drag(cx).0, lane, cx)",
         "this.forget_lane_drop(lane, cx)",

@@ -131,7 +131,11 @@ pub(crate) const EQ_GRAPH_MAX_H: f32 = 320.;
 /// pixels, an actually taller curve with more room per decibel and per
 /// decade.
 pub(crate) fn eq_graph_h(maximized: bool) -> f32 {
-    if maximized { EQ_GRAPH_MAX_H } else { EQ_GRAPH_H }
+    if maximized {
+        EQ_GRAPH_MAX_H
+    } else {
+        EQ_GRAPH_H
+    }
 }
 
 /// How wide the equalizer card is allowed to get. It is the one card that is a
@@ -225,7 +229,11 @@ mod eq_graph_maximize_tests {
     /// clamp is a layout-time panic, not a compile-time one).
     #[test]
     fn maximized_graph_floor_matches_docked_and_never_exceeds_its_own_ceiling() {
-        assert_eq!(eq_graph_h(false), EQ_GRAPH_H, "docked height must be the floor maximized also uses");
+        assert_eq!(
+            eq_graph_h(false),
+            EQ_GRAPH_H,
+            "docked height must be the floor maximized also uses"
+        );
         assert!(EQ_GRAPH_H <= EQ_GRAPH_MAX_H);
     }
 }
@@ -246,7 +254,6 @@ mod eq_tick_end_w_tests {
         assert!(bumped_w > dark_w);
     }
 }
-
 
 /// How many played samples one spectrum frame is transformed from. A power of
 /// two ([`fft`] is radix-2) and the whole of the engine's tap: 1024 at 48 kHz
