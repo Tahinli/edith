@@ -657,6 +657,19 @@ impl Player {
             // right-clicked is not a row, and one this moment refuses is drawn
             // dimmed and says why in place of its hint.
             for item in row_items(ctx) {
+                // DESIGN §9: destructive verbs sit below a rule line. One
+                // hairline, drawn once, above whichever of the two removes
+                // this row context offers.
+                if matches!(item, RowItem::Remove | RowItem::RemoveWithClips) && darkroom {
+                    rows.push(
+                        div()
+                            .flex_none()
+                            .my(px(3.))
+                            .h(px(1.))
+                            .bg(rgb(DARK_HAIRLINE()))
+                            .into_any_element(),
+                    );
+                }
                 let refusal = row_enable(item, ctx);
                 let enabled = refusal.yes();
                 rows.push(
@@ -711,17 +724,7 @@ impl Player {
                     }),
                 )
                 .child(
-                    div()
-                        .id("library-menu-card")
-                        .absolute()
-                        .left(px(x))
-                        .top(px(y))
-                        .w(px(MENU_W))
-                        .flex()
-                        .flex_col()
-                        .p(px(MENU_PAD))
-                        .rounded(px(6.))
-                        .bg(rgb(BG_RAISED()))
+                    menu_plate("library-menu-card", x, y, darkroom)
                         // Painted after the scrim, so this listener runs first
                         // and a press meant for an item never closes the menu
                         // out from under its own click (`context_card`).

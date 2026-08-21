@@ -66,7 +66,7 @@ fn glyph(
         .flex_col()
         .items_center()
         .gap(px(1.))
-        .px(px(4.))
+        .px(px(3.))
         .py(px(1.))
         .rounded(px(3.))
         .when(active, |d| d.bg(rgb(DARK_RAISED())))
@@ -158,7 +158,7 @@ fn trim_control(active: bool, player: &Player, cx: &mut Context<Player>) -> impl
         .flex_col()
         .items_center()
         .gap(px(1.))
-        .px(px(4.))
+        .px(px(3.))
         .py(px(1.))
         .rounded(px(3.))
         .when(active, |d| d.bg(rgb(DARK_RAISED())))
@@ -189,9 +189,14 @@ fn pair(left: impl IntoElement, right: impl IntoElement) -> impl IntoElement {
     div()
         .flex_none()
         .flex()
+        .w_full()
         .items_center()
         .justify_center()
-        .gap(px(6.))
+        // 4px, not 6: two two-glyph halves plus their own padding used to
+        // measure wider than the 56px rail and bled past its left edge
+        // (measured at 1280x720: the `AP`/`FS` row started at x=0, outside
+        // the spine's own surface).
+        .gap(px(4.))
         .child(left)
         .child(right)
 }
@@ -336,60 +341,46 @@ pub(crate) fn render(player: &Player, cx: &mut Context<Player>) -> impl IntoElem
             cx,
         ))
         .child(group_head("track"))
-        .child(glyph(
-            "spine-add-video",
-            "+V",
-            ActionId::AddVideoLane,
-            false,
-            false,
-            player,
-            cx,
-        ))
-        .child(glyph(
-            "spine-add-audio",
-            "+A",
-            ActionId::AddAudioLane,
-            false,
-            false,
-            player,
-            cx,
-        ))
-        // The subtitle trio (homeless per this task's audit): AddSubtitleLane
-        // joins +V/+A on the same "+letter" grammar per this task's own
-        // instruction ("+S joins +V/+A in TRACK"); remove/import are "the
-        // subtitle work" the instruction says to place them beside, so they
-        // share the row underneath rather than each eating a full row (the
-        // same space-saving `pair` the walk-cuts and zoom in/out already
-        // use). ToggleSubtitles (whether the cues draw over the picture at
-        // all) is the fourth subtitle-lane command with no home anywhere in
-        // the darkroom -- filed here too, "CC" being the glyph every player
-        // already uses for exactly this toggle, rather than in the quiet
-        // ROOM cluster below: cue visibility is judged shot to shot, closer
-        // in frequency to a view toggle used often than to a once-a-session
-        // preference.
-        .child(glyph(
-            "spine-add-subtitle",
-            "+S",
-            ActionId::AddSubtitleLane,
-            false,
-            false,
-            player,
-            cx,
-        ))
         .child(pair(
             glyph(
-                "spine-remove-subtitle",
-                "−S",
-                ActionId::RemoveSubtitleLane,
+                "spine-add-video",
+                "+V",
+                ActionId::AddVideoLane,
                 false,
                 false,
                 player,
                 cx,
             ),
             glyph(
-                "spine-import-subtitles",
-                "↓S",
-                ActionId::ImportSubtitles,
+                "spine-add-audio",
+                "+A",
+                ActionId::AddAudioLane,
+                false,
+                false,
+                player,
+                cx,
+            ),
+        ))
+        // The subtitle lane pair: add beside remove, one row, the same
+        // "+letter"/"−letter" grammar +V/+A above it already reads in. Import
+        // (`↓S`) left this rail entirely -- it is an import, so it lives in
+        // the dock's own IMPORT list beside "Add files" (`dock_stance`),
+        // where an editor already goes to bring a file into the room. That
+        // move is what takes this group from three crowded rows to two.
+        .child(pair(
+            glyph(
+                "spine-add-subtitle",
+                "+S",
+                ActionId::AddSubtitleLane,
+                false,
+                false,
+                player,
+                cx,
+            ),
+            glyph(
+                "spine-remove-subtitle",
+                "−S",
+                ActionId::RemoveSubtitleLane,
                 false,
                 false,
                 player,
@@ -405,45 +396,31 @@ pub(crate) fn render(player: &Player, cx: &mut Context<Player>) -> impl IntoElem
             player,
             cx,
         ))
-        // ROOM: the once-a-session/once-a-project acts this task's charter
-        // names explicitly (theme, proxies, screenshot, fullscreen) -- ink-
-        // demoted (`quiet: true`) and paired two-to-a-row to keep the group
-        // cheap, the same "rare acts live out of the way" pattern DESIGN §2
-        // names for re-inking, applied here to the spine's own bottom
-        // instead of a right-click menu (these four are toggled/fired by a
-        // click, not by picking a source dot, so a context menu is not
-        // their shape). Left off this list: Save, which sits beside Export
-        // in the time band instead (see timeband_stance.rs) because the
-        // ledger already gives the saved/unsaved state a home there, and
-        // keymap.rs's own `Category::File` files Save beside Export and
-        // Screenshot on the strength of what each one writes.
+        // ROOM, cut to the three acts that are *acts* rather than settings
+        // (user 2026-08-21: "the spine menu is too crowded and looks weird
+        // also not fitting" -- measured at 1280x720 the rail overflowed its
+        // own height and the settings glyph, the last row, could only be
+        // reached by scrolling the spine). Theme, proxies and auto-proxies
+        // were the three that are *preferences*, not verbs: they are rows on
+        // the settings page now (`settings_stance`), which is where an
+        // editor already goes to change what the room is rather than what
+        // the film is -- so nothing lost a visible home (DESIGN §9) and the
+        // rail lost three rows.
         .child(group_head("room"))
         .child(pair(
-            glyph("spine-theme", "H", ActionId::Theme, false, true, player, cx),
             glyph(
-                "spine-proxies",
-                "P",
-                ActionId::ToggleProxies,
-                player.proxies_on,
-                true,
-                player,
-                cx,
-            ),
-        ))
-        .child(pair(
-            glyph(
-                "spine-auto-proxies",
-                "AP",
-                ActionId::ToggleAutoProxies,
-                player.auto_proxies_on,
+                "spine-settings",
+                "St",
+                ActionId::Settings,
+                player.settings_open,
                 true,
                 player,
                 cx,
             ),
             glyph(
-                "spine-fullscreen",
-                "FS",
-                ActionId::Fullscreen,
+                "spine-screenshot",
+                "Sh",
+                ActionId::Screenshot,
                 false,
                 true,
                 player,
@@ -451,24 +428,10 @@ pub(crate) fn render(player: &Player, cx: &mut Context<Player>) -> impl IntoElem
             ),
         ))
         .child(glyph(
-            "spine-screenshot",
-            "Sh",
-            ActionId::Screenshot,
+            "spine-fullscreen",
+            "FS",
+            ActionId::Fullscreen,
             false,
-            true,
-            player,
-            cx,
-        ))
-        // The settings page's own visible door (user complaint: "some
-        // options are only reachable via keyboard shortcut") -- a chord
-        // alone is a defect class this room has hit repeatedly, so this
-        // glyph sits beside the other once-a-session ROOM acts even though
-        // its chord (`^,`) is a preference, not a mnemonic.
-        .child(glyph(
-            "spine-settings",
-            "St",
-            ActionId::Settings,
-            player.settings_open,
             true,
             player,
             cx,

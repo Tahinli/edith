@@ -373,12 +373,22 @@ pub(crate) fn row_enable(item: RowItem, ctx: RowCtx) -> Enable {
     match item {
         // The two that change the timeline, so an export reading it stops them
         // both -- the key handler's rule, applied to a menu.
-        RowItem::Add | RowItem::Remove if ctx.exporting => Enable::No("an export is running"),
-        RowItem::Add | RowItem::Remove if !ctx.timeline => Enable::No("no timeline open"),
+        RowItem::Add | RowItem::Remove | RowItem::RemoveWithClips if ctx.exporting => {
+            Enable::No("an export is running")
+        }
+        RowItem::Add | RowItem::Remove | RowItem::RemoveWithClips if !ctx.timeline => {
+            Enable::No("no timeline open")
+        }
         // Dimmed and saying why rather than clicked and refused afterwards: the
         // row's own grey already says the file cannot join this timeline.
         RowItem::Add if !ctx.usable => Enable::No("it cannot join this one"),
-        RowItem::Remove if ctx.placed > 0 => Enable::No("clips play it"),
+        // The two removes are one verb with two shapes, and exactly one of
+        // them is ever on the plate: the plain one while nothing plays the
+        // source, the clips-too one while something does. Hidden rather than
+        // dimmed, because a dimmed "Remove" sitting above a live "Remove —
+        // with its clips" is two rows arguing about the same act.
+        RowItem::Remove if ctx.placed > 0 => Enable::Hidden("clips play it"),
+        RowItem::RemoveWithClips if ctx.placed == 0 => Enable::Hidden("nothing plays it"),
         // Neither of these touches the timeline: a file can be found on disk and
         // described whatever the editor is doing, with no timeline at all.
         _ => Enable::Yes,

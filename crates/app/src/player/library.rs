@@ -199,6 +199,90 @@ impl Player {
         cx.notify();
     }
 
+    /// Removes a library row *and* every clip playing it, in that order --
+    /// the plain [`Player::remove_source`] is refused by the engine while any
+    /// clip still plays a source, which left a placed file with no reachable
+    /// way out of the library at all (user 2026-08-21: "can not remove a
+    /// media from library"). Destructive, and named so on the plate it is
+    /// picked from; one undo entry per deleted clip, exactly as deleting them
+    /// by hand would leave, and then the source itself goes the same door
+    /// every other removal takes.
+    pub(crate) fn remove_source_and_clips(
+        &mut self,
+        path: &Path,
+        stream: usize,
+        cx: &mut Context<Self>,
+    ) {
+        if self.exporting().is_some() {
+            return;
+        }
+        let Some(session) = self.session.as_mut() else {
+            self.notify_user("NO TIMELINE — open a file first".into());
+            return;
+        };
+        let Some(idx) = session
+            .sources()
+            .iter()
+            .position(|s| s.path == path && s.audio_stream == stream)
+        else {
+            return;
+        };
+        // One clip at a time, re-scanning after each: deleting a clip takes
+        // its group partners (a V1 picture and its A1 sound) with it, so a
+        // list of indices collected up front goes stale the moment the first
+        // one lands -- and a stale index deletes some other film's clip.
+        // Bounded by the count that was there when we started, so a
+        // `delete_clip` that ever answers false cannot spin here.
+        let count_of = |session: &engine::PlaybackSession| {
+            session
+                .lanes()
+                .into_iter()
+                .flat_map(|lane| session.lane_clips(lane))
+                .filter(|c| c.source == idx)
+                .count()
+        };
+        let started_with = count_of(session);
+        let mut budget = session
+            .lanes()
+            .into_iter()
+            .flat_map(|lane| session.lane_clips(lane))
+            .filter(|c| c.source == idx)
+            .count();
+        while budget > 0 {
+            let Some((lane, at)) = session.lanes().into_iter().find_map(|lane| {
+                session
+                    .lane_clips(lane)
+                    .iter()
+                    .position(|c| c.source == idx)
+                    .map(|at| (lane, at))
+            }) else {
+                break;
+            };
+            if !session.delete_clip(lane, at) {
+                break;
+            }
+            budget -= 1;
+        }
+        // What actually left the bench, not how many calls it took: one
+        // `delete_clip` on a grouped clip takes its partner with it.
+        let deleted = started_with.saturating_sub(count_of(session));
+        self.reset_after_reseek();
+        self.remove_source(path, stream, cx);
+        // `remove_source` already wrote its own line; this one says what went
+        // with it, which is the half that line cannot know about.
+        if deleted > 0 {
+            self.notify_user(
+                format!(
+                    "{deleted} clip{} deleted with {}",
+                    if deleted == 1 { "" } else { "s" },
+                    file_name(path)
+                )
+                .into(),
+            );
+        }
+        cx.notify();
+    }
+
     /// Back to the window the editor launches as: no timeline, no library, no
     /// picture -- and the hint that says to open a file. What removing the last
     /// library row leaves, since a session whose library is empty has nothing

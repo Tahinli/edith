@@ -185,6 +185,37 @@ pub(crate) fn scrim() -> Div {
     div().absolute().inset_0().occlude()
 }
 
+/// The body every hanging menu is drawn on: the clip menu, the library row
+/// menu and the open choice list, one shape for all three.
+///
+/// It exists because the three drifted: each carried its own copy of the
+/// plate chrome, so styling one (the picker, 2026-08-21) left the other two
+/// painting the legacy raised grey -- the user's "right click menu in library
+/// is old too". A plate is `panel` with a seam around it and a 6px radius
+/// (DESIGN §2/§4); the legacy tree keeps its own raised sheet. One function,
+/// so the next change reaches all three or none.
+pub(crate) fn menu_plate(id: &'static str, x: f32, y: f32, darkroom: bool) -> Stateful<Div> {
+    div()
+        .id(id)
+        .absolute()
+        .left(px(x))
+        .top(px(y))
+        .w(px(crate::layout::MENU_W))
+        .flex()
+        .flex_col()
+        .p(px(crate::layout::MENU_PAD))
+        .rounded(px(6.))
+        .bg(rgb(if darkroom {
+            crate::ui::theme::DARK_PANEL()
+        } else {
+            crate::ui::theme::BG_RAISED()
+        }))
+        .when(darkroom, |d| {
+            d.border_1()
+                .border_color(rgba(crate::ui::theme::DARK_SEAM()))
+        })
+}
+
 /// The sheet a card with a *slider* in it takes instead: the same scrim, with
 /// the window's own drag listeners on it as well.
 ///
