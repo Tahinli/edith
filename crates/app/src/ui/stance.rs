@@ -594,14 +594,19 @@ fn notice_plate(message: SharedString, bench_h: f32) -> impl IntoElement {
         .absolute()
         .bottom(px(notice_bottom_offset(bench_h)))
         .left(px(12.))
-        // Wide enough to hold a refusal-plus-remedy sentence in two or three
-        // lines rather than one line cut mid-word: the ledger strip below is
-        // the one place that must stay a single truncated line (it also
-        // carries the project identity, export progress and the timecode on
-        // the same row), so this plate is the surface with room, and it
-        // takes it.
+        // `max_w` only caps a box after GPUI has measured its text at
+        // max-content width. `w_full` supplies a definite width to that
+        // measurement (then `max_w` bounds it at 480 px), and normal
+        // whitespace gives the text system permission to shape every word
+        // into the resulting lines. Keep this a block: as a flex child the
+        // text's automatic min-content width can overflow its own plate.
+        //
+        // No fixed height: GPUI's shaped lines contribute their actual
+        // default `phi()` line boxes, so two or three lines grow upward from
+        // this bottom anchor without reaching down over the bench lanes.
+        .w_full()
         .max_w(px(480.))
-        .flex()
+        .whitespace_normal()
         .px(px(10.))
         .py(px(6.))
         .rounded(px(2.))
