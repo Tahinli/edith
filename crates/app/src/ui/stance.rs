@@ -562,9 +562,18 @@ pub(crate) fn notice_bottom_offset(bench_h: f32) -> f32 {
 /// A notice plate (DESIGN §8): one at a time, rising above the *bench*, its
 /// severity a 3px left spine rather than a colour flood. Fed by the same
 /// [`Player::notify_user`]/`notices` queue the legacy bar reads
-/// ([`Player::notice_bar`]) -- no second notice channel. Dismissal is
-/// already wired: [`render`]'s `on_key_down` calls `dismiss_notice()` on
-/// every stroke, the same door the legacy handler uses.
+/// ([`Player::notice_bar`]) -- no second notice channel.
+///
+/// Reads the *back* of the queue, not the front: dismissal only ever fires
+/// on a keystroke ([`render`]'s `on_key_down` calling `dismiss_notice()`),
+/// and most of what fills this queue -- a click on a gap, a menu row, a
+/// drag -- is not one. A `front()` plate left showing a `ctrl+s` "SAVED"
+/// notice sat frozen through an unrelated mouse-driven refusal that queued
+/// in behind it: the ledger strip's own "last action" already reads
+/// `back()` for exactly this reason, and the plate disagreeing with it is
+/// what made the refusal look like it never reached the notice surface at
+/// all. `back()` keeps the two in step and guarantees the newest, most
+/// actionable message is always the one on screen.
 ///
 /// Anchored off `bench_h` rather than a fixed offset off the ledger: at the
 /// bench's floor a fixed `LEDGER_H + 6.` bottom offset put the plate right
@@ -585,9 +594,14 @@ fn notice_plate(message: SharedString, bench_h: f32) -> impl IntoElement {
         .absolute()
         .bottom(px(notice_bottom_offset(bench_h)))
         .left(px(12.))
-        .max_w(px(360.))
+        // Wide enough to hold a refusal-plus-remedy sentence in two or three
+        // lines rather than one line cut mid-word: the ledger strip below is
+        // the one place that must stay a single truncated line (it also
+        // carries the project identity, export progress and the timecode on
+        // the same row), so this plate is the surface with room, and it
+        // takes it.
+        .max_w(px(480.))
         .flex()
-        .items_center()
         .px(px(10.))
         .py(px(6.))
         .rounded(px(2.))
@@ -922,7 +936,7 @@ pub(crate) fn render(
                 .child(divider(Split::Bench, cx))
                 .child(bench(player, bench_h, cx))
                 .child(ledger(player, position))
-                .when_some(player.notices.front().cloned(), |el, n| {
+                .when_some(player.notices.back().cloned(), |el, n| {
                     el.child(notice_plate(n, bench_h))
                 })
                 .when(player.keys_open, |el| el.child(keys_overlay(player)))
