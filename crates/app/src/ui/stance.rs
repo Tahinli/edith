@@ -10,6 +10,7 @@
 
 use crate::ui::bench_stance;
 use crate::ui::dock_stance;
+use crate::ui::hitmap;
 use crate::ui::settings_stance;
 use crate::ui::spine_stance;
 use crate::ui::timeband_stance;
@@ -959,6 +960,7 @@ pub(crate) fn render(
         .size_full()
         .flex()
         .bg(rgb(DARK_CANVAS()))
+        .children(hitmap::frame())
         .child(mouse_exit_listener(cx))
         .child(spine(player, cx))
         .child(

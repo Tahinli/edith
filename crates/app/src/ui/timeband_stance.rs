@@ -8,6 +8,7 @@
 //! close to the mock's ~20px reading. Every size in this module comes from
 //! `ui::type_scale` (role, not a bare `px()` literal).
 
+use crate::ui::hitmap;
 use crate::ui::type_scale::{self, label, mono};
 use crate::*;
 use gpui::FontWeight;
@@ -70,6 +71,7 @@ fn ghost(
         .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
             this.act(action, window, cx);
         }))
+        .children(hitmap::action(action, player.enable(action, None).yes()))
         .font(glyph_style.font)
         .text_size(glyph_style.size)
         .text_color(rgb(if active { INK1() } else { INK2() }))
@@ -351,6 +353,7 @@ fn contact_strip(player: &Player, position: f64, cx: &mut Context<Player>) -> im
             MouseButton::Left,
             cx.listener(|_, _, _, _| PAN_ANCHOR.with(|a| a.set(None))),
         )
+        .children(hitmap::control("timeline.contact-strip", "Timeline contact strip", true))
         .child(bounds_probe(strip_bounds))
         // Baseline: a quiet hairline under the real traces below it, so an
         // audio-free stretch of film still reads as film rather than gap.
@@ -456,6 +459,7 @@ fn grip(id: &'static str, left: bool, top: bool) -> impl IntoElement {
             PAN_ANCHOR.with(|a| a.set(Some(f32::from(event.position.x))));
             cx.stop_propagation();
         })
+        .children(hitmap::control(id, "Timeline viewport grip", true))
 }
 
 /// The Export chip (MOCK-SPEC "Export chip", DESIGN §4): the room's single
@@ -494,6 +498,14 @@ fn export_chip(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
             }
             cx.notify();
         }))
+        .children(hitmap::action(
+            if exporting {
+                ActionId::CancelExport
+            } else {
+                ActionId::Export
+            },
+            true,
+        ))
         .child(
             div()
                 .font(label_style.font)
@@ -541,6 +553,7 @@ fn volume_slider(player: &Player, cx: &mut Context<Player>) -> impl IntoElement 
                 )
                 .child(bounds_probe(player.volume_bar.clone()))
         })
+        .children(hitmap::control("timeline.volume", "Volume", enabled))
         .child(
             div()
                 .w_full()
@@ -771,6 +784,10 @@ fn save_verb(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
         .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
             this.act(ActionId::Save, window, cx);
         }))
+        .children(hitmap::action(
+            ActionId::Save,
+            player.enable(ActionId::Save, None).yes(),
+        ))
         .child(
             div()
                 .font(label_style.font)
