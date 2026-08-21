@@ -861,6 +861,15 @@ fn sources_tab(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
                             this.library_tab = tab;
                             cx.notify();
                         }))
+                        .children(hitmap::dynamic(
+                            move || {
+                                (
+                                    format!("dock.filter.{}", tab.label()),
+                                    format!("Filter {}", tab.label()),
+                                )
+                            },
+                            true,
+                        ))
                         .child(tab.label())
                 })),
         )
@@ -888,6 +897,15 @@ fn sources_tab(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
                             this.dock_sort = sort;
                             cx.notify();
                         }))
+                        .children(hitmap::dynamic(
+                            move || {
+                                (
+                                    format!("dock.sort.{}", sort.label()),
+                                    format!("Sort {}", sort.label()),
+                                )
+                            },
+                            true,
+                        ))
                         .child(sort.label())
                 })),
         )
