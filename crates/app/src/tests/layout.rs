@@ -2761,6 +2761,7 @@ fn hitmap_names_every_darkroom_pointer_entry_surface() {
     for needle in [
         "subtitle.{group_ord}.{track}.row",
         "subtitle.{group_ord}.{track}.select",
+        "source.{i}.preview",
         "source.{i}.proxy",
         "Proxy making",
     ] {
