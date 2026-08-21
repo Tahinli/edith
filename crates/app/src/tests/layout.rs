@@ -1930,6 +1930,31 @@ fn the_notice_plate_cannot_reach_the_bench_at_any_height() {
         );
     }
 }
+/// The renderer only wraps text when the text measurement receives a definite
+/// width and normal whitespace. This source-level guard keeps both declarations
+/// on the notice plate: `max_w` alone limits max-content after that measurement
+/// and silently permits one-line overflow. It cannot inspect GPUI's painted
+/// lines; only live driving can confirm the full notice actually wrapped.
+#[test]
+fn the_notice_plate_declares_a_bounded_wrapping_text_layout() {
+    let stance = src_text("ui/stance.rs");
+    let notice_start = stance.find("fn notice_plate(").expect("notice plate moved or renamed");
+    let notice_end = stance[notice_start..]
+        .find("\n/// Thin strip")
+        .map(|end| notice_start + end)
+        .expect("notice plate no longer precedes the ledger");
+    let plate = &stance[notice_start..notice_end];
+
+    assert!(
+        plate.contains(".w_full()") && plate.contains(".max_w(px(480.))"),
+        "notice plate lacks a definite width bounded to 480 px; max_w alone does not wrap text"
+    );
+    assert!(
+        plate.contains(".whitespace_normal()"),
+        "notice plate no longer explicitly requests GPUI's wrapping whitespace mode"
+    );
+}
+
 
 /// A round trip through the file: what is saved is what the next load reads
 /// back, one seam touched and the other left at its default -- a scratch
