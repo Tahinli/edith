@@ -1463,16 +1463,24 @@ impl Player {
             )
             .child(eq_curve(self.eq_params.clone(), sample_rate))
             .children(handles)
-            .children(EQ_TICKS.map(|(freq, label)| {
-                div()
-                    .absolute()
-                    .left(relative(eq_x(freq)))
-                    // Pulled back so the mark reads as sitting *at* its
-                    // frequency; the two ends then hug the corners.
-                    .ml(px(-12.))
-                    .bottom(px(1.))
-                    .w(px(24.))
-                    .text_align(TextAlign::Center)
+            .children(EQ_TICKS.iter().enumerate().map(|(i, (freq, label))| {
+                // Centred on its own frequency for the three inner ticks --
+                // pulled back by half its own width, as the comment above
+                // used to say for all five. The two ends used the same
+                // centring and, sitting at 0%/100% of the axis, hung half
+                // their own label off the graph's edge: "20 Hz" clipped to a
+                // bare "z", "20k" lost its "k" and half its trailing "0".
+                // Anchored to the graph's own edge instead and read inward,
+                // both now sit wholly inside the plot they label.
+                let div = div().absolute().bottom(px(1.)).w(px(24.));
+                let div = if i == 0 {
+                    div.left(px(0.)).text_align(TextAlign::Left)
+                } else if i == EQ_TICKS.len() - 1 {
+                    div.right(px(0.)).text_align(TextAlign::Right)
+                } else {
+                    div.left(relative(eq_x(*freq))).ml(px(-12.)).text_align(TextAlign::Center)
+                };
+                div
                     .when(dark, |d| {
                         d.type_style(type_scale::mono(
                             type_scale::CHORD_METADATA_MIN_PX,
@@ -1481,7 +1489,7 @@ impl Player {
                         .text_color(rgb(INK3()))
                     })
                     .when(!dark, |d| d.text_size(px(9.)).text_color(rgb(FG_SECONDARY())))
-                    .child(label)
+                    .child(*label)
             }))
             .child(
                 div()
@@ -1517,7 +1525,7 @@ impl Player {
                 .justify_center()
                 .items_center()
                 .bg(rgba(SCRIM()))
-                .when(self.card_maximized, |d| d.top(px(crate::ui::stance::below_picture_floor(f32::from(viewport.height), self.split_px(Split::Bench, viewport)))))
+                .when(self.card_maximized, |d| d.top(px(crate::ui::stance::maximized_card_top(f32::from(viewport.height), self.split_px(Split::Bench, viewport)))))
                 // Click away closes it, as on every card here.
                 .on_mouse_down(
                     MouseButton::Left,
@@ -2022,7 +2030,7 @@ impl Player {
                 .justify_center()
                 .items_center()
                 .bg(rgba(SCRIM()))
-                .when(self.card_maximized, |d| d.top(px(crate::ui::stance::below_picture_floor(f32::from(viewport.height), self.split_px(Split::Bench, viewport)))))
+                .when(self.card_maximized, |d| d.top(px(crate::ui::stance::maximized_card_top(f32::from(viewport.height), self.split_px(Split::Bench, viewport)))))
                 // Click away closes it, as on every card here.
                 .on_mouse_down(
                     MouseButton::Left,
@@ -2205,7 +2213,7 @@ impl Player {
                 .justify_center()
                 .items_center()
                 .bg(rgba(SCRIM()))
-                .when(self.card_maximized, |d| d.top(px(crate::ui::stance::below_picture_floor(f32::from(viewport.height), self.split_px(Split::Bench, viewport)))))
+                .when(self.card_maximized, |d| d.top(px(crate::ui::stance::maximized_card_top(f32::from(viewport.height), self.split_px(Split::Bench, viewport)))))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _: &MouseDownEvent, _, cx| {
@@ -2344,7 +2352,7 @@ impl Player {
                 .justify_center()
                 .items_center()
                 .bg(rgba(SCRIM()))
-                .when(self.card_maximized, |d| d.top(px(crate::ui::stance::below_picture_floor(f32::from(viewport.height), self.split_px(Split::Bench, viewport)))))
+                .when(self.card_maximized, |d| d.top(px(crate::ui::stance::maximized_card_top(f32::from(viewport.height), self.split_px(Split::Bench, viewport)))))
                 // Click away closes it, as on every card here.
                 .on_mouse_down(
                     MouseButton::Left,
@@ -2578,7 +2586,7 @@ impl Player {
                 .justify_center()
                 .items_center()
                 .bg(rgba(SCRIM()))
-                .when(self.card_maximized, |d| d.top(px(crate::ui::stance::below_picture_floor(f32::from(viewport.height), self.split_px(Split::Bench, viewport)))))
+                .when(self.card_maximized, |d| d.top(px(crate::ui::stance::maximized_card_top(f32::from(viewport.height), self.split_px(Split::Bench, viewport)))))
                 // Click away closes it, as on every card here.
                 .on_mouse_down(
                     MouseButton::Left,
@@ -2784,7 +2792,7 @@ impl Player {
                 .justify_center()
                 .items_center()
                 .bg(rgba(SCRIM()))
-                .when(self.card_maximized, |d| d.top(px(crate::ui::stance::below_picture_floor(f32::from(viewport.height), self.split_px(Split::Bench, viewport)))))
+                .when(self.card_maximized, |d| d.top(px(crate::ui::stance::maximized_card_top(f32::from(viewport.height), self.split_px(Split::Bench, viewport)))))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _: &MouseDownEvent, _, cx| {
@@ -3028,7 +3036,7 @@ impl Player {
                 // Light enough to read the lanes and the marks on them through:
                 // the preview is the point of this card.
                 .bg(rgba(SCRIM_LIGHT()))
-                .when(self.card_maximized, |d| d.top(px(crate::ui::stance::below_picture_floor(f32::from(viewport.height), self.split_px(Split::Bench, viewport)))))
+                .when(self.card_maximized, |d| d.top(px(crate::ui::stance::maximized_card_top(f32::from(viewport.height), self.split_px(Split::Bench, viewport)))))
                 // Click away closes it, as on every card here -- and the marks
                 // go with it, which is what makes this one a call and not a flag.
                 .on_mouse_down(
