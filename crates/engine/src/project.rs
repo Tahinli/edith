@@ -4198,18 +4198,29 @@ impl Project {
 
     /// The empty stretch of `lane` covering `frame`, as `(start, len)` -- what
     /// a right-click on empty bench space names before offering to close it.
-    /// `None` when `frame` sits inside a clip, or past the last one: the open
-    /// end of a lane is not a gap, since there is nothing after it to slide
-    /// back ([`gap`]).
+    /// `None` when `frame` sits inside a placement, or past the last one: the
+    /// open end of a lane is not a gap, since there is nothing after it to slide
+    /// back ([`gap`]). Subtitle lanes are asked of their [`SubClip`] list, not
+    /// the media [`Clip`] list they deliberately never hold.
     pub fn gap_at(&self, lane: Lane, frame: u32) -> Option<(u32, u32)> {
-        gap(self.lane(lane), frame)
+        let data = self.index(lane).map(|i| &self.lanes[i])?;
+        match data.kind {
+            LaneKind::Subtitle => gap(&data.subs, frame),
+            LaneKind::Video | LaneKind::Audio => gap(&data.clips, frame),
+        }
     }
 
-    /// How many bounded holes `lane` holds. The open end after the last clip is
-    /// not counted, like [`gap_at`](Self::gap_at), because closing it would move
-    /// nothing.
+    /// How many bounded holes `lane` holds. The open end after the last
+    /// placement is not counted, like [`gap_at`](Self::gap_at), because closing
+    /// it would move nothing.
     pub fn gap_count(&self, lane: Lane) -> usize {
-        gaps(self.lane(lane)).len()
+        let Some(data) = self.index(lane).map(|i| &self.lanes[i]) else {
+            return 0;
+        };
+        match data.kind {
+            LaneKind::Subtitle => gaps(&data.subs).len(),
+            LaneKind::Video | LaneKind::Audio => gaps(&data.clips).len(),
+        }
     }
 
     /// The lanes closing the gap `(start, frames)` on `lane` must ripple
@@ -4234,6 +4245,11 @@ impl Project {
     ///
     /// `Ok(vec![lane])` alone for a gap that borders no take, or none whose
     /// partner clip sits on another lane -- the unlinked case, untouched.
+    ///
+    /// Subtitle lanes have no media take halves to inspect. A caption can be
+    /// hand-grouped with clips, but it is not the imported A/V take this method
+    /// widens for, so a subtitle gap stays scoped to its own lane; the later
+    /// scoped cut still refuses an explicit group split.
     pub fn gap_take_scope(&self, lane: Lane, start: u32, frames: u32) -> crate::Result<Vec<Lane>> {
         let Some(li) = self.index(lane) else {
             return Err("no track to work on".into());
@@ -4281,10 +4297,13 @@ impl Project {
     }
 
     /// Close every bounded gap on `lane`, as one undo step, without making the
-    /// lane's scope global. Each gap uses the same take-safety widening
+    /// lane's scope global. Media lanes use the same take-safety widening
     /// [`gap_take_scope`](Self::gap_take_scope) gives a single close: linked
     /// halves ride along only when their matching lane is empty over that exact
-    /// stretch; mismatches are skipped and reported.
+    /// stretch; mismatches are skipped and reported. Subtitle lanes close their
+    /// own [`SubClip`] list only: captions may be hand-grouped, but they are not
+    /// halves of an imported A/V take, so the media take-widening rule has
+    /// nothing to add there.
     ///
     /// The walk is back-to-front. Closing a gap shifts everything after it, so
     /// later holes must be consumed while their measured starts are still true;
@@ -4292,9 +4311,12 @@ impl Project {
     /// only before the first successful close, so an all-skipped sweep is not an
     /// undo step.
     pub fn close_all_gaps_on_lane(&mut self, lane: Lane) -> crate::Result<GapSweep> {
-        let Some(_) = self.index(lane) else {
+        let Some(i) = self.index(lane) else {
             return Err("no track to work on".into());
         };
+        if self.lanes[i].kind == LaneKind::Subtitle {
+            return Ok(self.close_all_subtitle_gaps_on_lane(i));
+        }
         let mut report = GapSweep::default();
         let mut snapshot = false;
         for (start, frames) in gaps(self.lane(lane)).into_iter().rev() {
@@ -4322,6 +4344,35 @@ impl Project {
         report.skipped.reverse();
         debug_assert!(links_are_consistent(&self.lanes).is_ok());
         Ok(report)
+    }
+
+    /// Subtitle lanes have the same bounded-gap sweep as media lanes, but no
+    /// take-scope widening: a caption is not one half of an A/V take. Explicit
+    /// hand groups still obey [`scope_holds_takes_whole`](Self::scope_holds_takes_whole),
+    /// so a grouped caption is refused rather than pulled away from its group.
+    fn close_all_subtitle_gaps_on_lane(&mut self, i: usize) -> GapSweep {
+        let mut report = GapSweep::default();
+        let mut snapshot = false;
+        let on = [i];
+        for (start, frames) in gaps(&self.lanes[i].subs).into_iter().rev() {
+            match self.scope_holds_takes_whole(&on, start) {
+                Ok(()) => {
+                    if !snapshot {
+                        self.snapshot();
+                        snapshot = true;
+                    }
+                    ripple(&mut self.lanes, &on, start, frames);
+                    report.closed += 1;
+                }
+                Err(e) => report.skipped.push(GapSkip {
+                    start,
+                    reason: e.to_string(),
+                }),
+            }
+        }
+        report.skipped.reverse();
+        debug_assert!(links_are_consistent(&self.lanes).is_ok());
+        report
     }
 
     /// Cut **every** one of `regions` -- `(start, len)` in timeline frames --
@@ -5036,38 +5087,67 @@ fn source_frame(c: &Clip, timeline_frame: u32) -> u32 {
     (c.in_frame + c.speed.source_at(timeline_frame - c.start)).min(c.out_frame - 1)
 }
 
-/// Index of the clip covering `frame`, or `None` for a gap or past the end.
-/// Binary search: the sorted-disjoint invariant is what makes it legal.
-fn at(clips: &[Clip], frame: u32) -> Option<usize> {
-    let idx = clips.partition_point(|c| c.start <= frame).checked_sub(1)?;
-    (frame < clips[idx].end()).then_some(idx)
+/// The tiny interface `Clip` and `SubClip` share for gap maths. Keeping the gap
+/// finder generic makes the subtitle path use the same bounded-hole rules as
+/// media lanes without teaching the media-specific take logic about captions.
+trait GapPlacement {
+    fn start_frame(&self) -> u32;
+    fn end_frame(&self) -> u32;
 }
 
-/// The empty stretch of `clips` covering `frame`, as `(start, len)` -- `None`
-/// when `frame` is inside a clip, or past the last one. Sorted-disjoint
-/// invariant like [`at`]: the first clip whose start is past `frame` is the
-/// far wall, and the last one that ends at or before `frame` (or the
+impl GapPlacement for Clip {
+    fn start_frame(&self) -> u32 {
+        self.start
+    }
+
+    fn end_frame(&self) -> u32 {
+        self.end()
+    }
+}
+
+impl GapPlacement for SubClip {
+    fn start_frame(&self) -> u32 {
+        self.start
+    }
+
+    fn end_frame(&self) -> u32 {
+        self.end()
+    }
+}
+
+/// Index of the placement covering `frame`, or `None` for a gap or past the
+/// end. Binary search: the sorted-disjoint invariant is what makes it legal.
+fn at<T: GapPlacement>(items: &[T], frame: u32) -> Option<usize> {
+    let idx = items.partition_point(|item| item.start_frame() <= frame).checked_sub(1)?;
+    (frame < items[idx].end_frame()).then_some(idx)
+}
+
+/// The empty stretch of `items` covering `frame`, as `(start, len)` -- `None`
+/// when `frame` is inside a placement, or past the last one. Sorted-disjoint
+/// invariant like [`at`]: the first placement whose start is past `frame` is
+/// the far wall, and the last one that ends at or before `frame` (or the
 /// timeline's own head, `0`, when there is none) is the near one.
-fn gap(clips: &[Clip], frame: u32) -> Option<(u32, u32)> {
-    if at(clips, frame).is_some() {
+fn gap<T: GapPlacement>(items: &[T], frame: u32) -> Option<(u32, u32)> {
+    if at(items, frame).is_some() {
         return None;
     }
-    let idx = clips.partition_point(|c| c.start <= frame);
-    let next = clips.get(idx)?;
-    let start = idx.checked_sub(1).map_or(0, |i| clips[i].end());
-    Some((start, next.start - start))
+    let idx = items.partition_point(|item| item.start_frame() <= frame);
+    let next = items.get(idx)?;
+    let start = idx.checked_sub(1).map_or(0, |i| items[i].end_frame());
+    Some((start, next.start_frame() - start))
 }
 
-/// Every bounded hole in `clips`, left to right. The tail after the last clip is
-/// deliberately absent: there is no later placement for a ripple to bring back.
-fn gaps(clips: &[Clip]) -> Vec<(u32, u32)> {
+/// Every bounded hole in `items`, left to right. The tail after the last
+/// placement is deliberately absent: there is no later placement for a ripple
+/// to bring back.
+fn gaps<T: GapPlacement>(items: &[T]) -> Vec<(u32, u32)> {
     let mut out = Vec::new();
     let mut next = 0;
-    for c in clips {
-        if c.start > next {
-            out.push((next, c.start - next));
+    for item in items {
+        if item.start_frame() > next {
+            out.push((next, item.start_frame() - next));
         }
-        next = c.end();
+        next = item.end_frame();
     }
     out
 }
@@ -5501,6 +5581,33 @@ mod tests {
             transform: None,
             fit: FitPolicy::default(),
             speed: Speed::NORMAL,
+        }
+    }
+
+    /// A caption placement for pure timeline tests: the track window is the
+    /// same duration as the placement, so assertions can stay in frames.
+    fn caption(start: u32, frames: u32) -> SubClip {
+        SubClip {
+            start,
+            frames,
+            track: 0,
+            in_us: 0,
+            out_us: i64::from(frames) * 1_000_000,
+            link: None,
+        }
+    }
+
+    /// A subtitle palette row for tests that place captions on lanes.
+    fn subtitle_track() -> SubtitleTrack {
+        SubtitleTrack {
+            path: FILE.into(),
+            track: None,
+            language: "eng".into(),
+            name: String::new(),
+            label: "eng".into(),
+            cues: Vec::new(),
+            bitmap: false,
+            refused: None,
         }
     }
 
@@ -7954,6 +8061,87 @@ mod tests {
         links_are_consistent(&p.lanes).expect("every linked take that moved stayed whole");
         assert!(p.undo(), "one undo restores every closed gap");
         assert_eq!(shape(&p), before);
+    }
+
+    /// Subtitle lanes use the same bounded-hole hit test as clip lanes, against
+    /// their own caption storage: head gaps and gaps between cues count, an
+    /// empty lane and the tail after the last cue do not.
+    #[test]
+    fn gap_at_finds_the_hole_a_caption_frame_sits_in() {
+        let mut p = Project::single(FILE, 20).with_subtitles(vec![subtitle_track()]);
+        let s = p.add_lane(LaneKind::Subtitle);
+        assert_eq!(p.gap_at(s, 0), None, "an empty subtitle lane has nothing to close");
+
+        p.place_sub(s, 5, caption(0, 3)).expect("single cue at [5,8)");
+        assert_eq!(p.gap_at(s, 0), Some((0, 5)), "head gap before first cue");
+        assert_eq!(p.gap_at(s, 4), Some((0, 5)));
+        assert_eq!(p.gap_at(s, 5), None, "inside the cue");
+        assert_eq!(p.gap_at(s, 8), None, "tail after a single cue is not a gap");
+
+        p.place_sub(s, 12, caption(0, 2)).expect("second cue at [12,14)");
+        assert_eq!(p.gap_at(s, 8), Some((8, 4)), "gap between cues");
+        assert_eq!(p.gap_at(s, 11), Some((8, 4)));
+        assert_eq!(p.gap_at(s, 14), None, "tail after the last cue is still open-ended");
+    }
+
+    /// Closing a caption gap ripples the subtitle lane only. It is not a media
+    /// take close, so the video and audio lanes keep their frame positions.
+    #[test]
+    fn closing_a_caption_gap_ripples_no_video_or_audio_clips() {
+        let mut p = Project::single(FILE, 20).with_subtitles(vec![subtitle_track()]);
+        let s = p.add_lane(LaneKind::Subtitle);
+        p.place_sub(s, 5, caption(0, 3)).expect("single cue at [5,8)");
+        let before_clips = shape(&p);
+        let before_subs = p.sub_lane(s).to_vec();
+
+        let (start, len) = p.gap_at(s, 0).expect("gap before the caption");
+        assert_eq!((start, len), (0, 5));
+        p.cut_regions(&[(start, len)], &[s]).expect("caption lane gap closes");
+
+        assert_eq!(shape(&p), before_clips, "media lanes did not move");
+        assert_eq!(p.sub_lane(s), &[caption(0, 3)], "caption slid left");
+        assert!(p.undo(), "one undo restores the caption close");
+        assert_eq!(shape(&p), before_clips);
+        assert_eq!(p.sub_lane(s), before_subs);
+    }
+
+    /// The subtitle sweep is the clip sweep's bounded-gap arithmetic on
+    /// [`SubClip`] storage: right-to-left, one undo, no tail close, and no
+    /// history entry for empty or already-contiguous lanes.
+    #[test]
+    fn close_all_gaps_on_subtitle_lane_closes_bounded_gaps_and_undoes_once() {
+        let mut p = Project::single(FILE, 30).with_subtitles(vec![subtitle_track()]);
+        let s = p.add_lane(LaneKind::Subtitle);
+        let history = p.history.len();
+        let report = p.close_all_gaps_on_lane(s).expect("empty subtitle lane exists");
+        assert_eq!(report, GapSweep::default(), "empty subtitle lane has no bounded gap");
+        assert_eq!(p.history.len(), history, "empty sweep is not an undo step");
+
+        p.place_sub(s, 2, caption(0, 2)).expect("head gap [0,2)");
+        p.place_sub(s, 7, caption(0, 2)).expect("middle gap [4,7)");
+        p.place_sub(s, 14, caption(0, 1)).expect("middle gap [9,14), tail after 15");
+        let before = p.sub_lane(s).to_vec();
+
+        assert_eq!(p.gap_count(s), 3);
+        let report = p.close_all_gaps_on_lane(s).expect("subtitle lane exists");
+        assert_eq!(report.closed, 3);
+        assert!(report.skipped.is_empty());
+        assert_eq!(
+            p.sub_lane(s),
+            &[caption(0, 2), caption(2, 2), caption(4, 1)],
+            "all bounded caption gaps closed without touching windows"
+        );
+        assert!(p.undo(), "one undo restores every caption gap");
+        assert_eq!(p.sub_lane(s), before);
+
+        let mut p = Project::single(FILE, 30).with_subtitles(vec![subtitle_track()]);
+        let s = p.add_lane(LaneKind::Subtitle);
+        p.place_sub(s, 0, caption(0, 3)).expect("contiguous at the head");
+        let history = p.history.len();
+        let report = p.close_all_gaps_on_lane(s).expect("subtitle lane exists");
+        assert_eq!(report, GapSweep::default(), "the open tail is not closed");
+        assert_eq!(p.sub_lane(s), &[caption(0, 3)]);
+        assert_eq!(p.history.len(), history);
     }
 
     #[test]

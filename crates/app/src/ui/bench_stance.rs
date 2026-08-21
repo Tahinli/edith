@@ -764,6 +764,9 @@ fn lane_row(
                     }),
                 )
                 .drag_over::<SubPick>(|d, _, _, _| d.bg(rgb(DARK_RAISED())))
+                .on_drop(cx.listener(move |this, drag: &SubPick, window, cx| {
+                    this.place_sub(drag.0, lane, window.mouse_position().x, cx);
+                }))
                 .on_drag_move(
                     cx.listener(move |this, event: &DragMoveEvent<SubPick>, _, cx| {
                         if !event.bounds.contains(&event.event.position) {
