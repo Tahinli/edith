@@ -4,17 +4,13 @@
 //! drew. `stance.rs::spine()` keeps the panel frame (width, surface,
 //! border); this module owns the rows inside it.
 
-use crate::*;
 use crate::ui::type_scale::{self, Typeset};
+use crate::*;
 
-/// The glyph icon itself: DESIGN §3 names no separate role for it, so this
-/// keeps the size the module has always drawn it at (13px, the same number
-/// as the hero timecode by coincidence, not by role) and routes only the
-/// font family through [`type_scale`] (Archivo -- the glyph is a verb, the
-/// room's voice, not something the film says).
-const GLYPH_SIZE: f32 = 13.;
+/// The glyph icon is a room verb, so it uses the label role rather than a
+/// bespoke size: Archivo at `LABEL_ROW_PX`.
 
-/// A group head: 9px uppercase Archivo 700 in `ink3`, +0.14em tracking
+/// A group head: uppercase Archivo 700 in `ink3`, +0.14em tracking
 /// (DESIGN §3) -- reused as its own small fn rather than `stance::section_head`
 /// because that one is private to its module and carries a different
 /// vertical rhythm (a region label, not a spine group head).
@@ -79,16 +75,21 @@ fn glyph(
         .when(on, |d| {
             d.cursor_pointer()
                 .hover(|s| s.bg(rgb(DARK_RAISED())).text_color(rgb(INK1())))
-                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                    this.act(action, window, cx)
-                }))
+                .on_click(
+                    cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        this.act(action, window, cx)
+                    }),
+                )
         })
         .child(
             div()
                 .line_height(relative(1.05))
                 // FAULT 1: the glyph is the loudest thing in its row -- BOLD,
                 // not the MEDIUM weight the chord beneath it also wears.
-                .type_style(type_scale::label(GLYPH_SIZE, gpui::FontWeight::BOLD))
+                .type_style(type_scale::label(
+                    type_scale::LABEL_ROW_PX,
+                    gpui::FontWeight::BOLD,
+                ))
                 .text_color(rgb(if active {
                     INK1()
                 } else if quiet {
@@ -143,7 +144,10 @@ fn trim_control(active: bool, player: &Player, cx: &mut Context<Player>) -> impl
             .child(
                 div()
                     .line_height(relative(1.05))
-                    .type_style(type_scale::label(GLYPH_SIZE, gpui::FontWeight::BOLD))
+                    .type_style(type_scale::label(
+                        type_scale::LABEL_ROW_PX,
+                        gpui::FontWeight::BOLD,
+                    ))
                     .text_color(rgb(if active { INK1() } else { INK2() }))
                     .child(txt),
             )
@@ -222,8 +226,24 @@ pub(crate) fn render(player: &Player, cx: &mut Context<Player>) -> impl IntoElem
         .gap(px(1.))
         .overflow_y_scroll()
         .child(group_head("edit"))
-        .child(glyph("spine-split", "||", ActionId::Cut, false, false, player, cx))
-        .child(glyph("spine-delete", "⊂⊃", ActionId::Delete, false, false, player, cx))
+        .child(glyph(
+            "spine-split",
+            "||",
+            ActionId::Cut,
+            false,
+            false,
+            player,
+            cx,
+        ))
+        .child(glyph(
+            "spine-delete",
+            "⊂⊃",
+            ActionId::Delete,
+            false,
+            false,
+            player,
+            cx,
+        ))
         .child(pair(
             glyph("spine-undo", "↺", ActionId::Undo, false, false, player, cx),
             // Redo had a legacy toolbar button (`toolbar.rs:347`) but no
@@ -234,8 +254,24 @@ pub(crate) fn render(player: &Player, cx: &mut Context<Player>) -> impl IntoElem
         ))
         .child(group_head("cut"))
         .child(pair(
-            glyph("spine-cut-prev", "‹", ActionId::WalkCutPrev, false, false, player, cx),
-            glyph("spine-cut-next", "›", ActionId::WalkCutNext, false, false, player, cx),
+            glyph(
+                "spine-cut-prev",
+                "‹",
+                ActionId::WalkCutPrev,
+                false,
+                false,
+                player,
+                cx,
+            ),
+            glyph(
+                "spine-cut-next",
+                "›",
+                ActionId::WalkCutNext,
+                false,
+                false,
+                player,
+                cx,
+            ),
         ))
         .child(trim_control(player.loop_trim.is_some(), player, cx))
         .child(glyph(
@@ -271,13 +307,53 @@ pub(crate) fn render(player: &Player, cx: &mut Context<Player>) -> impl IntoElem
         // less than walking/trimming cuts above it.
         .child(group_head("view"))
         .child(pair(
-            glyph("spine-zoom-out", "−", ActionId::ZoomOut, false, false, player, cx),
-            glyph("spine-zoom-in", "+", ActionId::ZoomIn, false, false, player, cx),
+            glyph(
+                "spine-zoom-out",
+                "−",
+                ActionId::ZoomOut,
+                false,
+                false,
+                player,
+                cx,
+            ),
+            glyph(
+                "spine-zoom-in",
+                "+",
+                ActionId::ZoomIn,
+                false,
+                false,
+                player,
+                cx,
+            ),
         ))
-        .child(glyph("spine-zoom-fit", "⊡", ActionId::ZoomFit, false, false, player, cx))
+        .child(glyph(
+            "spine-zoom-fit",
+            "⊡",
+            ActionId::ZoomFit,
+            false,
+            false,
+            player,
+            cx,
+        ))
         .child(group_head("track"))
-        .child(glyph("spine-add-video", "+V", ActionId::AddVideoLane, false, false, player, cx))
-        .child(glyph("spine-add-audio", "+A", ActionId::AddAudioLane, false, false, player, cx))
+        .child(glyph(
+            "spine-add-video",
+            "+V",
+            ActionId::AddVideoLane,
+            false,
+            false,
+            player,
+            cx,
+        ))
+        .child(glyph(
+            "spine-add-audio",
+            "+A",
+            ActionId::AddAudioLane,
+            false,
+            false,
+            player,
+            cx,
+        ))
         // The subtitle trio (homeless per this task's audit): AddSubtitleLane
         // joins +V/+A on the same "+letter" grammar per this task's own
         // instruction ("+S joins +V/+A in TRACK"); remove/import are "the
@@ -291,12 +367,44 @@ pub(crate) fn render(player: &Player, cx: &mut Context<Player>) -> impl IntoElem
         // ROOM cluster below: cue visibility is judged shot to shot, closer
         // in frequency to a view toggle used often than to a once-a-session
         // preference.
-        .child(glyph("spine-add-subtitle", "+S", ActionId::AddSubtitleLane, false, false, player, cx))
-        .child(pair(
-            glyph("spine-remove-subtitle", "−S", ActionId::RemoveSubtitleLane, false, false, player, cx),
-            glyph("spine-import-subtitles", "↓S", ActionId::ImportSubtitles, false, false, player, cx),
+        .child(glyph(
+            "spine-add-subtitle",
+            "+S",
+            ActionId::AddSubtitleLane,
+            false,
+            false,
+            player,
+            cx,
         ))
-        .child(glyph("spine-toggle-subtitles", "CC", ActionId::ToggleSubtitles, player.subs_on, false, player, cx))
+        .child(pair(
+            glyph(
+                "spine-remove-subtitle",
+                "−S",
+                ActionId::RemoveSubtitleLane,
+                false,
+                false,
+                player,
+                cx,
+            ),
+            glyph(
+                "spine-import-subtitles",
+                "↓S",
+                ActionId::ImportSubtitles,
+                false,
+                false,
+                player,
+                cx,
+            ),
+        ))
+        .child(glyph(
+            "spine-toggle-subtitles",
+            "CC",
+            ActionId::ToggleSubtitles,
+            player.subs_on,
+            false,
+            player,
+            cx,
+        ))
         // ROOM: the once-a-session/once-a-project acts this task's charter
         // names explicitly (theme, proxies, screenshot, fullscreen) -- ink-
         // demoted (`quiet: true`) and paired two-to-a-row to keep the group
@@ -312,18 +420,58 @@ pub(crate) fn render(player: &Player, cx: &mut Context<Player>) -> impl IntoElem
         .child(group_head("room"))
         .child(pair(
             glyph("spine-theme", "H", ActionId::Theme, false, true, player, cx),
-            glyph("spine-proxies", "P", ActionId::ToggleProxies, player.proxies_on, true, player, cx),
+            glyph(
+                "spine-proxies",
+                "P",
+                ActionId::ToggleProxies,
+                player.proxies_on,
+                true,
+                player,
+                cx,
+            ),
         ))
         .child(pair(
-            glyph("spine-auto-proxies", "AP", ActionId::ToggleAutoProxies, player.auto_proxies_on, true, player, cx),
-            glyph("spine-fullscreen", "FS", ActionId::Fullscreen, false, true, player, cx),
+            glyph(
+                "spine-auto-proxies",
+                "AP",
+                ActionId::ToggleAutoProxies,
+                player.auto_proxies_on,
+                true,
+                player,
+                cx,
+            ),
+            glyph(
+                "spine-fullscreen",
+                "FS",
+                ActionId::Fullscreen,
+                false,
+                true,
+                player,
+                cx,
+            ),
         ))
-        .child(glyph("spine-screenshot", "Sh", ActionId::Screenshot, false, true, player, cx))
+        .child(glyph(
+            "spine-screenshot",
+            "Sh",
+            ActionId::Screenshot,
+            false,
+            true,
+            player,
+            cx,
+        ))
         // The settings page's own visible door (user complaint: "some
         // options are only reachable via keyboard shortcut") -- a chord
         // alone is a defect class this room has hit repeatedly, so this
         // glyph sits beside the other once-a-session ROOM acts even though
         // its chord (`^,`) is a preference, not a mnemonic.
-        .child(glyph("spine-settings", "St", ActionId::Settings, player.settings_open, true, player, cx))
+        .child(glyph(
+            "spine-settings",
+            "St",
+            ActionId::Settings,
+            player.settings_open,
+            true,
+            player,
+            cx,
+        ))
         .child(div().flex_1())
 }
