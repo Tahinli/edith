@@ -466,6 +466,51 @@ fn export_chip(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
         )
 }
 
+/// The monitoring level's continuous pointer door. It shares the Player's
+/// measured bar and root drag plumbing with the legacy slider, but keeps the
+/// Darkroom's achromatic track and ink ladder.
+fn volume_slider(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
+    let volume = player.volume;
+    let enabled = player.enable(ActionId::ToggleMute, None).yes();
+    div()
+        .id("stance-tb-volume-bar")
+        .relative()
+        .flex_none()
+        .w(px(VOLUME_W))
+        .h(px(CONTROL_H))
+        .flex()
+        .items_center()
+        .tooltip(|_, cx| {
+            cx.new(|_| Tip("Volume — drag to set the level; the button mutes".into())).into()
+        })
+        .when(!enabled, |d| d.opacity(0.4).cursor_not_allowed())
+        .when(enabled, |d| {
+            d.cursor_pointer()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                        this.volume_dragging = true;
+                        this.drag_volume(event.position.x, cx);
+                    }),
+                )
+                .child(bounds_probe(player.volume_bar.clone()))
+        })
+        .child(
+            div()
+                .w_full()
+                .h(px(4.))
+                .rounded(px(2.))
+                .bg(rgb(DARK_RAISED()))
+                .child(
+                    div()
+                        .h_full()
+                        .w(relative(volume.along()))
+                        .rounded(px(2.))
+                        .bg(rgb(if volume.muted { INK3() } else { INK2() })),
+                ),
+        )
+}
+
 /// The whole band, left to right per MOCK-SPEC: hero timecode, ghost
 /// transport, cut readout, the contact strip filling the rest, the Export
 /// chip at the end.
@@ -576,6 +621,7 @@ pub(crate) fn render(player: &mut Player, position: f64, cx: &mut Context<Player
                     player.volume.muted,
                     cx,
                 ))
+                .child(volume_slider(player, cx))
                 .child(ghost("stance-tb-vol-up", player, "+", ActionId::VolumeUp, false, cx)),
         )
         .child(cut_readout(player))
