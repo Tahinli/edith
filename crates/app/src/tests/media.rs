@@ -5,6 +5,7 @@ use super::*;
 use crate::subs::{
     load_subtitle_style, save_subtitle_style, sub_line_h_for, subtitle_style_path, SUB_SIZE_RANGE,
 };
+use crate::player::library::{auto_proxies_pref_path, load_auto_proxies_pref, save_auto_proxies_pref};
 use crate::ui::preview::{bgra_to_rgba, screenshot_path};
 
 /// The import line's own state machine, driven the way a repaint drives
@@ -946,6 +947,46 @@ fn the_subtitle_style_file_round_trips_or_falls_back_to_defaults() {
     // failing the window that opens over it.
     std::fs::write(subtitle_style_path(), "not a number\n9999\n").unwrap();
     assert_eq!(load_subtitle_style(), (None, SUB_TEXT));
+
+    unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The auto-proxies default, round-tripped through a scratch config
+/// directory the same way the subtitle style is above -- the door D1 wired
+/// it through, so this is what the settings page header can now honestly
+/// call the same claim it makes about Proxies: a project's own line always
+/// beats this one once one is open ([`engine::edith::Document::auto_proxy`]),
+/// but with nothing open (or nothing saved since the flip) this is what a
+/// relaunch reads instead of the field's hardcoded `true`.
+#[test]
+fn the_auto_proxies_default_round_trips_through_its_own_config_file_or_falls_back_to_on() {
+    let dir = std::env::temp_dir().join(format!(
+        "edith-auto-proxies-pref-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    // Scoped to this test alone, the same guarantee the subtitle-style test
+    // above makes for the same env var.
+    unsafe { std::env::set_var("XDG_CONFIG_HOME", &dir) };
+
+    // Nothing written yet: On, the field's own long-standing default.
+    assert!(load_auto_proxies_pref(), "a missing file must read as On");
+
+    save_auto_proxies_pref(false).unwrap();
+    assert!(!load_auto_proxies_pref(), "off must round-trip");
+
+    save_auto_proxies_pref(true).unwrap();
+    assert!(load_auto_proxies_pref(), "on must round-trip too, not just off");
+
+    // Garbled bytes -- a stray edit, or a future dialect -- read as On rather
+    // than failing a startup on someone else's edit of the file.
+    std::fs::write(auto_proxies_pref_path(), "not on or off\n").unwrap();
+    assert!(load_auto_proxies_pref(), "unreadable content must fall back to On");
 
     unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
     std::fs::remove_dir_all(&dir).ok();

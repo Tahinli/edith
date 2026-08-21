@@ -11,6 +11,7 @@
 use crate::*;
 use crate::ui::bench_stance;
 use crate::ui::dock_stance;
+use crate::ui::settings_stance;
 use crate::ui::timeband_stance;
 use crate::ui::spine_stance;
 use crate::ui::type_scale::{self, Typeset};
@@ -754,14 +755,32 @@ pub(crate) fn render(
                 return;
             }
             // Same modal guard the legacy handler's rebinding/keys_open/
-            // export_open/exporting/colour/transform/speed/EQ/silence/mix/
+            // export_open/colour/transform/speed/EQ/silence/mix/
             // subtitle-style/menu chain (`render.rs`) amounts to, read as
             // one bool instead of re-copied field by field: while a card, a
             // rebind capture, or a menu owns the keyboard, the darkroom
             // stance yields to it exactly as the legacy tree does. This is
             // the fix for the stance's `Home`-inside-the-Colour-card
             // misfire.
-            if this.rebinding.is_some() || this.overlaid() {
+            //
+            // `exporting()` alone is deliberately left out of this list
+            // (`Player::card_open` is `modal()` minus it): a running export
+            // draws no card of its own to own the keyboard for, and a key
+            // caught here never reaches `enable()`/`act()` below, so a
+            // refusal the oracle would have spoken (`ActionId::Settings`
+            // among them) never got said -- the room went silent instead.
+            // Letting an export-only moment fall through costs nothing this
+            // guard exists for: every action the oracle would still refuse
+            // during an export says so through `act()`'s own `Enable::No`
+            // branch, and the six it leaves live (Theme, Fullscreen,
+            // SubtitleStyle, CancelExport, ...) are exactly the ones meant
+            // to keep working.
+            if this.rebinding.is_some()
+                || this.card_open()
+                || this.context_menu.is_some()
+                || this.library_menu.is_some()
+                || this.picker.is_some()
+            {
                 // Escape is every card's own way out (`Player::close_card`,
                 // the same list `overlaid`/`modal` read) -- blocking every
                 // key while a card is open must not also lock the card open.
@@ -843,6 +862,7 @@ pub(crate) fn render(
                     el.child(notice_plate(n, bench_h))
                 })
                 .when(player.keys_open, |el| el.child(keys_overlay(player)))
+                .when(player.settings_open, |el| el.child(settings_stance::render(player, cx)))
                 // The two menus (DESIGN §9: "verbs of the thing under the
                 // cursor", plate styling, the same scrim-and-row component
                 // the legacy tree already uses -- `library.rs`'s own doc

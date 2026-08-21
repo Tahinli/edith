@@ -2175,3 +2175,100 @@ fn every_darkroom_menu_sizes_its_list_against_the_floor_room_not_the_raw_viewpor
         assert!(sizings > 0, "{file} no longer opens any menu -- update this guard");
     }
 }
+
+/// The settings page's own organising rule: PROJECT rows open only the
+/// doors that write into the `.edith` file ([`Player::open_picker`],
+/// [`Player::open_mix`]), and EDITOR rows open only the doors that do not
+/// ([`Player::toggle_proxies`], [`Player::toggle_auto_proxies`],
+/// [`Player::open_subtitle_style`]) -- never the config-file writers
+/// (`ui::dock_stance::config_path`/`ui::theme::config_path`/
+/// `keymap::Keymap::config_path`) directly, which every editor-side row
+/// already routes around through its own opener. A row wired to the wrong
+/// section's opener is exactly the regression a page organised around two
+/// headings invites; this pins each half to its own doors so the two lists
+/// cannot cross.
+#[test]
+fn settings_project_and_editor_sections_open_disjoint_doors() {
+    let source = src_text("ui/settings_stance.rs");
+    let project_start = source.find("fn project_section(").expect("the project section");
+    let editor_start = source.find("fn editor_section(").expect("the editor section");
+    let render_start = source.find("pub(crate) fn render(").expect("the page's render fn");
+    assert!(project_start < editor_start && editor_start < render_start, "the three fns moved; this scan is blind");
+    let project_body = &source[project_start..editor_start];
+    let editor_body = &source[editor_start..render_start];
+
+    for door in ["open_picker(", "open_mix("] {
+        assert!(project_body.contains(door), "PROJECT section no longer opens {door} -- update this guard");
+        assert!(
+            !editor_body.contains(door),
+            "EDITOR section opens {door}, a project-file door -- that value belongs in PROJECT, not here"
+        );
+    }
+    for door in ["toggle_proxies(", "toggle_auto_proxies(", "open_subtitle_style("] {
+        assert!(editor_body.contains(door), "EDITOR section no longer opens {door} -- update this guard");
+        assert!(
+            !project_body.contains(door),
+            "PROJECT section opens {door}, an editor-only door -- that value belongs in EDITOR, not here"
+        );
+    }
+    // Neither section writes a config file straight from a row: both go
+    // through an opener, which is the one place a config-file write (the
+    // subtitle style card's Save, this window's next project load) is
+    // allowed to live.
+    for path_fn in ["dock_stance::config_path", "theme::config_path", "Keymap::config_path"] {
+        assert!(!project_body.contains(path_fn), "PROJECT section touches {path_fn} directly");
+        assert!(!editor_body.contains(path_fn), "EDITOR section touches {path_fn} directly");
+    }
+}
+
+/// D1's own class, pinned per row rather than per section: a row's hint can
+/// claim a `~/.config/edith` default (the section header claims nothing on
+/// its own since [`settings_project_and_editor_sections_open_disjoint_doors`]'s
+/// commit, so a lying section head no longer slips past a reviewer -- but a
+/// lying *row* hint did, on Proxies, because nothing scanned row text at all).
+/// For every row whose own hint text names that file, this requires the
+/// matching `save_*_pref`/`load_*_pref` pair to actually exist in
+/// `player/library.rs` -- the exact gap Proxies shipped with: a hint promising
+/// a default the row's own door never wrote.
+#[test]
+fn settings_row_hints_naming_config_edith_have_a_matching_pref_pair() {
+    let source = src_text("ui/settings_stance.rs");
+    let library = src_text("player/library.rs");
+    // (row id, the stem its pref functions are named after)
+    for (row_id, stem) in [("settings-proxies", "proxies"), ("settings-auto-proxies", "auto_proxies")] {
+        let row_start = source.find(&format!("\"{row_id}\"")).unwrap_or_else(|| panic!("{row_id} row moved or renamed -- update this guard"));
+        let row_end = source[row_start..].find(",\n        ))").map_or(source.len(), |i| row_start + i);
+        let row_text = &source[row_start..row_end];
+        if !row_text.contains("~/.config/edith") {
+            continue;
+        }
+        for prefix in ["save_", "load_"] {
+            let fn_name = format!("{prefix}{stem}_pref");
+            assert!(
+                library.contains(&format!("fn {fn_name}(")),
+                "{row_id}'s hint claims a ~/.config/edith default but \
+                 player/library.rs has no `{fn_name}` -- the hint promises \
+                 storage the row does not have"
+            );
+        }
+    }
+}
+
+/// With no project open, a PROJECT row must not fall back to a bare noun
+/// ("Size"/"Rate"/"HDR") standing in the value slot -- it reads as a value
+/// while carrying none. This binary has no `TestAppContext` to actually
+/// render the page with `player.session` empty, so this is a source scan
+/// for the fallback strings the bug shipped as, same as the guard above it.
+#[test]
+fn settings_project_rows_have_no_bare_noun_placeholder() {
+    let source = src_text("ui/settings_stance.rs");
+    let project_start = source.find("fn project_section(").expect("the project section");
+    let editor_start = source.find("fn editor_section(").expect("the editor section");
+    let project_body = &source[project_start..editor_start];
+    for placeholder in ["\"Size\".to_string()", "\"Rate\".to_string()", "\"HDR\".to_string()"] {
+        assert!(
+            !project_body.contains(placeholder),
+            "a PROJECT row fell back to the bare noun {placeholder} -- it reads as a value with no project open"
+        );
+    }
+}
