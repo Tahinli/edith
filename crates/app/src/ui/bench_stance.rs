@@ -1093,6 +1093,16 @@ pub(crate) fn render(
         .map_or_else(|| vec![Lane::V1, Lane::A1], PlaybackSession::lanes);
     let position = player.active_session().map_or(0., PlaybackSession::now);
     let scale = player.scale;
+    let select_all = player.enable(ActionId::SelectAll, None);
+    let select_all_tip: SharedString = match select_all.why() {
+        Some(why) => format!("{} — {why}", player.keymap.display(ActionId::SelectAll)),
+        None => format!(
+            "{} — {}",
+            player.keymap.display(ActionId::SelectAll),
+            ActionId::SelectAll.label()
+        ),
+    }
+    .into();
     let bed_w = f32::from(player.ruler.get().size.width).max(1.);
     let filled = scale.px_at(position).clamp(0., bed_w);
     let (picks, pick_links) = player.marks();
@@ -1209,6 +1219,35 @@ pub(crate) fn render(
                         ))
                         .text_color(rgb(INK1()))
                         .child(playhead_tc),
+                )
+                .child(
+                    div()
+                        .id("bench-select-all")
+                        .absolute()
+                        .right(px(4.))
+                        .top_0()
+                        .h_full()
+                        .flex()
+                        .items_center()
+                        .gap(px(3.))
+                        .px(px(3.))
+                        .rounded(px(2.))
+                        .tooltip(move |_, cx| cx.new(|_| Tip(select_all_tip.clone())).into())
+                        .when(!select_all.yes(), |d| d.opacity(0.4).cursor_not_allowed())
+                        .when(select_all.yes(), |d| {
+                            d.cursor_pointer()
+                                .hover(|s| s.bg(rgb(DARK_RAISED())).text_color(rgb(INK1())))
+                                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                    this.act(ActionId::SelectAll, window, cx)
+                                }))
+                        })
+                        .type_style(type_scale::mono(
+                            type_scale::CHORD_METADATA_MIN_PX,
+                            gpui::FontWeight::MEDIUM,
+                        ))
+                        .text_color(rgb(INK3()))
+                        .child("all")
+                        .child(player.keymap.chord(ActionId::SelectAll)),
                 ),
         )
         .child(
