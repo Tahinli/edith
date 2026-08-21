@@ -32,8 +32,8 @@
 //! since nothing in [`engine::project::Project`] holds a place to persist an
 //! override into.
 
-use crate::*;
 use crate::ui::type_scale;
+use crate::*;
 use engine::colorspace::ContentLight;
 
 /// A 9px uppercase Archivo section head, `ink3` -- [`dock_stance::section_head`]'s
@@ -106,7 +106,9 @@ fn row_ink(
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     value_ink: u32,
 ) -> impl IntoElement {
-    row_full(id, label_text, value, hint, None, player, on_click, value_ink)
+    row_full(
+        id, label_text, value, hint, None, player, on_click, value_ink,
+    )
 }
 
 /// The one row body all three wrappers share. `chord` is the stroke that also
@@ -141,7 +143,9 @@ fn row_full(
         .tooltip(move |_, cx| cx.new(|_| Tip(hint.clone())).into())
         .when(exporting, |d| d.opacity(0.4).cursor_not_allowed())
         .when(!exporting, |d| {
-            d.cursor_pointer().hover(|s| s.bg(rgb(DARK_RAISED()))).on_click(on_click)
+            d.cursor_pointer()
+                .hover(|s| s.bg(rgb(DARK_RAISED())))
+                .on_click(on_click)
         })
         .child(
             div()
@@ -244,7 +248,11 @@ fn project_section(player: &Player, cx: &mut Context<Player>) -> impl IntoElemen
     // Sample rate keeps its "Source" fallback: unlike resolution/fps it
     // states a real behaviour (derives from the first audio source) rather
     // than standing in for a value with nothing behind it.
-    let rate_val = match player.session.as_ref().map_or(player.pending_settings.2, |s| s.sample_rate()) {
+    let rate_val = match player
+        .session
+        .as_ref()
+        .map_or(player.pending_settings.2, |s| s.sample_rate())
+    {
         Some(rate) => format!("{rate} Hz"),
         None => "Source".to_string(),
     };
@@ -259,7 +267,10 @@ fn project_section(player: &Player, cx: &mut Context<Player>) -> impl IntoElemen
     // persist one into. `—` for a project with no session, and for a session
     // whose file is SDR or simply declared nothing (most files declare
     // nothing here at all).
-    let light = player.session.as_ref().map_or(ContentLight::default(), engine::playback::PlaybackSession::content_light);
+    let light = player.session.as_ref().map_or(
+        ContentLight::default(),
+        engine::playback::PlaybackSession::content_light,
+    );
     let (master_val, master_ink) = match (&player.session, light.mastering_max) {
         (Some(_), Some(nits)) => (format!("{nits:.0} nits"), INK1()),
         _ => ("—".to_string(), INK4()),
@@ -467,7 +478,13 @@ pub(crate) fn render(
                         .child("SETTINGS")
                         .child(
                             div()
-                                .font(type_scale::mono(type_scale::CHORD_METADATA_MIN_PX, gpui::FontWeight::MEDIUM).font)
+                                .font(
+                                    type_scale::mono(
+                                        type_scale::CHORD_METADATA_MIN_PX,
+                                        gpui::FontWeight::MEDIUM,
+                                    )
+                                    .font,
+                                )
                                 .text_size(px(type_scale::CHORD_METADATA_MIN_PX))
                                 .text_color(rgb(INK3()))
                                 .child(player.keymap.display(ActionId::Settings)),

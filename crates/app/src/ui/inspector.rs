@@ -7,15 +7,19 @@
 //! panel, and opening one occludes zero timeline pixels
 //! (`an_inspector_section_occludes_no_timeline`).
 
-use crate::*;
 use crate::ui::toolbar::{TONE_SLOT_W, ZOOM_SLOT_W};
+use crate::*;
 
 impl Player {
     /// The inspector column. Two sections that are always there -- the
     /// selection's and the project's -- and, over them, whichever settings card
     /// is open, which is a section of this panel rather than a sheet over the
     /// window.
-    pub(crate) fn inspector(&self, viewport: Size<Pixels>, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn inspector(
+        &self,
+        viewport: Size<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let width = self.split_px(Split::Inspector, viewport);
         // The cards measure themselves against the room they are given, and the
         // room they are given is this column -- not the window.
@@ -114,9 +118,9 @@ impl Player {
             .anchor()
             .filter(|_| picked.is_none())
             .and_then(|(lane, idx)| {
-            let sub = self.session.as_ref()?.sub_lane(lane).get(idx).copied()?;
-            Some((lane, sub))
-        });
+                let sub = self.session.as_ref()?.sub_lane(lane).get(idx).copied()?;
+                Some((lane, sub))
+            });
         // A multi-selection is named for its anchor and counted: what the
         // panel shows is the anchor's settings, and the count says there is
         // more in hand than the panel is showing.

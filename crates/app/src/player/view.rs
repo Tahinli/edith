@@ -170,7 +170,13 @@ impl Player {
     /// One clip's fit policy set, whichever asked: the stroke that steps to the
     /// next one and the list that names one outright come through here, so they
     /// cannot differ in what they do or in what they say they did.
-    pub(crate) fn apply_fit(&mut self, lane: Lane, idx: usize, fit: FitPolicy, cx: &mut Context<Self>) {
+    pub(crate) fn apply_fit(
+        &mut self,
+        lane: Lane,
+        idx: usize,
+        fit: FitPolicy,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(session) = &mut self.session
             && session.set_fit(lane, idx, fit)
         {
@@ -247,8 +253,12 @@ impl Player {
         if view.bed <= 0. || view.duration <= 0. {
             return;
         }
-        let (thumb_x, thumb_w) =
-            scroll_thumb(view.bed, view.duration, view.scale.start.max(0.), view.span());
+        let (thumb_x, thumb_w) = scroll_thumb(
+            view.bed,
+            view.duration,
+            view.scale.start.max(0.),
+            view.span(),
+        );
         let at = px_along(x, self.scroll_track.get());
         let grab = match (thumb_x..thumb_x + thumb_w).contains(&at) {
             true => at - thumb_x,
@@ -263,11 +273,13 @@ impl Player {
             // leaves is always a real place inside it -- at the thumb's floor
             // width as much as anywhere else.
             false => {
-                let start = f64::from((at - thumb_w / 2.).max(0.))
-                    / f64::from(view.bed.max(1.))
+                let start = f64::from((at - thumb_w / 2.).max(0.)) / f64::from(view.bed.max(1.))
                     * view.duration;
                 self.scale = View {
-                    scale: Scale { start, ..view.scale },
+                    scale: Scale {
+                        start,
+                        ..view.scale
+                    },
                     ..view
                 }
                 .settled();
@@ -297,7 +309,10 @@ impl Player {
         // is the clamp's to hold, exactly as every scrollbar's is.
         let start = f64::from((at - grab).max(0.)) / f64::from(view.bed.max(1.)) * view.duration;
         self.scale = View {
-            scale: Scale { start, ..view.scale },
+            scale: Scale {
+                start,
+                ..view.scale
+            },
             ..view
         }
         .settled();
@@ -335,9 +350,8 @@ impl Player {
             // the track by [`lanes_thumb`], so the grab this leaves is always
             // a real place inside it.
             false => {
-                let to = self.lanes_taken(
-                    (at - thumb_h / 2.).max(0.) / (track - thumb_h).max(1.) * max,
-                );
+                let to =
+                    self.lanes_taken((at - thumb_h / 2.).max(0.) / (track - thumb_h).max(1.) * max);
                 self.lanes_scroll
                     .set_offset(point(self.lanes_scroll.offset().x, px(-to)));
                 thumb_h / 2.

@@ -2009,6 +2009,8 @@ fn a_maximized_card_can_never_rise_above_the_picture_no_matter_the_bench_height(
 /// invent.
 #[test]
 fn a_maximized_card_reopens_exactly_as_left_across_a_restart() {
+    let _config_env = config_env_lock();
+
     let dir = std::env::temp_dir().join(format!(
         "edith-test-maximized-{}-{}",
         std::process::id(),
@@ -2018,8 +2020,8 @@ fn a_maximized_card_reopens_exactly_as_left_across_a_restart() {
             .as_nanos()
     ));
     std::fs::create_dir_all(&dir).unwrap();
-    // Scoped to this test alone, the same reasoning `tests/media.rs`'s own
-    // XDG_CONFIG_HOME mutation gives: nothing else reads this file.
+    // `config_env_lock` serializes every test that changes this process-wide
+    // path.
     unsafe { std::env::set_var("XDG_CONFIG_HOME", &dir) };
 
     // Nothing written yet: the default (not maximized), not a crash on a
@@ -2073,6 +2075,8 @@ fn darkroom_preview_mounts_stop_and_drag_scrub() {
             && preview.contains("this.preview_scrub_to(event.position.x, true, cx)"),
         "the mounted preview scrub no longer starts its drag-and-seek gesture"
     );
+}
+
 /// Source management must stay reachable in the Darkroom itself: per-row
 /// stand-in control/progress, pointer Add-at-playhead alongside its `↵` chord,
 /// and the three legacy source questions as dock filters. The test reads the

@@ -109,7 +109,9 @@ impl Player {
                         engine::decode::DecodeSession::open_range(&path, 0, 1).ok()?;
                     let frame = rx.recv().ok()?;
                     let buf = image::RgbaImage::from_raw(frame.width, frame.height, frame.bgra)?;
-                    Some(std::sync::Arc::new(RenderImage::new(vec![image::Frame::new(buf)])))
+                    Some(std::sync::Arc::new(RenderImage::new(vec![
+                        image::Frame::new(buf),
+                    ])))
                 }
             });
             cx.spawn(async move |this, cx| {
@@ -250,7 +252,12 @@ impl Player {
             let scan = cx.background_executor().spawn({
                 let (path, stream, progress) = (key.0.clone(), key.1, Arc::clone(&progress));
                 async move {
-                    engine::silence::levels_with_progress(&path, stream, (0., f64::INFINITY), &progress)
+                    engine::silence::levels_with_progress(
+                        &path,
+                        stream,
+                        (0., f64::INFINITY),
+                        &progress,
+                    )
                 }
             });
             cx.spawn(async move |this, cx| {
@@ -299,8 +306,7 @@ impl Player {
         let Some(session) = &self.session else {
             return;
         };
-        let settings =
-            export_settings(
+        let settings = export_settings(
             self.quality,
             self.custom_mbps,
             self.format,
@@ -338,9 +344,9 @@ impl Player {
             return;
         }
         self.export_seat = Some((key.0.clone(), key.1, key.2.clone(), None));
-        let probed = cx.background_executor().spawn(async move {
-            engine::export::planned_seats(&project, &meta, &settings)
-        });
+        let probed = cx
+            .background_executor()
+            .spawn(async move { engine::export::planned_seats(&project, &meta, &settings) });
         cx.spawn(async move |this, cx| {
             let probed = probed.await;
             this.update(cx, |this, cx| {
@@ -676,8 +682,7 @@ impl Player {
         if self.export.is_some() {
             return;
         }
-        let mut settings =
-            export_settings(
+        let mut settings = export_settings(
             self.quality,
             self.custom_mbps,
             self.format,
