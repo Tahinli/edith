@@ -4180,6 +4180,15 @@ impl Project {
         true
     }
 
+    /// The empty stretch of `lane` covering `frame`, as `(start, len)` -- what
+    /// a right-click on empty bench space names before offering to close it.
+    /// `None` when `frame` sits inside a clip, or past the last one: the open
+    /// end of a lane is not a gap, since there is nothing after it to slide
+    /// back ([`gap`]).
+    pub fn gap_at(&self, lane: Lane, frame: u32) -> Option<(u32, u32)> {
+        gap(self.lane(lane), frame)
+    }
+
     /// Cut **every** one of `regions` -- `(start, len)` in timeline frames --
     /// out of the lanes in `scope` and close each hole, as one edit: the
     /// jumpcut a silence scan asks for ([`crate::silence`]).
@@ -4897,6 +4906,21 @@ fn source_frame(c: &Clip, timeline_frame: u32) -> u32 {
 fn at(clips: &[Clip], frame: u32) -> Option<usize> {
     let idx = clips.partition_point(|c| c.start <= frame).checked_sub(1)?;
     (frame < clips[idx].end()).then_some(idx)
+}
+
+/// The empty stretch of `clips` covering `frame`, as `(start, len)` -- `None`
+/// when `frame` is inside a clip, or past the last one. Sorted-disjoint
+/// invariant like [`at`]: the first clip whose start is past `frame` is the
+/// far wall, and the last one that ends at or before `frame` (or the
+/// timeline's own head, `0`, when there is none) is the near one.
+fn gap(clips: &[Clip], frame: u32) -> Option<(u32, u32)> {
+    if at(clips, frame).is_some() {
+        return None;
+    }
+    let idx = clips.partition_point(|c| c.start <= frame);
+    let next = clips.get(idx)?;
+    let start = idx.checked_sub(1).map_or(0, |i| clips[i].end());
+    Some((start, next.start - start))
 }
 
 /// Index of the clip `frame` falls *strictly inside*, i.e. the one a split
@@ -7519,6 +7543,67 @@ mod tests {
             p.lane(Lane::A1)[1].start,
             "and still covers the same span as its sound"
         );
+    }
+
+    /// The gap-close menu's hit test: what `gap_at` says about a frame at the
+    /// head of a lane, between two clips, inside a clip, past the last one,
+    /// and on a lane holding nothing at all.
+    #[test]
+    fn gap_at_finds_the_hole_a_frame_sits_in() {
+        let mut p = Project::single(FILE, 1);
+        let v = p.add_lane(LaneKind::Video);
+        // Empty lane: nothing before and nothing after -- not a gap, since
+        // there is nothing to ripple toward.
+        assert_eq!(p.gap_at(v, 0), None, "an empty lane has nothing to close");
+
+        assert!(p.place(v, 5, clip(5, 0, 3, 0)), "single clip at [5,8)");
+        // Before the only clip: the gap runs from the timeline's own head.
+        assert_eq!(p.gap_at(v, 0), Some((0, 5)));
+        assert_eq!(p.gap_at(v, 4), Some((0, 5)));
+        // Inside the clip: not a gap.
+        assert_eq!(p.gap_at(v, 5), None);
+        assert_eq!(p.gap_at(v, 7), None);
+        // Past the only clip: the open end of the lane, not a gap -- there is
+        // nothing after it to slide back.
+        assert_eq!(p.gap_at(v, 8), None);
+        assert_eq!(p.gap_at(v, 100), None);
+
+        assert!(p.place(v, 12, clip(12, 0, 2, 0)), "a second clip at [12,14)");
+        // Between the two: the gap [8,12).
+        assert_eq!(p.gap_at(v, 8), Some((8, 4)));
+        assert_eq!(p.gap_at(v, 11), Some((8, 4)));
+        assert_eq!(p.gap_at(v, 14), None, "still the open end");
+
+        assert!(
+            p.place(v, 8, clip(8, 0, 4, 0)),
+            "fills [8,12) exactly, meeting both neighbours"
+        );
+        assert_eq!(p.gap_at(v, 8), None, "adjacent clips leave no frame to name a gap");
+        assert_eq!(p.gap_at(v, 11), None);
+    }
+
+    /// Closing a gap is [`Project::cut_regions`] scoped to the one lane the
+    /// menu named: the clip after the gap slides back on that lane, a clip on
+    /// another lane at the very same frame range does not move, and the whole
+    /// close is one press of undo.
+    #[test]
+    fn closing_a_gap_ripples_only_its_own_lane_and_undoes_in_one_step() {
+        let mut p = Project::single(FILE, 1);
+        let v = p.add_lane(LaneKind::Video);
+        let a = p.add_lane(LaneKind::Audio);
+        assert!(p.place(v, 5, clip(5, 0, 3, 0)), "V clip at [5,8)");
+        assert!(
+            p.place(a, 0, clip(0, 0, 3, 0)),
+            "A clip at [0,3) -- outside the video lane's gap and this scope"
+        );
+        let before = shape(&p);
+        let (start, len) = p.gap_at(v, 0).expect("a gap before the only clip");
+        assert_eq!((start, len), (0, 5));
+        assert!(p.cut_regions(&[(start, len)], &[v]).is_ok());
+        assert_eq!(p.lane(v)[0].start, 0, "the clip slid back to close the gap");
+        assert_eq!(p.lane(a)[0].start, 0, "the untouched lane's clip did not move");
+        assert!(p.undo(), "one press undoes the whole close");
+        assert_eq!(shape(&p), before, "back to exactly where it was");
     }
 
     #[test]
