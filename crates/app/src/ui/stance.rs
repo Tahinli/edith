@@ -8,13 +8,13 @@
 //! interaction, no cut machinery -- `// hook:` comments below mark where the
 //! later steps in DESIGN §12's package attach.
 
-use crate::*;
 use crate::ui::bench_stance;
 use crate::ui::dock_stance;
 use crate::ui::settings_stance;
-use crate::ui::timeband_stance;
 use crate::ui::spine_stance;
+use crate::ui::timeband_stance;
 use crate::ui::type_scale::{self, Typeset};
+use crate::*;
 
 /// Left rail, full height (DESIGN §5).
 const SPINE_W: f32 = 56.;
@@ -39,16 +39,13 @@ pub(crate) const DOCK_W: f32 = 280.;
 /// What [`bench`] spends above `bench_stance::render`'s own content: the
 /// `bench` div's own `.border_t_1()` (1px) + its `py(4.)` top padding +
 /// the section head's real line box -- `type_scale::head()` sizes text at
-/// `SECTION_HEAD_PX` (10) but never calls `.line_height()`, so gpui's
+/// `SECTION_HEAD_PX` (12) but never calls `.line_height()`, so gpui's
 /// default `TextStyle::line_height` (the golden ratio, `gpui::phi()` ==
 /// `1.618034`, not 1x the font size) is what it actually draws:
-/// `round(10. * 1.618034)` = `round(16.18034)` = `16`. A driven pass found
-/// this constant undercounting that line box as a bare `10`, one of the two
-/// causes of `layout::BENCH_MIN_H`'s third clip (see its own doc comment for
-/// the other). `1 + 4 + 16` = `21`. Named and `pub(crate)` rather than the
-/// `- 20.` it used to be inlined as, so `layout::BENCH_MIN_H` can add it
-/// into its own derivation instead of guessing it back out.
-pub(crate) const BENCH_CHROME_H: f32 = 21.;
+/// `round(12. * 1.618034)` = `round(19.416408)` = `19`.
+/// `1 + 4 + 19` = `24`. Named and `pub(crate)` rather than an inline
+/// subtraction, so `layout::BENCH_MIN_H` can derive from the real chrome.
+pub(crate) const BENCH_CHROME_H: f32 = 24.;
 
 /// The lowest a menu's top edge may sit and still land inside the
 /// bench/ledger/dock footprint below the screen (DESIGN §5, §9, §11 check 6):
@@ -136,7 +133,10 @@ mod menu_floor_tests {
         let list_h = (396f32).min(f32::from(room.height));
         assert!(list_h <= f32::from(room.height));
         let (_, y) = crate::oracle::menu_at(at, viewport, list_h);
-        assert_eq!(y, floor, "the top edge must not be walked back above the floor");
+        assert_eq!(
+            y, floor,
+            "the top edge must not be walked back above the floor"
+        );
     }
 }
 
@@ -196,7 +196,11 @@ thread_local! {
 /// reimplemented here. Split out from `picture_scale` so this arithmetic has
 /// a runnable check with no `Player`/window to stand up.
 fn fit_scale(bounds: Bounds<Pixels>, native: gpui::Size<gpui::DevicePixels>) -> Option<f32> {
-    if bounds.size.width <= px(0.) || bounds.size.height <= px(0.) || native.width.0 <= 0 || native.height.0 <= 0 {
+    if bounds.size.width <= px(0.)
+        || bounds.size.height <= px(0.)
+        || native.width.0 <= 0
+        || native.height.0 <= 0
+    {
         return None;
     }
     let fitted = gpui::ObjectFit::Contain.get_bounds(bounds, native);
@@ -269,7 +273,7 @@ fn scale_plate(player: &Player) -> impl IntoElement {
         .child(div().text_color(rgb(INK1())).child(value))
 }
 
-/// A section head: 9px, uppercase, `ink3` -- DESIGN §3's scale for the label
+/// A section head, uppercase, `ink3` -- DESIGN §3's scale for the label
 /// that names a region before anything else lives in it.
 fn section_head(label: &str) -> impl IntoElement {
     div()
@@ -291,7 +295,10 @@ fn ghost(player: &Player, glyph: &str, action: ActionId) -> impl IntoElement {
         .gap(px(2.))
         .py(px(6.))
         .rounded(px(3.))
-        .type_style(type_scale::label(13., gpui::FontWeight::MEDIUM))
+        .type_style(type_scale::label(
+            type_scale::LABEL_ROW_PX,
+            gpui::FontWeight::MEDIUM,
+        ))
         .text_color(rgb(INK2()))
         .child(glyph.to_string())
         .child(
@@ -352,43 +359,16 @@ fn keys_overlay(player: &Player) -> impl IntoElement {
                 .flex_col()
                 .gap(px(3.))
                 .child(section_head("all commands · hold ? · release to close"))
-                .children(keys_rows().into_iter().map(|row| match row {
-                    KeyRow::Head(category) => div()
-                        .flex_none()
-                        .pt(px(4.))
-                        .type_style(type_scale::head())
-                        .text_color(rgb(INK3()))
-                        .child(category.label().to_uppercase())
-                        .into_any_element(),
-                    KeyRow::Act(action) => div()
-                        .flex()
-                        .justify_between()
-                        .gap(px(12.))
-                        .child(
-                            div()
-                                .type_style(type_scale::label(
-                                    type_scale::CHORD_METADATA_MIN_PX,
-                                    gpui::FontWeight::MEDIUM,
-                                ))
-                                .text_color(rgb(INK2()))
-                                .child(action.label()),
-                        )
-                        .child(
-                            div()
-                                .type_style(type_scale::mono(
-                                    type_scale::CHORD_METADATA_MIN_PX,
-                                    gpui::FontWeight::MEDIUM,
-                                ))
-                                .text_color(rgb(INK3()))
-                                // The keys overlay is the full-truth surface
-                                // (FAULT 1): every chord an action answers to,
-                                // not the badge's primary-only compact form.
-                                .child(player.keymap.display(action)),
-                        )
-                        .into_any_element(),
-                    KeyRow::Fixed(i) => {
-                        let f = &keymap::FIXED[i];
-                        div()
+                .children(keys_rows().into_iter().map(|row| {
+                    match row {
+                        KeyRow::Head(category) => div()
+                            .flex_none()
+                            .pt(px(4.))
+                            .type_style(type_scale::head())
+                            .text_color(rgb(INK3()))
+                            .child(category.label().to_uppercase())
+                            .into_any_element(),
+                        KeyRow::Act(action) => div()
                             .flex()
                             .justify_between()
                             .gap(px(12.))
@@ -399,7 +379,7 @@ fn keys_overlay(player: &Player) -> impl IntoElement {
                                         gpui::FontWeight::MEDIUM,
                                     ))
                                     .text_color(rgb(INK2()))
-                                    .child(f.label),
+                                    .child(action.label()),
                             )
                             .child(
                                 div()
@@ -408,9 +388,38 @@ fn keys_overlay(player: &Player) -> impl IntoElement {
                                         gpui::FontWeight::MEDIUM,
                                     ))
                                     .text_color(rgb(INK3()))
-                                    .child(f.chord.clone()),
+                                    // The keys overlay is the full-truth surface
+                                    // (FAULT 1): every chord an action answers to,
+                                    // not the badge's primary-only compact form.
+                                    .child(player.keymap.display(action)),
                             )
-                            .into_any_element()
+                            .into_any_element(),
+                        KeyRow::Fixed(i) => {
+                            let f = &keymap::FIXED[i];
+                            div()
+                                .flex()
+                                .justify_between()
+                                .gap(px(12.))
+                                .child(
+                                    div()
+                                        .type_style(type_scale::label(
+                                            type_scale::CHORD_METADATA_MIN_PX,
+                                            gpui::FontWeight::MEDIUM,
+                                        ))
+                                        .text_color(rgb(INK2()))
+                                        .child(f.label),
+                                )
+                                .child(
+                                    div()
+                                        .type_style(type_scale::mono(
+                                            type_scale::CHORD_METADATA_MIN_PX,
+                                            gpui::FontWeight::MEDIUM,
+                                        ))
+                                        .text_color(rgb(INK3()))
+                                        .child(f.chord.clone()),
+                                )
+                                .into_any_element()
+                        }
                     }
                 })),
         )
@@ -447,7 +456,12 @@ fn spine(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
 /// the two-up OUT|IN judging *below* it as a flex sibling (DESIGN §6) rather
 /// than layering plates over it: the picture's own `flex_1` shrinks to make
 /// room, so every picture pixel that is drawn stays visible.
-fn screen(player: &mut Player, position: f64, window: &mut Window, cx: &mut Context<Player>) -> impl IntoElement {
+fn screen(
+    player: &mut Player,
+    position: f64,
+    window: &mut Window,
+    cx: &mut Context<Player>,
+) -> impl IntoElement {
     let two_up = player.two_up().map(IntoElement::into_any_element);
     div()
         .id("stance-screen")
@@ -615,7 +629,10 @@ fn notice_plate(message: SharedString, bench_h: f32) -> impl IntoElement {
         // shape as the legacy notice bar's own tone stripe (`notice_bar`).
         .border_l(px(3.))
         .border_color(rgb(notice_severity(&message)))
-        .type_style(type_scale::label(10., gpui::FontWeight::MEDIUM))
+        .type_style(type_scale::label(
+            type_scale::LABEL_ROW_PX,
+            gpui::FontWeight::MEDIUM,
+        ))
         .text_color(rgb(INK1()))
         .child(message)
 }
@@ -627,7 +644,14 @@ fn ledger(player: &Player, position: f64) -> impl IntoElement {
         true => "untitled".to_string(),
         false => file_name(&player.project_path),
     };
-    let identity = format!("{name} · {}", if player.autosave_dirty { "unsaved" } else { "saved" });
+    let identity = format!(
+        "{name} · {}",
+        if player.autosave_dirty {
+            "unsaved"
+        } else {
+            "saved"
+        }
+    );
     let last_action = player.notices.back().cloned().unwrap_or_else(|| "—".into());
     let export = player
         .exporting()
@@ -698,7 +722,12 @@ fn ledger(player: &Player, position: f64) -> impl IntoElement {
 /// "ui fields are not stretchable" for the dock. `window_size` is threaded
 /// through so the maximize-in-place cards inside the dock (`dock_stance.rs`)
 /// see the real viewport rather than a fabricated `size(px(DOCK_W), h)`.
-fn dock(player: &Player, dock_w: f32, window_size: Size<Pixels>, cx: &mut Context<Player>) -> impl IntoElement {
+fn dock(
+    player: &Player,
+    dock_w: f32,
+    window_size: Size<Pixels>,
+    cx: &mut Context<Player>,
+) -> impl IntoElement {
     div()
         .id("stance-dock")
         .flex_none()
@@ -945,7 +974,9 @@ pub(crate) fn render(
                     el.child(notice_plate(n, bench_h))
                 })
                 .when(player.keys_open, |el| el.child(keys_overlay(player)))
-                .when(player.settings_open, |el| el.child(settings_stance::render(player, cx)))
+                .when(player.settings_open, |el| {
+                    el.child(settings_stance::render(player, cx))
+                })
                 // The two menus (DESIGN §9: "verbs of the thing under the
                 // cursor", plate styling, the same scrim-and-row component
                 // the legacy tree already uses -- `library.rs`'s own doc

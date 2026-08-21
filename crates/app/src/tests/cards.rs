@@ -16,7 +16,9 @@ use std::sync::atomic::Ordering;
 #[test]
 fn no_overlaid_state_in_the_stance_goes_modal_without_painting_something() {
     let stance = src_text("ui/stance.rs");
-    let render_body = &stance[stance.find("pub(crate) fn render(").expect("the stance's entry point")..];
+    let render_body = &stance[stance
+        .find("pub(crate) fn render(")
+        .expect("the stance's entry point")..];
     for menu in ["context_card(", "library_card(", "picker_card("] {
         assert!(
             render_body.contains(menu),
@@ -28,7 +30,11 @@ fn no_overlaid_state_in_the_stance_goes_modal_without_painting_something() {
         .find("if this.rebinding.is_some()\n                || this.card_open()")
         .expect("the stance's modal guard");
     let guard = &stance[guard_at..guard_at + 1600];
-    for field in ["this.context_menu = None", "this.library_menu = None", "this.picker = None"] {
+    for field in [
+        "this.context_menu = None",
+        "this.library_menu = None",
+        "this.picker = None",
+    ] {
         assert!(
             guard.contains(field),
             "the overlaid()/rebinding branch no longer clears {field} on every key -- \
@@ -61,7 +67,10 @@ fn every_modal_field_has_a_mounted_surface_somewhere_in_the_darkroom() {
             fields.push(name);
         }
     }
-    assert!(fields.len() >= 9, "modal()'s own field list looks too short to have been parsed: {fields:?}");
+    assert!(
+        fields.len() >= 9,
+        "modal()'s own field list looks too short to have been parsed: {fields:?}"
+    );
     // The mounted-surface function each field's own card draws, by the
     // convention the param cards already follow (`x_open` -> `x_card(` --
     // `Player::eq_card`/`color_card`/... in `ui/cards.rs`). `keys_open` and
@@ -91,7 +100,11 @@ fn every_modal_field_has_a_mounted_surface_somewhere_in_the_darkroom() {
             ),
         }
     };
-    let haystack = format!("{}\n{}", src_text("ui/stance.rs"), src_text("ui/dock_stance.rs"));
+    let haystack = format!(
+        "{}\n{}",
+        src_text("ui/stance.rs"),
+        src_text("ui/dock_stance.rs")
+    );
     for field in &fields {
         let mount = mount_for(field);
         assert!(
@@ -249,7 +262,10 @@ fn every_action_is_on_the_actions_card() {
     }
     // The list scrolls inside a card the smallest window holds, so a
     // thirty-fourth action costs no height at all.
-    assert!(rows.len() as f32 * KEYS_ROW_H > KEYS_ROWS_H, "no cap needed?");
+    assert!(
+        rows.len() as f32 * KEYS_ROW_H > KEYS_ROWS_H,
+        "no cap needed?"
+    );
     // Both halves of a row are click targets, so WCAG 2.5.8 binds them.
     assert!(KEYS_ROW_H >= HIT_MIN);
 }
@@ -458,10 +474,19 @@ fn the_equalizer_graph_puts_a_band_where_a_drag_reads_it_and_fits_the_smallest_w
 
     // The card fits the smallest window and takes the room a bigger one has
     // -- it is a graph, and the width *is* the frequency resolution.
-    assert!(eq_card_w(640., false) <= 640. - 24., "card too wide for 640");
-    assert!(eq_card_w(1280., false) > eq_card_w(640., false), "card ignores the window");
+    assert!(
+        eq_card_w(640., false) <= 640. - 24.,
+        "card too wide for 640"
+    );
+    assert!(
+        eq_card_w(1280., false) > eq_card_w(640., false),
+        "card ignores the window"
+    );
     assert_eq!(eq_card_w(1920., false), EQ_W_MAX, "card grows without end");
-    assert!(eq_card_w(320., false) >= KEYS_W, "card narrower than a row of text");
+    assert!(
+        eq_card_w(320., false) >= KEYS_W,
+        "card narrower than a row of text"
+    );
     // At the smallest window the graph is still a graph: three across for
     // one down, so an octave is wide enough to put a handle in.
     assert!(
@@ -905,7 +930,10 @@ fn the_clock_stops_where_the_timeline_does_and_the_end_still_restarts() {
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut state = transport(session.is_playing(), session.is_eos());
     while state != Transport::Ended {
-        assert!(Instant::now() < deadline, "never reached the end of a 5s file");
+        assert!(
+            Instant::now() < deadline,
+            "never reached the end of a 5s file"
+        );
         session.tick();
         while session.try_frame().is_some() {}
         state = transport(session.is_playing(), session.is_eos());
@@ -982,7 +1010,14 @@ fn a_quality_row_is_the_bitrate_it_promises() {
         Some(2_000_000)
     );
     assert_eq!(
-        export_settings(Quality::Medium, 0, mp4, DEFAULT_AUDIO_KBPS, EncoderSeat::Auto).bitrate,
+        export_settings(
+            Quality::Medium,
+            0,
+            mp4,
+            DEFAULT_AUDIO_KBPS,
+            EncoderSeat::Auto
+        )
+        .bitrate,
         Some(6_000_000)
     );
     assert_eq!(
@@ -991,7 +1026,14 @@ fn a_quality_row_is_the_bitrate_it_promises() {
     );
     // Megabits as typed, and as the row says it back.
     assert_eq!(
-        export_settings(Quality::Custom, 7, mp4, DEFAULT_AUDIO_KBPS, EncoderSeat::Auto).bitrate,
+        export_settings(
+            Quality::Custom,
+            7,
+            mp4,
+            DEFAULT_AUDIO_KBPS,
+            EncoderSeat::Auto
+        )
+        .bitrate,
         Some(7_000_000)
     );
     assert_eq!(Quality::Low.detail(0), "2 Mbps");
@@ -999,7 +1041,14 @@ fn a_quality_row_is_the_bitrate_it_promises() {
     // choice the engine never hears about.
     for format in [Format::Mp4, Format::Wav, Format::Flac] {
         assert_eq!(
-            export_settings(Quality::Auto, 0, format, DEFAULT_AUDIO_KBPS, EncoderSeat::Auto).format,
+            export_settings(
+                Quality::Auto,
+                0,
+                format,
+                DEFAULT_AUDIO_KBPS,
+                EncoderSeat::Auto
+            )
+            .format,
             format
         );
     }
@@ -1008,7 +1057,13 @@ fn a_quality_row_is_the_bitrate_it_promises() {
     // silently changes -- the ceiling row included, which is the one a
     // raised cap could have walked out past.
     for quality in Quality::ALL {
-        let settings = export_settings(quality, MBPS_MAX, mp4, DEFAULT_AUDIO_KBPS, EncoderSeat::Auto);
+        let settings = export_settings(
+            quality,
+            MBPS_MAX,
+            mp4,
+            DEFAULT_AUDIO_KBPS,
+            EncoderSeat::Auto,
+        );
         if let Some(bitrate) = settings.bitrate {
             assert!(
                 (u64::from(MBPS_MIN) * 1_000_000..=u64::from(MBPS_MAX) * 1_000_000)
@@ -1144,7 +1199,10 @@ fn a_typed_bitrate_is_a_field_and_not_a_key_capture() {
     // The hint the field shows when there is nothing to refuse names both
     // ways out of it.
     let detail = NumberEdit::new(6).detail();
-    assert!(detail.contains("enter") && detail.contains("esc"), "{detail}");
+    assert!(
+        detail.contains("enter") && detail.contains("esc"),
+        "{detail}"
+    );
     assert!(detail.starts_with("6▏"), "{detail}");
 }
 
@@ -1198,10 +1256,7 @@ fn a_held_key_moves_a_value_and_nothing_else() {
             held,
             matches!(
                 action,
-                ActionId::VolumeUp
-                    | ActionId::VolumeDown
-                    | ActionId::ZoomIn
-                    | ActionId::ZoomOut
+                ActionId::VolumeUp | ActionId::VolumeDown | ActionId::ZoomIn | ActionId::ZoomOut
             ),
             "{action:?} on a hold"
         );
@@ -1292,10 +1347,7 @@ fn a_choice_list_offers_every_value_and_fits_the_smallest_window() {
     // The media's own size says so: it is the one rung a person cannot read
     // off a number they chose.
     let (.., native_detail, _) = &rows[3];
-    assert!(
-        native_detail.contains("the media's own"),
-        "{native_detail}"
-    );
+    assert!(native_detail.contains("the media's own"), "{native_detail}");
     // A project at a size nobody listed still gets the whole list, with
     // nothing marked rather than a wrong row marked.
     assert!(
@@ -1375,7 +1427,11 @@ fn a_choice_list_offers_every_value_and_fits_the_smallest_window() {
     for format in [Format::Av1, Format::Av1Mp4] {
         assert!(av1_hw_warning(format, EncoderSeat::Hardware).is_some());
         for seat in [EncoderSeat::Auto, EncoderSeat::Software] {
-            assert_eq!(av1_hw_warning(format, seat), None, "{seat:?} is the safe seat");
+            assert_eq!(
+                av1_hw_warning(format, seat),
+                None,
+                "{seat:?} is the safe seat"
+            );
         }
     }
     for format in [Format::Mp4, Format::Hevc, Format::HevcMp4, Format::Wav] {
@@ -1411,7 +1467,10 @@ fn a_choice_list_offers_every_value_and_fits_the_smallest_window() {
 fn the_resolution_and_rate_lists_work_before_any_file_is_open() {
     let none = pending_resolution_choices(None);
     assert_eq!(none.len(), RESOLUTIONS.len());
-    assert!(none.iter().all(|(.., picked)| !picked), "nothing picked yet");
+    assert!(
+        none.iter().all(|(.., picked)| !picked),
+        "nothing picked yet"
+    );
     for ((choice, label, detail, _), size) in none.iter().zip(RESOLUTIONS) {
         assert_eq!(*choice, Choice::Size(size.0, size.1));
         assert_eq!(label.as_ref(), format!("{}p", size.1));
@@ -1510,10 +1569,10 @@ fn the_export_card_fits_the_smallest_window() {
             "{id:?}: refusal ink {:.2}",
             contrast(p.FG_SECONDARY, p.BG_RAISED)
         );
-    // ...and on the picked row, where the highlight is the accent at
-    // surface brightness. Both inks clear 4.5:1 on it now -- the row still
-    // lifts its key and detail to `FG_PRIMARY`, as emphasis rather than as
-    // the rescue it used to be.
+        // ...and on the picked row, where the highlight is the accent at
+        // surface brightness. Both inks clear 4.5:1 on it now -- the row still
+        // lifts its key and detail to `FG_PRIMARY`, as emphasis rather than as
+        // the rescue it used to be.
         assert!(contrast(p.FG_PRIMARY, p.BG_SELECTED) >= 4.5, "{id:?}");
         assert!(
             contrast(p.FG_SECONDARY, p.BG_SELECTED) >= 4.5,
@@ -1662,8 +1721,7 @@ fn every_preset_bundle_round_trips_through_from_state() {
 /// dimmed row is ignored.
 #[test]
 fn a_preset_over_a_picture_this_timeline_has_none_of_carries_the_codec_refusal() {
-    let mut session =
-        PlaybackSession::open(asset("test_tone.mp3")).expect("a song is a timeline");
+    let mut session = PlaybackSession::open(asset("test_tone.mp3")).expect("a song is a timeline");
     session.set_gain(0.0);
     let path = session.sources()[0].path.clone();
     session.seek(1.0);
@@ -1751,18 +1809,26 @@ fn a_cards_own_help_paints_while_the_card_is_open_but_the_ui_under_it_stays_quie
          exemption must not weaken"
     );
     OVERLAID.store(false, Ordering::Relaxed);
-    assert!(tip_may_paint(false), "with nothing overlaid, an ordinary tip paints too");
+    assert!(
+        tip_may_paint(false),
+        "with nothing overlaid, an ordinary tip paints too"
+    );
 
     // Structural half: every card routes its head through `dark_card_head`,
     // so checking its one help-tooltip call site covers all seven cards (and
     // any future eighth) at once -- it must build an `OverlayTip`, not a
     // plain `Tip`, or this whole fix is undone by construction.
     let cards_src = src_text("ui/cards.rs");
-    let head_fn_at = cards_src.find("fn dark_card_head(").expect("dark_card_head");
-    // 1200 was wide enough before this session's maximize glyph/tooltip
-    // (`.when(maximize.is_some(), ...)` + its own `OverlayTip`) grew the
-    // function ahead of the help tooltip this test is actually pinning.
-    let head_fn = &cards_src[head_fn_at..head_fn_at + 2400];
+    let head_fn_at = cards_src
+        .find("fn dark_card_head(")
+        .expect("dark_card_head");
+    // Bound the inspected source by the next item, not a byte count: rustfmt
+    // may legitimately reflow this function without moving its tooltip out of
+    // scope.
+    let head_fn_end = cards_src[head_fn_at..]
+        .find("\n/// A ghost action row")
+        .expect("dark_card_head's following item");
+    let head_fn = &cards_src[head_fn_at..head_fn_at + head_fn_end];
     assert!(
         head_fn.contains("OverlayTip(h.clone())"),
         "dark_card_head's own `?` tooltip no longer builds an OverlayTip -- the \
@@ -1831,8 +1897,8 @@ fn maximizing_a_card_grows_its_box_without_moving_where_a_value_sits_in_it() {
 /// inside the dock, or hands it the dock's width again, fails this.
 #[test]
 fn a_maximized_cards_room_is_bigger_than_the_docked_rooms_not_smaller() {
-    use crate::layout::{Split, split_size};
     use crate::SPLIT_W;
+    use crate::layout::{Split, split_size};
 
     // Mirrors `ui/stance.rs`'s private `SPINE_W` (56.) and `layout::SPLIT_W`
     // (the one divider between `stance-centre` and the dock): recomputed
@@ -1934,7 +2000,11 @@ fn a_maximized_card_reopens_exactly_as_left_across_a_restart() {
 
     // A file from a future/corrupt version leaves the default in force
     // rather than failing the room that opens over it.
-    std::fs::write(crate::ui::dock_stance::maximized_config_path(), "not a bool\n").unwrap();
+    std::fs::write(
+        crate::ui::dock_stance::maximized_config_path(),
+        "not a bool\n",
+    )
+    .unwrap();
     assert_eq!(crate::ui::dock_stance::load_maximized(), false);
 
     unsafe { std::env::remove_var("XDG_CONFIG_HOME") };

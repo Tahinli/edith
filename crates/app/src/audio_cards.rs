@@ -235,7 +235,7 @@ mod eq_tick_end_w_tests {
     use super::*;
 
     /// The defect measured live: a fixed 24 px box wrapped "20 Hz" (5 chars)
-    /// at the dark theme's 11 px end-tick size. The derived width must clear
+    /// at the dark theme's 13 px end-tick size. The derived width must clear
     /// that box, and must grow, not shrink, if a future scale bump raises
     /// the size fed in.
     #[test]
