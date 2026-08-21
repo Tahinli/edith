@@ -30,10 +30,10 @@
 //! started it, for the darkroom tree exactly as for the legacy one -- no
 //! root wiring lives here.
 //!
-//! Still deferred: fades/dissolve glyphs, and the lane header's own
-//! drop-line cue (the legacy `LaneDrop` preview) -- a plain drag_over
-//! highlight stands in for it here, since the cue itself is display-only and
-//! `reorder_lane` at the release does not need it.
+//! Fade wedges, dissolve joins, and the lane header's drop-line cue reuse the
+//! legacy interaction state: `FadeDrag` previews the ramp until release,
+//! `dissolve_selected` still owns the toggle, and `LaneDrop` answers the same
+//! slot that `reorder_lane` commits.
 //!
 //! `nudge_cut` and friends still act on `Player::selected` directly, with no
 //! element under the pointer required, and stay untouched by any of this.
@@ -179,6 +179,7 @@ fn clip_box(
     lane: Lane,
     idx: usize,
     clip: &Clip,
+    next: Option<Clip>,
     scale: Scale,
     picks: &[(Lane, usize)],
     pick_links: &[Option<u32>],
@@ -201,6 +202,16 @@ fn clip_box(
     let source = player.sources().get(clip.source);
     let label = source.map(|s| file_name(&s.path));
     let audio = lane.kind == LaneKind::Audio;
+    let fade_in = player.shown_fade_in(lane, idx, clip);
+    let fade_out = player.shown_fade_out(lane, idx, clip);
+    let dissolves = lane.kind == LaneKind::Video
+        && clip.transition_out > 0
+        && next.is_some_and(|next| next.start == clip.end());
+    let dissolve_tip: SharedString = format!(
+        "Remove dissolve — {}",
+        player.keymap.display(ActionId::Dissolve)
+    )
+    .into();
     let wave = source
         .and_then(|s| player.waves.get(&(s.path.clone(), s.audio_stream)))
         .cloned();
@@ -382,6 +393,38 @@ fn clip_box(
                     }),
             )
         })
+        // Fades shade their own ramps over the waveform, including the live
+        // `FadeDrag` value, so the ramp follows the hand before release.
+        .when(audio, |d| {
+            d.children(
+                [
+                    (fade_in > 0).then(|| {
+                        div()
+                            .absolute()
+                            .left_0()
+                            .top_0()
+                            .h_full()
+                            .w(px(scale
+                                .width_px(f64::from(fade_in) / player.fps)
+                                .min(width)))
+                            .child(fade_wedge(true))
+                    }),
+                    (fade_out > 0).then(|| {
+                        div()
+                            .absolute()
+                            .right_0()
+                            .top_0()
+                            .h_full()
+                            .w(px(scale
+                                .width_px(f64::from(fade_out) / player.fps)
+                                .min(width)))
+                            .child(fade_wedge(false))
+                    }),
+                ]
+                .into_iter()
+                .flatten(),
+            )
+        })
         // Name plate + trim/duration readout: one strip, DESIGN §4's plate
         // (canvas-on-panel), sat at the clip's top-left/top-right per the mock
         // rather than the name alone hanging below the box. Its 21px height is
@@ -442,6 +485,56 @@ fn clip_box(
                     .text_color(rgb(INK2()))
                     .child(format!("{speed}")),
             )
+        })
+        // The dissolve is the join's click target: it remains visible only
+        // where the engine says two video clips really abut, and a click
+        // selects that leading clip then takes the same toggle as Ctrl+X.
+        .when(dissolves, |d| {
+            d.child(
+                div()
+                    .id(("bench-dissolve", lane.ord * 1000 + idx))
+                    .absolute()
+                    .right_0()
+                    .top_0()
+                    .h_full()
+                    .w(px(scale
+                        .width_px(f64::from(clip.transition_out) / player.fps)
+                        .min(width)))
+                    .occlude()
+                    .cursor_pointer()
+                    .tooltip(move |_, cx| cx.new(|_| Tip(dissolve_tip.clone())).into())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.pick((lane, idx), false, cx);
+                        this.dissolve_selected(cx);
+                    }))
+                    .child(dissolve_glyph()),
+            )
+        })
+        // The fade handles sit inside the trim strips, so their small top
+        // corners change a ramp while the outer full-height strips still trim.
+        .when(audio && trims(span), |d| {
+            d.children([Edge::Start, Edge::End].into_iter().map(|edge| {
+                let is_in = edge == Edge::Start;
+                let mut handle = div()
+                    .absolute()
+                    .top_0()
+                    .w(px(FADE_HANDLE_W))
+                    .h(px(FADE_HANDLE_H))
+                    .occlude()
+                    .cursor(CursorStyle::ResizeLeftRight)
+                    .hover(|s| s.bg(rgb(INK2())))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                            this.start_fade_drag(lane, idx, is_in, event.position.x, cx);
+                        }),
+                    );
+                handle = match edge {
+                    Edge::Start => handle.left(px(EDGE_W)),
+                    Edge::End => handle.right(px(EDGE_W)),
+                };
+                handle
+            }))
         })
         // Splice gap: the lamp-white sliver at every clip's trailing edge --
         // DESIGN §1 law 3's other legal white, present at every tier (a
@@ -610,7 +703,19 @@ fn lane_row(
     let boxes: Vec<_> = clips
         .iter()
         .enumerate()
-        .map(|(idx, clip)| clip_box(player, lane, idx, clip, scale, picks, pick_links, cx))
+        .map(|(idx, clip)| {
+            clip_box(
+                player,
+                lane,
+                idx,
+                clip,
+                clips.get(idx + 1).copied(),
+                scale,
+                picks,
+                pick_links,
+                cx,
+            )
+        })
         .collect();
     // The bed's other kind of box: a subtitle lane holds no `Clip` at all
     // (`LaneKind::Subtitle`'s own doc), so this is empty everywhere but S1..
@@ -642,20 +747,30 @@ fn lane_row(
         type_scale::CHORD_METADATA_MIN_PX,
         gpui::FontWeight::MEDIUM,
     );
+    let drop = player
+        .lane_drop
+        .filter(|drop| drop.lane == lane && cx.has_active_drag());
     div()
         .id(("bench-lane", lane.ord * 10 + lane.kind as usize))
         .flex_none()
         .h(px(h))
         .flex()
+        .relative()
         // Dragged, the whole track moves in the stack (`LaneDrag`,
         // `Player::reorder_lane`) -- let go anywhere along the row, not just
         // over the head column, since a slot is what is being aimed at.
-        // corner-cut: no drop-line cue (module doc) -- a plain highlight
-        // while the pointer is over the row stands in for it.
         .drag_over::<LaneDrag>(|d, _, _, _| d.bg(rgb(DARK_RAISED())))
         .on_drop(cx.listener(move |this, drag: &LaneDrag, _, cx| {
             this.reorder_lane(drag.0, lane, cx);
         }))
+        .on_drag_move(
+            cx.listener(move |this, event: &DragMoveEvent<LaneDrag>, _, cx| {
+                if !event.bounds.contains(&event.event.position) {
+                    return this.forget_lane_drop(lane, cx);
+                }
+                this.preview_lane_drop(event.drag(cx).0, lane, cx);
+            }),
+        )
         .child(
             // Pinned track head: its drag handle remains the lane label; verbs
             // stay separate pointer targets so a mix/remove click never starts
@@ -952,6 +1067,17 @@ fn lane_row(
                         }),
                 ),
         )
+        // The drop-line is inside its target row so it survives the lane
+        // column's clipping at the first row; it marks exactly the slot the
+        // release will reorder into, rather than a generic drag highlight.
+        .children(drop.map(|drop| {
+            let line = div().absolute().left_0().w_full().h(px(2.)).bg(rgb(INK1()));
+            if drop.above {
+                line.top_0()
+            } else {
+                line.bottom_0()
+            }
+        }))
 }
 
 /// The bench's content: pinned ruler, pinned heads, lane stack -- compressed
