@@ -1560,14 +1560,19 @@ impl Player {
                         // outright hung the card's right-hand third off the edge
                         // of the window. The two cards beside it are built this
                         // way for the same reason.
+                        .id("eq-card")
                         .w_full()
                         .max_w(px(eq_card_w(f32::from(viewport.width), self.card_maximized)))
                         // And a cap the other way, for the same reason the width
                         // has one: the card is docked in a column now, and at the
                         // 360 px floor it is taller than that column -- its title
                         // ran off the top and its buttons off the bottom, with
-                        // neither reachable. Capped here, scrolled below.
+                        // neither reachable. The card itself owns that scroll:
+                        // every child, including the below-fold line, is in its
+                        // wheel surface rather than a fixed sibling dead zone.
                         .max_h(relative(1.))
+                        .overflow_y_scroll()
+                        .track_scroll(&self.eq_scroll)
                         // Maximized also *claims* the room the cap above
                         // only allows: `flex_1()`/`max_h` on the graph below
                         // has nothing to grow into if the card itself still
@@ -1584,18 +1589,12 @@ impl Player {
                         .child(
                             div()
                                 .id("eq-card-rows")
-                                // Shrinkable below its content, which is what
-                                // makes the cap above a scroll rather than a
-                                // clip; the rows themselves keep their heights.
-                                .min_h(px(0.))
-                                // Maximized: stretch to the room the card
-                                // above now claims, so the graph's own
-                                // `flex_1` (above) has the leftover space to
-                                // grow into instead of the card just hugging
-                                // its content and leaving none.
+                                // A non-maximized card exposes the body's full
+                                // natural height to its parent scroll surface;
+                                // maximized fills the claimed card room so the
+                                // graph can consume only the leftover height.
+                                .when(!graph_maximized, |d| d.flex_none())
                                 .when(graph_maximized, |d| d.flex_1())
-                                .overflow_y_scroll()
-                                .track_scroll(&self.eq_scroll)
                                 .flex()
                                 .flex_col()
                                 .gap(px(2.))
