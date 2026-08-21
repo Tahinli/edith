@@ -11,7 +11,7 @@
 //! still supply the row facts ([`library_rows`], [`source_tint`],
 //! [`clip_middle`]...), only the anatomy around them is new.
 
-use crate::ui::type_scale::{self, head, label, mono};
+use crate::ui::type_scale::{self, Typeset, head, label, mono};
 use crate::*;
 use gpui::FontWeight;
 
@@ -401,6 +401,182 @@ fn source_row(
         })
 }
 
+/// Imported subtitle tracks, grouped by their source. A row selects and drags
+/// its track; its header folds that source's rows without becoming a cycle.
+fn subtitle_palette(player: &Player, cx: &mut Context<Player>) -> Option<AnyElement> {
+    let groups = subtitle_rows(player.session.as_ref()?.subtitles());
+    if groups.is_empty() {
+        return None;
+    }
+    let count: usize = groups.iter().map(|group| group.rows.len()).sum();
+    let rows: Vec<_> = groups
+        .into_iter()
+        .enumerate()
+        .map(|(group_ord, group)| {
+            let folded = player.sub_folded.contains(&group.path);
+            let fold_path = group.path.clone();
+            let tint = file_tint(player.sources(), &group.path);
+            let track_count = group.rows.len();
+            let tracks: Vec<_> = group
+                .rows
+                .into_iter()
+                .map(|row| {
+                    let track = row.track;
+                    let picked = track == player.sub_track;
+                    let usable = row.refused.is_none();
+                    let title: SharedString = match track_count {
+                        1 => row.label,
+                        _ => format!("{} {}", row.label, row.number),
+                    }
+                    .into();
+                    let detail: SharedString = row
+                        .refused
+                        .unwrap_or_else(|| "drag onto an S lane to place".to_string())
+                        .into();
+                    let ghost = title.clone();
+                    div()
+                        .id(("dock-subtitle-track", track))
+                        .flex_none()
+                        .h(px(CONTROL_H))
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .px(px(8.))
+                        .rounded(px(3.))
+                        .when(picked, |d| d.border_1().border_color(rgb(INK1())))
+                        .when(!usable, |d| d.opacity(0.5))
+                        .when(usable, |d| {
+                            d.cursor_pointer()
+                                .hover(|s| s.bg(rgb(DARK_RAISED())))
+                                .on_drag(SubPick(track), move |_, _, _, cx| {
+                                    cx.new(|_| Tip(ghost.clone()))
+                                })
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    this.sub_track = track;
+                                    cx.notify();
+                                }))
+                        })
+                        .child(
+                            div()
+                                .flex_none()
+                                .w(px(4.))
+                                .h(px(16.))
+                                .rounded(px(2.))
+                                .when_some(tint, |d, tint| d.bg(rgb(tint))),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .truncate()
+                                .type_style(mono(
+                                    type_scale::CHORD_METADATA_MIN_PX,
+                                    FontWeight::MEDIUM,
+                                ))
+                                .text_color(rgb(INK2()))
+                                .child(title),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .truncate()
+                                .type_style(mono(type_scale::FLOOR_PX, FontWeight::MEDIUM))
+                                .text_color(rgb(INK3()))
+                                .child(detail),
+                        )
+                        .child(
+                            div()
+                                .id(("dock-subtitle-remove", track))
+                                .flex_none()
+                                .w(px(HIT_MIN))
+                                .h_full()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(3.))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(rgb(DARK_RAISED())).text_color(rgb(INK1())))
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    cx.stop_propagation();
+                                    this.remove_subtitle_track(track, cx);
+                                }))
+                                .child("×"),
+                        )
+                })
+                .collect();
+            div()
+                .flex_none()
+                .flex()
+                .flex_col()
+                .gap(px(2.))
+                .child(
+                    div()
+                        .id(("dock-subtitle-group", group_ord))
+                        .flex_none()
+                        .h(px(CONTROL_H))
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .px(px(8.))
+                        .rounded(px(3.))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgb(DARK_RAISED())))
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            if !this.sub_folded.remove(&fold_path) {
+                                this.sub_folded.insert(fold_path.clone());
+                            }
+                            cx.notify();
+                        }))
+                        .child(if folded { "▸" } else { "▾" })
+                        .when_some(tint, |d, tint| {
+                            d.child(
+                                div()
+                                    .flex_none()
+                                    .w(px(4.))
+                                    .h(px(16.))
+                                    .rounded(px(2.))
+                                    .bg(rgb(tint)),
+                            )
+                        })
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .truncate()
+                                .type_style(label(type_scale::LABEL_ROW_PX, FontWeight::MEDIUM))
+                                .text_color(rgb(INK2()))
+                                .child(group.name),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .type_style(mono(
+                                    type_scale::CHORD_METADATA_MIN_PX,
+                                    FontWeight::MEDIUM,
+                                ))
+                                .text_color(rgb(INK3()))
+                                .child(format!(
+                                    "{track_count} track{}",
+                                    if track_count == 1 { "" } else { "s" }
+                                )),
+                        ),
+                )
+                .when(!folded, |d| d.children(tracks))
+        })
+        .collect();
+    Some(
+        div()
+            .id("dock-subtitle-palette")
+            .flex_none()
+            .flex()
+            .flex_col()
+            .gap(px(2.))
+            .child(section_head(format!("SUBTITLES · {count}")))
+            .children(rows)
+            .into_any_element(),
+    )
+}
+
 /// The Sources tab, built off MOCK-SPEC.md's "Dock" section: count line,
 /// filter, sort chips, rows, IMPORT, hint -- none of it the legacy
 /// Media/Audio/Text panel `library.rs` draws. That panel's row facts
@@ -551,6 +727,7 @@ fn sources_tab(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
                     elements
                 }),
         )
+        .children(subtitle_palette(player, cx))
         .child(section_head("IMPORT"))
         .child(
             div()

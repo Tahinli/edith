@@ -1380,6 +1380,37 @@ fn the_text_tab_carries_the_add_subtitles_door() {
     );
 }
 
+/// The Darkroom keeps imported subtitle tracks in the Sources dock, where a
+/// row can be selected, folded with its source, removed, and dragged to the
+/// bench's existing subtitle-lane target.
+#[test]
+fn the_darkroom_subtitle_palette_drags_tracks_to_subtitle_lanes() {
+    let dock = src_text("ui/dock_stance.rs");
+    let palette = &dock[dock
+        .find("fn subtitle_palette")
+        .expect("no Darkroom subtitle palette")..];
+    for required in [
+        "subtitle_rows",
+        "dock-subtitle-group",
+        "sub_folded.remove",
+        "sub_folded.insert",
+        "this.sub_track = track",
+        ".on_drag(SubPick(track)",
+        "remove_subtitle_track(track",
+    ] {
+        assert!(palette.contains(required), "palette lost {required}");
+    }
+    let bench = src_text("ui/bench_stance.rs");
+    let drop_at = bench
+        .find(".drag_over::<SubPick>")
+        .expect("no subtitle-track lane target");
+    let drop = &bench[drop_at..(drop_at + 500).min(bench.len())];
+    assert!(
+        drop.contains("this.place_sub(drag.0, lane"),
+        "a dock subtitle drag does not place on the lane: {drop}"
+    );
+}
+
 /// A source's group header in the library must not vanish on a short
 /// window: it is drawn whenever there is more than one source
 /// (`several_files`), never gated on the viewport's height, and the list
