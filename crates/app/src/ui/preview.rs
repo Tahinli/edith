@@ -1,5 +1,6 @@
 //! The picture: what is drawn over it and what is read off it.
 
+use crate::ui::hitmap;
 use crate::ui::type_scale::{self, Typeset};
 use crate::*;
 use std::path::{Path, PathBuf};
@@ -41,6 +42,7 @@ impl Player {
                         .bg(rgb(BG_RAISED()))
                         .hover(|s| s.bg(rgb(BG_HOVER())))
                         .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.close_preview(cx)))
+                        .children(hitmap::control("preview.stop", "Stop preview", true))
                         .child("Stop (esc)"),
                 )
         })
@@ -94,6 +96,7 @@ impl Player {
                         .cursor_pointer()
                         .hover(|s| s.bg(rgb(DARK_RAISED())))
                         .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.close_preview(cx)))
+                        .children(hitmap::control("preview.stop", "Stop preview", true))
                         .child(div().text_color(rgb(INK2())).child("Stop"))
                         .child(
                             div()
@@ -146,6 +149,7 @@ impl Player {
                         this.preview_scrub_to(event.position.x, true, cx);
                     }),
                 )
+                .children(hitmap::control("preview.scrub", "Preview scrub bar", true))
                 .child(
                     div()
                         .relative()
