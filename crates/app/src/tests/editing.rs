@@ -80,8 +80,7 @@ fn an_import_adds_a_row_at_its_own_length_and_leaves_the_lanes_alone() {
 /// an export.
 #[test]
 fn a_song_opens_the_window_by_itself() {
-    let mut session =
-        PlaybackSession::open(asset("test_tone.mp3")).expect("a song is a timeline");
+    let mut session = PlaybackSession::open(asset("test_tone.mp3")).expect("a song is a timeline");
     session.set_gain(0.0);
     // The source's own path, which is the canonical one a row carries.
     let path = session.sources()[0].path.clone();
@@ -345,11 +344,13 @@ fn a_caption_is_deleted_by_the_same_row_and_stroke_every_box_is() {
     );
     // ...and the same reading with a clip under it is the clip menu, untouched:
     // the flag is off wherever a `Clip` was clicked.
-    assert!(menu_items(Ctx {
-        timeline: true,
-        ..Ctx::default()
-    })
-    .contains(&ActionId::Cut));
+    assert!(
+        menu_items(Ctx {
+            timeline: true,
+            ..Ctx::default()
+        })
+        .contains(&ActionId::Cut)
+    );
 }
 
 /// A timeline with a subtitle palette and an empty subtitle lane: what a
@@ -383,7 +384,9 @@ fn one_second(start: u32) -> SubClip {
 fn a_refused_caption_drop_leaves_the_mark_where_it_was() {
     use crate::sub_mark;
     let (mut session, lane) = with_subtitle_lane();
-    session.place_sub(lane, 0, one_second(0)).expect("A goes down");
+    session
+        .place_sub(lane, 0, one_second(0))
+        .expect("A goes down");
     session
         .place_sub(lane, 60, one_second(0))
         .expect("B goes down after it");
@@ -517,8 +520,14 @@ fn a_caption_anchor_names_the_media_half_of_its_group() {
         .place_sub(lane, 0, one_second(0))
         .expect("the caption goes down");
     // Ungrouped: no pictures and no sound behind the words.
-    assert_eq!(caption_media_half(&session, (lane, 0), LaneKind::Video), None);
-    assert_eq!(caption_media_half(&session, (lane, 0), LaneKind::Audio), None);
+    assert_eq!(
+        caption_media_half(&session, (lane, 0), LaneKind::Video),
+        None
+    );
+    assert_eq!(
+        caption_media_half(&session, (lane, 0), LaneKind::Audio),
+        None
+    );
     // Grouped with the take -- whose sound rides along unasked -- both halves
     // answer by lane and index.
     session
@@ -601,7 +610,9 @@ fn the_playhead_actions_still_work_with_a_caption_marked() {
     // And the edits themselves, on a timeline holding a placed caption: the
     // split at the playhead and the rejoin at the seam it leaves.
     let (mut session, lane) = with_subtitle_lane();
-    session.place_sub(lane, 0, one_second(0)).expect("it goes down");
+    session
+        .place_sub(lane, 0, one_second(0))
+        .expect("it goes down");
     let clips = session.lane_clips(Lane::V1).len();
     assert!(session.cut_at(2.0), "the playhead splits the clip under it");
     assert_eq!(session.lane_clips(Lane::V1).len(), clips + 1);
@@ -665,7 +676,10 @@ fn the_clip_menu_dims_what_the_playhead_is_not_on_and_stays_in_the_window() {
         ..clip
     };
     assert_eq!(slow.frames(), 240, "a quarter speed is four times as long");
-    assert!(offered(&slow, v1, ActionId::Cut, 34), "34 is a source frame");
+    assert!(
+        offered(&slow, v1, ActionId::Cut, 34),
+        "34 is a source frame"
+    );
     assert!(!offered(&slow, v1, ActionId::Cut, 35));
     assert_eq!(
         on(&slow, v1, ActionId::Cut, 35).why(),
@@ -785,7 +799,10 @@ fn the_clip_menu_dims_what_the_playhead_is_not_on_and_stays_in_the_window() {
         assert!(on(&clip, lane, action, 60).why().is_some());
     }
     assert!(matches!(on(&clip, v1, ActionId::Cut, 30), Enable::No(_)));
-    assert!(matches!(on(&clip, v1, ActionId::Regroup, 60), Enable::No(_)));
+    assert!(matches!(
+        on(&clip, v1, ActionId::Regroup, 60),
+        Enable::No(_)
+    ));
     assert!(matches!(on(&clip, v1, ActionId::Detach, 0), Enable::No(_)));
     // Every refusal says something, and says it short enough to sit in the
     // menu's right-hand column beside a label -- the still's included, which
@@ -943,7 +960,10 @@ fn the_clip_menu_dims_what_the_playhead_is_not_on_and_stays_in_the_window() {
     // for it, never the card that grows.
     let items = MENU_ITEMS.len() + 1; // Properties
     let floor = size(px(640.), px(360.));
-    assert!(MENU_PAD * 2. + menu_rows_h(items, floor) <= 360., "too tall");
+    assert!(
+        MENU_PAD * 2. + menu_rows_h(items, floor) <= 360.,
+        "too tall"
+    );
     assert!(
         menu_rows_h(items, floor) / MENU_ROW_H >= 12.,
         "too few items visible to scan on the smallest window"
@@ -1093,11 +1113,16 @@ fn a_menu_offers_only_what_applies_and_is_drawn_inside_the_window() {
     assert!(row_enable(RowItem::RemoveWithClips, placed).yes());
     let unplaced = row_items(live);
     assert!(unplaced.contains(&RowItem::Remove) && !unplaced.contains(&RowItem::RemoveWithClips));
-    assert!(!row_enable(
-        RowItem::RemoveWithClips,
-        RowCtx { exporting: true, ..placed }
-    )
-    .yes());
+    assert!(
+        !row_enable(
+            RowItem::RemoveWithClips,
+            RowCtx {
+                exporting: true,
+                ..placed
+            }
+        )
+        .yes()
+    );
     assert!(!row_enable(RowItem::Add, RowCtx::default()).yes());
     // Every refusal is short enough to sit in the hint column beside its
     // label, the clip menu's rule.
@@ -1288,7 +1313,10 @@ fn a_clip_box_is_never_narrower_than_its_target() {
         pps: 0.1,
         start: 0.,
     };
-    assert!(far.width_px(2.) < 1., "the fixture is not zoomed out enough");
+    assert!(
+        far.width_px(2.) < 1.,
+        "the fixture is not zoomed out enough"
+    );
     assert_eq!(clip_width(far.width_px(2.)), HIT_MIN);
     // Zero is the floor's own case: a clip trimmed to nothing, and the
     // width a lane draws before its first frame is measured.
@@ -1378,8 +1406,7 @@ fn group_reaches_the_sound_before_a_video_layer_over_it() {
     let file = dir.join("lanes.edith");
     session.save_project(&file).expect("save the project");
     let text = std::fs::read_to_string(&file).expect("read it back");
-    let (sound, rest): (Vec<&str>, Vec<&str>) =
-        text.lines().partition(|l| l.starts_with("audio "));
+    let (sound, rest): (Vec<&str>, Vec<&str>) = text.lines().partition(|l| l.starts_with("audio "));
     std::fs::write(
         &file,
         format!("{}\n{}\n", rest.join("\n"), sound.join("\n")),
@@ -1479,8 +1506,7 @@ fn adding_a_row_drops_the_whole_source_in_at_the_playhead() {
     // The same door with a *second audio stream* of a file already there:
     // a new source entry, the same picture, and the row that was dragged
     // is what plays. This is the whole user-facing point of the slice.
-    let mut session =
-        PlaybackSession::open(asset("test_multilang.mp4")).expect("open the fixture");
+    let mut session = PlaybackSession::open(asset("test_multilang.mp4")).expect("open the fixture");
     session.set_gain(0.0);
     let path = session.sources()[0].path.clone();
     let frames = session.file_frames(&path);
@@ -1920,7 +1946,8 @@ fn a_grouped_clip_on_an_added_lane_closes_its_hole_with_its_caption() {
         "its grouped caption went with it, not left as an orphan"
     );
     assert_eq!(
-        session.sub_lane(sub_lane)[0].start, 30,
+        session.sub_lane(sub_lane)[0].start,
+        30,
         "and the hole under it closed: the caption after it slid up"
     );
 }
@@ -2106,7 +2133,11 @@ fn nudge_edge_moves_one_frame_and_clamps_to_the_room() {
     assert_eq!(nudge_edge(50, 1, 0, 100), 51);
     assert_eq!(nudge_edge(50, -1, 0, 100), 49);
     assert_eq!(nudge_edge(0, -1, 0, 100), 0, "the room's own floor holds");
-    assert_eq!(nudge_edge(100, 1, 0, 100), 100, "the room's own ceiling holds");
+    assert_eq!(
+        nudge_edge(100, 1, 0, 100),
+        100,
+        "the room's own ceiling holds"
+    );
     // A 4px-wide clip's room can be one frame wide: still clamps, never
     // panics on the narrow end.
     assert_eq!(nudge_edge(5, 1, 5, 5), 5);
@@ -2119,8 +2150,14 @@ fn should_loop_restart_only_at_the_windows_far_edge() {
     use crate::timeline_math::should_loop_restart;
     assert!(!should_loop_restart(40, Some((30, 60))));
     assert!(should_loop_restart(60, Some((30, 60))));
-    assert!(should_loop_restart(61, Some((30, 60))), "past it restarts too");
-    assert!(!should_loop_restart(60, None), "loop-trim off restarts nothing");
+    assert!(
+        should_loop_restart(61, Some((30, 60))),
+        "past it restarts too"
+    );
+    assert!(
+        !should_loop_restart(60, None),
+        "loop-trim off restarts nothing"
+    );
 }
 
 /// The paused-then-started repro this predicate was blamed for and cleared

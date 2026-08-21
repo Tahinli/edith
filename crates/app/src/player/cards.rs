@@ -69,8 +69,11 @@ impl Player {
             // timeline yet to cut at it.
             self.pending_settings.1 = Some(fps);
             self.notify_user(
-                format!("PROJECT: {} fps — takes effect on the next file opened", fps_label(fps))
-                    .into(),
+                format!(
+                    "PROJECT: {} fps — takes effect on the next file opened",
+                    fps_label(fps)
+                )
+                .into(),
             );
         }
         cx.notify();
@@ -84,7 +87,9 @@ impl Player {
     /// seek, an edit, a reopen), not the stream already playing
     /// ([`engine::PlaybackSession::set_sample_rate`]).
     pub(crate) fn apply_sample_rate(&mut self, rate: Option<u32>, cx: &mut Context<Self>) {
-        let label = |rate: Option<u32>| rate.map_or("the source's own rate".to_string(), |r| format!("{r} Hz"));
+        let label = |rate: Option<u32>| {
+            rate.map_or("the source's own rate".to_string(), |r| format!("{r} Hz"))
+        };
         if let Some(session) = &mut self.session {
             session.set_sample_rate(rate);
             self.notify_user(
@@ -97,8 +102,11 @@ impl Player {
         } else {
             self.pending_settings.2 = rate;
             self.notify_user(
-                format!("PROJECT SOUND: {} — takes effect on the next file opened", label(rate))
-                    .into(),
+                format!(
+                    "PROJECT SOUND: {} — takes effect on the next file opened",
+                    label(rate)
+                )
+                .into(),
             );
         }
         cx.notify();
@@ -450,7 +458,12 @@ impl Player {
     /// Both writes: `live` is the one that takes no undo step, which is what
     /// every sample *inside* a drag goes through --
     /// [`write_color`](Self::write_color)'s own rule.
-    pub(crate) fn write_transform(&mut self, params: TransformParams, live: bool, cx: &mut Context<Self>) {
+    pub(crate) fn write_transform(
+        &mut self,
+        params: TransformParams,
+        live: bool,
+        cx: &mut Context<Self>,
+    ) {
         self.pending_transform = None;
         let Some((lane, idx)) = self.transform_open else {
             return;
@@ -904,7 +917,11 @@ impl Player {
         if let Err(e) = save_subtitle_style(self.sub_family.as_deref(), self.sub_text) {
             let path = subtitle_style_path();
             self.notify_user(
-                format!("SUBTITLE STYLE COULD NOT BE KEPT — {} — {e}", path.display()).into(),
+                format!(
+                    "SUBTITLE STYLE COULD NOT BE KEPT — {} — {e}",
+                    path.display()
+                )
+                .into(),
             );
         }
         cx.notify();
@@ -1336,11 +1353,8 @@ impl Player {
         // card opens on that; one in no group has no sound to equalize and
         // falls to the lane refusal below, in the words it always used.
         let anchor = match (self.selected.anchor(), self.session.as_ref()) {
-            (Some((lane, idx)), Some(session))
-                if lane.kind == LaneKind::Subtitle =>
-            {
-                caption_media_half(session, (lane, idx), LaneKind::Audio)
-                    .or(self.selected.anchor())
+            (Some((lane, idx)), Some(session)) if lane.kind == LaneKind::Subtitle => {
+                caption_media_half(session, (lane, idx), LaneKind::Audio).or(self.selected.anchor())
             }
             _ => self.selected.anchor(),
         };
@@ -1499,7 +1513,12 @@ impl Player {
     /// missing from the darkroom for. Returns `true` when a card was open
     /// and ate the key, the caller's cue to `cx.notify()` and stop exactly
     /// where each of these branches used to `return` inline.
-    pub(crate) fn param_card_key(&mut self, key: &str, shift: bool, cx: &mut Context<Self>) -> bool {
+    pub(crate) fn param_card_key(
+        &mut self,
+        key: &str,
+        shift: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
         // The one chord every param card answers to, wherever the pointer
         // toggle sits in `dark_card_head` -- mouse and key reach the same
         // switch (DESIGN's repeated "some options are only reachable via

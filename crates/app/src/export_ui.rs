@@ -607,7 +607,12 @@ pub(crate) fn fps_choices(current: f64, native: f64) -> Vec<ChoiceRow> {
 /// The fit list's rows: all four policies against the canvas they place a
 /// picture on, since the word alone ("fill") says nothing about the size it is
 /// filling -- which is the very thing the notice says after a stroke.
-pub(crate) fn fit_choices(lane: Lane, idx: usize, current: FitPolicy, (w, h): (u32, u32)) -> Vec<ChoiceRow> {
+pub(crate) fn fit_choices(
+    lane: Lane,
+    idx: usize,
+    current: FitPolicy,
+    (w, h): (u32, u32),
+) -> Vec<ChoiceRow> {
     FITS.into_iter()
         .map(|fit| {
             (
@@ -688,9 +693,8 @@ pub(crate) fn encoder_choices(current: EncoderSeat) -> Vec<ChoiceRow> {
 /// risk is theirs to be told about. `None` for every other pair, which is what
 /// keeps this from becoming a row nobody reads.
 pub(crate) fn av1_hw_warning(format: Format, seat: EncoderSeat) -> Option<&'static str> {
-    (seat == EncoderSeat::Hardware && matches!(format, Format::Av1 | Format::Av1Mp4)).then_some(
-        "AV1 on the GPU reset this machine's driver once — Software is the safe seat",
-    )
+    (seat == EncoderSeat::Hardware && matches!(format, Format::Av1 | Format::Av1Mp4))
+        .then_some("AV1 on the GPU reset this machine's driver once — Software is the safe seat")
 }
 
 /// How a rendition is named where a person reads it: the panel button, the
@@ -746,7 +750,11 @@ pub(crate) fn next_resolution(current: (u32, u32), native: (u32, u32)) -> (u32, 
 /// sound will be, or that there is none. Every field here is one `ffprobe`
 /// reads back off the finished file, so the line is checkable rather than a
 /// promise.
-pub(crate) fn summary_head(format: Format, picture: Option<((u32, u32), f64)>, audio: &str) -> String {
+pub(crate) fn summary_head(
+    format: Format,
+    picture: Option<((u32, u32), f64)>,
+    audio: &str,
+) -> String {
     let line = match picture.filter(|_| format.has_video()) {
         Some(((w, h), fps)) => {
             format!("{} · {w}x{h} · {} fps", format_line(format), fps_label(fps))
@@ -759,7 +767,12 @@ pub(crate) fn summary_head(format: Format, picture: Option<((u32, u32), f64)>, a
 /// The second: where it lands, roughly how big, and what will encode the
 /// picture -- the seat as the probe found it (`…` until it lands, never a
 /// guess), which is what the running export then names on its progress line.
-pub(crate) fn summary_tail(path: &Path, bytes: Option<u64>, seat: Option<&'static str>, video: bool) -> String {
+pub(crate) fn summary_tail(
+    path: &Path,
+    bytes: Option<u64>,
+    seat: Option<&'static str>,
+    video: bool,
+) -> String {
     let size = bytes.map_or_else(String::new, |bytes| format!("≈ {}", size_label(bytes)));
     let seat = match (video, seat) {
         (true, Some(seat)) => seat,
@@ -967,7 +980,10 @@ impl NumberEdit {
     /// and stays inside the range, because a step is a walk through the legal
     /// numbers rather than a way out of them.
     pub(crate) fn step(&mut self, by: i32) {
-        let at = self.text.parse::<i32>().unwrap_or(MBPS_MIN as i32 - by.signum());
+        let at = self
+            .text
+            .parse::<i32>()
+            .unwrap_or(MBPS_MIN as i32 - by.signum());
         self.text = (at + by)
             .clamp(MBPS_MIN as i32, MBPS_MAX as i32)
             .to_string();

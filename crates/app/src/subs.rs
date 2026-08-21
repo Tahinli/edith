@@ -168,7 +168,11 @@ pub(crate) fn open_ahead(
 /// import into, which fills the library instead. One function because they are
 /// one read -- the engine's two doors differ by which lanes come up empty
 /// ([`engine::PlaybackSession::open_library`]), not by what they walk.
-pub(crate) fn open_whole(path: &std::path::Path, place: bool, stage: &std::sync::atomic::AtomicU8) -> Landed {
+pub(crate) fn open_whole(
+    path: &std::path::Path,
+    place: bool,
+    stage: &std::sync::atomic::AtomicU8,
+) -> Landed {
     use std::sync::atomic::Ordering::Relaxed;
     let opened = match place {
         true => PlaybackSession::open(path),
@@ -270,7 +274,10 @@ pub(crate) fn walk_subtitles(path: &std::path::Path) -> Subs {
 /// this runs on the worker ([`open_ahead`]), never the render thread; an
 /// import splits the two halves across the hop instead ([`read_ahead`] walks,
 /// [`subtitle_tail`] pushes).
-pub(crate) fn subtitle_notice(session: &mut PlaybackSession, path: &std::path::Path) -> Option<String> {
+pub(crate) fn subtitle_notice(
+    session: &mut PlaybackSession,
+    path: &std::path::Path,
+) -> Option<String> {
     subtitle_tail(session, walk_subtitles(path))
 }
 
@@ -606,7 +613,10 @@ pub(crate) fn sub_pick_after_removal(picked: usize, removed: usize, left: usize)
     picked.min(left.saturating_sub(1))
 }
 
-pub(crate) fn sub_pick_name(tracks: &[engine::subtitle::SubtitleTrack], track: usize) -> Option<String> {
+pub(crate) fn sub_pick_name(
+    tracks: &[engine::subtitle::SubtitleTrack],
+    track: usize,
+) -> Option<String> {
     subtitle_rows(tracks).into_iter().find_map(|group| {
         let row = group.rows.iter().find(|row| row.track == track)?;
         let track = match group.rows.len() > 1 {

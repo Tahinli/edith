@@ -51,8 +51,7 @@ impl Player {
         // seen without a manual replay after every nudge. Checked off the
         // engine's own clock, not a frame counter this pump keeps -- the
         // same `now()` [`Player::step`] reads.
-        if session.is_playing()
-            && should_loop_restart(frame_at(session.now(), fps), self.loop_trim)
+        if session.is_playing() && should_loop_restart(frame_at(session.now(), fps), self.loop_trim)
         {
             let start = self.loop_trim.map_or(0, |(lo, _)| lo);
             session.seek(f64::from(start) / fps);
@@ -456,10 +455,22 @@ mod tests {
     /// otherwise silently stop covering).
     #[test]
     fn the_loop_restarts_only_on_the_crossing_with_loop_on() {
-        assert!(crosses_into_loop(Transport::Playing, Transport::Ended, true));
-        assert!(!crosses_into_loop(Transport::Playing, Transport::Ended, false));
+        assert!(crosses_into_loop(
+            Transport::Playing,
+            Transport::Ended,
+            true
+        ));
+        assert!(!crosses_into_loop(
+            Transport::Playing,
+            Transport::Ended,
+            false
+        ));
         assert!(!crosses_into_loop(Transport::Ended, Transport::Ended, true));
-        assert!(!crosses_into_loop(Transport::Ended, Transport::Playing, true));
+        assert!(!crosses_into_loop(
+            Transport::Ended,
+            Transport::Playing,
+            true
+        ));
     }
 
     /// `loop_restart_frame` picks the seek target the crossing above plays
@@ -493,7 +504,11 @@ mod tests {
         let loop_trim = Some((30, 60));
         let armed = loop_on || loop_trim.is_some();
         assert!(armed, "loop_trim alone must arm the crossing");
-        assert!(crosses_into_loop(Transport::Playing, Transport::Ended, armed));
+        assert!(crosses_into_loop(
+            Transport::Playing,
+            Transport::Ended,
+            armed
+        ));
         assert_eq!(loop_restart_frame(loop_on, loop_trim), Some(30));
     }
 

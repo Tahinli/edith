@@ -2,10 +2,12 @@
 //! command line, the scans, the codecs offered, and the subtitles found.
 
 use super::*;
-use crate::subs::{
-    load_subtitle_style, save_subtitle_style, sub_line_h_for, subtitle_style_path, SUB_SIZE_RANGE,
+use crate::player::library::{
+    auto_proxies_pref_path, load_auto_proxies_pref, save_auto_proxies_pref,
 };
-use crate::player::library::{auto_proxies_pref_path, load_auto_proxies_pref, save_auto_proxies_pref};
+use crate::subs::{
+    SUB_SIZE_RANGE, load_subtitle_style, save_subtitle_style, sub_line_h_for, subtitle_style_path,
+};
 use crate::ui::preview::{bgra_to_rgba, screenshot_path};
 
 /// The import line's own state machine, driven the way a repaint drives
@@ -160,7 +162,11 @@ fn a_bar_wide_sweep_writes_once_per_frame_delivered() {
     }
     // The release, whatever the worker is doing.
     written.extend(stash.take());
-    assert_eq!(written, vec![0, 9, 19, 29, 39], "one write per frame landed");
+    assert_eq!(
+        written,
+        vec![0, 9, 19, 29, 39],
+        "one write per frame landed"
+    );
 }
 
 /// The one value a gesture may never lose: where the hand let go. The
@@ -293,7 +299,10 @@ fn a_second_film_does_not_cost_the_first_one_its_levels() {
     assert_eq!(scan_plan(false, Some(&a), &half), ScanPlan::Start);
     // ...and the seconds asked for are the clip's, at the project's rate.
     assert_eq!(source_secs(&half, 30.), (0., 50.));
-    assert_eq!(source_secs(&(half.0.clone(), 0, 900, 1500), 30.), (30., 50.));
+    assert_eq!(
+        source_secs(&(half.0.clone(), 0, 900, 1500), 30.),
+        (30., 50.)
+    );
     // A rate that is not one reads the file rather than nothing.
     assert_eq!(source_secs(&half, 0.), (0., f64::INFINITY));
 }
@@ -307,7 +316,8 @@ fn a_second_film_does_not_cost_the_first_one_its_levels() {
 #[test]
 fn a_warm_whole_source_scan_answers_the_card_for_every_clip_cut_from_it() {
     use std::sync::Arc;
-    let mut levels: std::collections::HashMap<ScanKey, Arc<Vec<f32>>> = std::collections::HashMap::new();
+    let mut levels: std::collections::HashMap<ScanKey, Arc<Vec<f32>>> =
+        std::collections::HashMap::new();
     let clip_a = (PathBuf::from("/films/a.mkv"), 0, 300, 900);
     let clip_b = (PathBuf::from("/films/a.mkv"), 0, 1_200, 1_800);
     // Nothing yet -- neither clip's own read nor a background one.
@@ -347,11 +357,17 @@ fn a_clips_slice_of_the_whole_scan_is_the_windows_its_own_read_would_have_found(
     assert_eq!(slice, (10..20).map(|i| i as f32).collect::<Vec<f32>>());
     // The clip's own in point is where its slice starts, not the file's:
     // a take an hour into the film reads the same as one at its head.
-    assert_eq!(slice_whole_levels(&whole, fps, 0, 5), vec![0., 1., 2., 3., 4.]);
+    assert_eq!(
+        slice_whole_levels(&whole, fps, 0, 5),
+        vec![0., 1., 2., 3., 4.]
+    );
     // Past what the background scan has read so far (still running, or
     // cancelled) is not padded with zeroes -- the caller is told nothing is
     // there yet, same as [`SilenceScan`]'s own cancel leaves a prefix.
-    assert_eq!(slice_whole_levels(&whole, fps, 35, 60), vec![35., 36., 37., 38., 39.]);
+    assert_eq!(
+        slice_whole_levels(&whole, fps, 35, 60),
+        vec![35., 36., 37., 38., 39.]
+    );
     assert_eq!(slice_whole_levels(&whole, fps, 45, 60), Vec::<f32>::new());
     // A rate that is not a rate reads nothing, the same refusal
     // `source_secs` makes for a background scan's own range.
@@ -378,8 +394,7 @@ fn probing_ahead_lands_exactly_what_importing_in_place_lands() {
     let split = {
         let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open");
         session.set_gain(0.0);
-        let (subs, probe) =
-            read_parts(&asset("test_av2.mp4"), &stage, Some(session.import_gate()));
+        let (subs, probe) = read_parts(&asset("test_av2.mp4"), &stage, Some(session.import_gate()));
         // This mp4 is walked now (an mp4 can carry `tx3g`) and has no
         // subtitle track in it, so the worker hands over an empty list --
         // the same thing the import lands with.
@@ -408,7 +423,11 @@ fn probing_ahead_lands_exactly_what_importing_in_place_lands() {
     // notice shows -- worded exactly as importing in place worded it.
     let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open");
     session.set_gain(0.0);
-    let (_, probe) = read_parts(&asset("test_25fps.mp4"), &stage, Some(session.import_gate()));
+    let (_, probe) = read_parts(
+        &asset("test_25fps.mp4"),
+        &stage,
+        Some(session.import_gate()),
+    );
     let on_the_worker = probe
         .expect("a container is probed")
         .map(|_| ())
@@ -426,7 +445,9 @@ fn probing_ahead_lands_exactly_what_importing_in_place_lands() {
     let mut moved = PlaybackSession::open(asset("test_av.mp4")).expect("open");
     moved.set_gain(0.0);
     let (_, probe) = read_parts(&asset("test_av2.mp4"), &stage, Some(moved.import_gate()));
-    moved.import(&asset("test_still.png")).expect("a still joins");
+    moved
+        .import(&asset("test_still.png"))
+        .expect("a still joins");
     let stale = probe.expect("a container is probed").expect("av2 matches");
     assert_eq!(
         moved.import_probed(&asset("test_av2.mp4"), stale).ok(),
@@ -784,7 +805,12 @@ fn the_summary_states_the_file_before_it_is_written() {
     // still a real file with a real size.
     let short = estimated_bytes(Some(1_000_000), 3.).expect("a rate and a length");
     assert_eq!(size_label(short), "375 kB");
-    let frame = summary_tail(Path::new("/a/x.mp4"), estimated_bytes(Some(1_000_000), 1. / 60.), None, true);
+    let frame = summary_tail(
+        Path::new("/a/x.mp4"),
+        estimated_bytes(Some(1_000_000), 1. / 60.),
+        None,
+        true,
+    );
     assert!(
         frame.contains("≈ 2 kB") && !frame.contains("0 MB") && !frame.contains("0 kB"),
         "{frame}"
@@ -873,7 +899,10 @@ fn the_subtitle_plate_and_lanes_fit_the_smallest_window() {
     // What is left for the picture at the floor, with a project's two tracks
     // and a subtitle lane under them.
     let picture = 360. - HEADER_H - panel_h(3);
-    assert!(picture > 0., "a subtitle lane pushed the picture off the window");
+    assert!(
+        picture > 0.,
+        "a subtitle lane pushed the picture off the window"
+    );
     // A two-line cue and the gap under it fit inside that, which is the
     // whole claim: the plate sits *over* the picture and must not need more
     // of it than there is.
@@ -913,6 +942,8 @@ fn the_subtitle_plate_and_lanes_fit_the_smallest_window() {
 /// than crashing a startup on someone else's edit of the file.
 #[test]
 fn the_subtitle_style_file_round_trips_or_falls_back_to_defaults() {
+    let _config_env = config_env_lock();
+
     let dir = std::env::temp_dir().join(format!(
         "edith-subtitle-style-test-{}-{}",
         std::process::id(),
@@ -922,9 +953,8 @@ fn the_subtitle_style_file_round_trips_or_falls_back_to_defaults() {
             .as_nanos()
     ));
     std::fs::create_dir_all(&dir).unwrap();
-    // Scoped to this test alone: no other test reads XDG_CONFIG_HOME or the
-    // subtitle-style file it names, so this narrow, restored mutation of the
-    // process environment cannot race another test's own file.
+    // The shared process environment is serialized across every config
+    // round-trip test by `config_env_lock`.
     unsafe { std::env::set_var("XDG_CONFIG_HOME", &dir) };
 
     // Nothing written yet: the defaults, not a crash on a missing file.
@@ -932,10 +962,7 @@ fn the_subtitle_style_file_round_trips_or_falls_back_to_defaults() {
 
     // A save, read back whole: family and size both.
     save_subtitle_style(Some("Iosevka"), 22.).unwrap();
-    assert_eq!(
-        load_subtitle_style(),
-        (Some("Iosevka".to_string()), 22.)
-    );
+    assert_eq!(load_subtitle_style(), (Some("Iosevka".to_string()), 22.));
 
     // The platform default (`None`) round-trips too, and is not a family
     // called "".
@@ -961,6 +988,8 @@ fn the_subtitle_style_file_round_trips_or_falls_back_to_defaults() {
 /// relaunch reads instead of the field's hardcoded `true`.
 #[test]
 fn the_auto_proxies_default_round_trips_through_its_own_config_file_or_falls_back_to_on() {
+    let _config_env = config_env_lock();
+
     let dir = std::env::temp_dir().join(format!(
         "edith-auto-proxies-pref-test-{}-{}",
         std::process::id(),
@@ -970,8 +999,8 @@ fn the_auto_proxies_default_round_trips_through_its_own_config_file_or_falls_bac
             .as_nanos()
     ));
     std::fs::create_dir_all(&dir).unwrap();
-    // Scoped to this test alone, the same guarantee the subtitle-style test
-    // above makes for the same env var.
+    // `config_env_lock` serializes every test that changes this process-wide
+    // path.
     unsafe { std::env::set_var("XDG_CONFIG_HOME", &dir) };
 
     // Nothing written yet: On, the field's own long-standing default.
@@ -981,12 +1010,18 @@ fn the_auto_proxies_default_round_trips_through_its_own_config_file_or_falls_bac
     assert!(!load_auto_proxies_pref(), "off must round-trip");
 
     save_auto_proxies_pref(true).unwrap();
-    assert!(load_auto_proxies_pref(), "on must round-trip too, not just off");
+    assert!(
+        load_auto_proxies_pref(),
+        "on must round-trip too, not just off"
+    );
 
     // Garbled bytes -- a stray edit, or a future dialect -- read as On rather
     // than failing a startup on someone else's edit of the file.
     std::fs::write(auto_proxies_pref_path(), "not on or off\n").unwrap();
-    assert!(load_auto_proxies_pref(), "unreadable content must fall back to On");
+    assert!(
+        load_auto_proxies_pref(),
+        "unreadable content must fall back to On"
+    );
 
     unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
     std::fs::remove_dir_all(&dir).ok();
@@ -1059,7 +1094,9 @@ fn subtitles_arrive_beside_the_media_and_inside_it() {
     // no source in it to import, so the drop door has to send it where `+ S`
     // sends it. Its two siblings are media and must not come here -- a
     // `.mka` is a song this would stop importing.
-    for name in ["subs.srt", "SUBS.SRT", "a.vtt", "a.ass", "a.ssa", "s.mks", "S.MKS"] {
+    for name in [
+        "subs.srt", "SUBS.SRT", "a.vtt", "a.ass", "a.ssa", "s.mks", "S.MKS",
+    ] {
         assert!(is_subtitle(Path::new(name)), "{name}");
     }
     for name in ["a.mp4", "a.mkv", "song.mka", "film.mk3d", "notes.txt", "a"] {
@@ -1070,7 +1107,14 @@ fn subtitles_arrive_beside_the_media_and_inside_it() {
     // The Matroska half is the engine's own closed set, extension for
     // extension, so no file is walked here that it would refuse there.
     for name in [
-        "film.MKV", "clip.webm", "clip.mp4", "a.m4v", "a.MOV", "song.mka", "s.mks", "f.MK3D",
+        "film.MKV",
+        "clip.webm",
+        "clip.mp4",
+        "a.m4v",
+        "a.MOV",
+        "song.mka",
+        "s.mks",
+        "f.MK3D",
     ] {
         assert!(carries_subtitles(Path::new(name)), "{name}");
         assert!(
@@ -1201,7 +1245,11 @@ fn subtitles_arrive_beside_the_media_and_inside_it() {
         .cut_regions(&[(15, 60)], &lanes)
         .expect("cut 0.5s..2.5s out");
     assert_eq!(session.timeline_duration(), 3.0);
-    assert_eq!(session.subtitles()[0].cues.len(), 3, "the track is untouched");
+    assert_eq!(
+        session.subtitles()[0].cues.len(),
+        3,
+        "the track is untouched"
+    );
     let mapped = session.timeline_cues(0);
     assert_eq!(
         mapped
@@ -1312,7 +1360,11 @@ fn a_second_session_playing_never_moves_the_first() {
     preview.seek(1.0);
     preview.play();
 
-    assert_eq!(timeline.now(), before, "the preview's seek moved the wrong session");
+    assert_eq!(
+        timeline.now(),
+        before,
+        "the preview's seek moved the wrong session"
+    );
     assert_eq!(
         timeline.is_playing(),
         before_playing,
@@ -1341,7 +1393,11 @@ fn ticking_the_preview_session_never_moves_the_timeline() {
     // showing: only the active session -- the preview -- gets ticked.
     preview.tick();
 
-    assert_eq!(timeline.now(), before, "ticking the preview moved the timeline's clock");
+    assert_eq!(
+        timeline.now(),
+        before,
+        "ticking the preview moved the timeline's clock"
+    );
 }
 
 /// [`bgra_to_rgba`] and [`save_screenshot`]'s own PNG write, round-tripped: a
@@ -1357,7 +1413,11 @@ fn a_screenshot_frame_round_trips_through_its_png() {
         255, 0, 0, 255,   255, 255, 255, 128,
     ];
     let rgba = bgra_to_rgba(&bgra);
-    assert_eq!(rgba[0..4], [255, 0, 0, 255], "red survives the channel swap");
+    assert_eq!(
+        rgba[0..4],
+        [255, 0, 0, 255],
+        "red survives the channel swap"
+    );
     assert_eq!(rgba[4..8], [0, 255, 0, 255], "green is unmoved by the swap");
     assert_eq!(rgba[8..12], [0, 0, 255, 255], "blue swaps into place");
     assert_eq!(rgba[12..16], [255, 255, 255, 128], "alpha is untouched");
@@ -1368,7 +1428,11 @@ fn a_screenshot_frame_round_trips_through_its_png() {
     let buf = image::RgbaImage::from_raw(2, 2, rgba.clone()).expect("2x2 rgba buffer");
     buf.save(&path).expect("png write");
     let decoded = image::open(&path).expect("png read").to_rgba8();
-    assert_eq!(decoded.into_raw(), rgba, "the PNG round-trips the pixels exactly");
+    assert_eq!(
+        decoded.into_raw(),
+        rgba,
+        "the PNG round-trips the pixels exactly"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

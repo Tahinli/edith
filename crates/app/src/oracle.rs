@@ -107,7 +107,10 @@ pub(crate) fn enable(action: ActionId, ctx: Ctx) -> Enable {
     // the exporting card owns (`Player::open_settings`, one card at a time),
     // so a permission this oracle granted here would be a permission nobody
     // could ever observe. It is refused below, with every other card.
-    if action == ActionId::Theme || action == ActionId::Fullscreen || action == ActionId::SubtitleStyle {
+    if action == ActionId::Theme
+        || action == ActionId::Fullscreen
+        || action == ActionId::SubtitleStyle
+    {
         return Enable::Yes;
     }
     if action == ActionId::Settings {
@@ -198,7 +201,9 @@ pub(crate) fn enable(action: ActionId, ctx: Ctx) -> Enable {
         // filters samples, and a video clip has none of its own here: the sound
         // is the audio lane's, clip for clip.
         ActionId::Equalizer => match ctx.clip {
-            Some((_, lane)) if lane.kind != LaneKind::Audio => Enable::Hidden("this clip is picture"),
+            Some((_, lane)) if lane.kind != LaneKind::Audio => {
+                Enable::Hidden("this clip is picture")
+            }
             _ => Enable::Yes,
         },
         // A grade is a picture setting and an audio clip has no picture. A fit
@@ -252,9 +257,7 @@ pub(crate) fn enable(action: ActionId, ctx: Ctx) -> Enable {
         // question, like the regroup above.
         ActionId::Detach => match (ctx.clip, ctx.caption) {
             (Some((clip, _)), _) if clip.link.is_none() => Enable::No("this clip is not grouped"),
-            (None, true) if ctx.caption_link.is_none() => {
-                Enable::No("this caption is not grouped")
-            }
+            (None, true) if ctx.caption_link.is_none() => Enable::No("this caption is not grouped"),
             _ => Enable::Yes,
         },
         // The manual group: a *selection* of placements, at most one per lane.

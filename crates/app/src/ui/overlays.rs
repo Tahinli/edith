@@ -1,9 +1,9 @@
 //! The bars and the floating cards that are not inspector sections.
 
-use crate::*;
-use crate::ui::widgets::*;
 use crate::ui::stance::menu_floor;
 use crate::ui::type_scale::{self, Typeset};
+use crate::ui::widgets::*;
+use crate::*;
 
 impl Player {
     /// The running import holds its own bar above the notice's, for the notice
@@ -305,18 +305,20 @@ impl Player {
                                 })
                                 .when(!refusal.yes(), |d| d.opacity(0.4).cursor_not_allowed())
                                 .when(refusal.yes(), |d| {
-                                    d.cursor_pointer().hover(|s| s.bg(rgb(BG_HOVER()))).on_click(
-                                        cx.listener(move |this, _: &ClickEvent, window, cx| {
-                                            // The card goes first: several of
-                                            // these open a card of their own,
-                                            // and every edit moves the indices
-                                            // the menus are holding.
-                                            this.keys_open = false;
-                                            this.rebinding = None;
-                                            this.act(action, window, cx);
-                                            cx.notify();
-                                        }),
-                                    )
+                                    d.cursor_pointer()
+                                        .hover(|s| s.bg(rgb(BG_HOVER())))
+                                        .on_click(cx.listener(
+                                            move |this, _: &ClickEvent, window, cx| {
+                                                // The card goes first: several of
+                                                // these open a card of their own,
+                                                // and every edit moves the indices
+                                                // the menus are holding.
+                                                this.keys_open = false;
+                                                this.rebinding = None;
+                                                this.act(action, window, cx);
+                                                cx.notify();
+                                            },
+                                        ))
                                 }),
                         )
                         .child(
@@ -402,15 +404,9 @@ impl Player {
                                 .px(px(6.))
                                 .text_size(px(11.))
                                 .text_color(rgb(FG_SECONDARY()))
-                                .child(
-                                    self.notices
-                                        .front()
-                                        .cloned()
-                                        .unwrap_or_else(|| {
-                                            "click an action to do it · click its key to change it"
-                                                .into()
-                                        }),
-                                ),
+                                .child(self.notices.front().cloned().unwrap_or_else(|| {
+                                    "click an action to do it · click its key to change it".into()
+                                })),
                         )
                         // The search box: no focus and no text field -- the
                         // card's key handler is the field, exactly as the
@@ -552,17 +548,19 @@ impl Player {
                 rows.push(
                     row(rows.len())
                         .child(label)
-                        .child(chord_style(
-                            div()
-                                .min_w(px(0.))
-                                .truncate()
-                                // A size smaller than the labels: a timecode
-                                // pair is 25 characters and has to fit beside
-                                // its label inside `MENU_W`.
-                                .text_size(px(11.))
-                                .text_color(rgb(FG_SECONDARY())),
+                        .child(
+                            chord_style(
+                                div()
+                                    .min_w(px(0.))
+                                    .truncate()
+                                    // A size smaller than the labels: a timecode
+                                    // pair is 25 characters and has to fit beside
+                                    // its label inside `MENU_W`.
+                                    .text_size(px(11.))
+                                    .text_color(rgb(FG_SECONDARY())),
+                            )
+                            .child(value),
                         )
-                        .child(value))
                         .into_any_element(),
                 );
             }
@@ -594,7 +592,9 @@ impl Player {
                             this.close_all_gaps_on_lane(lane, cx);
                         }))
                         .child(format!("Close all {} gaps", lane.label()))
-                        .child(chord_style(div().text_color(rgb(FG_SECONDARY()))).child("this track"))
+                        .child(
+                            chord_style(div().text_color(rgb(FG_SECONDARY()))).child("this track"),
+                        )
                         .into_any_element(),
                 );
             }
@@ -664,32 +664,36 @@ impl Player {
                             // Every command wears its chord (DESIGN §4): mono,
                             // `ink3`, the same face the spine badges and the
                             // keys overlay already read theirs in.
-                            None => chord_style(div().flex_shrink_0().text_color(rgb(FG_SECONDARY())))
-                                .child(self.keymap.display(action)),
+                            None => {
+                                chord_style(div().flex_shrink_0().text_color(rgb(FG_SECONDARY())))
+                                    .child(self.keymap.display(action))
+                            }
                         })
                         .when(!enabled, |d| d.opacity(0.4).cursor_not_allowed())
                         .when(enabled, |d| {
                             d.cursor_pointer()
                                 .hover(|s| s.bg(rgb(BG_HOVER())))
-                                .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                                    // Closed first: the action moves the very
-                                    // indices this menu is holding.
-                                    this.context_menu = None;
-                                    // The one item that is a *choice* and not a
-                                    // doing: four policies, so the pointer gets
-                                    // the list of them on this clip rather than
-                                    // the next one stepped to behind the click.
-                                    // The stroke still steps -- same door.
-                                    if action == ActionId::Fit {
-                                        this.open_picker(
-                                            Pick::Fit(menu.lane, idx),
-                                            event.position(),
-                                            cx,
-                                        );
-                                    } else {
-                                        this.act(action, window, cx);
-                                    }
-                                }))
+                                .on_click(cx.listener(
+                                    move |this, event: &ClickEvent, window, cx| {
+                                        // Closed first: the action moves the very
+                                        // indices this menu is holding.
+                                        this.context_menu = None;
+                                        // The one item that is a *choice* and not a
+                                        // doing: four policies, so the pointer gets
+                                        // the list of them on this clip rather than
+                                        // the next one stepped to behind the click.
+                                        // The stroke still steps -- same door.
+                                        if action == ActionId::Fit {
+                                            this.open_picker(
+                                                Pick::Fit(menu.lane, idx),
+                                                event.position(),
+                                                cx,
+                                            );
+                                        } else {
+                                            this.act(action, window, cx);
+                                        }
+                                    },
+                                ))
                         })
                         .into_any_element(),
                 );
@@ -725,7 +729,12 @@ impl Player {
         // footprint (`room`), not the whole window, so a menu taller than
         // the footprint scrolls inside its own plate instead of walking its
         // clamped top edge back up over the picture ([`menu_floor`]).
-        let (at, room) = menu_floor(menu.at, viewport, self.darkroom, self.split_px(Split::Bench, viewport));
+        let (at, room) = menu_floor(
+            menu.at,
+            viewport,
+            self.darkroom,
+            self.split_px(Split::Bench, viewport),
+        );
         let list_h = menu_rows_h(rows.len(), room);
         let (x, y) = menu_at(at, viewport, MENU_PAD * 2. + list_h);
         let full: SharedString = source
@@ -899,7 +908,12 @@ impl Player {
             .collect();
         // The window's own room, and the list scrolls only where the window has
         // none -- the clip menu's rule, one function for both.
-        let (at, room) = menu_floor(picker.at, viewport, darkroom, self.split_px(Split::Bench, viewport));
+        let (at, room) = menu_floor(
+            picker.at,
+            viewport,
+            darkroom,
+            self.split_px(Split::Bench, viewport),
+        );
         let list_h = menu_rows_h(rows.len(), room);
         let (x, y) = menu_at(at, viewport, MENU_PAD * 2. + list_h);
         Some(

@@ -95,7 +95,6 @@ impl DockSort {
     }
 }
 
-
 /// A ghost verb (DESIGN §4): borderless glyph/label in `ink2`, its chord in
 /// `ink3` beside it, read live off the keymap so it can never drift from the
 /// key that does the same thing. Hover is one fill step and an ink brighten;
@@ -758,10 +757,7 @@ fn sources_tab(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
                 || ("unused".contains(&filter) && *placed == 0)
         })
         .collect();
-    let unused_count = rows
-        .iter()
-        .filter(|(_, placed)| *placed == 0)
-        .count();
+    let unused_count = rows.iter().filter(|(_, placed)| *placed == 0).count();
     match player.dock_sort {
         DockSort::Recent => {}
         DockSort::Name => {

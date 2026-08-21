@@ -743,10 +743,7 @@ fn lane_row(
         .as_ref()
         .map_or(0., |session| session.lane_gain_db(lane));
     let shown = player.sub_lane_on(lane);
-    let chord_style = type_scale::mono(
-        type_scale::CHORD_METADATA_MIN_PX,
-        gpui::FontWeight::MEDIUM,
-    );
+    let chord_style = type_scale::mono(type_scale::CHORD_METADATA_MIN_PX, gpui::FontWeight::MEDIUM);
     let drop = player
         .lane_drop
         .filter(|drop| drop.lane == lane && cx.has_active_drag());
@@ -815,13 +812,11 @@ fn lane_row(
                                     .hover(|s| s.bg(rgb(DARK_RAISED())).text_color(rgb(INK1())))
                                     .tooltip(move |_, cx| {
                                         cx.new(|_| {
-                                            Tip(
-                                                format!(
-                                                    "{} {gain_db:+.0} dB — mix this lane",
-                                                    lane.label()
-                                                )
-                                                .into(),
+                                            Tip(format!(
+                                                "{} {gain_db:+.0} dB — mix this lane",
+                                                lane.label()
                                             )
+                                            .into())
                                         })
                                         .into()
                                     })
@@ -849,13 +844,11 @@ fn lane_row(
                                     .hover(|s| s.bg(rgb(DARK_RAISED())).text_color(rgb(INK1())))
                                     .tooltip(move |_, cx| {
                                         cx.new(|_| {
-                                            Tip(
-                                                format!(
-                                                    "{} — click to show this subtitle lane",
-                                                    lane.label()
-                                                )
-                                                .into(),
+                                            Tip(format!(
+                                                "{} — click to show this subtitle lane",
+                                                lane.label()
                                             )
+                                            .into())
                                         })
                                         .into()
                                     })
@@ -883,13 +876,11 @@ fn lane_row(
                                     .hover(|s| s.bg(rgb(DARK_RAISED())).text_color(rgb(INK1())))
                                     .tooltip(move |_, cx| {
                                         cx.new(|_| {
-                                            Tip(
-                                                format!(
-                                                    "Remove {} — it must be empty first",
-                                                    lane.label()
-                                                )
-                                                .into(),
+                                            Tip(format!(
+                                                "Remove {} — it must be empty first",
+                                                lane.label()
                                             )
+                                            .into())
                                         })
                                         .into()
                                     })
