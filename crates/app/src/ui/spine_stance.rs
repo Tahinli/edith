@@ -278,6 +278,26 @@ pub(crate) fn render(player: &Player, cx: &mut Context<Player>) -> impl IntoElem
                 cx,
             ),
         ))
+        .child(pair(
+            glyph(
+                "spine-cut-prev-ten",
+                "‹10",
+                ActionId::WalkCutPrev10,
+                false,
+                false,
+                player,
+                cx,
+            ),
+            glyph(
+                "spine-cut-next-ten",
+                "10›",
+                ActionId::WalkCutNext10,
+                false,
+                false,
+                player,
+                cx,
+            ),
+        ))
         .child(trim_control(player.loop_trim.is_some(), player, cx))
         .child(glyph(
             "spine-loop-trim",
