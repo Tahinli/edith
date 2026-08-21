@@ -22,7 +22,7 @@ use crate::ao::AoSession;
 use crate::audio::{AudioChunk, AudioSession};
 use crate::clock::{ClockSource, PlaybackClock};
 use crate::color::ColorParams;
-use crate::colorspace::ColorDescription;
+use crate::colorspace::{ColorDescription, ContentLight};
 use crate::decode::{Backend, BackendCell, DecodeSession, Frame, Worker};
 use crate::demux::{Codec, Demuxer, VideoMeta};
 use crate::eq::EqParams;
@@ -312,6 +312,13 @@ pub struct PlaybackSession {
     /// `resolution` line makes it after that. Every clip is composed onto it, so
     /// a file of another size is a placed picture rather than a refusal.
     meta: VideoMeta,
+    /// What source 0's own file declared about how bright it gets
+    /// ([`crate::colorspace::ContentLight`]) -- MaxCLL/MaxFALL and the
+    /// mastering display's peak/black, read once at open exactly as `native`
+    /// is, since the value is a property of the file and never changes under
+    /// a running session. [`ContentLight::default()`] (every field `None`)
+    /// for an SDR file and for a song or a still, neither of which is graded.
+    content_light: ContentLight,
     /// Source 0's own picture, kept from the open: the project resolution
     /// starts here, and a caller offering sizes to pick from needs the media's
     /// own among them or a project moved off it could never come back.
@@ -585,8 +592,15 @@ impl PlaybackSession {
         // first edit -- and the range opened above is exactly that clip's.
         let project = Project::single(&path, meta.frame_count);
         let span = project.composite_span_at(0);
+        // A second, header-only open purely for the light level: `open_worker`
+        // above already read one to hand the decode thread its own, but never
+        // hands it back out. The same trade the audio header cache above this
+        // makes -- a second container open, paid once at open rather than never
+        // -- since nothing here decodes a single picture.
+        let content_light = Demuxer::open(&path).map(|(_, d)| d.light()).unwrap_or_default();
         Ok(Self {
             meta,
+            content_light,
             native: (meta.width, meta.height),
             native_fps: meta.frame_rate,
             frames: stream.frames,
@@ -707,6 +721,7 @@ impl PlaybackSession {
         let stream = DecodeSession::open_black(width, height, span.map_or(1, |s| s.len));
         Ok(Self {
             meta,
+            content_light: ContentLight::default(),
             native: (width, height),
             native_fps: frame_rate,
             frames: stream.frames,
@@ -803,6 +818,7 @@ impl PlaybackSession {
         )?;
         Ok(Self {
             meta,
+            content_light: ContentLight::default(),
             native: (meta.width, meta.height),
             native_fps: IMAGE_ONLY_RATE,
             frames: stream.frames,
@@ -897,6 +913,15 @@ impl PlaybackSession {
         // ([`open_audio_only`](Self::open_audio_only)), and the placeholder
         // black stream is superseded by the `seek` at the end of this function
         // like every other worker opened here.
+        // What source 0's own file declares about its light level, read the
+        // same way [`open_stream`](Self::open_stream) reads it for a fresh
+        // open: [`ContentLight::default()`] for a song or a still, neither of
+        // which is graded.
+        let content_light = if crate::is_audio(&first.path) || crate::is_image(&first.path) {
+            ContentLight::default()
+        } else {
+            Demuxer::open(&first.path).map(|(_, d)| d.light()).unwrap_or_default()
+        };
         let (mut meta, stream) = match crate::is_audio(&first.path) {
             true => {
                 let (width, height, canvas_fps) = AUDIO_ONLY_CANVAS;
@@ -1109,6 +1134,7 @@ impl PlaybackSession {
         };
         let mut session = Self {
             meta,
+            content_light,
             native,
             native_fps,
             frames: stream.frames,
@@ -2714,6 +2740,15 @@ impl PlaybackSession {
     /// another, and a setting on the project rather than on any clip.
     pub fn tone(&self) -> crate::tonemap::Preset {
         self.project.tone()
+    }
+
+    /// What source 0's own file declared about how bright it gets
+    /// ([`ContentLight`]): a property of the film, read once at open, and
+    /// entirely absent (every field `None`) for an SDR file, a song or a
+    /// still. Read-only -- the number a file carries, never a project setting
+    /// a user can override, since nothing in [`Project`] holds one to persist.
+    pub fn content_light(&self) -> ContentLight {
+        self.content_light
     }
 
     /// Picks one. Rebuilds the **picture** where the playhead is, exactly as
