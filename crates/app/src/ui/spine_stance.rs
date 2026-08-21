@@ -224,7 +224,14 @@ pub(crate) fn render(player: &Player, cx: &mut Context<Player>) -> impl IntoElem
         .child(group_head("edit"))
         .child(glyph("spine-split", "||", ActionId::Cut, false, false, player, cx))
         .child(glyph("spine-delete", "⊂⊃", ActionId::Delete, false, false, player, cx))
-        .child(glyph("spine-undo", "↺", ActionId::Undo, false, false, player, cx))
+        .child(pair(
+            glyph("spine-undo", "↺", ActionId::Undo, false, false, player, cx),
+            // Redo had a legacy toolbar button (`toolbar.rs:347`) but no
+            // darkroom home -- Undo got a glyph here and Redo did not.
+            // Same row, same door (`this.act`), the pair anatomy the
+            // cut-prev/cut-next row below already uses.
+            glyph("spine-redo", "⟳", ActionId::Redo, false, false, player, cx),
+        ))
         .child(group_head("cut"))
         .child(pair(
             glyph("spine-cut-prev", "‹", ActionId::WalkCutPrev, false, false, player, cx),
