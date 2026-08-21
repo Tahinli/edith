@@ -37,7 +37,7 @@ pub(crate) fn load() -> bool {
 }
 
 /// Writes the pick. One word, written whole.
-fn save(src_active: bool) {
+pub(crate) fn save(src_active: bool) {
     let path = config_path();
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
@@ -262,6 +262,7 @@ fn source_row(
     let usage = usage_line(player, row.tint, placed);
     let (path, stream) = (row.path.clone(), row.stream);
     let dragged = (path.clone(), stream);
+    let preview_path = path.clone();
     let dot_path = path.clone();
     let menu_path = path.clone();
     let add_path = path.clone();
@@ -443,6 +444,38 @@ fn source_row(
                         .text_size(style.size)
                         .text_color(rgb(INK3()))
                         .child(usage)
+                })
+                .when(usable, |d| {
+                    d.child({
+                        let style = label(type_scale::FLOOR_PX, FontWeight::MEDIUM);
+                        div()
+                            .id(("dock-preview", i))
+                            .flex_none()
+                            .px(px(4.))
+                            .py(px(2.))
+                            .rounded(px(3.))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(DARK_RAISED())).text_color(rgb(INK1())))
+                            .tooltip(move |_, cx| {
+                                cx.new(|_| Tip("Preview — play this source outside the timeline".into()))
+                                    .into()
+                            })
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                cx.stop_propagation();
+                                this.open_preview(&preview_path, stream, cx);
+                            }))
+                            .children(hitmap::dynamic(
+                                move || (format!("source.{i}.preview"), "Preview source".into()),
+                                true,
+                            ))
+                            .child(
+                                div()
+                                    .font(style.font)
+                                    .text_size(style.size)
+                                    .text_color(rgb(INK2()))
+                                    .child("Preview"),
+                            )
+                    })
                 })
                 .when(usable, |d| {
                     d.child({
