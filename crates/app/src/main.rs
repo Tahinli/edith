@@ -500,6 +500,11 @@ struct Player {
     /// pointer: a stroke or a click meant for a row must not also cut the
     /// timeline.
     keys_open: bool,
+    /// The settings page is up (`?` overlay's sibling, but a latch rather
+    /// than a hold -- it carries clickable rows, not a glance-and-release
+    /// list). Cleared by [`Player::close_card`], the one reset list every
+    /// opener routes through.
+    settings_open: bool,
     /// What has been typed into the card's search box, which is the card's own
     /// input exactly as the export card's digits are (nothing in it takes
     /// focus, so the root's key handler is the field). Emptied every time the
@@ -794,6 +799,13 @@ fn main() {
     // The subtitle style the last session picked, same silence on a missing
     // or unreadable file.
     let (sub_family, sub_text) = load_subtitle_style();
+    // The auto-proxies default the last session left the switch at, before
+    // any project's own line ([`engine::edith::Document::auto_proxy`])
+    // overrides it the moment one opens.
+    let auto_proxies_on = player::library::load_auto_proxies_pref();
+    // The Proxies default the last session left the switch at, same
+    // before-any-project-line precedence as the auto-proxies default above.
+    let proxies_on = player::library::load_proxies_pref();
     // Nothing named on the command line is read here. The first file makes the
     // timeline -- a `.edith` restores a whole one, anything else *is* one --
     // and the rest are imports like any other: rows in the library, dragged
@@ -867,8 +879,8 @@ fn main() {
                     volume_dragging: false,
                     // What a session comes up at, so the first one opened is
                     // pushed the values it already holds.
-                    proxies_on: false,
-                    auto_proxies_on: true,
+                    proxies_on,
+                    auto_proxies_on,
                     // Only ever used with a timeline; 30 keeps the empty
                     // timecode reading in frames rather than in NaN.
                     fps: 30.,
@@ -944,6 +956,7 @@ fn main() {
                     autosave_armed: false,
                     keymap: keymap.clone(),
                     keys_open: false,
+                    settings_open: false,
                     keys_search: String::new(),
                     keys_scroll: ScrollHandle::new(),
                     lanes_scroll: ScrollHandle::new(),

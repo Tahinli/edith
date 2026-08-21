@@ -210,6 +210,14 @@ actions! {
     /// The cue plate's font and size -- a person's own preference, kept
     /// beside the theme and not the project, and opened the same way.
     SubtitleStyle,
+    /// The settings page: PROJECT rows (resolution, fps, sample-rate, HDR
+    /// tonemap, the mix) beside EDITOR rows (proxies, auto-proxies, subtitle
+    /// font) -- one door, two clearly-headed sections, per the split rule
+    /// that "anything that changes the rendered output or lives in the
+    /// project file is PROJECT; anything about this machine, this person,
+    /// this window is EDITOR." Always answerable, same as `Theme`: it is
+    /// about the editor and the project's own numbers, not about a clip.
+    Settings,
 }
 
 impl ActionId {
@@ -290,6 +298,7 @@ impl ActionId {
             ActionId::ShowActions => "All actions and their keys…",
             ActionId::Screenshot => "Save the frame on screen as a PNG",
             ActionId::SubtitleStyle => "Subtitle style: font and size…",
+            ActionId::Settings => "Settings: project and editor…",
         }
     }
 
@@ -368,6 +377,7 @@ impl ActionId {
             ActionId::ShowActions => "show-actions",
             ActionId::Screenshot => "screenshot",
             ActionId::SubtitleStyle => "subtitle-style",
+            ActionId::Settings => "settings",
         }
     }
 
@@ -448,7 +458,10 @@ impl ActionId {
             | ActionId::SubtitleStyle
             // ...and whether that window fills the screen: a way of looking,
             // same as the zoom and the theme beside it.
-            | ActionId::Fullscreen => Category::View,
+            | ActionId::Fullscreen
+            // The settings page: it changes no clip and no lane, only the
+            // project's own numbers and this window's preferences.
+            | ActionId::Settings => Category::View,
             ActionId::Cut
             | ActionId::Regroup
             | ActionId::Detach
@@ -1205,6 +1218,10 @@ impl Keymap {
                 // opened as often as the theme, not a switch thrown once a
                 // session.
                 b(ActionId::SubtitleStyle, "y", false),
+                // The consumer-editor convention (Cmd/Ctrl+,) -- free here:
+                // bare "," is WalkCutPrev, and nothing else answers to the
+                // ctrl chord.
+                b(ActionId::Settings, ",", true),
             ],
         }
     }
@@ -1483,7 +1500,7 @@ mod tests {
     #[test]
     fn every_default_stroke_reaches_its_action() {
         let k = Keymap::defaults();
-        assert_eq!(k.entries().len(), 73);
+        assert_eq!(k.entries().len(), 74);
         // The cut odometer: bare walks one, `<`/`>` (what shift+,/shift+.
         // actually type) strides ten.
         assert_eq!(k.lookup(".", false), Some(ActionId::WalkCutNext));
