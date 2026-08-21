@@ -76,9 +76,9 @@ Two faces, fixed roles (bundled, no runtime deps):
 - **Spline Sans Mono** — everything the film says: timecode, chords, readouts, metadata,
   cue text, the ledger. Mono = data; if a string is *about the footage or a key*, it is mono.
 
-Scale: 15px hero timecode (700, colons in `ink3`) · 13px labels/rows (500) · 11–12px chords
-and metadata (500) · 10px section heads (Archivo 700, uppercase, +0.14em letter-spacing, `ink3`).
-Nothing below 9px. Every size is a whole pixel (no half-pixel sizes -- they put glyph baselines
+Scale: 18px hero timecode (700, colons in `ink3`) · 15px labels/rows (500) · 13–14px chords
+and metadata (500) · 12px section heads (Archivo 700, uppercase, +0.14em letter-spacing, `ink3`).
+Nothing below 10px. Every size is a whole pixel (no half-pixel sizes -- they put glyph baselines
 off the pixel grid and blurred cosmic-text's AA). No italics. Tabular figures wherever digits
 align.
 

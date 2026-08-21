@@ -1,8 +1,8 @@
 //! The property cards -- docked into the inspector, or floated when modal.
 
-use crate::*;
 use crate::ui::type_scale::{self, Typeset};
 use crate::ui::widgets::*;
+use crate::*;
 
 /// DESIGN §3/§4 atoms shared by every param/setting card below (colour,
 /// transform, speed, EQ, silence, mix, subtitle style): what a row's label
@@ -11,11 +11,14 @@ use crate::ui::widgets::*;
 /// times (`export_card`'s own `dark`-branch technique, one level up).
 ///
 /// A row label is what the room says about the control -- Archivo, §3's
-/// 10.5px row size, `ink2` at rest / `ink1` picked (no permanent pill: the
+/// label-row size, `ink2` at rest / `ink1` picked (no permanent pill: the
 /// picked state is a 1px `ink1` rule, §4's focus ring, not a fill).
 fn dark_row_label(text: impl Into<SharedString>, picked: bool) -> Div {
     div()
-        .type_style(type_scale::label(type_scale::LABEL_ROW_PX, gpui::FontWeight::MEDIUM))
+        .type_style(type_scale::label(
+            type_scale::LABEL_ROW_PX,
+            gpui::FontWeight::MEDIUM,
+        ))
         .text_color(rgb(if picked { INK1() } else { INK2() }))
         .child(text.into())
 }
@@ -38,7 +41,10 @@ fn transform_row_value(band: usize, value: f32) -> String {
 /// A row's value -- what the film/the setting *says*, mono per §3.
 fn dark_row_value(text: impl Into<SharedString>) -> Div {
     div()
-        .type_style(type_scale::mono(type_scale::LABEL_ROW_PX, gpui::FontWeight::MEDIUM))
+        .type_style(type_scale::mono(
+            type_scale::LABEL_ROW_PX,
+            gpui::FontWeight::MEDIUM,
+        ))
         .text_color(rgb(INK1()))
         .child(text.into())
 }
@@ -95,15 +101,24 @@ fn dark_card_head(
                 .id("card-head-maximize")
                 .flex_none()
                 .cursor_pointer()
-                .type_style(type_scale::mono(type_scale::CHORD_METADATA_MAX_PX, gpui::FontWeight::MEDIUM))
+                .type_style(type_scale::mono(
+                    type_scale::CHORD_METADATA_MAX_PX,
+                    gpui::FontWeight::MEDIUM,
+                ))
                 .text_color(rgb(INK3()))
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                     this.toggle_maximize();
                     cx.notify();
                 }))
                 .tooltip(move |_, cx| {
-                    cx.new(|_| OverlayTip(if max { "m -- back to the room".into() } else { "m -- fills the room".into() }))
-                        .into()
+                    cx.new(|_| {
+                        OverlayTip(if max {
+                            "m -- back to the room".into()
+                        } else {
+                            "m -- fills the room".into()
+                        })
+                    })
+                    .into()
                 })
                 .child(if max { "▣ m" } else { "⤢ m" })
         }))
@@ -115,7 +130,10 @@ fn dark_card_head(
         )
         .children(meta.map(|m| {
             div()
-                .type_style(type_scale::mono(type_scale::CHORD_METADATA_MAX_PX, gpui::FontWeight::MEDIUM))
+                .type_style(type_scale::mono(
+                    type_scale::CHORD_METADATA_MAX_PX,
+                    gpui::FontWeight::MEDIUM,
+                ))
                 .text_color(rgb(INK3()))
                 .child(m)
         }))
@@ -123,7 +141,10 @@ fn dark_card_head(
             div()
                 .id("card-head-help")
                 .flex_none()
-                .type_style(type_scale::mono(type_scale::CHORD_METADATA_MAX_PX, gpui::FontWeight::MEDIUM))
+                .type_style(type_scale::mono(
+                    type_scale::CHORD_METADATA_MAX_PX,
+                    gpui::FontWeight::MEDIUM,
+                ))
                 .text_color(rgb(INK3()))
                 .tooltip(move |_, cx| cx.new(|_| OverlayTip(h.clone())).into())
                 .child("?")
@@ -136,7 +157,10 @@ fn dark_help(text: impl Into<SharedString>) -> Div {
     div()
         .flex_none()
         .px(px(6.))
-        .type_style(type_scale::mono(type_scale::LABEL_ROW_PX, gpui::FontWeight::MEDIUM))
+        .type_style(type_scale::mono(
+            type_scale::LABEL_ROW_PX,
+            gpui::FontWeight::MEDIUM,
+        ))
         .text_color(rgb(INK3()))
         .child(text.into())
 }
@@ -192,7 +216,10 @@ fn dark_ghost_button(
         .on_click(on_click)
         .child(
             div()
-                .type_style(type_scale::label(type_scale::LABEL_ROW_PX, gpui::FontWeight::MEDIUM))
+                .type_style(type_scale::label(
+                    type_scale::LABEL_ROW_PX,
+                    gpui::FontWeight::MEDIUM,
+                ))
                 .text_color(rgb(if active { INK1() } else { INK2() }))
                 .child(text.into()),
         )
@@ -260,8 +287,11 @@ impl Player {
         let bg_selected = if dark { DARK_RAISED() } else { BG_SELECTED() };
         // Archivo for what the row *says as a verb* (its label), mono for
         // what the film says through it (its detail/key) -- DESIGN §3.
-        let font_label = dark.then(|| type_scale::label(11., gpui::FontWeight::MEDIUM).font);
-        let font_mono = dark.then(|| type_scale::mono(11., gpui::FontWeight::MEDIUM).font);
+        let label_style =
+            dark.then(|| type_scale::label(type_scale::LABEL_ROW_PX, gpui::FontWeight::MEDIUM));
+        let mono_style = dark
+            .then(|| type_scale::mono(type_scale::CHORD_METADATA_MAX_PX, gpui::FontWeight::MEDIUM));
+        let head_style = dark.then(type_scale::head);
         let row = |id: (&'static str, usize)| {
             div()
                 .id(id)
@@ -287,7 +317,9 @@ impl Player {
             d.when(!enabled, |d| {
                 d.cursor_not_allowed().text_color(rgb(ink_secondary))
             })
-            .when(enabled, |d| d.cursor_pointer().hover(|s| s.bg(rgb(bg_hover))))
+            .when(enabled, |d| {
+                d.cursor_pointer().hover(|s| s.bg(rgb(bg_hover)))
+            })
         };
         // A row as this card writes them: the mark saying which one is picked,
         // the key that picks it, its name, and what the choice means. The mark
@@ -324,12 +356,16 @@ impl Player {
                                 .w(px(EXPORT_KEY_W))
                                 .text_size(px(11.))
                                 .text_color(rgb(ink))
-                                .when_some(font_mono.clone(), |d, f| d.font(f))
+                                .when_some(mono_style.clone(), |d, style| {
+                                    d.font(style.font).text_size(style.size)
+                                })
                                 .child(SharedString::from(key.to_string())),
                         )
                         .child(
                             div()
-                                .when_some(font_label.clone(), |d, f| d.font(f))
+                                .when_some(label_style.clone(), |d, style| {
+                                    d.font(style.font).text_size(style.size)
+                                })
                                 .child(label),
                         ),
                 )
@@ -342,7 +378,9 @@ impl Player {
                         .flex_shrink()
                         .text_size(px(11.))
                         .text_color(rgb(ink))
-                        .when_some(font_mono.clone(), |d, f| d.font(f))
+                        .when_some(mono_style.clone(), |d, style| {
+                            d.font(style.font).text_size(style.size)
+                        })
                         .child(detail),
                 )
         };
@@ -353,7 +391,9 @@ impl Player {
                 .pt(px(4.))
                 .text_size(px(10.))
                 .text_color(rgb(ink_secondary))
-                .when_some(font_label.clone(), |d, f| d.font(f))
+                .when_some(head_style.clone(), |d, style| {
+                    d.font(style.font).text_size(style.size)
+                })
                 .child(text)
                 .into_any_element()
         };
@@ -383,9 +423,11 @@ impl Player {
             // rows already carry: dimmed, unclickable, its reason in place of
             // the detail -- not bright and pickable over a click that would
             // only bounce off `set_format`'s own guard.
-            let refusal = preset
-                .bundle()
-                .and_then(|(format, _)| self.session.as_ref().and_then(|s| format_refusal(s, format)));
+            let refusal = preset.bundle().and_then(|(format, _)| {
+                self.session
+                    .as_ref()
+                    .and_then(|s| format_refusal(s, format))
+            });
             let detail: SharedString = match &refusal {
                 Some(why) => why.clone().into(),
                 None => preset.detail().into(),
@@ -409,8 +451,9 @@ impl Player {
         let advanced_detail = match self.export_advanced_open {
             true => "codec, container, quality, sound, encoder, subtitles — s collapses them"
                 .to_string(),
-            false => "codec, container, quality, sound, encoder, subtitles — s for the rows"
-                .to_string(),
+            false => {
+                "codec, container, quality, sound, encoder, subtitles — s for the rows".to_string()
+            }
         };
         list.push(
             entry(
@@ -433,313 +476,327 @@ impl Player {
         // it built exactly as the flat card built it, only not pushed at all
         // while the pane is shut.
         if self.export_advanced_open {
-        if self.export_grouped {
-            list.push(header("FORMAT"));
-        }
-        // The codecs first: which one is being written decides whether every
-        // row under it means anything. One a *this* timeline cannot be written
-        // as (an audio-only edit, for a picture codec) reads exactly like one
-        // there is no encoder for -- dimmed, unclickable, and carrying its own
-        // reason where its detail was, with nothing to click to find that out.
-        let mut refusals: Vec<String> = Vec::new();
-        for (i, (boxes, key, label, detail)) in FORMATS.into_iter().enumerate() {
-            let format = same_box(boxes, self.format);
-            let refused = format
-                .zip(self.session.as_ref())
-                .and_then(|(f, s)| format_refusal(s, f));
-            // A codec with no encoder here at all is the other kind of refusal,
-            // and the one the footer collects: it can never become pickable, so
-            // a row each is dead rows above the fold.
-            if format.is_none() {
-                refusals.push(format!("{label} — {detail}"));
-                if !self.export_refusals_inline {
-                    continue;
+            if self.export_grouped {
+                list.push(header("FORMAT"));
+            }
+            // The codecs first: which one is being written decides whether every
+            // row under it means anything. One a *this* timeline cannot be written
+            // as (an audio-only edit, for a picture codec) reads exactly like one
+            // there is no encoder for -- dimmed, unclickable, and carrying its own
+            // reason where its detail was, with nothing to click to find that out.
+            let mut refusals: Vec<String> = Vec::new();
+            for (i, (boxes, key, label, detail)) in FORMATS.into_iter().enumerate() {
+                let format = same_box(boxes, self.format);
+                let refused = format
+                    .zip(self.session.as_ref())
+                    .and_then(|(f, s)| format_refusal(s, f));
+                // A codec with no encoder here at all is the other kind of refusal,
+                // and the one the footer collects: it can never become pickable, so
+                // a row each is dead rows above the fold.
+                if format.is_none() {
+                    refusals.push(format!("{label} — {detail}"));
+                    if !self.export_refusals_inline {
+                        continue;
+                    }
+                }
+                let detail: SharedString = match &refused {
+                    Some(why) => why.clone().into(),
+                    None => detail.into(),
+                };
+                let format = format.filter(|_| refused.is_none());
+                let mut r = entry(
+                    ("format", i),
+                    key,
+                    label.into(),
+                    detail,
+                    boxes.contains(&self.format),
+                    format.is_some(),
+                );
+                if let Some(format) = format {
+                    r = r.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.set_format(format);
+                        cx.notify();
+                    }));
+                }
+                list.push(r.into_any_element());
+            }
+            if self.export_grouped {
+                list.push(header("DETAILS"));
+            }
+            // The container, and only where the picked codec has more than one box:
+            // a row offering a single choice reads as a choice.
+            let boxes = containers(self.format);
+            if boxes.len() > 1 {
+                let next = next_container(self.format);
+                list.push(
+                    entry(
+                        ("container", 0),
+                        "c",
+                        "Container".into(),
+                        format!(
+                            "{} — c for {}",
+                            self.format.ext().to_uppercase(),
+                            next.ext().to_uppercase()
+                        )
+                        .into(),
+                        false,
+                        true,
+                    )
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.cycle_container();
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+                );
+            }
+            match bitrate_refusal(self.format) {
+                // One dimmed row carrying the reason, rather than five rows of a
+                // figure that will not be written: the quality rows are the
+                // *picture's* bitrate, and this file has no picture in it.
+                Some(why) => list.push(
+                    entry(
+                        ("quality", 0),
+                        "q",
+                        "Quality".into(),
+                        why.into(),
+                        false,
+                        false,
+                    )
+                    .into_any_element(),
+                ),
+                None => {
+                    for (i, quality) in Quality::ALL.into_iter().enumerate() {
+                        // The custom row is a field: `n` opens it, a click in it
+                        // opens it too, and while it is open the row shows what is
+                        // being typed with a caret in it rather than the number in
+                        // force. The other four are picked whole.
+                        let field = self
+                            .mbps_edit
+                            .as_ref()
+                            .filter(|_| quality == Quality::Custom);
+                        let mut r = entry(
+                            ("quality", i),
+                            match quality {
+                                Quality::Custom => "n",
+                                _ => "q",
+                            },
+                            quality.label().into(),
+                            match field {
+                                Some(edit) => edit.detail().into(),
+                                None => quality.detail(self.custom_mbps).into(),
+                            },
+                            self.quality == quality,
+                            true,
+                        )
+                        .on_click(cx.listener(
+                            move |this, _: &ClickEvent, _, cx| {
+                                match quality {
+                                    Quality::Custom => this.edit_mbps(),
+                                    _ => this.quality = quality,
+                                }
+                                cx.notify();
+                            },
+                        ));
+                        if quality == Quality::Custom {
+                            // The wheel anywhere over the row moves the number, the
+                            // buttons being one step each: the range is fifty wide
+                            // now, and a number only a repeated press can walk to is
+                            // a number nobody walks to. Swallowed, so the notch that
+                            // moved the bitrate does not scroll the list under it as
+                            // well -- one gesture, one thing changed.
+                            r = r
+                                .on_scroll_wheel(cx.listener(
+                                    |this, event: &ScrollWheelEvent, _, cx| {
+                                        this.wheel_mbps(event);
+                                        cx.stop_propagation();
+                                        cx.notify();
+                                    },
+                                ))
+                                .child(self.mbps_steppers(cx));
+                        }
+                        list.push(r.into_any_element());
+                    }
                 }
             }
-            let detail: SharedString = match &refused {
-                Some(why) => why.clone().into(),
-                None => detail.into(),
-            };
-            let format = format.filter(|_| refused.is_none());
+            // The other half of the file, and the one this card used to write at a
+            // fixed rate without saying so: what the *sound* is coded at, for every
+            // format that codes it -- the AAC inside a video export as much as an
+            // MP3. Four rates, so the pointer gets the *list* of them
+            // ([`Pick::AudioRate`]) rather than a button clicked round -- the
+            // resolution row's rule, and the key still steps as `ctrl+r` still
+            // does. Dimmed with the reason where this timeline has no rate to pick,
+            // like the quality rows are.
+            let sound = self.audio_rate_refusal();
             let mut r = entry(
-                ("format", i),
-                key,
-                label.into(),
-                detail,
-                boxes.contains(&self.format),
-                format.is_some(),
+                ("sound", 0),
+                "b",
+                "Sound".into(),
+                match sound {
+                    Some(why) => why.into(),
+                    None => format!("{} kbps — b steps", self.audio_kbps).into(),
+                },
+                false,
+                sound.is_none(),
             );
-            if let Some(format) = format {
-                r = r.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                    this.set_format(format);
-                    cx.notify();
+            if sound.is_none() {
+                r = r.on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
+                    this.open_picker(Pick::AudioRate, event.position(), cx)
                 }));
             }
             list.push(r.into_any_element());
-        }
-        if self.export_grouped {
-            list.push(header("DETAILS"));
-        }
-        // The container, and only where the picked codec has more than one box:
-        // a row offering a single choice reads as a choice.
-        let boxes = containers(self.format);
-        if boxes.len() > 1 {
-            let next = next_container(self.format);
+            // Which encoder writes the picture, which was an env pin and therefore
+            // no choice at all. Three seats, so the pointer gets the *list* of them
+            // ([`Pick::Encoder`]) and never a button clicked round -- the Sound
+            // row's rule, one row above. Only where there is a picture to encode:
+            // a WAV has no seat to pick and the row would be a question about
+            // nothing.
+            if self.format.has_video() {
+                let seat = self.encoder_seat();
+                list.push(
+                    entry(
+                        ("encoder", 0),
+                        "e",
+                        "Encoder".into(),
+                        format!("{} — e steps", encoder_label(seat)).into(),
+                        false,
+                        true,
+                    )
+                    .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
+                        this.open_picker(Pick::Encoder, event.position(), cx)
+                    }))
+                    .into_any_element(),
+                );
+                // ...and, under it, the one thing about that pick a person cannot
+                // know from the words in the list: this box's driver reset itself
+                // on the vendored AV1 encoder. A dimmed row and not a modal -- the
+                // pick is theirs, and the export runs.
+                if let Some(warning) = av1_hw_warning(self.format, seat) {
+                    list.push(
+                        entry(
+                            ("encoder-av1", 0),
+                            "",
+                            "".into(),
+                            warning.into(),
+                            false,
+                            false,
+                        )
+                        .into_any_element(),
+                    );
+                }
+            }
+            // What happens to the subtitles on this timeline, in one line: how many
+            // are written into the file and under what names, or the reason each one
+            // is not. Which tracks travel is not a pick -- everything with a cue on
+            // the timeline goes ([`Player::export_subs`]) -- so the row says rather
+            // than offers, like the machine lines below.
+            // ...and the ones that do not travel are named here too, which they were
+            // not: `export_subs` had already filtered a track with no cue on *this*
+            // timeline out of the engine's sight, so the card said nothing about a
+            // row the list was still showing ([`subtitle_plan`]).
+            let plan = self.subtitle_line();
+            // The row used to end in "click for <fmt> in MKV" whenever the picture
+            // was going into an mp4, on the grounds that only Matroska carries a
+            // text track. An mp4 carries one now (`Mp4Muxer::write_subtitles` writes
+            // `tx3g`), so that was a refusal offering a way out of nothing: the
+            // container the card is already set to embeds them. The refusals left in
+            // `planned_subtitles` are the true ones -- a sound-only format has
+            // nowhere to put a track, and a PGS track is pictures whatever the box.
             list.push(
                 entry(
-                    ("container", 0),
-                    "c",
-                    "Container".into(),
-                    format!(
-                        "{} — c for {}",
-                        self.format.ext().to_uppercase(),
-                        next.ext().to_uppercase()
-                    )
-                    .into(),
+                    ("subtitles", 0),
+                    "",
+                    "Subtitles".into(),
+                    plan.into(),
                     false,
+                    false,
+                )
+                .into_any_element(),
+            );
+            // The card's own two layout switches. They were `g` and `r` and nothing
+            // else, while the status line under the title advertised both of them:
+            // a hand on the mouse read what they do and had nothing to press.
+            list.push(
+                entry(
+                    ("export-layout", 0),
+                    "g",
+                    "Layout".into(),
+                    match self.export_grouped {
+                        true => "sections — g for one flat list".into(),
+                        false => "one flat list — g for sections".into(),
+                    },
+                    self.export_grouped,
                     true,
                 )
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                    this.cycle_container();
+                    this.export_grouped = !this.export_grouped;
                     cx.notify();
                 }))
                 .into_any_element(),
             );
-        }
-        match bitrate_refusal(self.format) {
-            // One dimmed row carrying the reason, rather than five rows of a
-            // figure that will not be written: the quality rows are the
-            // *picture's* bitrate, and this file has no picture in it.
-            Some(why) => list.push(
-                entry(
-                    ("quality", 0),
-                    "q",
-                    "Quality".into(),
-                    why.into(),
-                    false,
-                    false,
-                )
-                .into_any_element(),
-            ),
-            None => {
-                for (i, quality) in Quality::ALL.into_iter().enumerate() {
-                    // The custom row is a field: `n` opens it, a click in it
-                    // opens it too, and while it is open the row shows what is
-                    // being typed with a caret in it rather than the number in
-                    // force. The other four are picked whole.
-                    let field = self.mbps_edit.as_ref().filter(|_| quality == Quality::Custom);
-                    let mut r = entry(
-                        ("quality", i),
-                        match quality {
-                            Quality::Custom => "n",
-                            _ => "q",
-                        },
-                        quality.label().into(),
-                        match field {
-                            Some(edit) => edit.detail().into(),
-                            None => quality.detail(self.custom_mbps).into(),
-                        },
-                        self.quality == quality,
-                        true,
-                    )
-                    .on_click(cx.listener(
-                        move |this, _: &ClickEvent, _, cx| {
-                            match quality {
-                                Quality::Custom => this.edit_mbps(),
-                                _ => this.quality = quality,
-                            }
-                            cx.notify();
-                        },
-                    ));
-                    if quality == Quality::Custom {
-                        // The wheel anywhere over the row moves the number, the
-                        // buttons being one step each: the range is fifty wide
-                        // now, and a number only a repeated press can walk to is
-                        // a number nobody walks to. Swallowed, so the notch that
-                        // moved the bitrate does not scroll the list under it as
-                        // well -- one gesture, one thing changed.
-                        r = r
-                            .on_scroll_wheel(cx.listener(
-                                |this, event: &ScrollWheelEvent, _, cx| {
-                                    this.wheel_mbps(event);
-                                    cx.stop_propagation();
-                                    cx.notify();
-                                },
-                            ))
-                            .child(self.mbps_steppers(cx));
-                    }
-                    list.push(r.into_any_element());
-                }
-            }
-        }
-        // The other half of the file, and the one this card used to write at a
-        // fixed rate without saying so: what the *sound* is coded at, for every
-        // format that codes it -- the AAC inside a video export as much as an
-        // MP3. Four rates, so the pointer gets the *list* of them
-        // ([`Pick::AudioRate`]) rather than a button clicked round -- the
-        // resolution row's rule, and the key still steps as `ctrl+r` still
-        // does. Dimmed with the reason where this timeline has no rate to pick,
-        // like the quality rows are.
-        let sound = self.audio_rate_refusal();
-        let mut r = entry(
-            ("sound", 0),
-            "b",
-            "Sound".into(),
-            match sound {
-                Some(why) => why.into(),
-                None => format!("{} kbps — b steps", self.audio_kbps).into(),
-            },
-            false,
-            sound.is_none(),
-        );
-        if sound.is_none() {
-            r = r.on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
-                this.open_picker(Pick::AudioRate, event.position(), cx)
-            }));
-        }
-        list.push(r.into_any_element());
-        // Which encoder writes the picture, which was an env pin and therefore
-        // no choice at all. Three seats, so the pointer gets the *list* of them
-        // ([`Pick::Encoder`]) and never a button clicked round -- the Sound
-        // row's rule, one row above. Only where there is a picture to encode:
-        // a WAV has no seat to pick and the row would be a question about
-        // nothing.
-        if self.format.has_video() {
-            let seat = self.encoder_seat();
             list.push(
                 entry(
-                    ("encoder", 0),
-                    "e",
-                    "Encoder".into(),
-                    format!("{} — e steps", encoder_label(seat)).into(),
-                    false,
+                    ("export-refusals", 0),
+                    "r",
+                    "Codecs with no encoder".into(),
+                    match self.export_refusals_inline {
+                        true => "a dimmed row each — r collapses them".into(),
+                        false => "one line at the foot — r shows a row each".into(),
+                    },
+                    self.export_refusals_inline,
                     true,
                 )
-                .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
-                    this.open_picker(Pick::Encoder, event.position(), cx)
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.export_refusals_inline = !this.export_refusals_inline;
+                    cx.notify();
                 }))
                 .into_any_element(),
             );
-            // ...and, under it, the one thing about that pick a person cannot
-            // know from the words in the list: this box's driver reset itself
-            // on the vendored AV1 encoder. A dimmed row and not a modal -- the
-            // pick is theirs, and the export runs.
-            if let Some(warning) = av1_hw_warning(self.format, seat) {
+            if !self.export_refusals_inline && !refusals.is_empty() {
+                // Last, and one line: the reason travels with the name (a footer
+                // that only listed them would be the "why not?" the rows exist to
+                // answer), but nothing here can ever be picked, so it sits under
+                // every row that can rather than above them.
                 list.push(
-                    entry(("encoder-av1", 0), "", "".into(), warning.into(), false, false)
+                    div()
+                        .flex_none()
+                        .px(px(6.))
+                        .py(px(2.))
+                        .text_size(px(11.))
+                        .text_color(rgb(ink_secondary))
+                        .when_some(mono_style.clone(), |d, style| {
+                            d.font(style.font).text_size(style.size)
+                        })
+                        .child(format!("cannot write: {}", refusals.join(" · ")))
                         .into_any_element(),
                 );
             }
-        }
-        // What happens to the subtitles on this timeline, in one line: how many
-        // are written into the file and under what names, or the reason each one
-        // is not. Which tracks travel is not a pick -- everything with a cue on
-        // the timeline goes ([`Player::export_subs`]) -- so the row says rather
-        // than offers, like the machine lines below.
-        // ...and the ones that do not travel are named here too, which they were
-        // not: `export_subs` had already filtered a track with no cue on *this*
-        // timeline out of the engine's sight, so the card said nothing about a
-        // row the list was still showing ([`subtitle_plan`]).
-        let plan = self.subtitle_line();
-        // The row used to end in "click for <fmt> in MKV" whenever the picture
-        // was going into an mp4, on the grounds that only Matroska carries a
-        // text track. An mp4 carries one now (`Mp4Muxer::write_subtitles` writes
-        // `tx3g`), so that was a refusal offering a way out of nothing: the
-        // container the card is already set to embeds them. The refusals left in
-        // `planned_subtitles` are the true ones -- a sound-only format has
-        // nowhere to put a track, and a PGS track is pictures whatever the box.
-        list.push(
-            entry(
-                ("subtitles", 0),
-                "",
-                "Subtitles".into(),
-                plan.into(),
-                false,
-                false,
-            )
-            .into_any_element(),
-        );
-        // The card's own two layout switches. They were `g` and `r` and nothing
-        // else, while the status line under the title advertised both of them:
-        // a hand on the mouse read what they do and had nothing to press.
-        list.push(
-            entry(
-                ("export-layout", 0),
-                "g",
-                "Layout".into(),
-                match self.export_grouped {
-                    true => "sections — g for one flat list".into(),
-                    false => "one flat list — g for sections".into(),
-                },
-                self.export_grouped,
-                true,
-            )
-            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                this.export_grouped = !this.export_grouped;
-                cx.notify();
-            }))
-            .into_any_element(),
-        );
-        list.push(
-            entry(
-                ("export-refusals", 0),
-                "r",
-                "Codecs with no encoder".into(),
-                match self.export_refusals_inline {
-                    true => "a dimmed row each — r collapses them".into(),
-                    false => "one line at the foot — r shows a row each".into(),
-                },
-                self.export_refusals_inline,
-                true,
-            )
-            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                this.export_refusals_inline = !this.export_refusals_inline;
-                cx.notify();
-            }))
-            .into_any_element(),
-        );
-        if !self.export_refusals_inline && !refusals.is_empty() {
-            // Last, and one line: the reason travels with the name (a footer
-            // that only listed them would be the "why not?" the rows exist to
-            // answer), but nothing here can ever be picked, so it sits under
-            // every row that can rather than above them.
-            list.push(
+            // What is doing the work, on this machine and in this build: the GPU
+            // half is asked of the driver through the plugin (a different answer on
+            // every machine, and "none" where there is no plugin at all), the build
+            // half is the crates that were compiled in. Last in the list, because it
+            // is what a user checks rather than what they pick -- and a listing
+            // rather than rows, since none of it can be clicked.
+            if self.export_grouped {
+                list.push(header("THIS MACHINE"));
+            }
+            let note = |text: String| {
                 div()
                     .flex_none()
                     .px(px(6.))
                     .py(px(2.))
                     .text_size(px(11.))
                     .text_color(rgb(ink_secondary))
-                    .when_some(font_mono.clone(), |d, f| d.font(f))
-                    .child(format!("cannot write: {}", refusals.join(" · ")))
-                    .into_any_element(),
-            );
-        }
-        // What is doing the work, on this machine and in this build: the GPU
-        // half is asked of the driver through the plugin (a different answer on
-        // every machine, and "none" where there is no plugin at all), the build
-        // half is the crates that were compiled in. Last in the list, because it
-        // is what a user checks rather than what they pick -- and a listing
-        // rather than rows, since none of it can be clicked.
-        if self.export_grouped {
-            list.push(header("THIS MACHINE"));
-        }
-        let note = |text: String| {
-            div()
-                .flex_none()
-                .px(px(6.))
-                .py(px(2.))
-                .text_size(px(11.))
-                .text_color(rgb(ink_secondary))
-                .when_some(font_mono.clone(), |d, f| d.font(f))
-                .child(text)
-                .into_any_element()
-        };
-        list.push(note(format!(
-            "GPU: {}",
-            self.hw_caps.clone().unwrap_or_else(|| "asking…".into())
-        )));
-        list.push(note(format!("Built in: {}", engine::caps::software())));
+                    .when_some(mono_style.clone(), |d, style| {
+                        d.font(style.font).text_size(style.size)
+                    })
+                    .child(text)
+                    .into_any_element()
+            };
+            list.push(note(format!(
+                "GPU: {}",
+                self.hw_caps.clone().unwrap_or_else(|| "asking…".into())
+            )));
+            list.push(note(format!("Built in: {}", engine::caps::software())));
         } // self.export_advanced_open
         // What the rows add up to, which is the one thing that has to be right:
         // codec, box, size, rate, sound, where it goes and about how big. Two
@@ -762,8 +819,7 @@ impl Player {
             },
             |(_, audio)| audio,
         );
-        let settings =
-            export_settings(
+        let settings = export_settings(
             self.quality,
             self.custom_mbps,
             self.format,
@@ -875,9 +931,11 @@ impl Player {
                                 div()
                                     .flex_none()
                                     .px(px(6.))
-                                    .text_size(px(10.5))
                                     .text_color(rgb(INK3()))
-                                    .type_style(type_scale::mono(10.5, gpui::FontWeight::MEDIUM))
+                                    .type_style(type_scale::mono(
+                                        type_scale::CHORD_METADATA_MAX_PX,
+                                        gpui::FontWeight::MEDIUM,
+                                    ))
                                     .child(status_line),
                             )
                             .child(
@@ -894,8 +952,10 @@ impl Player {
                                 div()
                                     .flex_none()
                                     .px(px(6.))
-                                    .text_size(px(11.))
-                                    .type_style(type_scale::mono(10.5, gpui::FontWeight::MEDIUM))
+                                    .type_style(type_scale::mono(
+                                        type_scale::CHORD_METADATA_MAX_PX,
+                                        gpui::FontWeight::MEDIUM,
+                                    ))
                                     .text_color(rgb(INK2()))
                                     .child(head),
                             )
@@ -903,7 +963,10 @@ impl Player {
                                 div()
                                     .flex_none()
                                     .px(px(6.))
-                                    .type_style(type_scale::mono(10.5, gpui::FontWeight::MEDIUM))
+                                    .type_style(type_scale::mono(
+                                        type_scale::CHORD_METADATA_MAX_PX,
+                                        gpui::FontWeight::MEDIUM,
+                                    ))
                                     .text_color(rgb(INK3()))
                                     .child(format!(
                                         "RANGE {}\u{2013}{} ({})",
@@ -916,7 +979,10 @@ impl Player {
                                 div()
                                     .flex_none()
                                     .px(px(6.))
-                                    .type_style(type_scale::mono(10.5, gpui::FontWeight::MEDIUM))
+                                    .type_style(type_scale::mono(
+                                        type_scale::CHORD_METADATA_MAX_PX,
+                                        gpui::FontWeight::MEDIUM,
+                                    ))
                                     .text_color(rgb(INK3()))
                                     .child(tail),
                             )
@@ -946,7 +1012,10 @@ impl Player {
                                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                                         this.start_export(cx)
                                     }))
-                                    .type_style(type_scale::label(11., gpui::FontWeight::MEDIUM))
+                                    .type_style(type_scale::label(
+                                        type_scale::LABEL_ROW_PX,
+                                        gpui::FontWeight::MEDIUM,
+                                    ))
                                     .text_color(rgb(match blocked.is_some() {
                                         true => INK4(),
                                         false => INK1(),
@@ -956,7 +1025,7 @@ impl Player {
                                         d.child(
                                             div()
                                                 .type_style(type_scale::mono(
-                                                    9.5,
+                                                    type_scale::CHORD_METADATA_MIN_PX,
                                                     gpui::FontWeight::MEDIUM,
                                                 ))
                                                 .text_color(rgb(INK3()))
@@ -1143,8 +1212,12 @@ impl Player {
                         .rounded(px(6.))
                         .bg(rgb(if dark { DARK_PANEL() } else { BG_RAISED() }))
                         .when(dark, |d| d.border_1().border_color(rgba(DARK_SEAM())))
-                        .when(dark, |d| d.child(dark_card_head("Exporting", None, None, None, cx)))
-                        .when(!dark, |d| d.child(div().flex_none().px(px(6.)).child("Exporting")))
+                        .when(dark, |d| {
+                            d.child(dark_card_head("Exporting", None, None, None, cx))
+                        })
+                        .when(!dark, |d| {
+                            d.child(div().flex_none().px(px(6.)).child("Exporting"))
+                        })
                         // The bar itself: the same number as the percentage
                         // below it, and it only ever moves forward -- the
                         // worker's progress is a monotone `fetch_max`.
@@ -1191,8 +1264,9 @@ impl Player {
                         ))
                         .child(note(
                             match armed {
-                                true => "cancelling deletes what has been written so far"
-                                    .to_string(),
+                                true => {
+                                    "cancelling deletes what has been written so far".to_string()
+                                }
                                 false => format!(
                                     "{} cancels · esc alone does nothing while this runs · the \
                                      timeline is read-only until it finishes",
@@ -1262,8 +1336,10 @@ impl Player {
                                         match armed {
                                             true => "stops the worker and deletes the part file"
                                                 .to_string(),
-                                            false => "asks first -- one press only offers the choice"
-                                                .to_string(),
+                                            false => {
+                                                "asks first -- one press only offers the choice"
+                                                    .to_string()
+                                            }
                                         },
                                         true,
                                         cx.listener(move |this, _: &ClickEvent, _, cx| {
@@ -1393,10 +1469,16 @@ impl Player {
             // tracked from.
             .id("eq-graph")
             .relative()
-            .when(graph_maximized, |d| d.flex_1().min_h(px(EQ_GRAPH_H)).max_h(px(EQ_GRAPH_MAX_H)))
+            .when(graph_maximized, |d| {
+                d.flex_1().min_h(px(EQ_GRAPH_H)).max_h(px(EQ_GRAPH_MAX_H))
+            })
             .when(!graph_maximized, |d| d.flex_none().h(px(eq_graph_h(false))))
             .rounded(px(3.))
-            .bg(rgb(if dark { DARK_HAIRLINE() } else { BG_HOVER_DIM() }))
+            .bg(rgb(if dark {
+                DARK_HAIRLINE()
+            } else {
+                BG_HOVER_DIM()
+            }))
             .cursor_pointer()
             // The press picks the band under it *and* is already the first
             // sample of the drag, so a plain click sets a value. A second click
@@ -1488,25 +1570,37 @@ impl Player {
                 // a box narrower than the text. `.whitespace_nowrap()` is
                 // the platform's own backstop, so a mis-measured box clips
                 // or overhangs instead of silently wrapping again.
-                let end_px = if dark { type_scale::CHORD_METADATA_MIN_PX } else { 9. };
+                let end_px = if dark {
+                    type_scale::CHORD_METADATA_MIN_PX
+                } else {
+                    9.
+                };
                 let div = div().absolute().bottom(px(1.)).whitespace_nowrap();
                 let div = if i == 0 {
-                    div.w(px(eq_tick_end_w(label, end_px))).left(px(0.)).text_align(TextAlign::Left)
+                    div.w(px(eq_tick_end_w(label, end_px)))
+                        .left(px(0.))
+                        .text_align(TextAlign::Left)
                 } else if i == EQ_TICKS.len() - 1 {
-                    div.w(px(eq_tick_end_w(label, end_px))).right(px(0.)).text_align(TextAlign::Right)
+                    div.w(px(eq_tick_end_w(label, end_px)))
+                        .right(px(0.))
+                        .text_align(TextAlign::Right)
                 } else {
-                    div.w(px(24.)).left(relative(eq_x(*freq))).ml(px(-12.)).text_align(TextAlign::Center)
+                    div.w(px(24.))
+                        .left(relative(eq_x(*freq)))
+                        .ml(px(-12.))
+                        .text_align(TextAlign::Center)
                 };
-                div
-                    .when(dark, |d| {
-                        d.type_style(type_scale::mono(
-                            type_scale::CHORD_METADATA_MIN_PX,
-                            gpui::FontWeight::MEDIUM,
-                        ))
-                        .text_color(rgb(INK3()))
-                    })
-                    .when(!dark, |d| d.text_size(px(9.)).text_color(rgb(FG_SECONDARY())))
-                    .child(*label)
+                div.when(dark, |d| {
+                    d.type_style(type_scale::mono(
+                        type_scale::CHORD_METADATA_MIN_PX,
+                        gpui::FontWeight::MEDIUM,
+                    ))
+                    .text_color(rgb(INK3()))
+                })
+                .when(!dark, |d| {
+                    d.text_size(px(9.)).text_color(rgb(FG_SECONDARY()))
+                })
+                .child(*label)
             }))
             .child(
                 div()
@@ -1520,7 +1614,9 @@ impl Player {
                         ))
                         .text_color(rgb(INK3()))
                     })
-                    .when(!dark, |d| d.text_size(px(9.)).text_color(rgb(FG_SECONDARY())))
+                    .when(!dark, |d| {
+                        d.text_size(px(9.)).text_color(rgb(FG_SECONDARY()))
+                    })
                     .child(format!("+{EQ_GAIN_LIMIT:.0} dB")),
             );
         // The bottom of the axis is not named: -12 dB would land in the same
@@ -1835,7 +1931,11 @@ impl Player {
     /// arrows do the same three things, but a value only a key can change is a
     /// value a hand on the pointer cannot reach at all, which is the same reason
     /// [`Player::mbps_steppers`] exists.
-    pub(crate) fn eq_numbers(&self, picked: Option<&Band>, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn eq_numbers(
+        &self,
+        picked: Option<&Band>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let dark = self.darkroom;
         let row = div()
             .flex_none()
@@ -1858,9 +1958,8 @@ impl Player {
                     label: &'static str,
                     change: fn(&mut Band),
                     cx: &mut Context<Self>| {
-            let on_click = cx.listener(move |this, _: &ClickEvent, _, cx| {
-                this.nudge_band(change, cx)
-            });
+            let on_click =
+                cx.listener(move |this, _: &ClickEvent, _, cx| this.nudge_band(change, cx));
             match dark {
                 true => dark_step_glyph(id, label == "+", on_click).into_any_element(),
                 false => div()
@@ -1901,16 +2000,17 @@ impl Player {
                 self.eq_params.bands.len()
             ))
             .into_any_element(),
-            false => format!("Band {} of {}", self.eq_band + 1, self.eq_params.bands.len())
-                .into_any_element(),
+            false => format!(
+                "Band {} of {}",
+                self.eq_band + 1,
+                self.eq_params.bands.len()
+            )
+            .into_any_element(),
         })
         .child(number(
             band_label(&band),
             ("eq-freq-down", "eq-freq-up"),
-            (
-                |b| b.freq_hz /= EQ_FREQ_STEP,
-                |b| b.freq_hz *= EQ_FREQ_STEP,
-            ),
+            (|b| b.freq_hz /= EQ_FREQ_STEP, |b| b.freq_hz *= EQ_FREQ_STEP),
             cx,
         ))
         .child(number(
@@ -1939,11 +2039,9 @@ impl Player {
                 .bg(rgb(BG_PANEL()))
                 .cursor_pointer()
                 .hover(|s| s.bg(rgb(BG_HOVER())))
-                .on_click(
-                    cx.listener(|this, _: &ClickEvent, _, cx| {
-                        this.nudge_band(|b| b.gain_db = 0., cx)
-                    }),
-                )
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.nudge_band(|b| b.gain_db = 0., cx)
+                }))
                 .child("Flatten this"),
         )
     }
@@ -1959,7 +2057,11 @@ impl Player {
     /// the decoder is grading with, never a copy that could drift from it. The
     /// graph above them is counted off the frame that came *back* through that
     /// grade ([`histogram`]), so pulling exposure tilts it while the hand moves.
-    pub(crate) fn color_card(&self, viewport: Size<Pixels>, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+    pub(crate) fn color_card(
+        &self,
+        viewport: Size<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
         let (lane, idx) = self.color_open?;
         let params = self.color_params();
         let dark = self.darkroom;
@@ -2040,7 +2142,9 @@ impl Player {
                     .child(
                         div()
                             .w(px(44.))
-                            .when(dark, |d| d.child(dark_row_value(format!("{:.0}%", value * 100.))))
+                            .when(dark, |d| {
+                                d.child(dark_row_value(format!("{:.0}%", value * 100.)))
+                            })
                             .when(!dark, |d| {
                                 d.text_size(px(11.))
                                     .text_color(rgb(FG_SECONDARY()))
@@ -2058,7 +2162,12 @@ impl Player {
                 .justify_center()
                 .items_center()
                 .bg(rgba(SCRIM()))
-                .when(self.card_maximized, |d| d.top(px(crate::ui::stance::maximized_card_top(f32::from(viewport.height), self.split_px(Split::Bench, viewport)))))
+                .when(self.card_maximized, |d| {
+                    d.top(px(crate::ui::stance::maximized_card_top(
+                        f32::from(viewport.height),
+                        self.split_px(Split::Bench, viewport),
+                    )))
+                })
                 // Click away closes it, as on every card here.
                 .on_mouse_down(
                     MouseButton::Left,
@@ -2071,7 +2180,11 @@ impl Player {
                 .child(
                     div()
                         .w_full()
-                        .max_w(px(card_max_w(COLOR_W, self.card_maximized, f32::from(viewport.width))))
+                        .max_w(px(card_max_w(
+                            COLOR_W,
+                            self.card_maximized,
+                            f32::from(viewport.width),
+                        )))
                         .on_mouse_down(MouseButton::Left, swallow)
                         .flex()
                         .flex_col()
@@ -2081,7 +2194,13 @@ impl Player {
                         .bg(rgb(if dark { DARK_PANEL() } else { BG_RAISED() }))
                         .when(dark, |d| d.border_1().border_color(rgba(DARK_SEAM())))
                         .when(dark, |d| {
-                            d.child(dark_card_head("Colour", Some(head_meta.clone()), Some(help_text.into()), Some(self.card_maximized), cx))
+                            d.child(dark_card_head(
+                                "Colour",
+                                Some(head_meta.clone()),
+                                Some(help_text.into()),
+                                Some(self.card_maximized),
+                                cx,
+                            ))
                         })
                         .when(!dark, |d| {
                             d.child(div().flex_none().px(px(6.)).child(format!(
@@ -2109,7 +2228,11 @@ impl Player {
                                 .flex_none()
                                 .h(px(HIST_H))
                                 .rounded(px(3.))
-                                .bg(rgb(if dark { DARK_HAIRLINE() } else { BG_HOVER_DIM() }))
+                                .bg(rgb(if dark {
+                                    DARK_HAIRLINE()
+                                } else {
+                                    BG_HOVER_DIM()
+                                }))
                                 .relative()
                                 .child(hist_curves(self.histogram)),
                         )
@@ -2151,7 +2274,11 @@ impl Player {
     /// The transform card: [`color_card`](Self::color_card)'s own shape, one
     /// row per [`TRANSFORM_BANDS`] entry instead of four, and no histogram --
     /// there is nothing here a graded frame would tilt.
-    pub(crate) fn transform_card(&self, viewport: Size<Pixels>, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+    pub(crate) fn transform_card(
+        &self,
+        viewport: Size<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
         let (lane, idx) = self.transform_open?;
         let params = self.transform_params();
         let dark = self.darkroom;
@@ -2222,13 +2349,16 @@ impl Player {
                             ),
                     )
                     .child(
-                        div().w(px(44.)).when(dark, |d| {
-                            d.child(dark_row_value(transform_row_value(i, value)))
-                        }).when(!dark, |d| {
-                            d.text_size(px(11.))
-                                .text_color(rgb(FG_SECONDARY()))
-                                .child(transform_row_value(i, value))
-                        }),
+                        div()
+                            .w(px(44.))
+                            .when(dark, |d| {
+                                d.child(dark_row_value(transform_row_value(i, value)))
+                            })
+                            .when(!dark, |d| {
+                                d.text_size(px(11.))
+                                    .text_color(rgb(FG_SECONDARY()))
+                                    .child(transform_row_value(i, value))
+                            }),
                     )
             })
             .collect();
@@ -2241,7 +2371,12 @@ impl Player {
                 .justify_center()
                 .items_center()
                 .bg(rgba(SCRIM()))
-                .when(self.card_maximized, |d| d.top(px(crate::ui::stance::maximized_card_top(f32::from(viewport.height), self.split_px(Split::Bench, viewport)))))
+                .when(self.card_maximized, |d| {
+                    d.top(px(crate::ui::stance::maximized_card_top(
+                        f32::from(viewport.height),
+                        self.split_px(Split::Bench, viewport),
+                    )))
+                })
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _: &MouseDownEvent, _, cx| {
@@ -2253,7 +2388,11 @@ impl Player {
                 .child(
                     div()
                         .w_full()
-                        .max_w(px(card_max_w(TRANSFORM_W, self.card_maximized, f32::from(viewport.width))))
+                        .max_w(px(card_max_w(
+                            TRANSFORM_W,
+                            self.card_maximized,
+                            f32::from(viewport.width),
+                        )))
                         .on_mouse_down(MouseButton::Left, swallow)
                         .flex()
                         .flex_col()
@@ -2263,7 +2402,13 @@ impl Player {
                         .bg(rgb(if dark { DARK_PANEL() } else { BG_RAISED() }))
                         .when(dark, |d| d.border_1().border_color(rgba(DARK_SEAM())))
                         .when(dark, |d| {
-                            d.child(dark_card_head("Transform", Some(head_meta.clone()), Some(help_text.into()), Some(self.card_maximized), cx))
+                            d.child(dark_card_head(
+                                "Transform",
+                                Some(head_meta.clone()),
+                                Some(help_text.into()),
+                                Some(self.card_maximized),
+                                cx,
+                            ))
                         })
                         .when(!dark, |d| {
                             d.child(div().flex_none().px(px(6.)).child(format!(
@@ -2326,7 +2471,11 @@ impl Player {
     ///
     /// Honest about what it does: the sound is *resampled*, so the pitch goes up
     /// with the rate, which is what the tape in the title means.
-    pub(crate) fn speed_card(&self, viewport: Size<Pixels>, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+    pub(crate) fn speed_card(
+        &self,
+        viewport: Size<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
         let (lane, idx) = self.speed_open?;
         let speed = self.card_speed();
         let session = self.session.as_ref()?;
@@ -2365,8 +2514,7 @@ impl Player {
             })
             .collect();
         let head_meta: SharedString = format!("{} clip {}", lane.label(), idx + 1).into();
-        let help_text =
-            "drag the bar or ←→ moves it, r is 1.00x — the pitch moves with the rate; a click away or esc closes";
+        let help_text = "drag the bar or ←→ moves it, r is 1.00x — the pitch moves with the rate; a click away or esc closes";
         let tail_text: SharedString = format!(
             "{speed} — {} source frames over {} on the timeline ({})",
             clip.len(),
@@ -2380,7 +2528,12 @@ impl Player {
                 .justify_center()
                 .items_center()
                 .bg(rgba(SCRIM()))
-                .when(self.card_maximized, |d| d.top(px(crate::ui::stance::maximized_card_top(f32::from(viewport.height), self.split_px(Split::Bench, viewport)))))
+                .when(self.card_maximized, |d| {
+                    d.top(px(crate::ui::stance::maximized_card_top(
+                        f32::from(viewport.height),
+                        self.split_px(Split::Bench, viewport),
+                    )))
+                })
                 // Click away closes it, as on every card here.
                 .on_mouse_down(
                     MouseButton::Left,
@@ -2393,7 +2546,11 @@ impl Player {
                 .child(
                     div()
                         .w_full()
-                        .max_w(px(card_max_w(COLOR_W, self.card_maximized, f32::from(viewport.width))))
+                        .max_w(px(card_max_w(
+                            COLOR_W,
+                            self.card_maximized,
+                            f32::from(viewport.width),
+                        )))
                         .on_mouse_down(MouseButton::Left, swallow)
                         .flex()
                         .flex_col()
@@ -2403,7 +2560,13 @@ impl Player {
                         .bg(rgb(if dark { DARK_PANEL() } else { BG_RAISED() }))
                         .when(dark, |d| d.border_1().border_color(rgba(DARK_SEAM())))
                         .when(dark, |d| {
-                            d.child(dark_card_head("Speed (tape)", Some(head_meta.clone()), Some(help_text.into()), Some(self.card_maximized), cx))
+                            d.child(dark_card_head(
+                                "Speed (tape)",
+                                Some(head_meta.clone()),
+                                Some(help_text.into()),
+                                Some(self.card_maximized),
+                                cx,
+                            ))
                         })
                         .when(!dark, |d| {
                             d.child(div().flex_none().px(px(6.)).child(format!(
@@ -2492,7 +2655,11 @@ impl Player {
     /// move it too. The rows scroll rather than the card growing past the
     /// window -- a timeline may hold more tracks than a 360 px window has room
     /// for faders.
-    pub(crate) fn mix_card(&self, viewport: Size<Pixels>, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+    pub(crate) fn mix_card(
+        &self,
+        viewport: Size<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
         if !self.mix_open {
             return None;
         }
@@ -2583,13 +2750,15 @@ impl Player {
                                         .bg(rgb(BG_PANEL()))
                                         .cursor_pointer()
                                         .hover(|s| s.bg(rgb(BG_HOVER())))
-                                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                            // Picked as well as moved, the silence
-                                            // card's rule: the row a press lands on
-                                            // is the row the arrows carry on from.
-                                            this.mix_field = n;
-                                            this.nudge_mix(steps, cx);
-                                        }))
+                                        .on_click(cx.listener(
+                                            move |this, _: &ClickEvent, _, cx| {
+                                                // Picked as well as moved, the silence
+                                                // card's rule: the row a press lands on
+                                                // is the row the arrows carry on from.
+                                                this.mix_field = n;
+                                                this.nudge_mix(steps, cx);
+                                            },
+                                        ))
                                         .child(match steps > 0 {
                                             true => "+",
                                             false => "−",
@@ -2614,7 +2783,12 @@ impl Player {
                 .justify_center()
                 .items_center()
                 .bg(rgba(SCRIM()))
-                .when(self.card_maximized, |d| d.top(px(crate::ui::stance::maximized_card_top(f32::from(viewport.height), self.split_px(Split::Bench, viewport)))))
+                .when(self.card_maximized, |d| {
+                    d.top(px(crate::ui::stance::maximized_card_top(
+                        f32::from(viewport.height),
+                        self.split_px(Split::Bench, viewport),
+                    )))
+                })
                 // Click away closes it, as on every card here.
                 .on_mouse_down(
                     MouseButton::Left,
@@ -2627,7 +2801,11 @@ impl Player {
                 .child(
                     div()
                         .w_full()
-                        .max_w(px(card_max_w(COLOR_W, self.card_maximized, f32::from(viewport.width))))
+                        .max_w(px(card_max_w(
+                            COLOR_W,
+                            self.card_maximized,
+                            f32::from(viewport.width),
+                        )))
                         .on_mouse_down(MouseButton::Left, swallow)
                         .max_h(px(360. - 24.))
                         .flex()
@@ -2637,7 +2815,15 @@ impl Player {
                         .rounded(px(6.))
                         .bg(rgb(if dark { DARK_PANEL() } else { BG_RAISED() }))
                         .when(dark, |d| d.border_1().border_color(rgba(DARK_SEAM())))
-                        .when(dark, |d| d.child(dark_card_head("Mix", None, Some(help_text.into()), Some(self.card_maximized), cx)))
+                        .when(dark, |d| {
+                            d.child(dark_card_head(
+                                "Mix",
+                                None,
+                                Some(help_text.into()),
+                                Some(self.card_maximized),
+                                cx,
+                            ))
+                        })
                         .when(!dark, |d| {
                             d.child(
                                 div()
@@ -2690,13 +2876,25 @@ impl Player {
     /// card's shape for the same reason: app-global, kept in a file beside
     /// the theme, and drawn straight off `self.sub_text` / `self.sub_family`
     /// so a change is on the cue underneath before the card is closed.
-    pub(crate) fn subtitle_style_card(&self, viewport: Size<Pixels>, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+    pub(crate) fn subtitle_style_card(
+        &self,
+        viewport: Size<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
         if !self.subtitle_style_open {
             return None;
         }
         let dark = self.darkroom;
         let help_text = "− and + move the size, or ↑↓ picks a row and ←→ moves it (held or pressed); a family row picks it outright — a click away or esc closes";
-        let head = dark.then(|| dark_card_head("Subtitle style", None, Some(help_text.into()), Some(self.card_maximized), cx));
+        let head = dark.then(|| {
+            dark_card_head(
+                "Subtitle style",
+                None,
+                Some(help_text.into()),
+                Some(self.card_maximized),
+                cx,
+            )
+        });
         let size_picked = self.subtitle_style_field == 0;
         let size_row = div()
             .id("subtitle-size-row")
@@ -2707,7 +2905,9 @@ impl Player {
             .justify_between()
             .px(px(6.))
             .rounded(px(3.))
-            .when(dark && size_picked, |d| d.border_l_2().border_color(rgb(INK1())))
+            .when(dark && size_picked, |d| {
+                d.border_l_2().border_color(rgb(INK1()))
+            })
             .when(!dark, |d| {
                 d.bg(rgb(match size_picked {
                     true => BG_SELECTED(),
@@ -2724,7 +2924,9 @@ impl Player {
                     .flex()
                     .items_center()
                     .gap(px(4.))
-                    .when(dark, |d| d.child(dark_row_value(format!("{:.0}px", self.sub_text))))
+                    .when(dark, |d| {
+                        d.child(dark_row_value(format!("{:.0}px", self.sub_text)))
+                    })
                     .when(!dark, |d| d.child(format!("{:.0}px", self.sub_text)))
                     .children([-1, 1].map(|steps: i32| {
                         let id = ("subtitle-size-step", usize::from(steps > 0));
@@ -2771,7 +2973,9 @@ impl Player {
             .items_center()
             .px(px(6.))
             .rounded(px(3.))
-            .when(dark && default_picked, |d| d.border_l_2().border_color(rgb(INK1())))
+            .when(dark && default_picked, |d| {
+                d.border_l_2().border_color(rgb(INK1()))
+            })
             .when(!dark, |d| {
                 d.bg(rgb(match default_picked {
                     true => BG_SELECTED(),
@@ -2783,7 +2987,9 @@ impl Player {
             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                 this.set_sub_family(None, cx);
             }))
-            .when(dark, |d| d.child(dark_row_label("System default", default_picked)))
+            .when(dark, |d| {
+                d.child(dark_row_label("System default", default_picked))
+            })
             .when(!dark, |d| d.child("System default"));
         let family_rows = self.subtitle_fonts.iter().enumerate().map(|(n, name)| {
             let picked = self.subtitle_style_field == n + 2
@@ -2820,7 +3026,12 @@ impl Player {
                 .justify_center()
                 .items_center()
                 .bg(rgba(SCRIM()))
-                .when(self.card_maximized, |d| d.top(px(crate::ui::stance::maximized_card_top(f32::from(viewport.height), self.split_px(Split::Bench, viewport)))))
+                .when(self.card_maximized, |d| {
+                    d.top(px(crate::ui::stance::maximized_card_top(
+                        f32::from(viewport.height),
+                        self.split_px(Split::Bench, viewport),
+                    )))
+                })
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _: &MouseDownEvent, _, cx| {
@@ -2832,7 +3043,11 @@ impl Player {
                 .child(
                     div()
                         .w_full()
-                        .max_w(px(card_max_w(COLOR_W, self.card_maximized, f32::from(viewport.width))))
+                        .max_w(px(card_max_w(
+                            COLOR_W,
+                            self.card_maximized,
+                            f32::from(viewport.width),
+                        )))
                         .on_mouse_down(MouseButton::Left, swallow)
                         .max_h(px(360. - 24.))
                         .flex()
@@ -2883,12 +3098,24 @@ impl Player {
     /// *about* the timeline -- the marks under it are the whole preview -- so
     /// the bed stays readable and the card sits up in the picture area rather
     /// than over the lanes.
-    pub(crate) fn silence_card(&self, viewport: Size<Pixels>, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+    pub(crate) fn silence_card(
+        &self,
+        viewport: Size<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
         let (lane, idx) = self.silence_open?;
         let dark = self.darkroom;
         let head_meta: SharedString = format!("{} clip {}", lane.label(), idx + 1).into();
         let help_text = "− and + move a setting, or ↑↓ picks one and ←→ moves it (hold to run it) — the marks on the lane are what would go; a click away or esc closes";
-        let head = dark.then(|| dark_card_head("Silences", Some(head_meta.clone()), Some(help_text.into()), Some(self.card_maximized), cx));
+        let head = dark.then(|| {
+            dark_card_head(
+                "Silences",
+                Some(head_meta.clone()),
+                Some(help_text.into()),
+                Some(self.card_maximized),
+                cx,
+            )
+        });
         let cfg = self.silence;
         // The unit is a label, never a conversion: the threshold is a level
         // below full scale whichever of the two the row says (`silence_dbfs`).
@@ -2926,7 +3153,10 @@ impl Player {
         let status = match &self.silence_scan {
             Some(scan) => silence_line(
                 scan.seen as f32 / 10.,
-                scan.progress.total.load(std::sync::atomic::Ordering::Relaxed) as f32 / 10.,
+                scan.progress
+                    .total
+                    .load(std::sync::atomic::Ordering::Relaxed) as f32
+                    / 10.,
                 scan.started.elapsed().as_secs_f32(),
                 scan.since.elapsed().as_secs_f32(),
             ),
@@ -3005,14 +3235,16 @@ impl Player {
                                         .bg(rgb(BG_PANEL()))
                                         .cursor_pointer()
                                         .hover(|s| s.bg(rgb(BG_HOVER())))
-                                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                            // Picked as well as moved: the row a
-                                            // press lands on is the row the arrows
-                                            // carry on from.
-                                            this.silence_field = n;
-                                            this.nudge_silence(steps);
-                                            cx.notify();
-                                        }))
+                                        .on_click(cx.listener(
+                                            move |this, _: &ClickEvent, _, cx| {
+                                                // Picked as well as moved: the row a
+                                                // press lands on is the row the arrows
+                                                // carry on from.
+                                                this.silence_field = n;
+                                                this.nudge_silence(steps);
+                                                cx.notify();
+                                            },
+                                        ))
                                         .child(match steps > 0 {
                                             true => "+",
                                             false => "−",
@@ -3064,7 +3296,12 @@ impl Player {
                 // Light enough to read the lanes and the marks on them through:
                 // the preview is the point of this card.
                 .bg(rgba(SCRIM_LIGHT()))
-                .when(self.card_maximized, |d| d.top(px(crate::ui::stance::maximized_card_top(f32::from(viewport.height), self.split_px(Split::Bench, viewport)))))
+                .when(self.card_maximized, |d| {
+                    d.top(px(crate::ui::stance::maximized_card_top(
+                        f32::from(viewport.height),
+                        self.split_px(Split::Bench, viewport),
+                    )))
+                })
                 // Click away closes it, as on every card here -- and the marks
                 // go with it, which is what makes this one a call and not a flag.
                 .on_mouse_down(
@@ -3078,7 +3315,11 @@ impl Player {
                 .child(
                     div()
                         .w_full()
-                        .max_w(px(card_max_w(COLOR_W, self.card_maximized, f32::from(viewport.width))))
+                        .max_w(px(card_max_w(
+                            COLOR_W,
+                            self.card_maximized,
+                            f32::from(viewport.width),
+                        )))
                         .on_mouse_down(MouseButton::Left, swallow)
                         .flex()
                         .flex_col()

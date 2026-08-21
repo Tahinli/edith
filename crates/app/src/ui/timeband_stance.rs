@@ -4,12 +4,9 @@
 //! the strip; this module owns what fills it, the same split
 //! `dock_stance.rs`/`bench_stance.rs` already make for their regions.
 //!
-//! Type note: DESIGN.md §3 says the hero timecode is 13px; the approved mock
-//! (MOCK-SPEC.md) reads closer to ~20px. Kept at 13px here -- the binding
-//! contract's own number, already what `stance.rs::time_band()` shipped --
-//! rather than silently picking the mock's, and named here per this task's
-//! own instruction to say so when the two disagree. Every size in this
-//! module now comes from `ui::type_scale` (role, not a bare `px()` literal).
+//! Type note: DESIGN.md §3's approved scale gives the hero timecode 18px,
+//! close to the mock's ~20px reading. Every size in this module comes from
+//! `ui::type_scale` (role, not a bare `px()` literal).
 
 use crate::*;
 use crate::ui::type_scale::{self, label, mono};
@@ -28,7 +25,7 @@ thread_local! {
 }
 
 /// A stacked ghost command (DESIGN §4, MOCK-SPEC "Ghost transport"/"spine"):
-/// glyph ~13px `ink2` over its chord ~9.5px `ink3`, read live off the keymap
+/// glyph 18px `ink2` over its chord 13px `ink3`, read live off the keymap
 /// so a rebind can never leave the band showing a stroke that no longer
 /// fires it -- the same shape `stance::ghost` draws for the spine, kept local
 /// here so this module owns its own region end to end.
