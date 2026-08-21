@@ -1968,6 +1968,39 @@ fn settings_project_and_editor_sections_open_disjoint_doors() {
     }
 }
 
+/// D1's own class, pinned per row rather than per section: a row's hint can
+/// claim a `~/.config/edith` default (the section header claims nothing on
+/// its own since [`settings_project_and_editor_sections_open_disjoint_doors`]'s
+/// commit, so a lying section head no longer slips past a reviewer -- but a
+/// lying *row* hint did, on Proxies, because nothing scanned row text at all).
+/// For every row whose own hint text names that file, this requires the
+/// matching `save_*_pref`/`load_*_pref` pair to actually exist in
+/// `player/library.rs` -- the exact gap Proxies shipped with: a hint promising
+/// a default the row's own door never wrote.
+#[test]
+fn settings_row_hints_naming_config_edith_have_a_matching_pref_pair() {
+    let source = src_text("ui/settings_stance.rs");
+    let library = src_text("player/library.rs");
+    // (row id, the stem its pref functions are named after)
+    for (row_id, stem) in [("settings-proxies", "proxies"), ("settings-auto-proxies", "auto_proxies")] {
+        let row_start = source.find(&format!("\"{row_id}\"")).unwrap_or_else(|| panic!("{row_id} row moved or renamed -- update this guard"));
+        let row_end = source[row_start..].find(",\n        ))").map_or(source.len(), |i| row_start + i);
+        let row_text = &source[row_start..row_end];
+        if !row_text.contains("~/.config/edith") {
+            continue;
+        }
+        for prefix in ["save_", "load_"] {
+            let fn_name = format!("{prefix}{stem}_pref");
+            assert!(
+                library.contains(&format!("fn {fn_name}(")),
+                "{row_id}'s hint claims a ~/.config/edith default but \
+                 player/library.rs has no `{fn_name}` -- the hint promises \
+                 storage the row does not have"
+            );
+        }
+    }
+}
+
 /// With no project open, a PROJECT row must not fall back to a bare noun
 /// ("Size"/"Rate"/"HDR") standing in the value slot -- it reads as a value
 /// while carrying none. This binary has no `TestAppContext` to actually
