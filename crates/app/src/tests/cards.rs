@@ -2072,4 +2072,39 @@ fn darkroom_preview_mounts_stop_and_drag_scrub() {
             && preview.contains("this.preview_scrub_to(event.position.x, true, cx)"),
         "the mounted preview scrub no longer starts its drag-and-seek gesture"
     );
+/// Source management must stay reachable in the Darkroom itself: per-row
+/// stand-in control/progress, pointer Add-at-playhead alongside its `↵` chord,
+/// and the three legacy source questions as dock filters. The test reads the
+/// mounted dock source because this binary has no `TestAppContext` to inspect
+/// GPUI's painted controls.
+#[test]
+fn darkroom_source_rows_keep_proxy_add_and_media_audio_text_paths() {
+    let dock = src_text("ui/dock_stance.rs");
+    let row_at = dock.find("fn source_row(").expect("Darkroom source row");
+    let row = &dock[row_at..];
+    for needle in [
+        "dock-proxy-toggle",
+        "toggle_proxy(&proxy_path, proxy_stops, cx)",
+        "proxy_progress.map",
+        "dock-add-at-playhead",
+        "Add at playhead — ↵ does the same",
+        "this.insert_source(",
+    ] {
+        assert!(
+            row.contains(needle),
+            "Darkroom source row lost `{needle}`: a source must keep its proxy control/progress \
+             and mouse-reachable Add-at-playhead path"
+        );
+    }
+    for needle in [
+        "LIBRARY_TABS.map",
+        "dock-source-filter",
+        "player.library_tab.holds(&row.path)",
+        "No subtitle sources yet — Import subtitles",
+    ] {
+        assert!(
+            dock.contains(needle),
+            "Darkroom Sources lost `{needle}`: Media, Audio, and Text must remain distinct paths"
+        );
+    }
 }
