@@ -2031,14 +2031,15 @@ impl PlaybackSession {
     }
 
     /// The empty stretch of `lane` covering `frame`, or `None` when `frame`
-    /// is inside a clip or past the last one ([`Project::gap_at`]). What a
-    /// right-click on empty bench space asks before offering to close it.
+    /// is inside a clip/caption placement or past the last one
+    /// ([`Project::gap_at`]). What a right-click on empty bench space asks
+    /// before offering to close it.
     pub fn gap_at(&self, lane: Lane, frame: u32) -> Option<(u32, u32)> {
         self.project.gap_at(lane, frame)
     }
 
     /// How many bounded gaps that same right-click lane holds. The tail after
-    /// the last clip is not counted, because nothing would ripple there.
+    /// the last placement is not counted, because nothing would ripple there.
     pub fn gap_count(&self, lane: Lane) -> usize {
         self.project.gap_count(lane)
     }
@@ -2459,16 +2460,17 @@ impl PlaybackSession {
     }
 
     /// The lanes closing the gap `(start, frames)` on `lane` must ripple
-    /// together to keep every take crossing it in sync
+    /// together to keep every media take crossing it in sync
     /// ([`Project::gap_take_scope`]) -- what a right-click on empty bench
-    /// space asks before offering to close it.
+    /// space asks before offering to close it. Subtitle gaps stay on their own
+    /// lane because captions are not A/V take halves.
     pub fn gap_take_scope(&self, lane: Lane, start: u32, frames: u32) -> crate::Result<Vec<Lane>> {
         self.project.gap_take_scope(lane, start, frames)
     }
 
-    /// Closes every bounded gap on one lane, keeping each linked take whole when
-    /// its other half has the matching empty stretch and reporting the gaps that
-    /// were not safe to close. One undo step for every gap that closed.
+    /// Closes every bounded gap on one lane. Media lanes keep linked takes
+    /// whole when the other half has the matching empty stretch and report the
+    /// gaps that were not safe to close; subtitle lanes ripple captions only.
     pub fn close_all_gaps_on_lane(&mut self, lane: Lane) -> crate::Result<GapSweep> {
         let report = self.project.close_all_gaps_on_lane(lane)?;
         if report.closed > 0 {
