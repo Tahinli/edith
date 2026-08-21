@@ -2694,6 +2694,28 @@ fn darkroom_bench_wires_transition_controls_and_lane_drop_cue() {
             "the Darkroom clip lost its transition affordance: {needle}"
         );
     }
+    let dissolve = &clip[clip
+        .find(".when(dissolves, |d| {")
+        .expect("the dissolve affordance")
+        ..clip
+            .find(".when(audio && trims(span)")
+            .expect("the fade handles")];
+    assert!(
+        dissolve.contains(".w(px(FADE_HANDLE_W))"),
+        "dissolve click target no longer matches fade-handle width"
+    );
+    assert!(
+        dissolve.contains(".h(px(FADE_HANDLE_H))"),
+        "dissolve click target no longer matches fade-handle height"
+    );
+    assert!(
+        !dissolve.contains("h_full()"),
+        "dissolve click target still covers the clip body"
+    );
+    assert!(
+        !dissolve.contains(".w(px(scale"),
+        "dissolve hit test still tracks transition width"
+    );
 
     let lane = &bench[bench.find("fn lane_row(").expect("the lane renderer")
         ..bench

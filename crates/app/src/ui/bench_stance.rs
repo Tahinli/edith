@@ -506,11 +506,8 @@ fn clip_box(
                     .absolute()
                     .right_0()
                     .top_0()
-                    .h_full()
-                    .w(px(scale
-                        .width_px(f64::from(clip.transition_out) / player.fps)
-                        .min(width)))
-                    .occlude()
+                    .w(px(FADE_HANDLE_W))
+                    .h(px(FADE_HANDLE_H))
                     .cursor_pointer()
                     .tooltip(move |_, cx| cx.new(|_| Tip(dissolve_tip.clone())).into())
                     .on_click(cx.listener(move |this, _, _, cx| {
