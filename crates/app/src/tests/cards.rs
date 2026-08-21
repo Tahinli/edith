@@ -2043,3 +2043,33 @@ fn a_maximized_card_reopens_exactly_as_left_across_a_restart() {
     unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Source preview must retain the mouse doors beside its `esc` stop chord:
+/// `screen` routes the Darkroom through `picture_area`, and that shared
+/// picture mounts the scrub bar whose press starts the root-tracked drag.
+#[test]
+fn darkroom_preview_mounts_stop_and_drag_scrub() {
+    let stance = src_text("ui/stance.rs");
+    let screen = &stance[stance.find("fn screen(").expect("the Darkroom screen")..];
+    assert!(
+        screen.contains(".children(player.preview_plate(cx))"),
+        "the Darkroom screen no longer mounts the preview Stop plate"
+    );
+    assert!(
+        screen.contains(".child(player.picture_area(position, window, cx))"),
+        "the Darkroom screen no longer routes through the shared picture"
+    );
+
+    let picture = fn_body("picture_area");
+    assert!(
+        picture.contains(".children(self.preview_scrub_bar(cx))"),
+        "the shared Darkroom picture no longer mounts the preview scrub bar"
+    );
+
+    let preview = src_text("ui/preview.rs");
+    assert!(
+        preview.contains("this.preview_scrubbing = true")
+            && preview.contains("this.preview_scrub_to(event.position.x, true, cx)"),
+        "the mounted preview scrub no longer starts its drag-and-seek gesture"
+    );
+}
