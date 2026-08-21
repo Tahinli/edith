@@ -37,20 +37,15 @@ pub const SPLINE_SANS_MONO: &str = "Spline Sans Mono";
 
 /// DESIGN §3's scale, named so a call site reads the role, not a number.
 ///
-/// Landed at a conservative +2px bump over the original half-pixel scale
-/// (13/10.5/10-9.5/9/8 -> 15/13/12-11/10/9), chosen over a fuller
-/// "readable at arm's length" candidate (18/15/14-13/12/10) to keep the
-/// fixed-width dock/bench card labels clear of the truncation ladder
-/// (DESIGN §7). To try the fuller scale, swap these six values for
-/// 18./15./14./13./12./10. and update `the_scale_matches_design_3` (and
-/// DESIGN.md §3) to match.
-pub const HERO_TIMECODE_PX: f32 = 15.;
-pub const LABEL_ROW_PX: f32 = 13.;
-pub const CHORD_METADATA_MAX_PX: f32 = 12.;
-pub const CHORD_METADATA_MIN_PX: f32 = 11.;
-pub const SECTION_HEAD_PX: f32 = 10.;
+/// The approved readable-at-arm's-length scale. Each role is a whole pixel:
+/// fractional baselines blur cosmic-text's greyscale AA.
+pub const HERO_TIMECODE_PX: f32 = 18.;
+pub const LABEL_ROW_PX: f32 = 15.;
+pub const CHORD_METADATA_MAX_PX: f32 = 14.;
+pub const CHORD_METADATA_MIN_PX: f32 = 13.;
+pub const SECTION_HEAD_PX: f32 = 12.;
 /// The floor DESIGN §3 sets: nothing in the room reads smaller than this.
-pub const FLOOR_PX: f32 = 9.;
+pub const FLOOR_PX: f32 = 10.;
 
 /// A family, weight and size together -- what a call site needs to paint
 /// text with `.font(style.font).text_size(style.size)`, and nothing it has
@@ -90,7 +85,10 @@ impl WithWeight for Font {
 /// Archivo, at the given size and weight -- labels, verbs, section heads.
 /// No italics anywhere in the room (DESIGN §3), so this never offers one.
 pub fn label(size_px: f32, weight: FontWeight) -> TypeStyle {
-    debug_assert!(size_px >= FLOOR_PX, "below DESIGN §3's 8px floor: {size_px}");
+    debug_assert!(
+        size_px >= FLOOR_PX,
+        "below DESIGN §3's 10px floor: {size_px}"
+    );
     TypeStyle {
         font: family_font(ARCHIVO, weight, false),
         size: px(size_px),
@@ -100,14 +98,17 @@ pub fn label(size_px: f32, weight: FontWeight) -> TypeStyle {
 /// Spline Sans Mono, at the given size and weight, tabular figures on --
 /// everything the film says.
 pub fn mono(size_px: f32, weight: FontWeight) -> TypeStyle {
-    debug_assert!(size_px >= FLOOR_PX, "below DESIGN §3's 8px floor: {size_px}");
+    debug_assert!(
+        size_px >= FLOOR_PX,
+        "below DESIGN §3's 10px floor: {size_px}"
+    );
     TypeStyle {
         font: family_font(SPLINE_SANS_MONO, weight, true),
         size: px(size_px),
     }
 }
 
-/// A 9px Archivo 700 section head, `ink3`. The caller still has to uppercase
+/// A 12px Archivo 700 section head, `ink3`. The caller still has to uppercase
 /// its own text (`.to_uppercase()`) and paint `ink3` -- this module only
 /// owns type, not colour, and stays out of `ui::theme`'s door.
 ///
@@ -122,7 +123,7 @@ pub fn head() -> TypeStyle {
 }
 
 /// Applies a [`TypeStyle`] to any styled element in one call --
-/// `div().type_style(mono(9.5, FontWeight::MEDIUM))` instead of the
+/// `div().type_style(mono(CHORD_METADATA_MIN_PX, FontWeight::MEDIUM))` instead of the
 /// `.font(style.font).text_size(style.size)` pair spelled out at every call
 /// site. Blanket-implemented over `Styled` so every element in the room gets
 /// it for free.
@@ -168,8 +169,10 @@ const EMBEDDED: &[(&[u8], &str)] = &[
 /// runtime one -- these bytes are fixed at compile time -- so it panics
 /// rather than falling silently back to a system face DESIGN §3 forbids.
 pub fn register(cx: &App) {
-    let fonts: Vec<Cow<'static, [u8]>> =
-        EMBEDDED.iter().map(|(bytes, _)| Cow::Borrowed(*bytes)).collect();
+    let fonts: Vec<Cow<'static, [u8]>> = EMBEDDED
+        .iter()
+        .map(|(bytes, _)| Cow::Borrowed(*bytes))
+        .collect();
     cx.text_system()
         .add_fonts(fonts)
         .expect("bundled Archivo / Spline Sans Mono TTFs failed to register");
@@ -181,7 +184,7 @@ mod tests {
     use gpui::FontStyle;
 
     /// The scale never drifts below DESIGN §3's floor, and role sizes match
-    /// the numbers §3 names -- a call site changing `15.` to `14.` for the
+    /// the numbers §3 names -- a call site changing `18.` to `17.` for the
     /// hero timecode is the design contract silently moving.
     ///
     /// Sizes are all whole pixels (raised from the original 13/10.5/9.5-10/9/8
@@ -192,11 +195,12 @@ mod tests {
     /// back into this scale.
     #[test]
     fn the_scale_matches_design_3() {
-        assert_eq!(HERO_TIMECODE_PX, 15.);
-        assert_eq!(LABEL_ROW_PX, 13.);
-        assert!((11. ..=12.).contains(&CHORD_METADATA_MIN_PX));
-        assert_eq!(SECTION_HEAD_PX, 10.);
-        assert_eq!(FLOOR_PX, 9.);
+        assert_eq!(HERO_TIMECODE_PX, 18.);
+        assert_eq!(LABEL_ROW_PX, 15.);
+        assert_eq!(CHORD_METADATA_MAX_PX, 14.);
+        assert_eq!(CHORD_METADATA_MIN_PX, 13.);
+        assert_eq!(SECTION_HEAD_PX, 12.);
+        assert_eq!(FLOOR_PX, 10.);
         for size in [
             HERO_TIMECODE_PX,
             LABEL_ROW_PX,

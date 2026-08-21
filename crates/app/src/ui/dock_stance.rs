@@ -11,8 +11,8 @@
 //! still supply the row facts ([`library_rows`], [`source_tint`],
 //! [`clip_middle`]...), only the anatomy around them is new.
 
-use crate::*;
 use crate::ui::type_scale::{self, head, label, mono};
+use crate::*;
 use gpui::FontWeight;
 
 /// Where the dock tab pick lives: one word beside the theme and the
@@ -79,7 +79,12 @@ pub(crate) enum DockSort {
 }
 
 impl DockSort {
-    const ALL: [DockSort; 4] = [DockSort::Recent, DockSort::Name, DockSort::Usage, DockSort::Unused];
+    const ALL: [DockSort; 4] = [
+        DockSort::Recent,
+        DockSort::Name,
+        DockSort::Usage,
+        DockSort::Unused,
+    ];
     fn label(self) -> &'static str {
         match self {
             DockSort::Recent => "Recent",
@@ -156,7 +161,12 @@ fn ghost_verb(
 /// DESIGN §11's frequency check puts a lift and a mark far ahead of a tab
 /// switch -- wearing a chord this room does not answer to would be exactly
 /// the lie DESIGN §4 forbids, so the letters go instead.
-fn dock_tab(id: &'static str, label_text: &'static str, active: bool, cx: &mut Context<Player>) -> impl IntoElement {
+fn dock_tab(
+    id: &'static str,
+    label_text: &'static str,
+    active: bool,
+    cx: &mut Context<Player>,
+) -> impl IntoElement {
     let style = label(type_scale::LABEL_ROW_PX, FontWeight::MEDIUM);
     div()
         .id(id)
@@ -183,7 +193,7 @@ fn dock_tab(id: &'static str, label_text: &'static str, active: bool, cx: &mut C
         )
 }
 
-/// A 9px uppercase Archivo section head, `ink3` (DESIGN §3).
+/// A 12px uppercase Archivo section head, `ink3` (DESIGN §3).
 fn section_head(text: impl Into<SharedString>) -> impl IntoElement {
     let style = head();
     div()
@@ -206,11 +216,20 @@ fn usage_line(player: &Player, source_idx: usize, placed: usize) -> String {
         session
             .lanes()
             .into_iter()
-            .filter(|lane| session.lane_clips(*lane).iter().any(|c| c.source == source_idx))
+            .filter(|lane| {
+                session
+                    .lane_clips(*lane)
+                    .iter()
+                    .any(|c| c.source == source_idx)
+            })
             .map(Lane::label)
             .collect()
     });
-    format!("{} · {placed} use{}", lanes.join(" "), if placed == 1 { "" } else { "s" })
+    format!(
+        "{} · {placed} use{}",
+        lanes.join(" "),
+        if placed == 1 { "" } else { "s" }
+    )
 }
 
 /// One source row, two lines (MOCK-SPEC "Dock" §4): an ink dot, the name in
@@ -220,12 +239,22 @@ fn usage_line(player: &Player, source_idx: usize, placed: usize) -> String {
 /// 2, wired in `render.rs`'s key handler since a row takes no keyboard focus
 /// of its own), double-click (gesture 3) and right-click the dot (gesture 4)
 /// all live here.
-fn source_row(player: &Player, i: usize, row: &Row, placed: usize, picked: bool, cx: &mut Context<Player>) -> impl IntoElement {
+fn source_row(
+    player: &Player,
+    i: usize,
+    row: &Row,
+    placed: usize,
+    picked: bool,
+    cx: &mut Context<Player>,
+) -> impl IntoElement {
     let usable = row.unusable.is_none();
     let name: SharedString = row.name.clone().into();
     let under: String = match &row.unusable {
         Some(why) => why.clone(),
-        None => join_detail(&row.detail, &timecode(f64::from(row.frames) / player.fps, player.fps)),
+        None => join_detail(
+            &row.detail,
+            &timecode(f64::from(row.frames) / player.fps, player.fps),
+        ),
     };
     let usage = usage_line(player, row.tint, placed);
     let (path, stream) = (row.path.clone(), row.stream);
@@ -354,11 +383,23 @@ fn source_row(player: &Player, i: usize, row: &Row, placed: usize, picked: bool,
 /// Media/Audio/Text panel `library.rs` draws. That panel's row facts
 /// ([`library_rows`]) are still what every row here is built from.
 fn sources_tab(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
-    let sources = player.session.as_ref().map_or(&[][..], PlaybackSession::sources);
+    let sources = player
+        .session
+        .as_ref()
+        .map_or(&[][..], PlaybackSession::sources);
     let meta = player.session.as_ref().map(PlaybackSession::meta);
-    let all_rows: Vec<Row> = library_rows(sources, &player.streams, &player.decoders, player.timeline_audio(), |path| {
-        player.session.as_ref().map_or(0, |session| session.file_frames(path))
-    });
+    let all_rows: Vec<Row> = library_rows(
+        sources,
+        &player.streams,
+        &player.decoders,
+        player.timeline_audio(),
+        |path| {
+            player
+                .session
+                .as_ref()
+                .map_or(0, |session| session.file_frames(path))
+        },
+    );
     let _ = meta;
     let unused_count = all_rows
         .iter()
@@ -380,7 +421,9 @@ fn sources_tab(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
         .collect();
     match player.dock_sort {
         DockSort::Recent => {}
-        DockSort::Name => rows.sort_by(|(a, _), (b, _)| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
+        DockSort::Name => {
+            rows.sort_by(|(a, _), (b, _)| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        }
         DockSort::Usage => rows.sort_by(|(_, a), (_, b)| b.cmp(a)),
         DockSort::Unused => rows.sort_by_key(|(_, placed)| *placed > 0),
     }
@@ -395,7 +438,9 @@ fn sources_tab(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
         .gap(px(6.))
         .p(px(8.))
         .overflow_y_scroll()
-        .child(section_head(format!("SOURCES · {total} · {unused_count} UNUSED")))
+        .child(section_head(format!(
+            "SOURCES · {total} · {unused_count} UNUSED"
+        )))
         .child({
             let style = mono(type_scale::CHORD_METADATA_MAX_PX, FontWeight::MEDIUM);
             div()
@@ -404,7 +449,11 @@ fn sources_tab(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
                 .cursor_text()
                 .font(style.font)
                 .text_size(style.size)
-                .text_color(rgb(if player.dock_filter_edit { INK1() } else { INK3() }))
+                .text_color(rgb(if player.dock_filter_edit {
+                    INK1()
+                } else {
+                    INK3()
+                }))
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                     this.dock_filter_edit = true;
                     cx.notify();
@@ -421,7 +470,7 @@ fn sources_tab(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
                 .gap(px(4.))
                 .children(DockSort::ALL.map(|sort| {
                     let on = sort == player.dock_sort;
-                    let style = label(9.5, FontWeight::MEDIUM);
+                    let style = label(type_scale::FLOOR_PX, FontWeight::MEDIUM);
                     div()
                         .id(("dock-sort", sort as usize))
                         .flex_none()
@@ -458,7 +507,8 @@ fn sources_tab(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
                             .text_size(style.size)
                             .text_color(rgb(INK3()))
                             .child(match player.dock_filter.is_empty() {
-                                true => "No sources yet — Add files, or drop one on the window".to_string(),
+                                true => "No sources yet — Add files, or drop one on the window"
+                                    .to_string(),
                                 false => "nothing matches the filter".to_string(),
                             }),
                     )
@@ -468,7 +518,10 @@ fn sources_tab(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
                         .iter()
                         .enumerate()
                         .map(|(i, (row, placed))| {
-                            let picked = player.selected_asset.as_ref().is_some_and(|p| *p == (row.path.clone(), row.stream));
+                            let picked = player
+                                .selected_asset
+                                .as_ref()
+                                .is_some_and(|p| *p == (row.path.clone(), row.stream));
                             source_row(player, i, row, *placed, picked, cx).into_any_element()
                         })
                         .collect();
@@ -501,11 +554,9 @@ fn sources_tab(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
                 )),
         )
         .child({
-            // FAULT 2: metadata, not a row -- DESIGN §3's 9.5-10px band via
-            // the named constant (a bespoke 9px literal was neither the
-            // metadata size nor any other named role), and the quietest text
-            // in the dock: ink3, tight leading so it never competes with the
-            // 10.5px source rows above it.
+            // Metadata, not a row: DESIGN §3's metadata role, and the quietest
+            // text in the dock: ink3, tight leading so it never competes with
+            // the source rows above it.
             let style = mono(type_scale::CHORD_METADATA_MIN_PX, FontWeight::MEDIUM);
             div()
                 .flex_none()
@@ -524,7 +575,12 @@ fn sources_tab(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
 /// these onto. Drag-while-playing and every other gesture on a row is
 /// whatever that card already does; nothing about the gesture is reimplemented
 /// here.
-fn clip_tab(player: &Player, width: f32, window_size: Size<Pixels>, cx: &mut Context<Player>) -> impl IntoElement {
+fn clip_tab(
+    player: &Player,
+    width: f32,
+    window_size: Size<Pixels>,
+    cx: &mut Context<Player>,
+) -> impl IntoElement {
     // The room actually given here, not the window's: `eq_card_w`/
     // `card_max_w` are asked "how wide may I draw" and answered with the
     // *whole viewport's* width when handed `window_size` verbatim -- but this
@@ -699,7 +755,12 @@ fn clip_tab(player: &Player, width: f32, window_size: Size<Pixels>, cx: &mut Con
 /// pair). What degrades *inside* fixed width is the two tabs' own content:
 /// Sources scrolls its own row list; Clip's param rows are whatever their
 /// card already draws at this width.
-pub(crate) fn render(player: &Player, width: f32, window_size: Size<Pixels>, cx: &mut Context<Player>) -> impl IntoElement {
+pub(crate) fn render(
+    player: &Player,
+    width: f32,
+    window_size: Size<Pixels>,
+    cx: &mut Context<Player>,
+) -> impl IntoElement {
     let src_active = player.dock_src_active;
     div()
         .id("stance-dock-body")
