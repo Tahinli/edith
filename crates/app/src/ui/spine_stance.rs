@@ -4,6 +4,7 @@
 //! drew. `stance.rs::spine()` keeps the panel frame (width, surface,
 //! border); this module owns the rows inside it.
 
+use crate::ui::hitmap;
 use crate::ui::type_scale::{self, Typeset};
 use crate::*;
 
@@ -81,6 +82,7 @@ fn glyph(
                     }),
                 )
         })
+        .children(hitmap::action(action, on))
         .child(
             div()
                 .line_height(relative(1.05))
@@ -141,6 +143,7 @@ fn trim_control(active: bool, player: &Player, cx: &mut Context<Player>) -> impl
                         this.act(action, window, cx)
                     }))
             })
+            .children(hitmap::action(action, on))
             .child(
                 div()
                     .line_height(relative(1.05))

@@ -2660,6 +2660,12 @@ fn every_action_has_a_darkroom_widget_home_or_explicit_owner() {
         let mentioned = darkroom.contains(&format!("ActionId::{name}"))
             || (action == ActionId::Resolution && darkroom.contains("Pick::Resolution"))
             || (action == ActionId::SubtitleStyle && darkroom.contains("open_subtitle_style(cx)"));
+        let hitmap_id = crate::ui::hitmap::action_id(action);
+        assert_eq!(
+            hitmap_id,
+            format!("action.{name}"),
+            "ActionId::{name} has a Darkroom widget home but no stable hitmap id"
+        );
         assert!(
             mentioned,
             "ActionId::{name} is bound to a chord but has no visible affordance \

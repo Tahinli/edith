@@ -32,6 +32,7 @@
 //! since nothing in [`engine::project::Project`] holds a place to persist an
 //! override into.
 
+use crate::ui::hitmap;
 use crate::ui::type_scale;
 use crate::*;
 use engine::colorspace::ContentLight;
@@ -147,6 +148,7 @@ fn row_full(
                 .hover(|s| s.bg(rgb(DARK_RAISED())))
                 .on_click(on_click)
         })
+        .children(hitmap::control(id, label_text, !exporting))
         .child(
             div()
                 .font(label_style.font)

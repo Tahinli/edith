@@ -1,5 +1,6 @@
 //! The property cards -- docked into the inspector, or floated when modal.
 
+use crate::ui::hitmap;
 use crate::ui::type_scale::{self, Typeset};
 use crate::ui::widgets::*;
 use crate::*;
@@ -121,6 +122,7 @@ fn dark_card_head(
                     .into()
                 })
                 .child(if max { "▣ m" } else { "⤢ m" })
+                .children(hitmap::control("card.maximize", "Toggle card size", true))
         }))
         .child(
             div()
@@ -179,8 +181,21 @@ fn dark_step_glyph(
     plus: bool,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
+    let id = id.into();
+    let hitmap = hitmap::enabled().then(|| {
+        let id = id.to_string();
+        hitmap::dynamic(
+            move || {
+                (
+                    format!("card.{id}"),
+                    if plus { "Increase" } else { "Decrease" }.into(),
+                )
+            },
+            true,
+        )
+    });
     div()
-        .id(id.into())
+        .id(id)
         .flex_none()
         .w(px(HIT_MIN))
         .h(px(KEYS_ROW_H))
@@ -191,6 +206,7 @@ fn dark_step_glyph(
         .cursor_pointer()
         .hover(|s| s.bg(rgb(DARK_RAISED())))
         .on_click(on_click)
+        .children(hitmap.flatten())
         .child(dark_row_value(if plus { "+" } else { "−" }))
 }
 
@@ -201,8 +217,15 @@ fn dark_ghost_button(
     active: bool,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
+    let id = id.into();
+    let text: SharedString = text.into();
+    let hitmap = hitmap::enabled().then(|| {
+        let id = id.to_string();
+        let label = text.clone();
+        hitmap::dynamic(move || (format!("card.{id}"), label.to_string()), true)
+    });
     div()
-        .id(id.into())
+        .id(id)
         .flex_1()
         .flex()
         .h(px(CONTROL_H))
@@ -214,6 +237,7 @@ fn dark_ghost_button(
         .cursor_pointer()
         .hover(|s| s.bg(rgb(DARK_RAISED())))
         .on_click(on_click)
+        .children(hitmap.flatten())
         .child(
             div()
                 .type_style(type_scale::label(
@@ -221,7 +245,7 @@ fn dark_ghost_button(
                     gpui::FontWeight::MEDIUM,
                 ))
                 .text_color(rgb(if active { INK1() } else { INK2() }))
-                .child(text.into()),
+                .child(text),
         )
         .when(!chord.is_empty(), |d| {
             d.child(
