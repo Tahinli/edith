@@ -58,3 +58,38 @@ pub(crate) fn audio_notice(session: &PlaybackSession) -> Option<String> {
         .audio_disabled_reason()
         .map(|reason| format!(" — NO AUDIO: {reason}"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The class this guards: a notice queued behind an earlier, undismissed
+    /// one is never *lost* -- `push_notice` still appends it to the back --
+    /// but a reader of `front()` alone (what `stance::notice_plate` read
+    /// before this fix) would never see it, because nothing but a keystroke
+    /// ever calls `dismiss_notice`, and most of what fills this queue (a
+    /// click on a gap, a menu row, a drag) is not one. `back()` is the read
+    /// that survives that: it always names the newest message, which is why
+    /// the plate and the ledger's "last action" both read it now.
+    ///
+    /// This is a value-level check on the queue only -- this binary has no
+    /// `TestAppContext`, so it cannot measure what actually painted, and this
+    /// test does not claim to.
+    #[test]
+    fn a_notice_queued_behind_an_unread_one_is_still_reachable_at_the_back() {
+        let mut notices = std::collections::VecDeque::new();
+        push_notice(&mut notices, "SAVED test_h264.edith".into());
+        let refusal = "the V1 clip at frame 0 is one take with the A1 clip at frame 0: \
+                        closing this gap alone would pull the take out of sync — close A1's \
+                        gap there too, or detach them first";
+        push_notice(&mut notices, refusal.into());
+        // Nobody dismissed the SAVED notice (no keystroke happened) -- it is
+        // still sitting at the front, exactly the scenario that froze the
+        // plate on stale text.
+        assert_eq!(notices.front().unwrap().as_ref(), "SAVED test_h264.edith");
+        // The refusal, remedy clause and all, is reachable at the back --
+        // whole, not truncated, because `push_notice` never touches a
+        // message's text.
+        assert_eq!(notices.back().unwrap().as_ref(), refusal);
+    }
+}
