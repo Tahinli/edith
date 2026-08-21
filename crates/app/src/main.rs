@@ -576,6 +576,13 @@ struct Player {
     /// the card is modal: while it is up nothing else can move an index, and
     /// the one edit it makes (`set_eq`) moves none.
     eq_open: Option<(Lane, usize)>,
+    /// Whichever of the seven param cards is open, filling the room in place
+    /// of the bench/ledger rows instead of its usual capped, floating size
+    /// (`Player::toggle_maximize`). One flag, not one per card, because only
+    /// one of them is ever open at a time (`close_card`'s own rule) and it
+    /// outlives any one card's close/reopen, persisted like the dock tab pick
+    /// (`ui::dock_stance::load_maximized`/`save_maximized`).
+    card_maximized: bool,
     /// The curve the card is showing, which is the clip's own or the flat
     /// five-band default. Edited live and written at the clip once per gesture
     /// ([`Player::commit_eq`]): the project's equalizer table is append-only, so
@@ -967,6 +974,7 @@ fn main() {
                     export_refusals_inline: false,
                     export_advanced_open: false,
                     eq_open: None,
+                    card_maximized: ui::dock_stance::load_maximized(),
                     // Replaced by the clip's own curve the moment the card
                     // opens; nothing reads it before that.
                     eq_params: EqParams::default(),
