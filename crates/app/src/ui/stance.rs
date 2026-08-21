@@ -64,6 +64,27 @@ pub(crate) fn below_picture_floor(viewport_h: f32, bench_h: f32) -> f32 {
     (viewport_h - TIME_BAND_H - bench_h - LEDGER_H).max(0.)
 }
 
+/// The maximized inspector card's own top -- deliberately *not*
+/// [`below_picture_floor`] fed the live bench straight through, the way
+/// `menu_floor` above correctly does for a menu. A maximized card is anchored
+/// to the same floor and grows downward to the window's own bottom edge, so
+/// its height is `viewport_h - floor` -- exactly the bench/ledger footprint,
+/// `TIME_BAND_H + bench_h + LEDGER_H`. Feeding the *live* bench in there means
+/// a hand-dragged bench smaller than [`BENCH_H`] starves the maximized card of
+/// room: driven at `bench=BENCH_MIN_H` the card shrank to 210px and its curve
+/// and band handles stopped rendering at all, while the same card *docked*
+/// (whose height was never bench-shaped to begin with) still drew everything
+/// -- maximize made the card strictly worse, backwards from what the feature
+/// promises. Floored at [`BENCH_H`], the bench's own untouched default, the
+/// maximized card is never smaller than it is at the bench nobody has
+/// dragged; a bench pulled *larger* than that still grows the card further,
+/// same as before, and the case actually verified good (card top exactly on
+/// the picture floor, picture unobstructed) is untouched because it ran at a
+/// bench already at or above this floor.
+pub(crate) fn maximized_card_top(viewport_h: f32, bench_h: f32) -> f32 {
+    below_picture_floor(viewport_h, bench_h.max(BENCH_H))
+}
+
 /// The floor-clamped placement for every scrolling menu (clip context menu,
 /// picker, library menu): the anchor pulled down to [`below_picture_floor`]
 /// *and* the room its list may fill capped to what is actually left between
@@ -116,6 +137,48 @@ mod menu_floor_tests {
         assert!(list_h <= f32::from(room.height));
         let (_, y) = crate::oracle::menu_at(at, viewport, list_h);
         assert_eq!(y, floor, "the top edge must not be walked back above the floor");
+    }
+}
+
+#[cfg(test)]
+mod maximized_card_top_tests {
+    use super::*;
+
+    /// The regression D1 shipped as: the old call site fed the *live* bench
+    /// straight into `below_picture_floor`, so a bench dragged down to
+    /// `crate::BENCH_MIN_H` (a legal value -- `layout::split_size` clamps
+    /// anything smaller up to it) gave the maximized card *less* room than
+    /// docked, not more. This binary has no `TestAppContext`, so it cannot
+    /// read back a painted rect the way a driven screenshot can -- this is a
+    /// value-level check of the two formulas the maximize feature is built
+    /// on, not a substitute for driving the app at the smallest bench. Swept
+    /// across the *whole* legal bench range (the earlier guard this replaces
+    /// checked only the untouched default, which is exactly why a small,
+    /// legal bench slipped through), maximized room must never fall below the
+    /// room at the bench nobody has dragged, and must never be smaller than
+    /// what the same live bench leaves for `below_picture_floor`'s own live
+    /// use (menu placement) -- the two must not tangle back together.
+    #[test]
+    fn maximized_room_never_shrinks_below_the_default_bench_across_every_legal_bench_height() {
+        let viewport = size(px(1280.), px(720.));
+        let v = f32::from(viewport.height);
+        let default_room = v - below_picture_floor(v, BENCH_H);
+        let mut bench_h = crate::BENCH_MIN_H;
+        while bench_h <= 600. {
+            let room = v - maximized_card_top(v, bench_h);
+            assert!(
+                room >= default_room,
+                "bench={bench_h}: maximized room {room} fell below the default-bench \
+                 room {default_room}"
+            );
+            // Still strictly bigger than a bare `below_picture_floor` room
+            // would ever have given it below `BENCH_H` -- the coupling this
+            // fix breaks.
+            if bench_h < BENCH_H {
+                assert!(room > v - below_picture_floor(v, bench_h));
+            }
+            bench_h += 25.;
+        }
     }
 }
 
@@ -613,8 +676,10 @@ fn ledger(player: &Player, position: f64) -> impl IntoElement {
 /// tab row and both tabs' content (DESIGN §12 step 4).
 /// Width comes from [`Player::split_px`] now, not the fixed [`DOCK_W`]: the
 /// seam [`crate::ui::stance::render`] mounts to its left is what answers
-/// "ui fields are not stretchable" for the dock.
-fn dock(player: &Player, dock_w: f32, window_h: Pixels, cx: &mut Context<Player>) -> impl IntoElement {
+/// "ui fields are not stretchable" for the dock. `window_size` is threaded
+/// through so the maximize-in-place cards inside the dock (`dock_stance.rs`)
+/// see the real viewport rather than a fabricated `size(px(DOCK_W), h)`.
+fn dock(player: &Player, dock_w: f32, window_size: Size<Pixels>, cx: &mut Context<Player>) -> impl IntoElement {
     div()
         .id("stance-dock")
         .flex_none()
@@ -625,7 +690,7 @@ fn dock(player: &Player, dock_w: f32, window_h: Pixels, cx: &mut Context<Player>
         .border_color(rgba(DARK_SEAM()))
         .flex()
         .flex_col()
-        .child(dock_stance::render(player, dock_w, window_h, cx))
+        .child(dock_stance::render(player, dock_w, window_size, cx))
 }
 
 /// A zero-size element whose only job is `window.on_mouse_event`'s door:
@@ -662,7 +727,6 @@ pub(crate) fn render(
     cx: &mut Context<Player>,
 ) -> impl IntoElement {
     let window_size = window.viewport_size();
-    let window_h = window_size.height;
     let position = player.playhead(player.drawn_duration());
     // The two seams a hand may drag (`Split::Dock`, `Split::Bench`): read
     // through the same door every legacy region measures itself by
@@ -882,8 +946,29 @@ pub(crate) fn render(
                 // what draws it once open.
                 .children(player.export_card(window_size, cx))
                 .children(player.export_progress_card(cx))
-                .children(player.picker_card(window_size, cx)),
+                .children(player.picker_card(window_size, cx))
+                // A maximized clip param card (EQ/Colour/Transform/Speed/
+                // Silence/Mix/Subtitle style) escapes the dock to mount here
+                // instead, the same window-space `stance-centre` context
+                // every card above already renders in -- `below_picture_floor`
+                // is a window coordinate, and `dock_stance.rs`'s
+                // "dock-clip-rows" is a ~280-390px strip whose own box is the
+                // containing block for anything absolutely positioned inside
+                // it, `.relative()` or not, so a card asking for the room
+                // below the picture cannot get it there. Un-maximized, the
+                // same seven functions stay mounted in the dock
+                // (`dock_stance::clip_tab`'s own `.when(!card_maximized, ...)`
+                // guard keeps this from ever double-mounting one).
+                .when(player.card_maximized, |el| {
+                    el.children(player.eq_card(window_size, cx))
+                        .children(player.color_card(window_size, cx))
+                        .children(player.transform_card(window_size, cx))
+                        .children(player.speed_card(window_size, cx))
+                        .children(player.silence_card(window_size, cx))
+                        .children(player.mix_card(window_size, cx))
+                        .children(player.subtitle_style_card(window_size, cx))
+                }),
         )
         .child(divider(Split::Dock, cx))
-        .child(dock(player, dock_w, window_h, cx))
+        .child(dock(player, dock_w, window_size, cx))
 }
