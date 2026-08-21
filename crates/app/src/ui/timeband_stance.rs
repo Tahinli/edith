@@ -169,6 +169,26 @@ fn cut_readout(player: &Player) -> impl IntoElement {
                 .child("roll"),
         )
 }
+/// Export-range marks belong beside the cut readout they constrain (DESIGN §9):
+/// each is a direct mouse door to the same action its chord asks for.
+fn range_marks(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
+    div()
+        .id("stance-range-marks")
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap(px(4.))
+        .child(ghost("stance-mark-in", player, "I", ActionId::SetIn, false, cx))
+        .child(ghost("stance-mark-out", player, "O", ActionId::SetOut, false, cx))
+        .child(ghost(
+            "stance-clear-range",
+            player,
+            "×",
+            ActionId::ClearRange,
+            false,
+            cx,
+        ))
+}
 
 /// The contact strip (MOCK-SPEC "Contact strip"): the whole-film minimap
 /// filling the band's remaining width, with a 1px viewport bracket marking
@@ -532,6 +552,54 @@ pub(crate) fn render(player: &mut Player, position: f64, cx: &mut Context<Player
                     false,
                     cx,
                 ))
+                .child(ghost(
+                    "stance-tb-step-back",
+                    player,
+                    "◀",
+                    ActionId::StepBack,
+                    false,
+                    cx,
+                ))
+                .child(ghost(
+                    "stance-tb-step-forward",
+                    player,
+                    "▶",
+                    ActionId::StepForward,
+                    false,
+                    cx,
+                ))
+                .child(ghost(
+                    "stance-tb-start",
+                    player,
+                    "↤",
+                    ActionId::GoStart,
+                    false,
+                    cx,
+                ))
+                .child(ghost(
+                    "stance-tb-end",
+                    player,
+                    "↦",
+                    ActionId::GoEnd,
+                    false,
+                    cx,
+                ))
+                .child(ghost(
+                    "stance-tb-sync-prev",
+                    player,
+                    "‹|",
+                    ActionId::PrevSyncPoint,
+                    false,
+                    cx,
+                ))
+                .child(ghost(
+                    "stance-tb-sync-next",
+                    player,
+                    "|›",
+                    ActionId::NextSyncPoint,
+                    false,
+                    cx,
+                ))
                 // Loop (homeless per this task's audit): the playback-loop
                 // toggle -- burst-use during editing per the charter's own
                 // classification -- earns the transport cluster it plays
@@ -578,6 +646,7 @@ pub(crate) fn render(player: &mut Player, position: f64, cx: &mut Context<Player
                 ))
                 .child(ghost("stance-tb-vol-up", player, "+", ActionId::VolumeUp, false, cx)),
         )
+        .child(range_marks(player, cx))
         .child(cut_readout(player))
         .child(contact_strip(player, position, cx))
         .child(save_verb(player, cx))
