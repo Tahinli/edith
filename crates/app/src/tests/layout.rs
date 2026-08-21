@@ -2272,3 +2272,77 @@ fn settings_project_rows_have_no_bare_noun_placeholder() {
         );
     }
 }
+
+/// The parity class this user has reported four separate times: "some
+/// options are only reachable via keyboard shortcut". A source scan (this
+/// binary has no `TestAppContext` to click through) over every darkroom
+/// surface -- the spine, the dock, the bench/timeband transport, the
+/// settings page, the maximized cards and the clip context menu
+/// (`menus.rs`'s `MENU_ITEMS`, rendered mouse-and-chord-visible by
+/// `overlays.rs`) -- for a literal `ActionId::<variant>` mention. An
+/// [`ActionId`] reachable by chord ([`Keymap::defaults`]) but absent from
+/// every one of those texts has no mouse door into the darkroom at all,
+/// which is exactly this bug's shape (`Fit` and `Redo` shipped that way
+/// until this commit).
+///
+/// [`ActionId::Resolution`] and [`ActionId::SubtitleStyle`] are the two
+/// deliberate exceptions: their settings-page rows open them through
+/// `Pick::Resolution` and `open_subtitle_style(cx)` respectively, never
+/// spelling the action name itself, so each is matched on its own door
+/// string instead.
+///
+/// [`ALLOWED_CHORD_ONLY`] is the honest remainder: fine-grained playhead/edit
+/// strokes with no button in the *legacy* tree either (`toolbar.rs`,
+/// `inspector.rs`, `library.rs` were all swept for the same names and come
+/// up equally empty) -- not a regression this task closes, just an existing
+/// keyboard-only stroke this editor has never given a face.
+#[test]
+fn every_chord_bound_action_has_a_darkroom_affordance_or_is_named_chord_only() {
+    use crate::ActionId;
+    const ALLOWED_CHORD_ONLY: &[ActionId] = &[
+        ActionId::StepBack,
+        ActionId::StepForward,
+        ActionId::GoStart,
+        ActionId::GoEnd,
+        ActionId::PrevSyncPoint,
+        ActionId::NextSyncPoint,
+        ActionId::WalkCutNext10,
+        ActionId::WalkCutPrev10,
+        ActionId::SetIn,
+        ActionId::SetOut,
+        ActionId::ClearRange,
+        ActionId::SelectAll,
+        ActionId::RemoveVideoLane,
+        ActionId::RemoveAudioLane,
+        ActionId::Crossfade,
+    ];
+    let darkroom = [
+        "ui/bench_stance.rs",
+        "ui/cards.rs",
+        "ui/dock_stance.rs",
+        "ui/overlays.rs",
+        "ui/settings_stance.rs",
+        "ui/spine_stance.rs",
+        "ui/stance.rs",
+        "ui/timeband_stance.rs",
+        "ui/timeline.rs",
+        "menus.rs",
+    ]
+    .map(src_text)
+    .join("\n");
+    for action in ActionId::ALL {
+        if ALLOWED_CHORD_ONLY.contains(&action) {
+            continue;
+        }
+        let name = format!("{action:?}");
+        let mentioned = darkroom.contains(&format!("ActionId::{name}"))
+            || (action == ActionId::Resolution && darkroom.contains("Pick::Resolution"))
+            || (action == ActionId::SubtitleStyle && darkroom.contains("open_subtitle_style(cx)"));
+        assert!(
+            mentioned,
+            "ActionId::{name} is bound to a chord but has no visible affordance \
+             anywhere in the darkroom tree -- either mount it (see Fit/Redo, this \
+             commit) or add it to ALLOWED_CHORD_ONLY with a reason"
+        );
+    }
+}
