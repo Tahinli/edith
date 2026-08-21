@@ -2450,6 +2450,14 @@ impl PlaybackSession {
             .and_then(|s| s.from)
     }
 
+    /// The lanes closing the gap `(start, frames)` on `lane` must ripple
+    /// together to keep every take crossing it in sync
+    /// ([`Project::gap_take_scope`]) -- what a right-click on empty bench
+    /// space asks before offering to close it.
+    pub fn gap_take_scope(&self, lane: Lane, start: u32, frames: u32) -> crate::Result<Vec<Lane>> {
+        self.project.gap_take_scope(lane, start, frames)
+    }
+
     /// Cuts every one of `regions` -- `(start, len)` in timeline frames -- out
     /// of the lanes in `scope` and closes each hole, as **one** edit
     /// ([`Project::cut_regions`]): the jumpcut a silence scan
