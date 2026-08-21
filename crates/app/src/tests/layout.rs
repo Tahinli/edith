@@ -1703,6 +1703,50 @@ fn the_volume_slider_lands_where_it_paints() {
     }
 }
 
+/// Darkroom lane heads dispatch only verbs that apply to the lane under the
+/// pointer; source checks pin the visible pointer doors to that guarded path.
+#[test]
+fn darkroom_lane_header_verbs_are_targeted_and_visible() {
+    let live = Ctx {
+        timeline: true,
+        ..Ctx::default()
+    };
+    assert_eq!(enable_lane(ActionId::Mix, Lane::A1, live), Enable::Yes);
+    assert_eq!(
+        enable_lane(ActionId::RemoveVideoLane, Lane::V1, live),
+        Enable::Yes
+    );
+    assert_eq!(
+        enable_lane(ActionId::RemoveAudioLane, Lane::A1, live),
+        Enable::Yes
+    );
+    assert!(matches!(
+        enable_lane(ActionId::Mix, Lane::V1, live),
+        Enable::Hidden(_)
+    ));
+
+    let bench = src_text("ui/bench_stance.rs");
+    for door in [
+        "\"bench-mix-lane\"",
+        "\"bench-show-sub-lane\"",
+        "\"bench-remove-lane\"",
+        "this.act_lane(ActionId::Mix, lane, cx)",
+        "this.show_sub_lane(lane, cx)",
+        "this.act_lane(action, lane, cx)",
+    ] {
+        assert!(bench.contains(door), "lane header lost {door}");
+    }
+    let time_band = src_text("ui/timeband_stance.rs");
+    for door in [
+        "fn volume_slider(",
+        "\"stance-tb-volume-bar\"",
+        "this.drag_volume(event.position.x, cx)",
+        ".child(volume_slider(player, cx))",
+    ] {
+        assert!(time_band.contains(door), "time band lost {door}");
+    }
+}
+
 /// The three seams a hand may move, and the two ends neither of them may be
 /// dragged past: a panel dragged to nothing is a panel nobody can get back, and
 /// a picture squeezed out by its two neighbours is that same loss from the

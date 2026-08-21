@@ -315,6 +315,19 @@ pub(crate) fn enable(action: ActionId, ctx: Ctx) -> Enable {
     }
 }
 
+/// Whether a lane-header verb applies to this particular lane as well as to
+/// the editor state. The shared action oracle still owns timeline/export
+/// refusal; this narrow gate prevents a header from borrowing a type-level
+/// chord for the wrong kind of lane.
+pub(crate) fn enable_lane(action: ActionId, lane: Lane, ctx: Ctx) -> Enable {
+    match (action, lane.kind) {
+        (ActionId::Mix, LaneKind::Audio)
+        | (ActionId::RemoveVideoLane, LaneKind::Video)
+        | (ActionId::RemoveAudioLane, LaneKind::Audio) => enable(action, ctx),
+        _ => Enable::Hidden("this verb does not apply to this lane"),
+    }
+}
+
 /// The rows a clip menu draws, for the clip it was opened on: the registry
 /// filtered by the one availability oracle, and the *only* way that menu is
 /// built. An action that means nothing for what was right-clicked -- a grade on

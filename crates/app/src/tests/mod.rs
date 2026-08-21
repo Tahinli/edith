@@ -24,8 +24,7 @@ use super::{
     Transport, VOLUME_W, Volume, WAVE_BPS, WAVE_COL, WAVE_COLS_MAX, Wave, band_label,
     bitrate_detail, bitrate_refusal, can_add, cancels_export, clipboard_after_remove, color_snap, commit_mbps,
     containers,
-    enable, envelope, eq_card_w, eq_freq, eq_freq_label, eq_graph_h, eq_spectrum, eq_x, eq_y,
-    EQ_GRAPH_MAX_H,
+    enable, enable_lane, envelope, eq_card_w, eq_freq, eq_freq_label, eq_graph_h, eq_spectrum, eq_x, eq_y,
     escape_leaves_player_fullscreen,
     estimated_bytes, export_path, export_settings, format_key,
     format_line, format_refusal, fps_choices, fps_label, frac_along, frac_down, frame_at,
@@ -43,7 +42,7 @@ use super::{
 };
 
 use super::{
-    Choice, EDGE_W, ETA_SPAN, Edge, FITS, FRAME_RATES, LaneKind, SubClip, PPS_DEFAULT, PPS_MIN, Preset, RESOLUTIONS, Repeat,
+    ActionId, Choice, EDGE_W, ETA_SPAN, Edge, FITS, FRAME_RATES, LaneKind, SubClip, PPS_DEFAULT, PPS_MIN, Preset, RESOLUTIONS, Repeat,
     Scale, View,
     ZOOM_MIN_FRAMES, ZOOM_OUT_MARGIN, ZOOM_STEP, audio_rate_choices, av1_hw_warning, clock,
     encoder_choices, encoder_label, eta_secs, file_name, file_uri,
