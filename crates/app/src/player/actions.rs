@@ -184,6 +184,29 @@ impl Player {
         }
     }
 
+    /// Dispatches a type-level keyboard verb from its concrete lane header.
+    /// The key still acts on the last lane of its kind; a header click must
+    /// keep the lane the hand named, so it enters through this targeted door.
+    pub(crate) fn act_lane(&mut self, action: ActionId, lane: Lane, cx: &mut Context<Self>) {
+        match enable_lane(action, lane, self.ctx(None)) {
+            Enable::Yes => {}
+            Enable::No(why) => {
+                self.notify_user(format!("{} — {why}", action.label()).into());
+                cx.notify();
+                return;
+            }
+            Enable::Hidden(_) => return,
+        }
+        match action {
+            ActionId::Mix => self.open_mix(Some(lane), cx),
+            ActionId::RemoveVideoLane | ActionId::RemoveAudioLane => {
+                self.mark_dirty();
+                self.remove_lane(lane, cx);
+            }
+            _ => unreachable!("only lane-header actions reach act_lane"),
+        }
+    }
+
     /// Says something to the user. The one door: every message in this editor
     /// comes through here, so "queued rather than overwritten" is a property of
     /// the field and not of seventy call sites remembering to be polite.
