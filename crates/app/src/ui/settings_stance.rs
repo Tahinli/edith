@@ -21,16 +21,20 @@
 //! Values apply live through those same doors; there is no Apply button here
 //! to be inconsistent with the rest of the room.
 //!
-//! Seams left for other builders (this task's scope boundary): the HDR
-//! mastering-display target row (a monitor fact, not in `inspector.rs`'s own
-//! project section yet) has no row here either -- it plugs into
-//! `project_section` below, beside the tonemap row it is the pair of. A
-//! finer fps/sample-rate/tone picker is the same builder's to extend; this
-//! page only ever asks for [`Pick::Fps`]/[`Pick::SampleRate`]/[`Pick::Tone`]
+//! Seams left for other builders (this task's scope boundary): a finer
+//! fps/sample-rate/tone picker is the same builder's to extend; this page
+//! only ever asks for [`Pick::Fps`]/[`Pick::SampleRate`]/[`Pick::Tone`]
 //! exactly as `inspector.rs`'s legacy panel already does.
+//!
+//! The HDR reference numbers beside the tonemap row (`HDR reference` and
+//! `Content light`) are the *file's* declared light level
+//! ([`engine::colorspace::ContentLight`]), not a monitor fact -- read-only,
+//! since nothing in [`engine::project::Project`] holds a place to persist an
+//! override into.
 
 use crate::*;
 use crate::ui::type_scale;
+use engine::colorspace::ContentLight;
 
 /// A 9px uppercase Archivo section head, `ink3` -- [`dock_stance::section_head`]'s
 /// exact shape, repeated rather than imported across a `pub(crate)` seam for
@@ -110,6 +114,51 @@ fn row_ink(
         )
 }
 
+/// [`row_ink`] with no opener: a readout rather than a picker, for a value
+/// this editor cannot set because nothing behind it can hold a pick --
+/// [`engine::playback::PlaybackSession`] has no field to persist one into.
+/// No `cursor_pointer`, no hover paint, no click: the row must not read as a
+/// button that does nothing when pressed. The hint still names where the
+/// number came from, since a reader who wants that detail should get it from
+/// the same door every other row's hint answers from.
+fn row_static(
+    id: &'static str,
+    label_text: &'static str,
+    value: impl Into<SharedString>,
+    hint: &'static str,
+    value_ink: u32,
+) -> impl IntoElement {
+    let value: SharedString = value.into();
+    let hint: SharedString = hint.into();
+    let label_style = type_scale::label(type_scale::LABEL_ROW_PX, gpui::FontWeight::MEDIUM);
+    let value_style = type_scale::mono(type_scale::LABEL_ROW_PX, gpui::FontWeight::MEDIUM);
+    div()
+        .id(id)
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_between()
+        .h(px(CONTROL_H))
+        .px(px(8.))
+        .rounded(px(3.))
+        .tooltip(move |_, cx| cx.new(|_| Tip(hint.clone())).into())
+        .child(
+            div()
+                .font(label_style.font)
+                .text_size(label_style.size)
+                .text_color(rgb(INK2()))
+                .child(label_text),
+        )
+        .child(
+            div()
+                .flex_none()
+                .font(value_style.font)
+                .text_size(value_style.size)
+                .text_color(rgb(value_ink))
+                .child(value),
+        )
+}
+
 /// PROJECT: the canvas every clip is composed onto, the rate it is cut at,
 /// the HDR rendition it is watched in, and the mix everything sums into --
 /// [`inspector.rs`]'s own four-plus-Mix list, ported rather than
@@ -139,6 +188,23 @@ fn project_section(player: &Player, cx: &mut Context<Player>) -> impl IntoElemen
     let (tone_val, tone_ink) = match &player.session {
         Some(session) => (format!("HDR {}", tone_label(session.tone())), INK1()),
         None => ("—".to_string(), INK4()),
+    };
+    // The reference row's own numbers: what source 0's file actually declared
+    // ([`engine::colorspace::ContentLight`], read at open by
+    // [`engine::playback::PlaybackSession::content_light`]) -- read-only,
+    // since nothing in [`engine::project::Project`] holds an override to
+    // persist one into. `—` for a project with no session, and for a session
+    // whose file is SDR or simply declared nothing (most files declare
+    // nothing here at all).
+    let light = player.session.as_ref().map_or(ContentLight::default(), engine::playback::PlaybackSession::content_light);
+    let (master_val, master_ink) = match (&player.session, light.mastering_max) {
+        (Some(_), Some(nits)) => (format!("{nits:.0} nits"), INK1()),
+        _ => ("—".to_string(), INK4()),
+    };
+    let (content_val, content_ink) = match (&player.session, light.max_cll, light.max_fall) {
+        (Some(_), Some(cll), Some(fall)) => (format!("{cll:.0}/{fall:.0} nits"), INK1()),
+        (Some(_), Some(cll), None) => (format!("{cll:.0} nits"), INK1()),
+        _ => ("—".to_string(), INK4()),
     };
     div()
         .flex_none()
@@ -172,9 +238,6 @@ fn project_section(player: &Player, cx: &mut Context<Player>) -> impl IntoElemen
             player,
             cx.listener(|this, event: &ClickEvent, _, cx| this.open_picker(Pick::SampleRate, event.position(), cx)),
         ))
-        // hook: the mastering-display target (a monitor peak-nits fact, not
-        // yet in `inspector.rs`'s own project section) is this row's pair --
-        // another builder's row, plugged in right here once it exists.
         .child(row_ink(
             "settings-tonemap",
             "HDR tonemap",
@@ -183,6 +246,23 @@ fn project_section(player: &Player, cx: &mut Context<Player>) -> impl IntoElemen
             player,
             cx.listener(|this, event: &ClickEvent, _, cx| this.open_picker(Pick::Tone, event.position(), cx)),
             tone_ink,
+        ))
+        // The tonemap row's pair: what the file actually declared, read-only
+        // ([`row_static`] -- there is nowhere in the project to persist a
+        // pick even if this page offered one).
+        .child(row_static(
+            "settings-hdr-reference",
+            "HDR reference",
+            master_val,
+            "the mastering display's own peak white, in cd/m^2, as the grade declared it -- what a 'Reference' tonemap targets before it ever looks at this film's own pixels",
+            master_ink,
+        ))
+        .child(row_static(
+            "settings-content-light",
+            "Content light",
+            content_val,
+            "MaxCLL/MaxFALL: the brightest single pixel and the brightest frame average measured in the finished encode -- what a 'Reference' tonemap actually rolls off from when the file declares it, ahead of the mastering peak above",
+            content_ink,
         ))
         .child(row(
             "settings-mix",
