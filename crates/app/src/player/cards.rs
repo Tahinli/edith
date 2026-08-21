@@ -801,6 +801,10 @@ impl Player {
             .and_then(|lane| self.mix_lanes().iter().position(|&l| l == lane))
             .unwrap_or(0);
         self.context_menu = None;
+        // Param cards live in the Clip tab. Route every opening door here so a
+        // lane header never opens a card behind Sources.
+        self.dock_src_active = false;
+        crate::ui::dock_stance::save(false);
         cx.notify();
     }
 
