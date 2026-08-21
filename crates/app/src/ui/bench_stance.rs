@@ -348,7 +348,25 @@ fn clip_box(
                             cx.listener(move |this, event: &MouseDownEvent, _, cx| {
                                 this.open_menu(lane, idx, event.position, cx);
                             }),
-                        );
+                        )
+                        .children(hitmap::dynamic(
+                            move || {
+                                (
+                                    format!(
+                                        "clip.{}.{}.{}.trim-{}",
+                                        lane.label(),
+                                        lane.ord,
+                                        idx,
+                                        if edge == Edge::Start { "l" } else { "r" }
+                                    ),
+                                    format!(
+                                        "Trim clip {} edge",
+                                        if edge == Edge::Start { "left" } else { "right" }
+                                    ),
+                                )
+                            },
+                            true,
+                        ));
                     zone = match edge {
                         Edge::Start => zone.left_0(),
                         Edge::End => zone.right_0(),
@@ -403,9 +421,9 @@ fn clip_box(
                     }),
             )
         })
-        // Fades shade their own ramps over the waveform, including the live
+        // Fades shade their own ramps over every clip, including the live
         // `FadeDrag` value, so the ramp follows the hand before release.
-        .when(audio, |d| {
+        .when(fade_in > 0 || fade_out > 0, |d| {
             d.children(
                 [
                     (fade_in > 0).then(|| {
@@ -528,7 +546,7 @@ fn clip_box(
         })
         // The fade handles sit inside the trim strips, so their small top
         // corners change a ramp while the outer full-height strips still trim.
-        .when(audio && trims(span), |d| {
+        .when(trims(span), |d| {
             d.children([Edge::Start, Edge::End].into_iter().map(|edge| {
                 let is_in = edge == Edge::Start;
                 let mut handle = div()
@@ -544,7 +562,22 @@ fn clip_box(
                         cx.listener(move |this, event: &MouseDownEvent, _, cx| {
                             this.start_fade_drag(lane, idx, is_in, event.position.x, cx);
                         }),
-                    );
+                    )
+                    .children(hitmap::dynamic(
+                        move || {
+                            (
+                                format!(
+                                    "clip.{}.{}.{}.fade-{}",
+                                    lane.label(),
+                                    lane.ord,
+                                    idx,
+                                    if is_in { "in" } else { "out" }
+                                ),
+                                format!("Adjust fade {}", if is_in { "in" } else { "out" }),
+                            )
+                        },
+                        true,
+                    ));
                 handle = match edge {
                     Edge::Start => handle.left(px(EDGE_W)),
                     Edge::End => handle.right(px(EDGE_W)),
@@ -812,6 +845,15 @@ fn lane_row(
                 .on_drag(LaneDrag(lane), move |_, _, _, cx| {
                     cx.new(|_| Tip(head_ghost.clone()))
                 })
+                .children(hitmap::dynamic(
+                    move || {
+                        (
+                            format!("lane.{}.reorder", lane.label()),
+                            format!("Reorder {}", lane.label()),
+                        )
+                    },
+                    true,
+                ))
                 .child(
                     div()
                         .flex()
@@ -892,7 +934,7 @@ fn lane_row(
                                     .children(hitmap::dynamic(
                                         move || {
                                             (
-                                                format!("lane.{}.subtitles", lane.label()),
+                                                format!("lane.{}.eye", lane.label()),
                                                 format!("Show {}", lane.label()),
                                             )
                                         },
