@@ -1100,6 +1100,59 @@ impl Player {
         cx.notify();
     }
 
+    /// Closes every bounded gap on `lane`, as one gesture. The scope stays the
+    /// clicked track's scope -- not the whole timeline -- and each linked take is
+    /// widened only when its other half has the same empty stretch. Unsafe gaps
+    /// are left open and counted in the notice, so the sweep never fails as a
+    /// silent no-op.
+    pub(crate) fn close_all_gaps_on_lane(&mut self, lane: Lane, cx: &mut Context<Self>) {
+        let Some(session) = self.session.as_mut() else {
+            return;
+        };
+        let report = match session.close_all_gaps_on_lane(lane) {
+            Ok(report) => report,
+            Err(e) => {
+                self.notify_user(e.to_string().into());
+                cx.notify();
+                return;
+            }
+        };
+        if report.closed > 0 {
+            self.mark_dirty();
+            self.selected.clear();
+            self.reset_after_reseek();
+        }
+        let skipped = report.skipped.len();
+        let notice = match (report.closed, skipped) {
+            (0, 0) => format!("NO GAPS TO CLOSE on {}", lane.label()),
+            (0, 1) => format!(
+                "NO GAPS CLOSED on {} — 1 skipped at {}; match linked gaps or detach",
+                lane.label(),
+                report.skipped[0].start
+            ),
+            (0, n) => format!(
+                "NO GAPS CLOSED on {} — {n} skipped; match linked gaps or detach",
+                lane.label()
+            ),
+            (n, 0) => format!(
+                "{n} GAPS CLOSED on {} — {} takes them back",
+                lane.label(),
+                self.keymap.display(ActionId::Undo)
+            ),
+            (n, 1) => format!(
+                "{n} GAPS CLOSED on {}; 1 skipped at {} — match linked gaps or detach",
+                lane.label(),
+                report.skipped[0].start
+            ),
+            (n, skipped) => format!(
+                "{n} GAPS CLOSED on {}; {skipped} skipped — match linked gaps or detach",
+                lane.label()
+            ),
+        };
+        self.notify_user(notice.into());
+        cx.notify();
+    }
+
     /// A press on an edge: the start of the drag that changes how much of a
     /// source it plays. It picks the placement as a press anywhere else on the
     /// box does -- the edge strip covers the box's own listener (`occlude`), so
