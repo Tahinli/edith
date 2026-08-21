@@ -307,6 +307,12 @@ fn source_row(
             ),
         };
     let proxy_stops = proxy_glyph == "■";
+    let proxy_label = match (proxy_on, proxy_waiting, proxy_progress) {
+        (_, true, _) => "Proxy cancelling".to_string(),
+        (true, false, Some(progress)) => format!("Proxy making {:.0}%", progress * 100.),
+        (true, false, None) => "Proxy ready".to_string(),
+        (false, false, _) => "Proxy off".to_string(),
+    };
     let proxy_tip: SharedString = proxy_tip.into();
     div()
         .id(("dock-source", i))
@@ -520,7 +526,7 @@ fn source_row(
                                 this.toggle_proxy(&proxy_path, proxy_stops, cx);
                             }))
                             .children(hitmap::dynamic(
-                                move || (format!("source.{i}.proxy"), "Toggle proxy".into()),
+                                move || (format!("source.{i}.proxy"), proxy_label),
                                 !proxy_waiting,
                             ))
                             .child(
@@ -593,6 +599,8 @@ fn subtitle_palette(player: &Player, cx: &mut Context<Player>) -> Option<AnyElem
                         .unwrap_or_else(|| "drag onto an S lane to place".to_string())
                         .into();
                     let ghost = title.clone();
+                    let hitmap_title = title.clone();
+                    let select_title = title.clone();
                     div()
                         .id(("dock-subtitle-track", track))
                         .flex_none()
@@ -615,6 +623,24 @@ fn subtitle_palette(player: &Player, cx: &mut Context<Player>) -> Option<AnyElem
                                     cx.notify();
                                 }))
                         })
+                        .children(hitmap::dynamic(
+                            move || {
+                                (
+                                    format!("subtitle.{group_ord}.{track}.row"),
+                                    hitmap_title.to_string(),
+                                )
+                            },
+                            usable,
+                        ))
+                        .children(hitmap::dynamic(
+                            move || {
+                                (
+                                    format!("subtitle.{group_ord}.{track}.select"),
+                                    format!("Select {select_title}"),
+                                )
+                            },
+                            usable,
+                        ))
                         .child(
                             div()
                                 .flex_none()

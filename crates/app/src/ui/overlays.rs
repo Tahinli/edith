@@ -295,6 +295,7 @@ impl Player {
                                 // than one truncated one.
                                 .truncate()
                                 .child(action.label())
+                                .children(hitmap::action(action, refusal.yes()))
                                 // The reason rides on the label rather than in
                                 // the stroke column, which the rebind half
                                 // needs whatever the editor's state is: an
@@ -696,7 +697,10 @@ impl Player {
                                     },
                                 ))
                         })
-                        .children(hitmap::action(action, enabled))
+                        .children(hitmap::dynamic(
+                            move || (format!("menu.{action:?}"), full.to_string()),
+                            enabled,
+                        ))
                         .into_any_element(),
                 );
             }
@@ -713,6 +717,7 @@ impl Player {
                         }
                         cx.notify();
                     }))
+                    .children(hitmap::control("menu.properties", "Properties", true))
                     .child("Properties")
                     // No stroke reaches this one, and a blank column would read
                     // as one that was forgotten.
@@ -814,11 +819,17 @@ impl Player {
     ) -> Option<impl IntoElement> {
         let picker = self.picker?;
         let darkroom = self.darkroom;
+        let theme_picker = picker.of == Pick::Theme;
         let rows: Vec<AnyElement> = self
             .choices(picker.of)
             .into_iter()
             .enumerate()
             .map(|(n, (choice, label, detail, picked))| {
+                let hitmap_label = label.clone();
+                let hitmap_id = match theme_picker {
+                    true => format!("theme.{n}.row"),
+                    false => format!("picker.choice.{n}"),
+                };
                 div()
                     .id(("picker-row", n))
                     .flex()
@@ -906,7 +917,7 @@ impl Player {
                         cx.listener(move |this, _: &ClickEvent, _, cx| this.choose(choice, cx)),
                     )
                     .children(hitmap::dynamic(
-                        move || (format!("picker.choice.{n}"), "Choose setting value".into()),
+                        move || (hitmap_id, hitmap_label.to_string()),
                         true,
                     ))
                     .into_any_element()
