@@ -260,6 +260,7 @@ fn source_row(
     let (path, stream) = (row.path.clone(), row.stream);
     let dragged = (path.clone(), stream);
     let dot_path = path.clone();
+    let menu_path = path.clone();
     let ghost = name.clone();
     div()
         .id(("dock-source", i))
@@ -283,6 +284,28 @@ fn source_row(
         // line, so the general focus/selection ring applies, the same one
         // the bench already uses for the same job.
         .when(picked, |d| d.border_1().border_color(rgb(INK1())))
+        // Right-click ANYWHERE on the row opens the row's menu -- Add,
+        // Remove, Reveal, Properties (DESIGN §9: "verbs of the thing under
+        // the cursor"). It used to hang off the 8px ink dot alone, and only
+        // for a usable row, which is how the room shipped with no reachable
+        // way to take a source out of the library at all (user 2026-08-21:
+        // "can not remove a media from library") -- and the one row that
+        // most wants removing, a file the editor cannot use, was the one
+        // row whose menu was gated off. Unconditional now, dot included.
+        .on_mouse_down(
+            MouseButton::Right,
+            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                cx.stop_propagation();
+                this.selected_asset = Some((menu_path.clone(), stream));
+                this.library_menu = Some(LibraryMenu {
+                    path: menu_path.clone(),
+                    stream,
+                    at: event.position,
+                    details: false,
+                });
+                cx.notify();
+            }),
+        )
         .when(usable, |d| {
             d.cursor_pointer()
                 .hover(|s| s.bg(rgb(DARK_RAISED())))
@@ -551,6 +574,23 @@ fn sources_tab(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
                     "imports the file named on the clipboard",
                     player,
                     cx.listener(|this, _: &ClickEvent, _, cx| this.paste_file_path(cx)),
+                ))
+                // Subtitles come in through the same door every other file
+                // does. This row is `↓S`'s new geographic home: the spine's
+                // TRACK group carried it as a two-glyph badge on a 56px rail
+                // that no longer had the height for it (user 2026-08-21:
+                // "the spine menu is too crowded"), and an import belongs
+                // beside the other two imports, not beside the lane verbs.
+                .child(ghost_verb(
+                    "dock-import-subtitles",
+                    "Import subtitles",
+                    ActionId::ImportSubtitles,
+                    false,
+                    "reads an .srt/.ass file onto a subtitle lane",
+                    player,
+                    cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.act(ActionId::ImportSubtitles, window, cx)
+                    }),
                 )),
         )
         .child({

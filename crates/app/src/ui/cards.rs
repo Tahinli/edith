@@ -335,10 +335,30 @@ impl Player {
             // The small print of a picked row sits on the highlight, where the
             // dim ink is only 3.3:1 -- the row it lands on lifts it (WCAG
             // 1.4.3, and the fit test pins both numbers).
-            let ink = match picked {
-                true => ink_primary,
-                false => ink_secondary,
+            // DESIGN §2's ink ladder, applied to a row rather than to a
+            // whole card (user 2026-08-21: the export card's "colors are not
+            // aligning a little so hard to read"). Two faults it fixes: the
+            // detail of a picked row was drawn BRIGHTER than the label it
+            // belongs to -- the loudest thing on the row was its small print
+            // -- and the resting rows' detail sat at `ink3` on `panel`, the
+            // metadata step, for text that is the row's actual content and
+            // has to be read at a glance. Label leads its row (`ink1`
+            // picked, `ink2` resting), detail follows one step behind
+            // (`ink2` picked, `ink2` resting -- never `ink3`, which stays
+            // for the key column and the summary's small print).
+            let ink = match (dark, picked) {
+                (true, true) => INK2(),
+                (true, false) => INK2(),
+                (false, true) => ink_primary,
+                (false, false) => ink_secondary,
             };
+            let label_ink = match (dark, picked) {
+                (true, true) => INK1(),
+                (true, false) => INK2(),
+                (false, true) => ink_primary,
+                (false, false) => ink_secondary,
+            };
+            let key_ink = if dark { INK3() } else { ink_secondary };
             live(row(id), enabled)
                 .when(picked, |d| d.bg(rgb(bg_selected)))
                 .child(
@@ -355,14 +375,22 @@ impl Player {
                             div()
                                 .w(px(EXPORT_KEY_W))
                                 .text_size(px(11.))
-                                .text_color(rgb(ink))
+                                .text_color(rgb(key_ink))
                                 .when_some(mono_style.clone(), |d, style| {
                                     d.font(style.font).text_size(style.size)
                                 })
                                 .child(SharedString::from(key.to_string())),
                         )
                         .child(
+                            // A fixed label column in the darkroom: the
+                            // details are the long half and they wrap, so
+                            // without one they start at a different x on
+                            // every row and a wrapped line reads as if it
+                            // began left of the label it belongs to.
                             div()
+                                .when(dark, |d| {
+                                    d.w(px(92.)).flex_none().text_color(rgb(label_ink))
+                                })
                                 .when_some(label_style.clone(), |d, style| {
                                     d.font(style.font).text_size(style.size)
                                 })
@@ -866,13 +894,13 @@ impl Player {
             // off the front pane with the rows they reshape -- so a shut
             // pane advertises `s` instead of a pair of keys with nothing on
             // screen for them to touch.
+            // Short enough to read at a glance in the plate's own head row:
+            // the long four-clause sentence was 11px `ink3` mono across the
+            // whole sheet and read as noise above the rows it was meant to
+            // explain (user 2026-08-21: "hard to read").
             (None, None) => match self.export_advanced_open {
-                true => "the keys are on the rows · enter exports · \
-                         a click away or esc closes · g/r change the layout"
-                    .into(),
-                false => "the keys are on the rows · enter exports · \
-                         a click away or esc closes · s for Advanced"
-                    .into(),
+                true => "↵ exports · esc closes · g/r layout".into(),
+                false => "↵ exports · esc closes · s Advanced".into(),
             },
         };
         if dark {
@@ -885,6 +913,33 @@ impl Player {
             // paints nothing (`SCRIM()` is deliberately not applied here) --
             // an invisible catcher changes zero picture pixels while a
             // dimming one would still tint the screen it must never cover.
+            // The plate is the room's below-picture footprint, not a 340px
+            // corner card (user 2026-08-21: "export section is not aligning
+            // with our design"). Measured at 1280x720 the corner card's own
+            // max-height was ~9px taller than the footprint it had to fit
+            // in, so its scrolling row list collapsed to a single visible
+            // row: the presets, Advanced and every codec row under them were
+            // unreachable by pointer, and the long status sentence wrapped to
+            // three lines over the top of them. Two columns instead -- rows
+            // left, what-it-adds-up-to and the one bordered chip right --
+            // inside the same bench+ledger footprint every menu already
+            // hangs in, so the picture stays uncovered (§11 check 6) and the
+            // list gets the whole height rather than a fraction of it.
+            let floor = crate::ui::stance::below_picture_floor(
+                f32::from(viewport.height),
+                self.split_px(Split::Bench, viewport),
+            );
+            let summary = |text: SharedString, ink: u32| {
+                div()
+                    .flex_none()
+                    .px(px(6.))
+                    .type_style(type_scale::mono(
+                        type_scale::CHORD_METADATA_MAX_PX,
+                        gpui::FontWeight::MEDIUM,
+                    ))
+                    .text_color(rgb(ink))
+                    .child(text)
+            };
             return Some(
                 div()
                     .id("export-click-catcher")
@@ -894,9 +949,14 @@ impl Player {
                     .left_0()
                     .right_0()
                     .flex()
-                    .items_end()
-                    .justify_end()
-                    .p(px(12.))
+                    // Below the time band, not merely below the picture: the
+                    // transport and the Export chip that opened this card are
+                    // on that band, and a sheet drawn over them hides the
+                    // control the editor just pressed. The bench and the
+                    // ledger are what this plate is allowed to cover.
+                    .pt(px(floor + crate::ui::stance::TIME_BAND_H + 6.))
+                    .pb(px(6.))
+                    .px(px(6.))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _: &MouseDownEvent, _, cx| {
@@ -908,131 +968,149 @@ impl Player {
                     .child(
                         div()
                             .id("export-plate")
-                            .w(px(EXPORT_W.min(340.)))
-                            .max_h(px(4. * KEYS_ROW_H + rows_h + 90.))
+                            .flex_1()
+                            .min_w(px(0.))
                             .on_mouse_down(MouseButton::Left, swallow)
                             .flex()
                             .flex_col()
-                            .gap(px(2.))
+                            .gap(px(4.))
                             .p(px(10.))
-                            .rounded(px(6.))
+                            .rounded(px(4.))
                             .bg(rgb(DARK_PANEL()))
                             .border_1()
                             .border_color(rgba(DARK_SEAM()))
                             .child(
                                 div()
                                     .flex_none()
-                                    .px(px(6.))
-                                    .type_style(type_scale::head())
-                                    .text_color(rgb(INK3()))
-                                    .child("EXPORT"),
-                            )
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .px(px(6.))
-                                    .text_color(rgb(INK3()))
-                                    .type_style(type_scale::mono(
-                                        type_scale::CHORD_METADATA_MAX_PX,
-                                        gpui::FontWeight::MEDIUM,
-                                    ))
-                                    .child(status_line),
-                            )
-                            .child(
-                                div()
-                                    .id("export-rows")
                                     .flex()
-                                    .flex_col()
-                                    .gap(px(2.))
-                                    .max_h(px(rows_h))
-                                    .overflow_y_scroll()
-                                    .children(list),
+                                    .items_baseline()
+                                    .justify_between()
+                                    .gap(px(12.))
+                                    .px(px(6.))
+                                    .child(
+                                        div()
+                                            .type_style(type_scale::head())
+                                            .text_color(rgb(INK3()))
+                                            .child("EXPORT"),
+                                    )
+                                    .child(
+                                        div()
+                                            .min_w(px(0.))
+                                            .truncate()
+                                            .type_style(type_scale::mono(
+                                                type_scale::CHORD_METADATA_MAX_PX,
+                                                gpui::FontWeight::MEDIUM,
+                                            ))
+                                            .text_color(rgb(INK2()))
+                                            .child(status_line),
+                                    ),
                             )
                             .child(
                                 div()
-                                    .flex_none()
-                                    .px(px(6.))
-                                    .type_style(type_scale::mono(
-                                        type_scale::CHORD_METADATA_MAX_PX,
-                                        gpui::FontWeight::MEDIUM,
-                                    ))
-                                    .text_color(rgb(INK2()))
-                                    .child(head),
-                            )
-                            .children(self.range.map(|(start, end)| {
-                                div()
-                                    .flex_none()
-                                    .px(px(6.))
-                                    .type_style(type_scale::mono(
-                                        type_scale::CHORD_METADATA_MAX_PX,
-                                        gpui::FontWeight::MEDIUM,
-                                    ))
-                                    .text_color(rgb(INK3()))
-                                    .child(format!(
-                                        "RANGE {}\u{2013}{} ({})",
-                                        timecode(f64::from(start) / self.fps, self.fps),
-                                        timecode(f64::from(end) / self.fps, self.fps),
-                                        frames_timecode(end - start, self.fps),
-                                    ))
-                            }))
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .px(px(6.))
-                                    .type_style(type_scale::mono(
-                                        type_scale::CHORD_METADATA_MAX_PX,
-                                        gpui::FontWeight::MEDIUM,
-                                    ))
-                                    .text_color(rgb(INK3()))
-                                    .child(tail),
-                            )
-                            // §4: "the single bordered chip in the whole
-                            // room" -- ghosts everywhere else in this card,
-                            // one border here, wearing its chord live off
-                            // the keymap so a rebind cannot leave it stale.
-                            .child(
-                                div()
-                                    .id("export-confirm")
-                                    .mt(px(4.))
+                                    .flex_1()
+                                    .min_h(px(0.))
                                     .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .gap(px(6.))
-                                    .h(px(CONTROL_H))
-                                    .px(px(10.))
-                                    .rounded(px(3.))
-                                    .border_1()
-                                    .border_color(rgb(match blocked.is_some() {
-                                        true => INK4(),
-                                        false => INK2(),
-                                    }))
-                                    .when(blocked.is_none(), |d| d.cursor_pointer())
-                                    .when(blocked.is_some(), |d| d.cursor_not_allowed())
-                                    .hover(|s| s.bg(rgb(DARK_RAISED())))
-                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                        this.start_export(cx)
-                                    }))
-                                    .type_style(type_scale::label(
-                                        type_scale::LABEL_ROW_PX,
-                                        gpui::FontWeight::MEDIUM,
-                                    ))
-                                    .text_color(rgb(match blocked.is_some() {
-                                        true => INK4(),
-                                        false => INK1(),
-                                    }))
-                                    .child(action)
-                                    .when(blocked.is_none(), |d| {
-                                        d.child(
-                                            div()
-                                                .type_style(type_scale::mono(
-                                                    type_scale::CHORD_METADATA_MIN_PX,
-                                                    gpui::FontWeight::MEDIUM,
-                                                ))
-                                                .text_color(rgb(INK3()))
-                                                .child(self.keymap.chord(ActionId::Export)),
-                                        )
-                                    }),
-                            ),
+                                    .gap(px(10.))
+                                    .child(
+                                        div()
+                                            .id("export-rows")
+                                            .flex_1()
+                                            .min_w(px(0.))
+                                            .h_full()
+                                            .flex()
+                                            .flex_col()
+                                            .gap(px(2.))
+                                            .overflow_y_scroll()
+                                            .children(list),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .w(px(300.))
+                                            .h_full()
+                                            .flex()
+                                            .flex_col()
+                                            .justify_end()
+                                            .gap(px(4.))
+                                            .border_l_1()
+                                            .border_color(rgb(DARK_HAIRLINE()))
+                                            .pl(px(8.))
+                                            .child(summary(head.into(), INK2()))
+                                            .children(self.range.map(|(start, end)| {
+                                                summary(
+                                                    format!(
+                                                        "RANGE {}\u{2013}{} ({})",
+                                                        timecode(
+                                                            f64::from(start) / self.fps,
+                                                            self.fps
+                                                        ),
+                                                        timecode(f64::from(end) / self.fps, self.fps),
+                                                        frames_timecode(end - start, self.fps),
+                                                    )
+                                                    .into(),
+                                                    INK3(),
+                                                )
+                                            }))
+                                            .child(summary(tail.into(), INK3()))
+                                            // §4: "the single bordered chip in
+                                            // the whole room" -- ghosts
+                                            // everywhere else in this card, one
+                                            // border here, wearing its chord
+                                            // live off the keymap so a rebind
+                                            // cannot leave it stale.
+                                            .child(
+                                                div()
+                                                    .id("export-confirm")
+                                                    .mt(px(4.))
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .gap(px(6.))
+                                                    .h(px(CONTROL_H))
+                                                    .px(px(10.))
+                                                    .rounded(px(3.))
+                                                    .border_1()
+                                                    .border_color(rgb(match blocked.is_some() {
+                                                        true => INK4(),
+                                                        false => INK2(),
+                                                    }))
+                                                    .when(blocked.is_none(), |d| d.cursor_pointer())
+                                                    .when(blocked.is_some(), |d| {
+                                                        d.cursor_not_allowed()
+                                                    })
+                                                    .hover(|s| s.bg(rgb(DARK_RAISED())))
+                                                    .on_click(cx.listener(
+                                                        |this, _: &ClickEvent, _, cx| {
+                                                            this.start_export(cx)
+                                                        },
+                                                    ))
+                                                    .type_style(type_scale::label(
+                                                        type_scale::LABEL_ROW_PX,
+                                                        gpui::FontWeight::MEDIUM,
+                                                    ))
+                                                    .text_color(rgb(match blocked.is_some() {
+                                                        true => INK4(),
+                                                        false => INK1(),
+                                                    }))
+                                                    .child(action)
+                                                    .when(blocked.is_none(), |d| {
+                                                        d.child(
+                                                            div()
+                                                                .type_style(type_scale::mono(
+                                                                    type_scale::CHORD_METADATA_MIN_PX,
+                                                                    gpui::FontWeight::MEDIUM,
+                                                                ))
+                                                                .text_color(rgb(INK3()))
+                                                                .child(
+                                                                    self.keymap
+                                                                        .chord(ActionId::Export),
+                                                                ),
+                                                        )
+                                                    }),
+                                            ),
+                                    ),
+                            )
+                            .into_any_element(),
                     )
                     .into_any_element(),
             );

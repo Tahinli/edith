@@ -429,6 +429,10 @@ impl Player {
                 self.library_menu = None;
                 self.remove_source(&menu.path, menu.stream, cx);
             }
+            RowItem::RemoveWithClips => {
+                self.library_menu = None;
+                self.remove_source_and_clips(&menu.path, menu.stream, cx);
+            }
             RowItem::Reveal => {
                 self.library_menu = None;
                 // Another process starting: off the UI thread, exactly as the

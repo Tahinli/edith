@@ -617,11 +617,28 @@ impl Player {
                 // The one item that is not about this clip says so, and says it
                 // here rather than in the registry: the stroke is global too,
                 // but its row in the keys menu is not sitting on a clip.
+                // The registry's label is a sentence -- it has to be, the keys
+                // overlay reads the same string -- and a sentence in a 260px
+                // plate row is cut mid-word by the chord column beside it
+                // ("Ungroup the selection (clips anc", "Group the selection
+                // (ctrl-c"). DESIGN §7's rule for the bench applies to a menu
+                // too: labels never truncate into soup. The verb is the head
+                // of the sentence, up to its first parenthesis or em-dash;
+                // the tail is what the row's tooltip carries, so nothing is
+                // lost, it just stops being drawn over the chord.
+                let full = action.label();
+                let verb = full
+                    .split_once(" (")
+                    .map(|(head, _)| head)
+                    .or_else(|| full.split_once(" — ").map(|(head, _)| head))
+                    .or_else(|| full.split_once(": ").map(|(head, _)| head))
+                    .unwrap_or(full);
                 let label = if matches!(action, ActionId::ToggleMute | ActionId::Paste) {
-                    format!("{} (global)", action.label())
+                    format!("{verb} (global)")
                 } else {
-                    action.label().to_string()
+                    verb.to_string()
                 };
+                let say: SharedString = full.to_string().into();
                 rows.push(
                     row(rows.len())
                         // Truncated and shrinkable: a long label ("Transform —
@@ -630,6 +647,7 @@ impl Player {
                         // of sharing the row with it, which is why Transform
                         // showed no stroke while a short label like Colour's
                         // did.
+                        .tooltip(move |_, cx| cx.new(|_| Tip(say.clone())).into())
                         .child(div().min_w(px(0.)).flex_shrink().truncate().child(label))
                         .child(match refusal.why() {
                             // One truncated line, like the details side: a
@@ -737,19 +755,10 @@ impl Player {
                     }),
                 )
                 .child(
-                    div()
-                        // Only so the details side can carry a tooltip, which
-                        // gpui gives to identified elements alone.
-                        .id("menu-card")
-                        .absolute()
-                        .left(px(x))
-                        .top(px(y))
-                        .w(px(MENU_W))
-                        .flex()
-                        .flex_col()
-                        .p(px(MENU_PAD))
-                        .rounded(px(6.))
-                        .bg(rgb(BG_RAISED()))
+                    // One plate shape for all three hanging menus
+                    // ([`menu_plate`]) -- the id is still this menu's own, so
+                    // the details side keeps its tooltip.
+                    menu_plate("menu-card", x, y, darkroom)
                         // Painted after the scrim, so this listener runs first
                         // (gpui bubbles mouse events in reverse, window.rs:3705)
                         // and a press meant for an item never closes the menu
@@ -819,17 +828,36 @@ impl Player {
                         .text_color(rgb(INK2()))
                     })
                     .cursor_pointer()
-                    .hover(|s| s.bg(rgb(BG_HOVER())))
+                    // DEFECT (user 2026-08-21: "some menus are belongs to old
+                    // ui ... for example resolution picker"): the list painted
+                    // the legacy sheet's greys (`BG_RAISED`/`BG_HOVER`/
+                    // `BG_SELECTED`, `FG_*`) in the darkroom too, so a room
+                    // whose every other plate is canvas-on-panel opened one
+                    // pale rounded card. The darkroom pass below is the same
+                    // plate grammar `context_card`/`library_card` already
+                    // draw: one `raised` fill step for hover, `ink1` for the
+                    // row in force, no second grey.
+                    .hover(|s| s.bg(rgb(if darkroom { DARK_RAISED() } else { BG_HOVER() })))
                     // The mark is a glyph as well as a highlight, like the
                     // export card's rows: a background alone is gone under a
                     // hover and invisible to anyone who cannot tell the two
                     // greys apart (WCAG 1.4.1).
-                    .when(picked, |d| d.bg(rgb(BG_SELECTED())))
+                    .when(picked, |d| {
+                        d.bg(rgb(if darkroom {
+                            DARK_RAISED()
+                        } else {
+                            BG_SELECTED()
+                        }))
+                        .when(darkroom, |d| d.text_color(rgb(INK1())))
+                    })
                     // Where the keyboard is, said after the mark so the cursor
-                    // is visible on the picked row too -- and as a background,
-                    // not a border, because a row that grew a stroke would move
-                    // every row under it.
-                    .when(n == picker.sel, |d| d.bg(rgb(BG_HOVER())))
+                    // is visible on the picked row too -- and as a border in
+                    // the darkroom (DESIGN §4's 1px `ink1` focus ring) rather
+                    // than a second grey nobody can tell from the first.
+                    .when(n == picker.sel, |d| match darkroom {
+                        true => d.border_1().border_color(rgb(INK1())),
+                        false => d.bg(rgb(BG_HOVER())),
+                    })
                     .child(
                         div()
                             .flex()
@@ -849,9 +877,11 @@ impl Player {
                             .text_size(px(11.))
                             // On the picked row the dim ink sits on the
                             // highlight, where it is only 3.3:1 (WCAG 1.4.3).
-                            .text_color(rgb(match picked {
-                                true => FG_PRIMARY(),
-                                false => FG_SECONDARY(),
+                            .text_color(rgb(match (darkroom, picked) {
+                                (true, true) => INK2(),
+                                (true, false) => INK3(),
+                                (false, true) => FG_PRIMARY(),
+                                (false, false) => FG_SECONDARY(),
                             }))
                             .when(darkroom, |d| {
                                 d.type_style(type_scale::mono(
@@ -893,17 +923,7 @@ impl Player {
                     }),
                 )
                 .child(
-                    div()
-                        .id("picker-card")
-                        .absolute()
-                        .left(px(x))
-                        .top(px(y))
-                        .w(px(MENU_W))
-                        .flex()
-                        .flex_col()
-                        .p(px(MENU_PAD))
-                        .rounded(px(6.))
-                        .bg(rgb(BG_RAISED()))
+                    menu_plate("picker-card", x, y, darkroom)
                         // Painted after the scrim, so this listener runs first
                         // and a press meant for a row never closes the list out
                         // from under its own click (`context_card`).

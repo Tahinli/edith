@@ -17,7 +17,7 @@ use crate::ui::type_scale::{self, Typeset};
 use crate::*;
 
 /// Left rail, full height (DESIGN §5).
-const SPINE_W: f32 = 56.;
+pub(crate) const SPINE_W: f32 = 56.;
 /// Fixed strip under the screen: timecode, transport, cut readout, contact
 /// strip, Export -- all placeholder at this step. Kept `pub(crate)` for
 /// `layout::split_bounds`'s bench ceiling, the same one-door reason
@@ -301,7 +301,11 @@ fn ghost(player: &Player, glyph: &str, action: ActionId) -> impl IntoElement {
         ))
         .text_color(rgb(INK2()))
         .child(glyph.to_string())
-        .child(
+        // The badge is skipped when the stroke IS the glyph: `?` over `?`
+        // drew as two identical rows stacked at the foot of the rail and read
+        // as a duplicated control rather than as one command wearing its own
+        // chord.
+        .children((player.keymap.chord(action) != glyph).then(|| {
             div()
                 .type_style(type_scale::mono(
                     type_scale::CHORD_METADATA_MIN_PX,
@@ -310,8 +314,8 @@ fn ghost(player: &Player, glyph: &str, action: ActionId) -> impl IntoElement {
                 .text_color(rgb(INK3()))
                 // FAULT 1: the badge shows the primary chord, compact --
                 // same rule as every glyph in `spine_stance`.
-                .child(player.keymap.chord(action)),
-        )
+                .child(player.keymap.chord(action))
+        }))
 }
 
 /// The keys overlay (DESIGN §9, §12 step 7): every bound command, sectioned
@@ -975,7 +979,7 @@ pub(crate) fn render(
                 })
                 .when(player.keys_open, |el| el.child(keys_overlay(player)))
                 .when(player.settings_open, |el| {
-                    el.child(settings_stance::render(player, cx))
+                    el.child(settings_stance::render(player, window_size, cx))
                 })
                 // The two menus (DESIGN §9: "verbs of the thing under the
                 // cursor", plate styling, the same scrim-and-row component
@@ -988,7 +992,6 @@ pub(crate) fn render(
                 // -- clip menu, then library menu, then the open list last so
                 // it floats over whichever row opened it.
                 .children(player.context_card(window_size, cx))
-                .children(player.library_card(window_size, cx))
                 // The export card and its running-progress sheet, mounted
                 // over the whole room exactly as the legacy tree mounts them
                 // (`render.rs`) -- the fix for the shipped "Export does
@@ -1021,4 +1024,14 @@ pub(crate) fn render(
         )
         .child(divider(Split::Dock, cx))
         .child(dock(player, dock_w, window_size, cx))
+        // The library row menu mounts on the ROOT, not inside
+        // `stance-centre` like the clip menu beside it: it is opened from a
+        // dock row, so its anchor is a window x past the centre column's own
+        // right edge, and the dock -- painted after the centre -- covered
+        // every pixel of it. That is the whole of the shipped "can not
+        // remove a media from library" defect: the plate was built, placed
+        // and never visible. Mounted here it paints last, over the dock it
+        // belongs to, and its own `menu_floor` window coordinates finally
+        // mean what they say.
+        .children(player.library_card(window_size, cx))
 }
