@@ -1377,14 +1377,24 @@ impl Player {
                     }))
             })
             .collect();
+        // Maximized used to claim a fixed 320 px slice for the graph
+        // regardless of how much room a small bench actually left the card,
+        // so the numbers/buttons rows below it were the ones squeezed into a
+        // scroll -- docked, at the same bench, showed all of them with no
+        // scroll at all. `flex_1` between the docked floor and the maximized
+        // ceiling lets the graph take whatever is *actually* left after the
+        // rows below it claim their own natural height first, the same
+        // leftover-space idiom `dock_stance::dock_sources` already uses for
+        // its own scroll region.
+        let graph_maximized = dark && self.card_maximized;
         let graph = div()
             // Ided like the band rows it replaces: what the pointer presses on
             // is one element with its own hitbox, which is what a drag is
             // tracked from.
             .id("eq-graph")
             .relative()
-            .flex_none()
-            .h(px(eq_graph_h(dark && self.card_maximized)))
+            .when(graph_maximized, |d| d.flex_1().min_h(px(EQ_GRAPH_H)).max_h(px(EQ_GRAPH_MAX_H)))
+            .when(!graph_maximized, |d| d.flex_none().h(px(eq_graph_h(false))))
             .rounded(px(3.))
             .bg(rgb(if dark { DARK_HAIRLINE() } else { BG_HOVER_DIM() }))
             .cursor_pointer()
@@ -1472,13 +1482,20 @@ impl Player {
                 // bare "z", "20k" lost its "k" and half its trailing "0".
                 // Anchored to the graph's own edge instead and read inward,
                 // both now sit wholly inside the plot they label.
-                let div = div().absolute().bottom(px(1.)).w(px(24.));
+                // The end boxes are widened to their own label at the size
+                // they draw at (`eq_tick_end_w`), not just anchored -- an
+                // anchor alone still let "20 Hz" wrap onto two lines inside
+                // a box narrower than the text. `.whitespace_nowrap()` is
+                // the platform's own backstop, so a mis-measured box clips
+                // or overhangs instead of silently wrapping again.
+                let end_px = if dark { type_scale::CHORD_METADATA_MIN_PX } else { 9. };
+                let div = div().absolute().bottom(px(1.)).whitespace_nowrap();
                 let div = if i == 0 {
-                    div.left(px(0.)).text_align(TextAlign::Left)
+                    div.w(px(eq_tick_end_w(label, end_px))).left(px(0.)).text_align(TextAlign::Left)
                 } else if i == EQ_TICKS.len() - 1 {
-                    div.right(px(0.)).text_align(TextAlign::Right)
+                    div.w(px(eq_tick_end_w(label, end_px))).right(px(0.)).text_align(TextAlign::Right)
                 } else {
-                    div.left(relative(eq_x(*freq))).ml(px(-12.)).text_align(TextAlign::Center)
+                    div.w(px(24.)).left(relative(eq_x(*freq))).ml(px(-12.)).text_align(TextAlign::Center)
                 };
                 div
                     .when(dark, |d| {
@@ -1551,6 +1568,11 @@ impl Player {
                         // ran off the top and its buttons off the bottom, with
                         // neither reachable. Capped here, scrolled below.
                         .max_h(relative(1.))
+                        // Maximized also *claims* the room the cap above
+                        // only allows: `flex_1()`/`max_h` on the graph below
+                        // has nothing to grow into if the card itself still
+                        // hugs its own content height.
+                        .when(graph_maximized, |d| d.h(relative(1.)))
                         .on_mouse_down(MouseButton::Left, swallow)
                         .flex()
                         .flex_col()
@@ -1566,6 +1588,12 @@ impl Player {
                                 // makes the cap above a scroll rather than a
                                 // clip; the rows themselves keep their heights.
                                 .min_h(px(0.))
+                                // Maximized: stretch to the room the card
+                                // above now claims, so the graph's own
+                                // `flex_1` (above) has the leftover space to
+                                // grow into instead of the card just hugging
+                                // its content and leaving none.
+                                .when(graph_maximized, |d| d.flex_1())
                                 .overflow_y_scroll()
                                 .track_scroll(&self.eq_scroll)
                                 .flex()
