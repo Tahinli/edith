@@ -2028,6 +2028,13 @@ impl PlaybackSession {
         self.project.lane(lane)
     }
 
+    /// The empty stretch of `lane` covering `frame`, or `None` when `frame`
+    /// is inside a clip or past the last one ([`Project::gap_at`]). What a
+    /// right-click on empty bench space asks before offering to close it.
+    pub fn gap_at(&self, lane: Lane, frame: u32) -> Option<(u32, u32)> {
+        self.project.gap_at(lane, frame)
+    }
+
     /// Every lane's handle, in display order -- what a front-end lays out top to
     /// bottom, and the list [`add_lane`](Self::add_lane) grows.
     pub fn lanes(&self) -> Vec<Lane> {
@@ -2441,6 +2448,14 @@ impl PlaybackSession {
         self.project
             .composite_span_at(secs_to_frame(timeline_secs, self.meta.frame_rate))
             .and_then(|s| s.from)
+    }
+
+    /// The lanes closing the gap `(start, frames)` on `lane` must ripple
+    /// together to keep every take crossing it in sync
+    /// ([`Project::gap_take_scope`]) -- what a right-click on empty bench
+    /// space asks before offering to close it.
+    pub fn gap_take_scope(&self, lane: Lane, start: u32, frames: u32) -> crate::Result<Vec<Lane>> {
+        self.project.gap_take_scope(lane, start, frames)
     }
 
     /// Cuts every one of `regions` -- `(start, len)` in timeline frames -- out

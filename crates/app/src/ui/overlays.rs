@@ -477,7 +477,11 @@ impl Player {
         // oracle's either way ([`Ctx::caption`]), so what the card *has* is
         // asked for where it is used rather than at the door -- refusing here
         // would be a right-click that opens nothing.
-        let clip = session.lane_clips(menu.lane).get(menu.idx).copied();
+        let idx = match menu.on {
+            MenuOn::Clip(idx) => Some(idx),
+            MenuOn::Gap(..) => None,
+        };
+        let clip = idx.and_then(|idx| session.lane_clips(menu.lane).get(idx).copied());
         let source = clip.and_then(|clip| session.sources().get(clip.source).cloned());
         let secs = |frames: u32| timecode(f64::from(frames) / self.fps, self.fps);
         // DESIGN §9/§3: a menu row is a plate row, Archivo at the room's
@@ -562,6 +566,22 @@ impl Player {
                         .into_any_element(),
                 );
             }
+        } else if let MenuOn::Gap(start, frames) = menu.on {
+            // The one item a gap offers: no properties, no clip actions, just
+            // the ripple that closes it -- Premiere's Close Gap, Resolve's
+            // Delete Gap, per-lane the way `Player::close_gap` documents.
+            rows.push(
+                row(rows.len())
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(BG_HOVER())))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.context_menu = None;
+                        this.close_gap(menu.lane, start, frames, cx);
+                    }))
+                    .child("Close gap")
+                    .child(chord_style(div().text_color(rgb(FG_SECONDARY()))).child("ripples left"))
+                    .into_any_element(),
+            );
         } else {
             // A grade on a waveform, an equalizer on a picture, a silence scan
             // on a still: things that do not exist for what was right-clicked,
@@ -570,7 +590,8 @@ impl Player {
             // `menu_items`, so there is no second answer to keep in step. The
             // state refusals below stay, dimmed and saying why -- the next
             // click of the playhead lights them.
-            let ctx = self.ctx(Some((menu.lane, menu.idx)));
+            let idx = idx.expect("MenuOn::Gap handled above");
+            let ctx = self.ctx(Some((menu.lane, idx)));
             for action in menu_items(ctx) {
                 // The registry's own answer, the same one the actions card
                 // dims a row with -- and a row that takes no click says *why*
@@ -627,7 +648,7 @@ impl Player {
                                     // The stroke still steps -- same door.
                                     if action == ActionId::Fit {
                                         this.open_picker(
-                                            Pick::Fit(menu.lane, menu.idx),
+                                            Pick::Fit(menu.lane, idx),
                                             event.position(),
                                             cx,
                                         );

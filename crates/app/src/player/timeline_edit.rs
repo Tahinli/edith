@@ -1031,10 +1031,72 @@ impl Player {
         }
         self.context_menu = Some(ContextMenu {
             lane,
-            idx,
+            on: MenuOn::Clip(idx),
             at,
             details: false,
         });
+        cx.notify();
+    }
+
+    /// Opens the same menu on the gap under the pointer instead of a clip --
+    /// the empty-bench-space door to [`Player::close_gap`]. Nothing is
+    /// selected: a gap owns no clip to select, unlike [`Player::open_menu`].
+    pub(crate) fn open_gap_menu(&mut self, lane: Lane, start: u32, frames: u32, at: Point<Pixels>, cx: &mut Context<Self>) {
+        if self.modal() {
+            return;
+        }
+        self.context_menu = Some(ContextMenu {
+            lane,
+            on: MenuOn::Gap(start, frames),
+            at,
+            details: false,
+        });
+        cx.notify();
+    }
+
+    /// Closes the gap `(start, frames)` -- Premiere's "Close Gap", scoped to
+    /// `lane` and, when the gap borders a take, to the take's other lane too
+    /// ([`engine::PlaybackSession::gap_take_scope`]): a lane not sharing the
+    /// take never moves, so a neighbour that meant to keep its own silence is
+    /// untouched, but the two halves of a linked A/V take close together --
+    /// the alternative is a ripple that pulls a take's picture and sound out
+    /// of step with each other, which no lane's own gap is worth. A take
+    /// whose gap does not match on its other lane is refused in words, not
+    /// silence ([`engine::Project::gap_take_scope`]).
+    pub(crate) fn close_gap(&mut self, lane: Lane, start: u32, frames: u32, cx: &mut Context<Self>) {
+        let Some(session) = self.session.as_mut() else {
+            return;
+        };
+        let scope = match session.gap_take_scope(lane, start, frames) {
+            Ok(scope) => scope,
+            Err(e) => {
+                self.notify_user(e.to_string().into());
+                cx.notify();
+                return;
+            }
+        };
+        match session.cut_regions(&[(start, frames)], &scope) {
+            Ok(()) => {
+                self.mark_dirty();
+                // The ripple moves every index after the gap on the scoped
+                // lanes, the same reason a delete drops the selection.
+                self.selected.clear();
+                self.reset_after_reseek();
+                let where_ = if scope.len() > 1 {
+                    "its take".to_string()
+                } else {
+                    lane.label().to_string()
+                };
+                self.notify_user(
+                    format!(
+                        "GAP CLOSED on {where_} — {} takes it back",
+                        self.keymap.display(ActionId::Undo)
+                    )
+                    .into(),
+                );
+            }
+            Err(e) => self.notify_user(e.to_string().into()),
+        }
         cx.notify();
     }
 

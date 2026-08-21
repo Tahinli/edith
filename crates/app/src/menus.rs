@@ -2,14 +2,28 @@
 
 use crate::*;
 
-/// An open clip menu: which clip it was opened on, where it hangs, and whether
-/// it has been turned over to show what that clip *is* instead of what can be
-/// done to it. The lane and index are the ones the same click selected, so
-/// every item acts on exactly the box under the pointer.
+/// What a right-click on the bench named: a clip at an index, or the empty
+/// stretch of the lane it landed in ([`engine::PlaybackSession::gap_at`]) --
+/// two different things the one menu can be about, so it stays one struct and
+/// one field to clear rather than a second `Option` beside `context_menu`
+/// that every closer would have to learn about too.
+#[derive(Clone, Copy)]
+pub(crate) enum MenuOn {
+    Clip(usize),
+    /// `(start, frames)` of the gap, in timeline frames -- what
+    /// [`Player::close_gap`] ripples shut.
+    Gap(u32, u32),
+}
+
+/// An open clip menu: what it was opened on, where it hangs, and whether it
+/// has been turned over to show what a clip *is* instead of what can be done
+/// to it (`details` means nothing for a gap, which has no properties side).
+/// The lane is the one the same click selected, so every item acts on
+/// exactly the box -- or the hole -- under the pointer.
 #[derive(Clone, Copy)]
 pub(crate) struct ContextMenu {
     pub(crate) lane: Lane,
-    pub(crate) idx: usize,
+    pub(crate) on: MenuOn,
     pub(crate) at: Point<Pixels>,
     pub(crate) details: bool,
 }

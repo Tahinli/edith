@@ -4180,6 +4180,83 @@ impl Project {
         true
     }
 
+    /// The empty stretch of `lane` covering `frame`, as `(start, len)` -- what
+    /// a right-click on empty bench space names before offering to close it.
+    /// `None` when `frame` sits inside a clip, or past the last one: the open
+    /// end of a lane is not a gap, since there is nothing after it to slide
+    /// back ([`gap`]).
+    pub fn gap_at(&self, lane: Lane, frame: u32) -> Option<(u32, u32)> {
+        gap(self.lane(lane), frame)
+    }
+
+    /// The lanes closing the gap `(start, frames)` on `lane` must ripple
+    /// together to keep sync -- what a right-click on empty bench space asks
+    /// before the menu offers to close it, and what widens
+    /// [`cut_regions`](Project::cut_regions)'s scope from the one lane a hand
+    /// named to the whole take the gap might be half of.
+    ///
+    /// A clip bordering the gap on `lane` -- the one ending where it starts,
+    /// the one starting where it ends -- carries a link when it is one take
+    /// with a clip on another lane. That lane joins the scope only when the
+    /// *exact same* stretch is empty there too (same start, same length): the
+    /// ripple then removes nothing but silence, on every lane it touches, and
+    /// both halves stay the length they always were. A link whose partner
+    /// lane is not empty there -- a gap of a different length, or none at all
+    /// -- is named back to the caller rather than silently widened past
+    /// (which would cut real media out of a lane nothing asked to touch) or
+    /// silently left out (which is the defect this closes: a per-lane ripple
+    /// would leave [`scope_holds_takes_whole`](Project::scope_holds_takes_whole)
+    /// to refuse it after the fact, on the very half this could have carried
+    /// along).
+    ///
+    /// `Ok(vec![lane])` alone for a gap that borders no take, or none whose
+    /// partner clip sits on another lane -- the unlinked case, untouched.
+    pub fn gap_take_scope(&self, lane: Lane, start: u32, frames: u32) -> crate::Result<Vec<Lane>> {
+        let Some(li) = self.index(lane) else {
+            return Err("no track to work on".into());
+        };
+        let labels = handles(&self.lanes);
+        let end = start + frames;
+        let mut scope = vec![lane];
+        for c in self.lanes[li]
+            .clips
+            .iter()
+            .filter(|c| c.end() == start || c.start == end)
+        {
+            let Some(id) = c.link else { continue };
+            for (j, data) in self.lanes.iter().enumerate() {
+                if j == li {
+                    continue;
+                }
+                let Some(half) = data.clips.iter().find(|o| o.link == Some(id)) else {
+                    continue;
+                };
+                match gap(&data.clips, start) {
+                    Some((s, f)) if s == start && f == frames => {
+                        let other = labels[j];
+                        if !scope.contains(&other) {
+                            scope.push(other);
+                        }
+                    }
+                    _ => {
+                        return Err(format!(
+                            "the {} clip at frame {} is one take with the {} clip at frame {}: \
+                             closing this gap alone would pull the take out of sync -- close {}'s \
+                             gap there too, or detach them first",
+                            labels[li].label(),
+                            c.start,
+                            labels[j].label(),
+                            half.start,
+                            labels[j].label()
+                        )
+                        .into());
+                    }
+                }
+            }
+        }
+        Ok(scope)
+    }
+
     /// Cut **every** one of `regions` -- `(start, len)` in timeline frames --
     /// out of the lanes in `scope` and close each hole, as one edit: the
     /// jumpcut a silence scan asks for ([`crate::silence`]).
@@ -4897,6 +4974,21 @@ fn source_frame(c: &Clip, timeline_frame: u32) -> u32 {
 fn at(clips: &[Clip], frame: u32) -> Option<usize> {
     let idx = clips.partition_point(|c| c.start <= frame).checked_sub(1)?;
     (frame < clips[idx].end()).then_some(idx)
+}
+
+/// The empty stretch of `clips` covering `frame`, as `(start, len)` -- `None`
+/// when `frame` is inside a clip, or past the last one. Sorted-disjoint
+/// invariant like [`at`]: the first clip whose start is past `frame` is the
+/// far wall, and the last one that ends at or before `frame` (or the
+/// timeline's own head, `0`, when there is none) is the near one.
+fn gap(clips: &[Clip], frame: u32) -> Option<(u32, u32)> {
+    if at(clips, frame).is_some() {
+        return None;
+    }
+    let idx = clips.partition_point(|c| c.start <= frame);
+    let next = clips.get(idx)?;
+    let start = idx.checked_sub(1).map_or(0, |i| clips[i].end());
+    Some((start, next.start - start))
 }
 
 /// Index of the clip `frame` falls *strictly inside*, i.e. the one a split
@@ -7519,6 +7611,166 @@ mod tests {
             p.lane(Lane::A1)[1].start,
             "and still covers the same span as its sound"
         );
+    }
+
+    /// The gap-close menu's hit test: what `gap_at` says about a frame at the
+    /// head of a lane, between two clips, inside a clip, past the last one,
+    /// and on a lane holding nothing at all.
+    #[test]
+    fn gap_at_finds_the_hole_a_frame_sits_in() {
+        let mut p = Project::single(FILE, 1);
+        let v = p.add_lane(LaneKind::Video);
+        // Empty lane: nothing before and nothing after -- not a gap, since
+        // there is nothing to ripple toward.
+        assert_eq!(p.gap_at(v, 0), None, "an empty lane has nothing to close");
+
+        assert!(p.place(v, 5, clip(5, 0, 3, 0)), "single clip at [5,8)");
+        // Before the only clip: the gap runs from the timeline's own head.
+        assert_eq!(p.gap_at(v, 0), Some((0, 5)));
+        assert_eq!(p.gap_at(v, 4), Some((0, 5)));
+        // Inside the clip: not a gap.
+        assert_eq!(p.gap_at(v, 5), None);
+        assert_eq!(p.gap_at(v, 7), None);
+        // Past the only clip: the open end of the lane, not a gap -- there is
+        // nothing after it to slide back.
+        assert_eq!(p.gap_at(v, 8), None);
+        assert_eq!(p.gap_at(v, 100), None);
+
+        assert!(p.place(v, 12, clip(12, 0, 2, 0)), "a second clip at [12,14)");
+        // Between the two: the gap [8,12).
+        assert_eq!(p.gap_at(v, 8), Some((8, 4)));
+        assert_eq!(p.gap_at(v, 11), Some((8, 4)));
+        assert_eq!(p.gap_at(v, 14), None, "still the open end");
+
+        assert!(
+            p.place(v, 8, clip(8, 0, 4, 0)),
+            "fills [8,12) exactly, meeting both neighbours"
+        );
+        assert_eq!(p.gap_at(v, 8), None, "adjacent clips leave no frame to name a gap");
+        assert_eq!(p.gap_at(v, 11), None);
+    }
+
+    /// Closing a gap is [`Project::cut_regions`] scoped to the one lane the
+    /// menu named: the clip after the gap slides back on that lane, a clip on
+    /// another lane at the very same frame range does not move, and the whole
+    /// close is one press of undo.
+    #[test]
+    fn closing_a_gap_ripples_only_its_own_lane_and_undoes_in_one_step() {
+        let mut p = Project::single(FILE, 1);
+        let v = p.add_lane(LaneKind::Video);
+        let a = p.add_lane(LaneKind::Audio);
+        assert!(p.place(v, 5, clip(5, 0, 3, 0)), "V clip at [5,8)");
+        assert!(
+            p.place(a, 0, clip(0, 0, 3, 0)),
+            "A clip at [0,3) -- outside the video lane's gap and this scope"
+        );
+        let before = shape(&p);
+        let (start, len) = p.gap_at(v, 0).expect("a gap before the only clip");
+        assert_eq!((start, len), (0, 5));
+        assert!(p.cut_regions(&[(start, len)], &[v]).is_ok());
+        assert_eq!(p.lane(v)[0].start, 0, "the clip slid back to close the gap");
+        assert_eq!(p.lane(a)[0].start, 0, "the untouched lane's clip did not move");
+        assert!(p.undo(), "one press undoes the whole close");
+        assert_eq!(shape(&p), before, "back to exactly where it was");
+    }
+
+    /// A clip carrying an explicit link id -- what a
+    /// [`from_parts`](Project::from_parts) fixture below needs to build a take
+    /// by hand, the same shape `a_link_id_is_never_two_clips_of_one_lane`
+    /// already builds inline.
+    fn linked(start: u32, in_frame: u32, out_frame: u32, link: u32) -> Clip {
+        Clip {
+            fade_in: 0,
+            fade_out: 0,
+            transition_out: 0,
+            start,
+            in_frame,
+            out_frame,
+            source: 0,
+            link: Some(link),
+            eq: None,
+            color: None,
+            transform: None,
+            fit: FitPolicy::default(),
+            speed: Speed::NORMAL,
+        }
+    }
+
+    /// The ordinary case the defect made a permanent no-op: a gap on `V1`
+    /// bordered by a linked take whose `A1` half is empty across the very
+    /// same stretch widens the scope to both lanes, so the ripple carries the
+    /// take rather than tearing it -- and one undo puts both halves back.
+    #[test]
+    fn closing_a_gap_carries_a_linked_take_when_the_gap_matches_on_both_lanes() {
+        let sources = vec![Source::new(FILE, 0)];
+        let video = vec![linked(0, 0, 3, 1), linked(5, 5, 9, 3)];
+        let audio = vec![linked(0, 0, 3, 1), linked(5, 5, 9, 3)];
+        let mut p = Project::from_parts(sources, two(video, audio), Vec::new(), Vec::new(), Vec::new())
+            .expect("valid parts");
+        let before = shape(&p);
+        assert_eq!(p.gap_at(Lane::V1, 3), Some((3, 2)));
+        assert_eq!(p.gap_at(Lane::A1, 3), Some((3, 2)), "the same stretch is empty on A1 too");
+
+        let scope = p
+            .gap_take_scope(Lane::V1, 3, 2)
+            .expect("a matching gap on both halves widens the scope");
+        assert_eq!(scope.len(), 2, "the take's other lane joins");
+        assert!(scope.contains(&Lane::V1) && scope.contains(&Lane::A1));
+
+        assert!(p.cut_regions(&[(3, 2)], &scope).is_ok());
+        assert_eq!(p.lane(Lane::V1)[1].start, 3, "V1's far half slid back");
+        assert_eq!(p.lane(Lane::A1)[1].start, 3, "A1's far half rode along, in sync");
+        assert!(p.undo(), "one press undoes the whole close");
+        assert_eq!(shape(&p), before, "back to exactly where it was");
+    }
+
+    /// The real design question: a take whose gap is not the *same size* on
+    /// both lanes cannot ripple by one number without pulling a lane's clip
+    /// out from under the other's sync -- refused by name, with the frame
+    /// naming which lane is out of step, rather than silently taking real
+    /// media off the shorter side.
+    #[test]
+    fn closing_a_gap_refuses_a_take_whose_gap_lengths_differ() {
+        let sources = vec![Source::new(FILE, 0)];
+        let video = vec![linked(0, 0, 3, 1), linked(5, 5, 9, 3)];
+        // A1's second half starts at 4, not 5: its gap is [3,4), one frame
+        // shorter than V1's [3,5) -- a legal offset-preserving group, and
+        // still one take.
+        let audio = vec![linked(0, 0, 3, 1), linked(4, 5, 9, 3)];
+        let p = Project::from_parts(sources, two(video, audio), Vec::new(), Vec::new(), Vec::new())
+            .expect("valid parts");
+        assert_eq!(p.gap_at(Lane::V1, 3), Some((3, 2)));
+        assert_eq!(p.gap_at(Lane::A1, 3), Some((3, 1)), "a shorter gap on A1");
+
+        let err = p
+            .gap_take_scope(Lane::V1, 3, 2)
+            .expect_err("a mismatched gap cannot ripple by one number")
+            .to_string();
+        assert!(err.contains("A1"), "{err}");
+        assert!(err.contains("out of sync"), "{err}");
+    }
+
+    /// A gap on `V1` whose `A1` half is not a gap at all -- real audio plays
+    /// there -- cannot close without cutting that audio out from under
+    /// nothing asked to touch it: refused, not widened silently past.
+    #[test]
+    fn closing_a_gap_refuses_a_take_whose_other_half_is_solid() {
+        let sources = vec![Source::new(FILE, 0)];
+        let video = vec![linked(0, 0, 3, 1), linked(5, 5, 9, 3)];
+        // A1 plays through the whole span as one continuous clip, sharing
+        // V1's first-half link: nothing empty at frame 3 there at all.
+        let audio = vec![linked(0, 0, 9, 1)];
+        let p = Project::from_parts(sources, two(video, audio), Vec::new(), Vec::new(), Vec::new())
+            .expect("valid parts");
+        assert_eq!(p.gap_at(Lane::V1, 3), Some((3, 2)));
+        assert_eq!(p.gap_at(Lane::A1, 3), None, "A1 plays through, no gap there");
+
+        let err = p
+            .gap_take_scope(Lane::V1, 3, 2)
+            .expect_err("a solid partner cannot ripple with the gap")
+            .to_string();
+        assert!(err.contains("A1"), "{err}");
+        assert!(err.contains("detach"), "{err}");
     }
 
     #[test]
