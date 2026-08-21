@@ -35,6 +35,9 @@ fn output_path() -> Option<&'static Path> {
         LazyLock::new(|| std::env::var_os("EDITH_HITMAP").map(PathBuf::from));
     PATH.as_deref()
 }
+pub(crate) fn enabled() -> bool {
+    output_path().is_some()
+}
 
 /// Clears the current-frame controls before descendants record their laid-out
 /// bounds, then writes the completed frame after all descendants prepaint.
