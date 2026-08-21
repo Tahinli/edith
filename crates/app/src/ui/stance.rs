@@ -562,9 +562,18 @@ pub(crate) fn notice_bottom_offset(bench_h: f32) -> f32 {
 /// A notice plate (DESIGN §8): one at a time, rising above the *bench*, its
 /// severity a 3px left spine rather than a colour flood. Fed by the same
 /// [`Player::notify_user`]/`notices` queue the legacy bar reads
-/// ([`Player::notice_bar`]) -- no second notice channel. Dismissal is
-/// already wired: [`render`]'s `on_key_down` calls `dismiss_notice()` on
-/// every stroke, the same door the legacy handler uses.
+/// ([`Player::notice_bar`]) -- no second notice channel.
+///
+/// Reads the *back* of the queue, not the front: dismissal only ever fires
+/// on a keystroke ([`render`]'s `on_key_down` calling `dismiss_notice()`),
+/// and most of what fills this queue -- a click on a gap, a menu row, a
+/// drag -- is not one. A `front()` plate left showing a `ctrl+s` "SAVED"
+/// notice sat frozen through an unrelated mouse-driven refusal that queued
+/// in behind it: the ledger strip's own "last action" already reads
+/// `back()` for exactly this reason, and the plate disagreeing with it is
+/// what made the refusal look like it never reached the notice surface at
+/// all. `back()` keeps the two in step and guarantees the newest, most
+/// actionable message is always the one on screen.
 ///
 /// Anchored off `bench_h` rather than a fixed offset off the ledger: at the
 /// bench's floor a fixed `LEDGER_H + 6.` bottom offset put the plate right
@@ -585,9 +594,19 @@ fn notice_plate(message: SharedString, bench_h: f32) -> impl IntoElement {
         .absolute()
         .bottom(px(notice_bottom_offset(bench_h)))
         .left(px(12.))
-        .max_w(px(360.))
-        .flex()
-        .items_center()
+        // `max_w` only caps a box after GPUI has measured its text at
+        // max-content width. `w_full` supplies a definite width to that
+        // measurement (then `max_w` bounds it at 480 px), and normal
+        // whitespace gives the text system permission to shape every word
+        // into the resulting lines. Keep this a block: as a flex child the
+        // text's automatic min-content width can overflow its own plate.
+        //
+        // No fixed height: GPUI's shaped lines contribute their actual
+        // default `phi()` line boxes, so two or three lines grow upward from
+        // this bottom anchor without reaching down over the bench lanes.
+        .w_full()
+        .max_w(px(480.))
+        .whitespace_normal()
         .px(px(10.))
         .py(px(6.))
         .rounded(px(2.))
@@ -922,7 +941,7 @@ pub(crate) fn render(
                 .child(divider(Split::Bench, cx))
                 .child(bench(player, bench_h, cx))
                 .child(ledger(player, position))
-                .when_some(player.notices.front().cloned(), |el, n| {
+                .when_some(player.notices.back().cloned(), |el, n| {
                     el.child(notice_plate(n, bench_h))
                 })
                 .when(player.keys_open, |el| el.child(keys_overlay(player)))
