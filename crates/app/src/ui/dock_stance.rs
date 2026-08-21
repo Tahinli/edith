@@ -11,6 +11,7 @@
 //! still supply the row facts ([`library_rows`], [`source_tint`],
 //! [`clip_middle`]...), only the anatomy around them is new.
 
+use crate::ui::hitmap;
 use crate::ui::type_scale::{self, Typeset, head, label, mono};
 use crate::*;
 use gpui::FontWeight;
@@ -136,6 +137,7 @@ fn ghost_verb(
                 .hover(|s| s.bg(rgb(DARK_RAISED())).text_color(rgb(INK1())))
                 .on_click(on_click)
         })
+        .children(hitmap::action(action, on))
         .child(
             div()
                 .font(label_style.font)
@@ -184,6 +186,7 @@ fn dock_tab(
             save(this.dock_src_active);
             cx.notify();
         }))
+        .children(hitmap::control(id, label_text, true))
         .child(
             div()
                 .font(style.font)
@@ -374,6 +377,10 @@ fn source_row(
                     cx.new(|_| Tip(ghost.clone()))
                 })
         })
+        .children(hitmap::dynamic(
+            move || (format!("source.{i}.row"), "Source row".into()),
+            usable,
+        ))
         .child(
             div()
                 .flex()
@@ -463,6 +470,10 @@ fn source_row(
                                         },
                                     ))
                             })
+                            .children(hitmap::dynamic(
+                                move || (format!("source.{i}.add"), "Add at playhead".into()),
+                                can_insert,
+                            ))
                             .tooltip(move |_, cx| {
                                 cx.new(|_| {
                                     Tip(
@@ -508,6 +519,10 @@ fn source_row(
                                 cx.stop_propagation();
                                 this.toggle_proxy(&proxy_path, proxy_stops, cx);
                             }))
+                            .children(hitmap::dynamic(
+                                move || (format!("source.{i}.proxy"), "Toggle proxy".into()),
+                                !proxy_waiting,
+                            ))
                             .child(
                                 div()
                                     .font(style.font)
@@ -644,6 +659,15 @@ fn subtitle_palette(player: &Player, cx: &mut Context<Player>) -> Option<AnyElem
                                     cx.stop_propagation();
                                     this.remove_subtitle_track(track, cx);
                                 }))
+                                .children(hitmap::dynamic(
+                                    move || {
+                                        (
+                                            format!("subtitle.{track}.remove"),
+                                            "Remove subtitle".into(),
+                                        )
+                                    },
+                                    true,
+                                ))
                                 .child("×"),
                         )
                 })
@@ -671,6 +695,15 @@ fn subtitle_palette(player: &Player, cx: &mut Context<Player>) -> Option<AnyElem
                             }
                             cx.notify();
                         }))
+                        .children(hitmap::dynamic(
+                            move || {
+                                (
+                                    format!("subtitle-group.{group_ord}.fold"),
+                                    "Toggle subtitle group".into(),
+                                )
+                            },
+                            true,
+                        ))
                         .child(if folded { "▸" } else { "▾" })
                         .when_some(tint, |d, tint| {
                             d.child(
@@ -798,6 +831,7 @@ fn sources_tab(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
                     this.dock_filter_edit = true;
                     cx.notify();
                 }))
+                .children(hitmap::control("dock.filter", "Filter sources", true))
                 .child(match player.dock_filter.is_empty() {
                     true => "⌕ type to filter — name, codec, unused…".to_string(),
                     false => format!("⌕ {filter_text}"),
@@ -827,6 +861,15 @@ fn sources_tab(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
                             this.library_tab = tab;
                             cx.notify();
                         }))
+                        .children(hitmap::dynamic(
+                            move || {
+                                (
+                                    format!("dock.filter.{}", tab.label()),
+                                    format!("Filter {}", tab.label()),
+                                )
+                            },
+                            true,
+                        ))
                         .child(tab.label())
                 })),
         )
@@ -854,6 +897,15 @@ fn sources_tab(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
                             this.dock_sort = sort;
                             cx.notify();
                         }))
+                        .children(hitmap::dynamic(
+                            move || {
+                                (
+                                    format!("dock.sort.{}", sort.label()),
+                                    format!("Sort {}", sort.label()),
+                                )
+                            },
+                            true,
+                        ))
                         .child(sort.label())
                 })),
         )
