@@ -2408,30 +2408,24 @@ fn hdr_reference_rows_read_content_light_and_use_the_established_empty_state() {
 /// spelling the action name itself, so each is matched on its own door
 /// string instead.
 ///
-/// [`ALLOWED_CHORD_ONLY`] is the honest remainder: fine-grained playhead/edit
-/// strokes with no button in the *legacy* tree either (`toolbar.rs`,
-/// `inspector.rs`, `library.rs` were all swept for the same names and come
-/// up equally empty) -- not a regression this task closes, just an existing
-/// keyboard-only stroke this editor has never given a face.
+/// Every action gets a persistent regional control or the context-menu row for
+/// the thing it acts on. The four exemptions are independently-owned lane
+/// parity work, named with their owners so a future removal cannot silently
+/// turn any unrelated action back into keyboard-only.
 #[test]
-fn every_chord_bound_action_has_a_darkroom_affordance_or_is_named_chord_only() {
+fn every_action_has_a_darkroom_widget_home_or_explicit_owner() {
     use crate::ActionId;
-    const ALLOWED_CHORD_ONLY: &[ActionId] = &[
-        ActionId::StepBack,
-        ActionId::StepForward,
-        ActionId::GoStart,
-        ActionId::GoEnd,
-        ActionId::PrevSyncPoint,
-        ActionId::NextSyncPoint,
-        ActionId::WalkCutNext10,
-        ActionId::WalkCutPrev10,
-        ActionId::SetIn,
-        ActionId::SetOut,
-        ActionId::ClearRange,
-        ActionId::SelectAll,
-        ActionId::RemoveVideoLane,
-        ActionId::RemoveAudioLane,
-        ActionId::Crossfade,
+    const EXPLICITLY_OWNED_ELSEWHERE: &[(ActionId, &str)] = &[
+        (
+            ActionId::RemoveVideoLane,
+            "lane-header remove parity owns video-lane controls",
+        ),
+        (
+            ActionId::RemoveAudioLane,
+            "lane-header remove parity owns audio-lane controls",
+        ),
+        (ActionId::Crossfade, "fade parity owns crossfade controls"),
+        (ActionId::Dissolve, "fade parity owns dissolve controls"),
     ];
     let darkroom = [
         "ui/bench_stance.rs",
@@ -2448,7 +2442,11 @@ fn every_chord_bound_action_has_a_darkroom_affordance_or_is_named_chord_only() {
     .map(src_text)
     .join("\n");
     for action in ActionId::ALL {
-        if ALLOWED_CHORD_ONLY.contains(&action) {
+        if let Some((_, owner)) = EXPLICITLY_OWNED_ELSEWHERE
+            .iter()
+            .find(|(owned, _)| *owned == action)
+        {
+            assert!(!owner.is_empty(), "ActionId::{action:?} needs an owner");
             continue;
         }
         let name = format!("{action:?}");
@@ -2458,8 +2456,7 @@ fn every_chord_bound_action_has_a_darkroom_affordance_or_is_named_chord_only() {
         assert!(
             mentioned,
             "ActionId::{name} is bound to a chord but has no visible affordance \
-             anywhere in the darkroom tree -- either mount it (see Fit/Redo, this \
-             commit) or add it to ALLOWED_CHORD_ONLY with a reason"
+             anywhere in the darkroom tree -- either mount it or name the owning parity lane"
         );
     }
 }
