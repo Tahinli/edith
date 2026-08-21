@@ -2463,3 +2463,39 @@ fn every_chord_bound_action_has_a_darkroom_affordance_or_is_named_chord_only() {
         );
     }
 }
+
+/// Transition affordances must be painted and use the existing edit state:
+/// fades own their drag handles, an active dissolve remains a mouse toggle,
+/// and a carried lane names the exact slot `reorder_lane` will use.
+#[test]
+fn darkroom_bench_wires_transition_controls_and_lane_drop_cue() {
+    let bench = src_text("ui/bench_stance.rs");
+    let clip = &bench[bench.find("fn clip_box(").expect("the clip renderer")
+        ..bench.find("fn sub_box(").expect("the subtitle renderer")];
+    for needle in [
+        "fade_wedge(true)",
+        "fade_wedge(false)",
+        "dissolve_glyph()",
+        "this.start_fade_drag(lane, idx, is_in, event.position.x, cx)",
+        "this.dissolve_selected(cx)",
+    ] {
+        assert!(
+            clip.contains(needle),
+            "the Darkroom clip lost its transition affordance: {needle}"
+        );
+    }
+
+    let lane = &bench[bench.find("fn lane_row(").expect("the lane renderer")
+        ..bench.find("pub(crate) fn render(").expect("the bench renderer")];
+    for needle in [
+        "this.preview_lane_drop(event.drag(cx).0, lane, cx)",
+        "this.forget_lane_drop(lane, cx)",
+        ".lane_drop",
+        "if drop.above",
+    ] {
+        assert!(
+            lane.contains(needle),
+            "the Darkroom lane lost its reorder feedback: {needle}"
+        );
+    }
+}
