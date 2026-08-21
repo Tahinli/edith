@@ -803,6 +803,9 @@ fn main() {
     // any project's own line ([`engine::edith::Document::auto_proxy`])
     // overrides it the moment one opens.
     let auto_proxies_on = player::library::load_auto_proxies_pref();
+    // The Proxies default the last session left the switch at, same
+    // before-any-project-line precedence as the auto-proxies default above.
+    let proxies_on = player::library::load_proxies_pref();
     // Nothing named on the command line is read here. The first file makes the
     // timeline -- a `.edith` restores a whole one, anything else *is* one --
     // and the rest are imports like any other: rows in the library, dragged
@@ -876,7 +879,7 @@ fn main() {
                     volume_dragging: false,
                     // What a session comes up at, so the first one opened is
                     // pushed the values it already holds.
-                    proxies_on: false,
+                    proxies_on,
                     auto_proxies_on,
                     // Only ever used with a timeline; 30 keeps the empty
                     // timecode reading in frames rather than in NaN.
