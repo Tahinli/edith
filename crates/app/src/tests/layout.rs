@@ -2697,9 +2697,7 @@ fn darkroom_bench_wires_transition_controls_and_lane_drop_cue() {
     let dissolve = &clip[clip
         .find(".when(dissolves, |d| {")
         .expect("the dissolve affordance")
-        ..clip
-            .find(".when(audio && trims(span)")
-            .expect("the fade handles")];
+        ..clip.find(".when(trims(span),").expect("the fade handles")];
     assert!(
         dissolve.contains(".w(px(FADE_HANDLE_W))"),
         "dissolve click target no longer matches fade-handle width"
@@ -2731,5 +2729,77 @@ fn darkroom_bench_wires_transition_controls_and_lane_drop_cue() {
             lane.contains(needle),
             "the Darkroom lane lost its reorder feedback: {needle}"
         );
+    }
+}
+
+/// The pointer harness can only drive controls that report the bounds of the
+/// element that owns the gesture. Keep every dynamic Darkroom entry surface
+/// named, so UI verification never falls back to guessed pixels.
+#[test]
+fn hitmap_names_every_darkroom_pointer_entry_surface() {
+    let bench = src_text("ui/bench_stance.rs");
+    for needle in [
+        "clip.{}.{}.{}.fade-{}",
+        "clip.{}.{}.{}.trim-{}",
+        "clip.{}.{}.{}.dissolve",
+        "lane.{}.reorder",
+        "lane.{}.mix",
+        "lane.{}.eye",
+        "lane.{}.remove",
+    ] {
+        assert!(
+            bench.contains(needle),
+            "bench control missing hitmap id: {needle}"
+        );
+    }
+    assert!(
+        bench.contains(".when(trims(span), |d| {"),
+        "fade handles must cover video clips as well as audio clips"
+    );
+
+    let dock = src_text("ui/dock_stance.rs");
+    for needle in [
+        "subtitle.{group_ord}.{track}.row",
+        "subtitle.{group_ord}.{track}.select",
+        "source.{i}.proxy",
+        "Proxy making",
+    ] {
+        assert!(
+            dock.contains(needle),
+            "dock control missing hitmap contract: {needle}"
+        );
+    }
+
+    for (path, needles) in [
+        (
+            "ui/timeband_stance.rs",
+            &[
+                "timeline.contact-strip",
+                "stance-strip-grip-lt",
+                "stance-strip-grip-rb",
+            ][..],
+        ),
+        ("ui/preview.rs", &["preview.stop", "preview.scrub"][..]),
+        (
+            "ui/overlays.rs",
+            &[
+                "menu.{action:?}",
+                "menu.properties",
+                "theme.{n}.row",
+                "hitmap::action(action, refusal.yes())",
+            ][..],
+        ),
+        (
+            "ui/settings_stance.rs",
+            &[".children(hitmap::control(id, label_text, !exporting))"][..],
+        ),
+    ] {
+        let source = src_text(path);
+        for needle in needles {
+            assert!(
+                source.contains(needle),
+                "{path} missing hitmap contract: {needle}"
+            );
+        }
     }
 }
