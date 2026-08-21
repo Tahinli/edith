@@ -1,5 +1,6 @@
 //! The bars and the floating cards that are not inspector sections.
 
+use crate::ui::hitmap;
 use crate::ui::stance::menu_floor;
 use crate::ui::type_scale::{self, Typeset};
 use crate::ui::widgets::*;
@@ -695,6 +696,7 @@ impl Player {
                                     },
                                 ))
                         })
+                        .children(hitmap::action(action, enabled))
                         .into_any_element(),
                 );
             }
@@ -903,6 +905,10 @@ impl Player {
                     .on_click(
                         cx.listener(move |this, _: &ClickEvent, _, cx| this.choose(choice, cx)),
                     )
+                    .children(hitmap::dynamic(
+                        move || (format!("picker.choice.{n}"), "Choose setting value".into()),
+                        true,
+                    ))
                     .into_any_element()
             })
             .collect();

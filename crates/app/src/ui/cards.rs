@@ -1,5 +1,6 @@
 //! The property cards -- docked into the inspector, or floated when modal.
 
+use crate::ui::hitmap;
 use crate::ui::type_scale::{self, Typeset};
 use crate::ui::widgets::*;
 use crate::*;
@@ -121,6 +122,7 @@ fn dark_card_head(
                     .into()
                 })
                 .child(if max { "▣ m" } else { "⤢ m" })
+                .children(hitmap::control("card.maximize", "Toggle card size", true))
         }))
         .child(
             div()
