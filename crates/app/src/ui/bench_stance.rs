@@ -62,10 +62,9 @@ const TICK_MIN_PX: f64 = 64.;
 const PLATE_W: f32 = 11. * crate::layout::LIST_CHAR_W / type_scale::CHORD_METADATA_MIN_PX
     * type_scale::CHORD_METADATA_MAX_PX
     + 9.;
-/// The pinned track-head column, DESIGN §5's "track heads" -- narrower than
-/// the legacy timeline's `HEADER_W` since a darkroom lane carries no mix/eye
-/// button yet (deferred with the rest of the header's verbs).
-const HEAD_W: f32 = 28.;
+/// The pinned track-head column: wide enough for its lane-specific ghost
+/// verbs and their compact chords without shrinking their pointer targets.
+const HEAD_W: f32 = 72.;
 pub(crate) const ROW_GAP: f32 = 2.;
 /// DESIGN §7: lanes compress evenly up to this many rows before the column
 /// scrolls behind the pinned ruler and heads instead of compressing further.
@@ -634,6 +633,15 @@ fn lane_row(
         .first()
         .map_or_else(INK4, |clip| source_tint(clip.source));
     let head_ghost: SharedString = lane.label().into();
+    let gain_db = player
+        .session
+        .as_ref()
+        .map_or(0., |session| session.lane_gain_db(lane));
+    let shown = player.sub_lane_on(lane);
+    let chord_style = type_scale::mono(
+        type_scale::CHORD_METADATA_MIN_PX,
+        gpui::FontWeight::MEDIUM,
+    );
     div()
         .id(("bench-lane", lane.ord * 10 + lane.kind as usize))
         .flex_none()
@@ -649,7 +657,9 @@ fn lane_row(
             this.reorder_lane(drag.0, lane, cx);
         }))
         .child(
-            // Pinned track head.
+            // Pinned track head: its drag handle remains the lane label; verbs
+            // stay separate pointer targets so a mix/remove click never starts
+            // a reorder drag.
             div()
                 .id(("bench-lane-head", lane.ord * 10 + lane.kind as usize))
                 .flex_none()
@@ -665,13 +675,122 @@ fn lane_row(
                 .on_drag(LaneDrag(lane), move |_, _, _, cx| {
                     cx.new(|_| Tip(head_ghost.clone()))
                 })
-                // MOCK-SPEC.md "Bench": "V1, A1 in mono".
-                .type_style(type_scale::mono(
-                    type_scale::CHORD_METADATA_MIN_PX,
-                    gpui::FontWeight::MEDIUM,
-                ))
-                .text_color(rgb(INK2()))
-                .child(lane.label())
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(2.))
+                        // MOCK-SPEC.md "Bench": "V1, A1 in mono".
+                        .type_style(type_scale::mono(
+                            type_scale::CHORD_METADATA_MIN_PX,
+                            gpui::FontWeight::MEDIUM,
+                        ))
+                        .text_color(rgb(INK2()))
+                        .child(lane.label())
+                        .when(lane.kind == LaneKind::Audio, |d| {
+                            d.child(
+                                div()
+                                    .id(("bench-mix-lane", lane.ord))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(1.))
+                                    .rounded(px(3.))
+                                    .px(px(2.))
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(rgb(DARK_RAISED())).text_color(rgb(INK1())))
+                                    .tooltip(move |_, cx| {
+                                        cx.new(|_| {
+                                            Tip(
+                                                format!(
+                                                    "{} {gain_db:+.0} dB — mix this lane",
+                                                    lane.label()
+                                                )
+                                                .into(),
+                                            )
+                                        })
+                                        .into()
+                                    })
+                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                        this.act_lane(ActionId::Mix, lane, cx);
+                                    }))
+                                    .child("≋")
+                                    .child(
+                                        div()
+                                            .type_style(chord_style.clone())
+                                            .text_color(rgb(INK3()))
+                                            .child(player.keymap.chord(ActionId::Mix)),
+                                    ),
+                            )
+                        })
+                        .when(lane.kind == LaneKind::Subtitle, |d| {
+                            d.child(
+                                div()
+                                    .id(("bench-show-sub-lane", lane.ord))
+                                    .rounded(px(3.))
+                                    .px(px(2.))
+                                    .cursor_pointer()
+                                    .text_color(rgb(if shown { INK1() } else { INK3() }))
+                                    .when(shown, |s| s.bg(rgb(DARK_RAISED())))
+                                    .hover(|s| s.bg(rgb(DARK_RAISED())).text_color(rgb(INK1())))
+                                    .tooltip(move |_, cx| {
+                                        cx.new(|_| {
+                                            Tip(
+                                                format!(
+                                                    "{} — click to show this subtitle lane",
+                                                    lane.label()
+                                                )
+                                                .into(),
+                                            )
+                                        })
+                                        .into()
+                                    })
+                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                        this.show_sub_lane(lane, cx);
+                                    }))
+                                    .child("◉"),
+                            )
+                        })
+                        .when(lane.kind != LaneKind::Subtitle, |d| {
+                            let action = match lane.kind {
+                                LaneKind::Video => ActionId::RemoveVideoLane,
+                                LaneKind::Audio => ActionId::RemoveAudioLane,
+                                LaneKind::Subtitle => unreachable!(),
+                            };
+                            d.child(
+                                div()
+                                    .id(("bench-remove-lane", lane.ord * 10 + lane.kind as usize))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(1.))
+                                    .rounded(px(3.))
+                                    .px(px(2.))
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(rgb(DARK_RAISED())).text_color(rgb(INK1())))
+                                    .tooltip(move |_, cx| {
+                                        cx.new(|_| {
+                                            Tip(
+                                                format!(
+                                                    "Remove {} — it must be empty first",
+                                                    lane.label()
+                                                )
+                                                .into(),
+                                            )
+                                        })
+                                        .into()
+                                    })
+                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                        this.act_lane(action, lane, cx);
+                                    }))
+                                    .child("×")
+                                    .child(
+                                        div()
+                                            .type_style(chord_style)
+                                            .text_color(rgb(INK3()))
+                                            .child(player.keymap.chord(action)),
+                                    ),
+                            )
+                        }),
+                )
                 .child(
                     div()
                         .flex_none()
