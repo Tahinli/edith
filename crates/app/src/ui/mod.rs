@@ -6,6 +6,7 @@
 pub mod bench_stance;
 pub mod cards;
 pub mod dock_stance;
+pub mod hitmap;
 pub mod inspector;
 pub mod library;
 pub mod overlays;

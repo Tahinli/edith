@@ -38,6 +38,7 @@
 //! `nudge_cut` and friends still act on `Player::selected` directly, with no
 //! element under the pointer required, and stay untouched by any of this.
 
+use crate::ui::hitmap;
 use crate::ui::type_scale::{self, Typeset};
 use crate::ui::widgets::*;
 use crate::*;
@@ -306,6 +307,15 @@ fn clip_box(
                 move |_, _, _, cx| cx.new(|_| Tip(ghost.clone()))
             },
         )
+        .children(hitmap::dynamic(
+            move || {
+                (
+                    format!("clip.{}.{}.{}", lane.label(), lane.ord, idx),
+                    "Timeline clip".into(),
+                )
+            },
+            true,
+        ))
         // The two edge strips a drag lengthens or shortens the clip by
         // (`Player::start_trim`), gated on the same `trims(span)` floor the
         // legacy strips use -- a clip too narrow to aim at keeps its whole
@@ -507,6 +517,15 @@ fn clip_box(
                         this.pick((lane, idx), false, cx);
                         this.dissolve_selected(cx);
                     }))
+                    .children(hitmap::dynamic(
+                        move || {
+                            (
+                                format!("clip.{}.{}.{}.dissolve", lane.label(), lane.ord, idx),
+                                "Toggle dissolve".into(),
+                            )
+                        },
+                        true,
+                    ))
                     .child(dissolve_glyph()),
             )
         })
@@ -627,6 +646,15 @@ fn sub_box(
                 move |_, _, _, cx| cx.new(|_| Tip(ghost.clone()))
             },
         )
+        .children(hitmap::dynamic(
+            move || {
+                (
+                    format!("subtitle.{}.{}.{}", lane.label(), lane.ord, idx),
+                    "Timeline subtitle".into(),
+                )
+            },
+            true,
+        ))
         // The same edge-trim strips a clip gets, on the same [`trims`] floor.
         .children(
             [Edge::Start, Edge::End]
@@ -823,6 +851,15 @@ fn lane_row(
                                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                                         this.act_lane(ActionId::Mix, lane, cx);
                                     }))
+                                    .children(hitmap::dynamic(
+                                        move || {
+                                            (
+                                                format!("lane.{}.mix", lane.label()),
+                                                format!("Mix {}", lane.label()),
+                                            )
+                                        },
+                                        true,
+                                    ))
                                     .child("≋")
                                     .child(
                                         div()
@@ -855,6 +892,15 @@ fn lane_row(
                                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                                         this.show_sub_lane(lane, cx);
                                     }))
+                                    .children(hitmap::dynamic(
+                                        move || {
+                                            (
+                                                format!("lane.{}.subtitles", lane.label()),
+                                                format!("Show {}", lane.label()),
+                                            )
+                                        },
+                                        true,
+                                    ))
                                     .child("◉"),
                             )
                         })
@@ -887,6 +933,15 @@ fn lane_row(
                                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                                         this.act_lane(action, lane, cx);
                                     }))
+                                    .children(hitmap::dynamic(
+                                        move || {
+                                            (
+                                                format!("lane.{}.remove", lane.label()),
+                                                format!("Remove {}", lane.label()),
+                                            )
+                                        },
+                                        player.enable(action, None).yes(),
+                                    ))
                                     .child("×")
                                     .child(
                                         div()
@@ -1010,6 +1065,15 @@ fn lane_row(
                     cx.stop_propagation();
                     this.timeline_wheel(event, cx);
                 }))
+                .children(hitmap::dynamic(
+                    move || {
+                        (
+                            format!("lane.{}.bed", lane.label()),
+                            format!("{} timeline bed", lane.label()),
+                        )
+                    },
+                    true,
+                ))
                 .children(boxes)
                 .children(sub_boxes)
                 // The shadow of the row in flight (`Player::ghost`, set by
