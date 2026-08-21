@@ -2272,3 +2272,36 @@ fn settings_project_rows_have_no_bare_noun_placeholder() {
         );
     }
 }
+
+/// The HDR reference rows must read the file's own declared numbers off
+/// [`engine::colorspace::ContentLight`] -- not invent a monitor override the
+/// engine has nowhere to persist -- and must fall back to the page's one
+/// established empty state (a bare `—` in `INK4`, [`row_ink`]/[`row_static`]'s
+/// own idiom) rather than a second placeholder idiom. No `TestAppContext`
+/// here either, so this is the same source-scan the guard above it is.
+#[test]
+fn hdr_reference_rows_read_content_light_and_use_the_established_empty_state() {
+    let source = src_text("ui/settings_stance.rs");
+    let project_start = source.find("fn project_section(").expect("the project section");
+    let editor_start = source.find("fn editor_section(").expect("the editor section");
+    let project_body = &source[project_start..editor_start];
+
+    assert!(project_body.contains("settings-hdr-reference"), "the HDR reference row is missing");
+    assert!(project_body.contains("settings-content-light"), "the content-light row is missing");
+
+    // Reads the real declared numbers, not an invented default or a fixed
+    // string standing in for one.
+    for field in ["mastering_max", "max_cll", "max_fall"] {
+        assert!(project_body.contains(field), "the HDR reference rows do not read ContentLight::{field}");
+    }
+
+    // No override field exists on the engine side to write one into, so the
+    // row must never claim a picker/opener the way every other PROJECT row
+    // does -- it is built with `row_static`, not `row`/`row_ink`.
+    assert!(project_body.contains("row_static(\n            \"settings-hdr-reference\""), "the HDR reference row must be read-only (row_static), not a picker");
+    assert!(project_body.contains("row_static(\n            \"settings-content-light\""), "the content-light row must be read-only (row_static), not a picker");
+
+    // The established empty state: a bare "—" reused, never a second idiom
+    // ("N/A", "None", "Unknown"...) invented for the same absence.
+    assert!(project_body.contains("\"—\".to_string()"), "the HDR reference rows must reuse the page's own empty-state dash");
+}
