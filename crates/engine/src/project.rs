@@ -872,6 +872,22 @@ pub type Parts = (
 /// that grows for as long as the session lasts.
 const HISTORY_CAP: usize = 100;
 
+/// One gap a close-all sweep left open, with the frame it still starts on and
+/// the same refusal a single [`Project::gap_take_scope`] close would have said.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GapSkip {
+    pub start: u32,
+    pub reason: String,
+}
+
+/// What [`Project::close_all_gaps_on_lane`] did: closed gaps count as edits,
+/// skipped gaps are the take-safety refusals the sweep did not hide.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GapSweep {
+    pub closed: usize,
+    pub skipped: Vec<GapSkip>,
+}
+
 /// The edit list plus its undo history.
 #[derive(Clone, Debug)]
 pub struct Project {
@@ -4189,6 +4205,13 @@ impl Project {
         gap(self.lane(lane), frame)
     }
 
+    /// How many bounded holes `lane` holds. The open end after the last clip is
+    /// not counted, like [`gap_at`](Self::gap_at), because closing it would move
+    /// nothing.
+    pub fn gap_count(&self, lane: Lane) -> usize {
+        gaps(self.lane(lane)).len()
+    }
+
     /// The lanes closing the gap `(start, frames)` on `lane` must ripple
     /// together to keep sync -- what a right-click on empty bench space asks
     /// before the menu offers to close it, and what widens
@@ -4255,6 +4278,50 @@ impl Project {
             }
         }
         Ok(scope)
+    }
+
+    /// Close every bounded gap on `lane`, as one undo step, without making the
+    /// lane's scope global. Each gap uses the same take-safety widening
+    /// [`gap_take_scope`](Self::gap_take_scope) gives a single close: linked
+    /// halves ride along only when their matching lane is empty over that exact
+    /// stretch; mismatches are skipped and reported.
+    ///
+    /// The walk is back-to-front. Closing a gap shifts everything after it, so
+    /// later holes must be consumed while their measured starts are still true;
+    /// earlier starts are unchanged by cuts to their right. A snapshot is taken
+    /// only before the first successful close, so an all-skipped sweep is not an
+    /// undo step.
+    pub fn close_all_gaps_on_lane(&mut self, lane: Lane) -> crate::Result<GapSweep> {
+        let Some(_) = self.index(lane) else {
+            return Err("no track to work on".into());
+        };
+        let mut report = GapSweep::default();
+        let mut snapshot = false;
+        for (start, frames) in gaps(self.lane(lane)).into_iter().rev() {
+            match self
+                .gap_take_scope(lane, start, frames)
+                .and_then(|scope| {
+                    let on = self.scoped(&scope)?;
+                    self.scope_holds_takes_whole(&on, start)?;
+                    Ok(on)
+                }) {
+                Ok(on) => {
+                    if !snapshot {
+                        self.snapshot();
+                        snapshot = true;
+                    }
+                    ripple(&mut self.lanes, &on, start, frames);
+                    report.closed += 1;
+                }
+                Err(e) => report.skipped.push(GapSkip {
+                    start,
+                    reason: e.to_string(),
+                }),
+            }
+        }
+        report.skipped.reverse();
+        debug_assert!(links_are_consistent(&self.lanes).is_ok());
+        Ok(report)
     }
 
     /// Cut **every** one of `regions` -- `(start, len)` in timeline frames --
@@ -4989,6 +5056,20 @@ fn gap(clips: &[Clip], frame: u32) -> Option<(u32, u32)> {
     let next = clips.get(idx)?;
     let start = idx.checked_sub(1).map_or(0, |i| clips[i].end());
     Some((start, next.start - start))
+}
+
+/// Every bounded hole in `clips`, left to right. The tail after the last clip is
+/// deliberately absent: there is no later placement for a ripple to bring back.
+fn gaps(clips: &[Clip]) -> Vec<(u32, u32)> {
+    let mut out = Vec::new();
+    let mut next = 0;
+    for c in clips {
+        if c.start > next {
+            out.push((next, c.start - next));
+        }
+        next = c.end();
+    }
+    out
 }
 
 /// Index of the clip `frame` falls *strictly inside*, i.e. the one a split
@@ -7771,6 +7852,108 @@ mod tests {
             .to_string();
         assert!(err.contains("A1"), "{err}");
         assert!(err.contains("detach"), "{err}");
+    }
+
+
+    /// The sweep is the single-gap close repeated on one lane, but measured once
+    /// and applied from the right. The differing gap lengths here expose a
+    /// front-to-back bug: the last clip would be cut against a stale frame after
+    /// the first gap shifted it.
+    #[test]
+    fn close_all_gaps_on_one_lane_closes_every_bounded_gap_and_undoes_once() {
+        let mut p = Project::single(FILE, 1);
+        let v = p.add_lane(LaneKind::Video);
+        assert!(p.place(v, 2, clip(2, 0, 2, 0)), "head gap [0,2)");
+        assert!(p.place(v, 7, clip(7, 2, 4, 0)), "middle gap [4,7)");
+        assert!(p.place(v, 14, clip(14, 4, 5, 0)), "middle gap [9,14)");
+        let before = shape(&p);
+
+        assert_eq!(p.gap_count(v), 3);
+        let report = p.close_all_gaps_on_lane(v).expect("the lane exists");
+        assert_eq!(report.closed, 3);
+        assert!(report.skipped.is_empty());
+        assert_eq!(
+            p.lane(v),
+            &[clip(0, 0, 2, 0), clip(2, 2, 4, 0), clip(4, 4, 5, 0)],
+            "all gaps closed without eating source frames"
+        );
+        assert!(p.undo(), "one undo for the whole sweep");
+        assert_eq!(shape(&p), before);
+    }
+
+    /// Empty, already-contiguous and tail-only lanes are not controls that do
+    /// work. A single clip with a head gap does close, because there is a real
+    /// placement to ripple back.
+    #[test]
+    fn close_all_gaps_on_one_lane_handles_empty_single_contiguous_and_tail_only_lanes() {
+        let mut p = Project::single(FILE, 9);
+        let v = p.add_lane(LaneKind::Video);
+        let history = p.history.len();
+        let report = p.close_all_gaps_on_lane(v).expect("empty lane exists");
+        assert_eq!(report, GapSweep::default(), "an empty lane has no bounded gap");
+        assert_eq!(p.history.len(), history, "no undo step for a no-op");
+
+        let mut p = Project::single(FILE, 9);
+        let v = p.add_lane(LaneKind::Video);
+        assert!(p.place(v, 5, clip(5, 0, 3, 0)));
+        let before = shape(&p);
+        let report = p.close_all_gaps_on_lane(v).expect("single clip lane exists");
+        assert_eq!(report.closed, 1, "the head gap closes");
+        assert_eq!(p.lane(v), &[clip(0, 0, 3, 0)]);
+        assert!(p.undo());
+        assert_eq!(shape(&p), before);
+
+        let mut p = Project::single(FILE, 9);
+        let history = p.history.len();
+        let report = p.close_all_gaps_on_lane(Lane::V1).expect("V1 exists");
+        assert_eq!(report, GapSweep::default(), "contiguous clips have no gaps");
+        assert_eq!(p.history.len(), history);
+
+        let mut p = Project::single(FILE, 9);
+        let v = p.add_lane(LaneKind::Video);
+        assert!(p.place(v, 0, clip(0, 0, 3, 0)));
+        let history = p.history.len();
+        let report = p.close_all_gaps_on_lane(v).expect("tail-only lane exists");
+        assert_eq!(report, GapSweep::default(), "the open-ended tail is not closed");
+        assert_eq!(p.lane(v), &[clip(0, 0, 3, 0)]);
+        assert_eq!(p.history.len(), history);
+    }
+
+    /// A sweep closes the gaps that satisfy the linked-take rule and leaves the
+    /// rest in place with a count and reason. Here [2,4) matches on both lanes,
+    /// while V1's [6,9) has only [6,8) empty on A1.
+    #[test]
+    fn close_all_gaps_on_one_lane_partially_closes_linked_takes_and_reports_skips() {
+        let sources = vec![Source::new(FILE, 0)];
+        let video = vec![
+            linked(0, 0, 2, 1),
+            linked(4, 4, 6, 2),
+            clip(9, 9, 11, 0),
+        ];
+        let audio = vec![
+            linked(0, 0, 2, 1),
+            linked(4, 4, 6, 2),
+            clip(8, 8, 11, 0),
+        ];
+        let mut p =
+            Project::from_parts(sources, two(video, audio), Vec::new(), Vec::new(), Vec::new())
+            .expect("valid parts");
+        let before = shape(&p);
+
+        let report = p.close_all_gaps_on_lane(Lane::V1).expect("V1 exists");
+        assert_eq!(report.closed, 1);
+        assert_eq!(report.skipped.len(), 1);
+        assert_eq!(report.skipped[0].start, 6);
+        assert!(report.skipped[0].reason.contains("A1"), "{report:?}");
+        assert!(report.skipped[0].reason.contains("out of sync"), "{report:?}");
+
+        assert_eq!(p.lane(Lane::V1)[1].start, 2, "the matched take moved");
+        assert_eq!(p.lane(Lane::A1)[1].start, 2, "and its other half stayed in sync");
+        assert_eq!(p.lane(Lane::V1)[2].start, 7, "the skipped later gap remains");
+        assert_eq!(p.lane(Lane::A1)[2].start, 6, "A1's shorter gap remains shorter");
+        links_are_consistent(&p.lanes).expect("every linked take that moved stayed whole");
+        assert!(p.undo(), "one undo restores every closed gap");
+        assert_eq!(shape(&p), before);
     }
 
     #[test]
