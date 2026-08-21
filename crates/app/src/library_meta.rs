@@ -320,8 +320,28 @@ pub(crate) fn unusable(info: &StreamInfo, timeline_audio: Option<(u32, u16)>) ->
 /// thousand hertz on 320 px spends four pixels on the octave below middle C --
 /// so it takes the room a big window has and stays inside a small one. Floored
 /// at the other cards' width, which is the last size the rows still read at.
-pub(crate) fn eq_card_w(window_w: f32) -> f32 {
-    (window_w - EQ_W_MARGIN).clamp(KEYS_W, EQ_W_MAX)
+pub(crate) fn eq_card_w(window_w: f32, maximized: bool) -> f32 {
+    let raw = window_w - EQ_W_MARGIN;
+    if maximized {
+        // Maximized drops the [`EQ_W_MAX`] ceiling: every pixel across is
+        // frequency resolution (the doc comment above), and a maximized card
+        // is asking for exactly the room a big window has to give it.
+        raw.max(KEYS_W)
+    } else {
+        raw.clamp(KEYS_W, EQ_W_MAX)
+    }
+}
+
+/// How wide a non-EQ param card is drawn: its usual fixed width, or (when
+/// maximized) all of the window bar the same margin the EQ card gives
+/// itself -- never narrower than its own floor, so a small window's
+/// maximize is a no-op rather than a shrink.
+pub(crate) fn card_max_w(base_w: f32, maximized: bool, window_w: f32) -> f32 {
+    if maximized {
+        (window_w - EQ_W_MARGIN).max(base_w)
+    } else {
+        base_w
+    }
 }
 
 /// What the media list is given of the window. A share of it, so a narrow
