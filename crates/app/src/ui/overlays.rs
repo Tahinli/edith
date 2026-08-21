@@ -567,21 +567,37 @@ impl Player {
                 );
             }
         } else if let MenuOn::Gap(start, frames) = menu.on {
-            // The one item a gap offers: no properties, no clip actions, just
-            // the ripple that closes it -- Premiere's Close Gap, Resolve's
-            // Delete Gap, per-lane the way `Player::close_gap` documents.
+            // Gap rows are ripples, not clip actions. The first is the exact
+            // hole under the pointer; the second appears only when the same
+            // track has another bounded hole too, and says the track in the row
+            // so "all" cannot read as the whole timeline.
+            let lane = menu.lane;
             rows.push(
                 row(rows.len())
                     .cursor_pointer()
                     .hover(|s| s.bg(rgb(BG_HOVER())))
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.context_menu = None;
-                        this.close_gap(menu.lane, start, frames, cx);
+                        this.close_gap(lane, start, frames, cx);
                     }))
                     .child("Close gap")
                     .child(chord_style(div().text_color(rgb(FG_SECONDARY()))).child("ripples left"))
                     .into_any_element(),
             );
+            if session.gap_count(lane) > 1 {
+                rows.push(
+                    row(rows.len())
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgb(BG_HOVER())))
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.context_menu = None;
+                            this.close_all_gaps_on_lane(lane, cx);
+                        }))
+                        .child(format!("Close all {} gaps", lane.label()))
+                        .child(chord_style(div().text_color(rgb(FG_SECONDARY()))).child("this track"))
+                        .into_any_element(),
+                );
+            }
         } else {
             // A grade on a waveform, an equalizer on a picture, a silence scan
             // on a still: things that do not exist for what was right-clicked,
