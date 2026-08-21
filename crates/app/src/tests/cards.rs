@@ -2,6 +2,7 @@
 //! colour and speed bars, the silence scan, the choices and the export.
 
 use super::*;
+use crate::audio_cards::EQ_GRAPH_MAX_H;
 use std::sync::atomic::Ordering;
 
 /// FAULT 2's general shape (not just the source dot's menu): `overlaid()`
