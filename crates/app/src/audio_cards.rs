@@ -119,6 +119,21 @@ pub(crate) const EQ_FREQ_HIGH: f32 = 20_000.;
 /// and short enough that the card still fits a 360 px window.
 pub(crate) const EQ_GRAPH_H: f32 = 132.;
 
+/// The curve box maximized: 1 dB and a semitone-ish band of frequency both
+/// read as more pixels than the docked floor spends on them -- the same
+/// curve, the same ±12 dB axis and the same 20 Hz-20 kHz sweep, just spread
+/// over more of the vertical resolution a maximized card borrows from the
+/// bench/ledger rows below the picture ([`crate::ui::stance::below_picture_floor`]).
+pub(crate) const EQ_GRAPH_MAX_H: f32 = 320.;
+
+/// The graph's own height for the card's current size: the docked floor, or
+/// the maximized card's own taller box -- never a CSS scale of the same
+/// pixels, an actually taller curve with more room per decibel and per
+/// decade.
+pub(crate) fn eq_graph_h(maximized: bool) -> f32 {
+    if maximized { EQ_GRAPH_MAX_H } else { EQ_GRAPH_H }
+}
+
 /// How wide the equalizer card is allowed to get. It is the one card that is a
 /// *graph*: every pixel across is frequency resolution, and at the 320 px the
 /// other cards use, a third of an octave was a couple of pixels. Past this the
@@ -172,6 +187,65 @@ pub(crate) const EQ_TICKS: [(f32, &str); 5] = [
 /// counting pixels. The limits themselves are the box's own edges and are
 /// named at the corners instead.
 pub(crate) const EQ_DB_GRID: [f32; 2] = [6., -6.];
+
+/// How wide an end tick's own label box has to be so "20 Hz" reads as one
+/// line rather than wrapping onto two ("20" over "Hz") -- driven live and
+/// found doing exactly that at a fixed 24 px box once the end ticks were
+/// anchored to the graph's edge instead of centred on it (the anchor alone
+/// was not the whole fix). Sized off the label's own character count at the
+/// size it is actually drawn, using the list-truncation ladder's already
+/// -calibrated characters-to-pixels ratio ([`crate::layout::LIST_CHAR_W`] at
+/// [`crate::ui::type_scale::CHORD_METADATA_MIN_PX`]) rather than a second
+/// magic pixel count -- so a future type-scale bump (this one already moved
+/// once this session) widens the box along with the text instead of
+/// re-wrapping it.
+pub(crate) fn eq_tick_end_w(label: &str, text_px: f32) -> f32 {
+    label.chars().count() as f32 * crate::layout::LIST_CHAR_W
+        / crate::ui::type_scale::CHORD_METADATA_MIN_PX
+        * text_px
+}
+
+#[cfg(test)]
+mod eq_graph_maximize_tests {
+    use super::*;
+
+    /// D2's regression class: the maximized card revealed LESS than docked
+    /// at the same bench, because the graph claimed a fixed slice (a flat
+    /// `EQ_GRAPH_MAX_H`) that left nothing for the rows below it, forcing a
+    /// scroll docked never needed at the same bench. This binary has no
+    /// `TestAppContext`, so it cannot read the flex layout gpui actually
+    /// paints back -- this is a value-level pin on the two numbers the fix
+    /// (`crates/app/src/ui/cards.rs`'s `graph_maximized` branch, `flex_1()`
+    /// between a floor and a ceiling rather than a fixed height) depends on,
+    /// not a substitute for driving a maximize at a small bench: the
+    /// maximized graph's floor must be the *same* constant docked draws its
+    /// fixed height at (so maximized can never show less graph than docked,
+    /// whatever room is left over for the graph to grow into), and that
+    /// floor must not exceed its own ceiling (an inverted `min_h`/`max_h`
+    /// clamp is a layout-time panic, not a compile-time one).
+    #[test]
+    fn maximized_graph_floor_matches_docked_and_never_exceeds_its_own_ceiling() {
+        assert_eq!(eq_graph_h(false), EQ_GRAPH_H, "docked height must be the floor maximized also uses");
+        assert!(EQ_GRAPH_H <= EQ_GRAPH_MAX_H);
+    }
+}
+
+#[cfg(test)]
+mod eq_tick_end_w_tests {
+    use super::*;
+
+    /// The defect measured live: a fixed 24 px box wrapped "20 Hz" (5 chars)
+    /// at the dark theme's 11 px end-tick size. The derived width must clear
+    /// that box, and must grow, not shrink, if a future scale bump raises
+    /// the size fed in.
+    #[test]
+    fn wide_enough_for_the_widest_end_label_and_grows_with_the_type_scale() {
+        let dark_w = eq_tick_end_w("20 Hz", crate::ui::type_scale::CHORD_METADATA_MIN_PX);
+        assert!(dark_w > 24., "{dark_w} must clear the old fixed box");
+        let bumped_w = eq_tick_end_w("20 Hz", crate::ui::type_scale::CHORD_METADATA_MIN_PX + 4.);
+        assert!(bumped_w > dark_w);
+    }
+}
 
 
 /// How many played samples one spectrum frame is transformed from. A power of
