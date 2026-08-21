@@ -26,7 +26,9 @@ use crate::colorspace::{ColorDescription, ContentLight};
 use crate::decode::{Backend, BackendCell, DecodeSession, Frame, Worker};
 use crate::demux::{Codec, Demuxer, VideoMeta};
 use crate::eq::EqParams;
-use crate::project::{Clip, Edge, Lane, LaneKind, Project, Rate, Source, Span, Speed, SubClip};
+use crate::project::{
+    Clip, Edge, GapSweep, Lane, LaneKind, Project, Rate, Source, Span, Speed, SubClip,
+};
 use crate::scale::{Composer, FitPolicy};
 use crate::transform::TransformParams;
 
@@ -2035,6 +2037,12 @@ impl PlaybackSession {
         self.project.gap_at(lane, frame)
     }
 
+    /// How many bounded gaps that same right-click lane holds. The tail after
+    /// the last clip is not counted, because nothing would ripple there.
+    pub fn gap_count(&self, lane: Lane) -> usize {
+        self.project.gap_count(lane)
+    }
+
     /// Every lane's handle, in display order -- what a front-end lays out top to
     /// bottom, and the list [`add_lane`](Self::add_lane) grows.
     pub fn lanes(&self) -> Vec<Lane> {
@@ -2456,6 +2464,18 @@ impl PlaybackSession {
     /// space asks before offering to close it.
     pub fn gap_take_scope(&self, lane: Lane, start: u32, frames: u32) -> crate::Result<Vec<Lane>> {
         self.project.gap_take_scope(lane, start, frames)
+    }
+
+    /// Closes every bounded gap on one lane, keeping each linked take whole when
+    /// its other half has the matching empty stretch and reporting the gaps that
+    /// were not safe to close. One undo step for every gap that closed.
+    pub fn close_all_gaps_on_lane(&mut self, lane: Lane) -> crate::Result<GapSweep> {
+        let report = self.project.close_all_gaps_on_lane(lane)?;
+        if report.closed > 0 {
+            let now = self.now();
+            self.seek(now);
+        }
+        Ok(report)
     }
 
     /// Cuts every one of `regions` -- `(start, len)` in timeline frames -- out
