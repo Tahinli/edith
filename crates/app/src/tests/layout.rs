@@ -44,6 +44,54 @@ fn toolbar_fits_the_smallest_window() {
     );
 }
 
+/// The class the user reported twice in one day ("some menus are belongs to
+/// old ui ... for example resolution picker", then "right click menu in
+/// library is old too"): a surface that paints a *role* token
+/// (`BG_HOVER`/`BG_SELECTED`/`BG_RAISED`) rather than a Darkroom token used
+/// to get the legacy tree's pale greys, because the Darkroom palette still
+/// carried them. Dozens of call sites read those three roles; the fix is the
+/// palette, and this pins it: every interaction grey in the Darkroom palette
+/// stays inside DESIGN §2's `raised` band (#14171B - #17191D), with only the
+/// picked-row fill allowed one step past it, and each stays distinguishable
+/// from the one below it so a hover is still visible on a resting row.
+#[test]
+fn the_darkroom_palettes_interaction_greys_stay_inside_the_raised_band() {
+    use crate::ui::theme::darkroom;
+    let grey = |v: u32| (v >> 16 & 0xff, v >> 8 & 0xff, v & 0xff);
+    let lum = |v: u32| {
+        let (r, g, b) = grey(v);
+        u32::from(r) + u32::from(g) + u32::from(b)
+    };
+    let band_low = lum(0x14171b);
+    let band_high = lum(0x17191d);
+    for (name, value) in [
+        ("BG_RAISED", darkroom::BG_RAISED),
+        ("BG_HOVER", darkroom::BG_HOVER),
+    ] {
+        assert!(
+            (band_low..=band_high).contains(&lum(value)),
+            "darkroom::{name} = {value:#08x} is outside DESIGN §2's raised band \
+             -- every menu, card and row that paints this role would open a \
+             pale plate in a dim room"
+        );
+    }
+    assert!(
+        lum(darkroom::BG_SELECTED) > lum(darkroom::BG_HOVER)
+            && lum(darkroom::BG_SELECTED) <= lum(0x1c1f24),
+        "the picked-row fill is one step past hover at most; the real mark is \
+         the 1px ink1 ring (DESIGN §4)"
+    );
+    assert!(
+        lum(darkroom::BG_HOVER) > lum(darkroom::BG_RAISED),
+        "hover must be a step ABOVE the resting raised fill or a hovered row \
+         cannot be seen at all"
+    );
+    assert!(
+        lum(darkroom::BG_HOVER_DIM) < lum(darkroom::BG_RAISED),
+        "the dim hover is the step below, not above"
+    );
+}
+
 /// The whole reason `ui/theme.rs` exists: a colour written anywhere else is
 /// a colour the next palette sweep will miss, which is exactly how 186 grey
 /// calls survived every previous attempt at this.
@@ -2222,13 +2270,25 @@ fn settings_project_and_editor_sections_open_disjoint_doors() {
     let project_body = &source[project_start..editor_start];
     let editor_body = &source[editor_start..render_start];
 
+    // `Pick::Theme` is the one list that is nobody's project -- the palette
+    // lives in ~/.config/edith like the subtitle font beside it (see
+    // `menus.rs`'s own note on the variant), so its row is EDITOR's by the
+    // same rule every other row here follows. The scan below is on the door
+    // *string*, so the palette row is subtracted from the EDITOR body before
+    // the project-door check runs rather than the check being loosened for
+    // every picker.
+    let editor_no_theme = editor_body.replace("open_picker(Pick::Theme", "");
     for door in ["open_picker(", "open_mix("] {
         assert!(project_body.contains(door), "PROJECT section no longer opens {door} -- update this guard");
         assert!(
-            !editor_body.contains(door),
+            !editor_no_theme.contains(door),
             "EDITOR section opens {door}, a project-file door -- that value belongs in PROJECT, not here"
         );
     }
+    assert!(
+        editor_body.contains("open_picker(Pick::Theme"),
+        "the palette row left EDITOR -- it is a ~/.config preference, not a project value"
+    );
     for door in ["toggle_proxies(", "toggle_auto_proxies(", "open_subtitle_style("] {
         assert!(editor_body.contains(door), "EDITOR section no longer opens {door} -- update this guard");
         assert!(

@@ -1288,11 +1288,25 @@ pub mod darkroom {
     // -- surfaces -----------------------------------------------------------
     pub const BG_CANVAS: u32 = 0x050607;
     pub const BG_PANEL: u32 = 0x0e1013;
-    pub const BG_RAISED: u32 = 0x15181c;
+    // DESIGN §2's `raised` band (#14171B - #17191D) is the WHOLE interaction
+    // ladder in this room: a resting raised fill, one step up for hover, one
+    // more for a picked row -- selection's real mark is the 1px `ink1` ring
+    // (§4), never a pale flood.
+    //
+    // These four used to carry the legacy tree's greys (hover #2A2E33,
+    // selected #2E3237 -- two and three steps outside the band). Every
+    // surface that paints a *role* rather than a Darkroom token -- the clip
+    // menu, the library row menu, the keys overlay, the seven param cards --
+    // read them, so each one opened a pale plate in a dim room while the
+    // handful of surfaces written against `DARK_*`/`INK*` directly looked
+    // right. That is the whole "some menus belong to old ui" class, and it
+    // is fixed here, once, rather than by another per-call-site `if
+    // darkroom` branch: role tokens ARE the theme's job (§2's guard).
+    pub const BG_RAISED: u32 = 0x14171b;
     pub const BG_TIMELINE: u32 = 0x08090b;
-    pub const BG_HOVER: u32 = 0x2a2e33;
-    pub const BG_HOVER_DIM: u32 = 0x1c1f24;
-    pub const BG_SELECTED: u32 = 0x2e3237;
+    pub const BG_HOVER: u32 = 0x17191d;
+    pub const BG_HOVER_DIM: u32 = 0x121418;
+    pub const BG_SELECTED: u32 = 0x1c1f24;
     pub const SCRIM: u32 = 0x050607cc;
     pub const SCRIM_LIGHT: u32 = 0x05060755;
 

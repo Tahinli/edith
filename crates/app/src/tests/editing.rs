@@ -1082,6 +1082,22 @@ fn a_menu_offers_only_what_applies_and_is_drawn_inside_the_window() {
         "a file that cannot join this timeline is not an Add anybody can ask for"
     );
     assert!(!row_enable(RowItem::Remove, RowCtx { placed: 1, ..live }).yes());
+    // The two removes are one verb with two shapes and exactly one of them is
+    // ever on the plate: a placed source offers "with its clips", an unplaced
+    // one the plain remove. Before this pair existed a placed source had no
+    // reachable way out of the library at all (user 2026-08-21: "can not
+    // remove a media from library").
+    let placed = RowCtx { placed: 2, ..live };
+    let items = row_items(placed);
+    assert!(items.contains(&RowItem::RemoveWithClips) && !items.contains(&RowItem::Remove));
+    assert!(row_enable(RowItem::RemoveWithClips, placed).yes());
+    let unplaced = row_items(live);
+    assert!(unplaced.contains(&RowItem::Remove) && !unplaced.contains(&RowItem::RemoveWithClips));
+    assert!(!row_enable(
+        RowItem::RemoveWithClips,
+        RowCtx { exporting: true, ..placed }
+    )
+    .yes());
     assert!(!row_enable(RowItem::Add, RowCtx::default()).yes());
     // Every refusal is short enough to sit in the hint column beside its
     // label, the clip menu's rule.

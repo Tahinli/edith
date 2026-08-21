@@ -116,13 +116,21 @@ pub(crate) type ChoiceRow = (Choice, SharedString, SharedString, bool);
 pub(crate) enum RowItem {
     Add,
     Remove,
+    /// Remove that first deletes every clip playing the row. The plain
+    /// [`RowItem::Remove`] is refused while any clip plays a source (the
+    /// engine's own rule), which used to leave a placed source with no way
+    /// out of the library at all -- this is that way out, and it is
+    /// destructive, so it is listed only when it is the one that applies and
+    /// it says how many clips it takes with it.
+    RemoveWithClips,
     Reveal,
     Properties,
 }
 
-pub(crate) const ROW_ITEMS: [RowItem; 4] = [
+pub(crate) const ROW_ITEMS: [RowItem; 5] = [
     RowItem::Add,
     RowItem::Remove,
+    RowItem::RemoveWithClips,
     RowItem::Reveal,
     RowItem::Properties,
 ];
@@ -132,6 +140,12 @@ impl RowItem {
         match self {
             Self::Add => "Add at playhead",
             Self::Remove => "Remove from library",
+            // Same label as the plain remove: only ever one of the two is on
+            // the plate (the oracle hides the other), so what differs is the
+            // consequence, and the consequence belongs in the hint column
+            // where every other row states its own. The long dashed title
+            // truncated its own hint at `MENU_W`.
+            Self::RemoveWithClips => "Remove from library",
             Self::Reveal => "Reveal in files",
             Self::Properties => "Properties",
         }
@@ -146,6 +160,7 @@ impl RowItem {
             // off mid-word says less than a shorter one.
             Self::Add => "the whole file",
             Self::Remove => "nothing plays it",
+            Self::RemoveWithClips => "clips too",
             Self::Reveal => "file manager",
             Self::Properties => "…",
         }
