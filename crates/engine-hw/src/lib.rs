@@ -24,6 +24,8 @@
 //! exists: give `vh_open_at`/`vh_next_frame` the message tags `vh_enc_*` have in
 //! `hwproc` and let the same helper hold both.
 
+mod slice_fix;
+
 use std::collections::VecDeque;
 use std::ffi::{CStr, c_char, c_void};
 use std::os::fd::IntoRawFd;
@@ -34,8 +36,8 @@ use std::rc::Rc;
 use cros_codecs::backend::vaapi::decoder::VaapiBackend;
 use cros_codecs::backend::vaapi::encoder::VaapiBackend as VaapiEncBackend;
 use cros_codecs::codec::av1::parser::Profile as Av1Profile;
-use cros_codecs::codec::h264::parser::{Level, Profile as H264Profile};
-use cros_codecs::codec::h265::parser::{Level as H265Level, Profile as H265Profile};
+use cros_codecs::codec::h264::parser::Profile as H264Profile;
+use cros_codecs::codec::h265::parser::Profile as H265Profile;
 use cros_codecs::decoder::stateless::av1::Av1;
 use cros_codecs::decoder::stateless::h264::H264;
 use cros_codecs::decoder::stateless::h265::H265;
@@ -1181,6 +1183,9 @@ struct EncSession {
     /// differs: the H.264 driver leaves a *NAL* header byte at zero, and
     /// neither an HEVC access unit nor an AV1 temporal unit has that one.
     codec: EncCodec,
+    /// The H.264 counters the driver zeroes, rewritten per access unit
+    /// ([`slice_fix`]).
+    counters: slice_fix::SliceCounters,
     /// Owns the DRM node the buffer objects below were allocated from.
     _gbm: gbm::Device<std::fs::File>,
     /// [`enc_depth`] input buffers, used round-robin.
@@ -1397,7 +1402,7 @@ impl EncSession {
                 let config = H265Config {
                     resolution: Resolution { width, height },
                     profile: H265Profile::Main,
-                    level: H265Level::L4,
+                    level: slice_fix::hevc_level(width, height, fps_num, fps_den),
                     pred_structure: PredictionStructure::LowDelay { limit: 1 },
                     initial_tunings: Tunings {
                         rate_control: RateControl::ConstantBitrate(bitrate),
@@ -1429,7 +1434,7 @@ impl EncSession {
                 let config = H264Config {
                     resolution: Resolution { width, height },
                     profile: H264Profile::Main,
-                    level: Level::L4,
+                    level: slice_fix::h264_level(width, height, fps_num, fps_den),
                     pred_structure,
                     initial_tunings: Tunings {
                         rate_control: RateControl::ConstantBitrate(bitrate),
@@ -1466,6 +1471,7 @@ impl EncSession {
             depth,
             slot: 0,
             in_flight: 0,
+            counters: slice_fix::SliceCounters::default(),
             layout,
             coded,
             width: width as usize,
@@ -1672,6 +1678,7 @@ impl EncSession {
         let mut au = coded.bitstream;
         if self.codec == EncCodec::H264 {
             fix_slice_nal_headers(&mut au);
+            self.counters.fix_au(&mut au);
         }
         self.ready.push_back(au);
         self.in_flight = self.in_flight.saturating_sub(1);
