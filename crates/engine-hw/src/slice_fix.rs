@@ -307,36 +307,11 @@ fn rewrite_slice(
     true
 }
 
-/// The lowest H.264 level (Table A-1) whose frame size and macroblock rate
-/// hold `width`x`height` at `fps`; 6.2 past the table.
+/// The H.264 level the plugin asks the driver for: [`engine::export::h264_level_idc`]
+/// as the vendored encoder's enum, 6.2 for anything it has no name for.
 pub fn h264_level(width: u32, height: u32, fps_num: u32, fps_den: u32) -> Level {
-    const LEVELS: [(u8, u64, u64); 17] = [
-        (10, 1485, 99),
-        (11, 3000, 396),
-        (12, 6000, 396),
-        (13, 11880, 396),
-        (20, 11880, 396),
-        (21, 19800, 792),
-        (22, 20250, 1620),
-        (30, 40500, 1620),
-        (31, 108000, 3600),
-        (32, 216000, 5120),
-        (40, 245760, 8192),
-        (41, 245760, 8192),
-        (42, 522240, 8704),
-        (50, 589824, 22080),
-        (51, 983040, 36864),
-        (52, 2073600, 36864),
-        (60, 4177920, 139264),
-    ];
-    let frame_mbs = u64::from(width.div_ceil(16)) * u64::from(height.div_ceil(16));
-    let fps = f64::from(fps_num.max(1)) / f64::from(fps_den.max(1));
-    let mbps = (frame_mbs as f64 * fps).ceil() as u64;
-    let idc = LEVELS
-        .iter()
-        .find(|&&(_, max_mbps, max_fs)| mbps <= max_mbps && frame_mbs <= max_fs)
-        .map_or(62, |&(idc, ..)| idc);
-    Level::try_from(idc).unwrap_or(Level::L6_2)
+    Level::try_from(engine::export::h264_level_idc(width, height, fps_num, fps_den))
+        .unwrap_or(Level::L6_2)
 }
 
 /// The lowest HEVC level (Table A.8, Main tier) whose luma picture size and
