@@ -375,6 +375,40 @@ pub struct ExportSettings {
     pub range: Option<(u32, u32)>,
 }
 
+/// The lowest H.264 level (Table A-1) whose frame size and macroblock rate
+/// hold `width`x`height` at `fps_num/fps_den`, as the `level_idc` byte; 62
+/// past the table. One table for both seats: the software encoder writes it
+/// into its SPS (its default is 3.0, which is out of spec above 720p30) and
+/// the plugin hands it to the driver.
+pub fn h264_level_idc(width: u32, height: u32, fps_num: u32, fps_den: u32) -> u8 {
+    const LEVELS: [(u8, u64, u64); 17] = [
+        (10, 1485, 99),
+        (11, 3000, 396),
+        (12, 6000, 396),
+        (13, 11880, 396),
+        (20, 11880, 396),
+        (21, 19800, 792),
+        (22, 20250, 1620),
+        (30, 40500, 1620),
+        (31, 108000, 3600),
+        (32, 216000, 5120),
+        (40, 245760, 8192),
+        (41, 245760, 8192),
+        (42, 522240, 8704),
+        (50, 589824, 22080),
+        (51, 983040, 36864),
+        (52, 2073600, 36864),
+        (60, 4177920, 139264),
+    ];
+    let frame_mbs = u64::from(width.div_ceil(16)) * u64::from(height.div_ceil(16));
+    let fps = f64::from(fps_num.max(1)) / f64::from(fps_den.max(1));
+    let mbps = (frame_mbs as f64 * fps).ceil() as u64;
+    LEVELS
+        .iter()
+        .find(|&&(_, max_mbps, max_fs)| mbps <= max_mbps && frame_mbs <= max_fs)
+        .map_or(62, |&(idc, ..)| idc)
+}
+
 struct Shared {
     /// Fraction of the job done, in [`PROGRESS_SCALE`]ths.
     ///
@@ -3702,6 +3736,8 @@ impl Enc {
             false => (meta.frame_rate * 2.0).round().max(1.0) as u32,
         };
         cfg.bframes = 0;
+        let (fps_num, fps_den) = crate::mux::frame_timing(meta.frame_rate)?;
+        cfg.level_idc = h264_level_idc(meta.width, meta.height, fps_num, fps_den);
         // S1 measured Fast at 1.30x realtime and Balanced at 0.46x for the same
         // bitrate, so Fast is what a fallback should be.
         cfg.preset = Preset::Fast;
@@ -4500,6 +4536,18 @@ impl SwDecoder {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn h264_levels_follow_table_a1() {
+        use super::h264_level_idc;
+        assert_eq!(h264_level_idc(1280, 720, 30, 1), 31);
+        assert_eq!(h264_level_idc(1920, 1080, 30, 1), 40);
+        assert_eq!(h264_level_idc(1920, 1080, 60, 1), 42);
+        assert_eq!(h264_level_idc(2560, 1440, 30, 1), 50);
+        assert_eq!(h264_level_idc(3840, 1608, 24000, 1001), 51);
+        assert_eq!(h264_level_idc(3840, 2160, 60, 1), 52);
+        assert_eq!(h264_level_idc(640, 360, 30, 1), 30);
+    }
+
     use super::*;
 
     /// How a decode thread ended is never guessed from the channel being shut.

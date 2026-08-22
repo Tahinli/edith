@@ -82,3 +82,6 @@ cros-libva = { path = "vendor/cros-libva" }
 cros-codecs = { path = "vendor/cros-codecs" }
 rusty_aac = { path = "vendor/rusty_aac" }
 rusty_h264-common = { path = "vendor/rusty_h264-common" }
+# Drops the `pub use proc_macro;` re-export (E0365 future-incompat, rustc
+# warns on every workspace build); nothing in the crate or its users names it.
+proc-macro-error2 = { path = "vendor/proc-macro-error2" }
