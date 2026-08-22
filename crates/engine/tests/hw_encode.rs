@@ -286,3 +286,130 @@ fn decode_and_encode_load_independently() {
     assert!(HwSession::open(&asset).is_some());
     assert!(HwEncoder::open(640, 480, FPS, 1, BITRATE).is_some());
 }
+
+/// Walks the Annex B stream and reads, per slice, `(is_idr, frame_num,
+/// pic_order_cnt_lsb)`, plus the SPS `level_idc`. Main profile, POC type 0 and
+/// frame_mbs_only -- the SPS the vendored encoder writes -- is all this reads;
+/// the test fails loudly on anything else rather than guessing.
+fn slice_counters(stream: &[u8]) -> (u8, Vec<(bool, u32, u32)>) {
+    struct Bits<'a>(&'a [u8], usize);
+    impl Bits<'_> {
+        fn bit(&mut self) -> u32 {
+            let b = (self.0[self.1 / 8] >> (7 - self.1 % 8)) & 1;
+            self.1 += 1;
+            u32::from(b)
+        }
+        fn bits(&mut self, n: u32) -> u32 {
+            (0..n).fold(0, |v, _| (v << 1) | self.bit())
+        }
+        fn ue(&mut self) -> u32 {
+            let mut zeros = 0;
+            while self.bit() == 0 {
+                zeros += 1;
+            }
+            (1 << zeros) - 1 + self.bits(zeros)
+        }
+    }
+    fn unescape(bytes: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut zeros = 0;
+        for &b in bytes {
+            if zeros >= 2 && b == 3 {
+                zeros = 0;
+                continue;
+            }
+            out.push(b);
+            zeros = if b == 0 { zeros + 1 } else { 0 };
+        }
+        out
+    }
+    let mut nals = Vec::new();
+    let mut i = 0;
+    while i + 3 <= stream.len() {
+        if stream[i..i + 3] == [0, 0, 1] {
+            nals.push(i + 3);
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    let (mut level, mut log2_fn, mut log2_poc) = (0u8, 0u32, 0u32);
+    let mut out = Vec::new();
+    for (n, &s) in nals.iter().enumerate() {
+        let e = nals.get(n + 1).map_or(stream.len(), |&x| x - 3);
+        let kind = stream[s] & 0x1f;
+        // Only the header is needed; 64 bytes of RBSP covers every field read.
+        let rbsp = unescape(&stream[s + 1..e.min(s + 1 + 64)]);
+        let mut b = Bits(&rbsp, 0);
+        match kind {
+            7 => {
+                let profile = b.bits(8);
+                assert_eq!(profile, 77, "Main profile SPS expected");
+                b.bits(8);
+                level = b.bits(8) as u8;
+                b.ue();
+                log2_fn = b.ue() + 4;
+                assert_eq!(b.ue(), 0, "pic_order_cnt_type 0 expected");
+                log2_poc = b.ue() + 4;
+            }
+            1 | 5 => {
+                assert!(log2_fn > 0, "slice before any SPS");
+                b.ue();
+                b.ue();
+                b.ue();
+                let frame_num = b.bits(log2_fn);
+                if kind == 5 {
+                    b.ue();
+                }
+                out.push((kind == 5, frame_num, b.bits(log2_poc)));
+            }
+            _ => {}
+        }
+    }
+    (level, out)
+}
+
+/// The driver on this box writes `frame_num = 0` and `pic_order_cnt_lsb = 0`
+/// into every slice it codes (mesa radeonsi 26.1.7, measured on three real
+/// exports); phones' stateful decoders then judder every few seconds. The
+/// plugin rewrites both, and this is the stream-level proof: over two GOPs the
+/// counters step the way 7.4.3 wants, restart at the second IDR, and the level
+/// is the one Table A-1 gives 1080p30 -- not the `L4` that used to be
+/// hard-coded for every size. `HW_ENCODE_DUMP=<path>` keeps the stream for
+/// `ffmpeg -bsf:v trace_headers`.
+#[test]
+#[ignore = "needs libengine_hw.so and a VA-API driver with an H.264 encode entrypoint"]
+fn slice_headers_carry_frame_num_and_poc() {
+    let (width, height) = (1920u32, 1080u32);
+    let count = 100; // a 2 s GOP at 30 fps is 60: two IDRs, frame_num wraps at 32
+    let (stream, units) =
+        encode(width, height, count).expect("no hardware encode plugin/driver available");
+    assert_eq!(units, count);
+    if let Ok(path) = std::env::var("HW_ENCODE_DUMP") {
+        std::fs::write(&path, &stream).expect("dump");
+        println!("stream written to {path}");
+    }
+    let (level, slices) = slice_counters(&stream);
+    assert_eq!(level, 40, "1920x1080 at 30 fps is level 4.0");
+    assert_eq!(slices.len() as u32, count, "one slice per picture");
+    let idrs: Vec<usize> = slices
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.0)
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(idrs, vec![0, 60], "an IDR every 2 s GOP");
+    let mut since_idr = 0u32;
+    for (i, &(idr, frame_num, poc)) in slices.iter().enumerate() {
+        if idr {
+            since_idr = 0;
+        }
+        assert_eq!(frame_num, since_idr % 32, "slice {i} frame_num");
+        assert_eq!(poc, (since_idr * 2) % 64, "slice {i} pic_order_cnt_lsb");
+        since_idr += 1;
+    }
+    let distinct: std::collections::BTreeSet<u32> = slices.iter().map(|s| s.1).collect();
+    assert!(distinct.len() > 1, "frame_num never moved -- the rewrite did not run");
+    // The rewrite is header-only: the picture still decodes.
+    assert_eq!(decode(&stream).len(), count as usize);
+}
