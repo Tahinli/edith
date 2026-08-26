@@ -931,7 +931,7 @@ fn main() {
                     hw_caps: None,
                     clipboard: None,
                     scrubbing: false,
-                    splits: load_stance_splits(),
+                    splits: load_stance_splits(bounds.size),
                     split_drag: None,
                     trim: None,
                     fade_drag: None,

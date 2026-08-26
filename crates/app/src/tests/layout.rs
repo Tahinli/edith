@@ -2135,22 +2135,48 @@ fn the_notice_plate_declares_a_bounded_wrapping_text_layout() {
 }
 
 /// A round trip through the file: what is saved is what the next load reads
-/// back, one seam touched and the other left at its default -- a scratch
-/// path, not the real config, the same isolation `keymap::tests`' own
-/// `load_from`/`save_to` already takes.
+/// back, all five seams touched -- a scratch path, not the real config, the
+/// same isolation `keymap::tests`' own `load_from`/`save_to` already takes.
+/// One of the five is written past its own ceiling (the library, past
+/// `SIDE_MAX_FRAC` of the window it is loaded back into): a file written at
+/// a wider window must not hand a narrower one an illegal layout, so the
+/// load clamps it back down rather than reading it verbatim.
 #[test]
 fn a_saved_seam_survives_a_reload() {
-    use crate::{Split, Splits, load_stance_splits_from, save_stance_splits_to};
+    use crate::{
+        BENCH_MIN_H, SIDE_MAX_FRAC, Split, Splits, load_stance_splits_from, save_stance_splits_to,
+    };
+    use gpui::{Pixels, Size, px, size};
 
     let dir = engine::scratch::Scratch::dir("edith-stance-splits");
     let path = dir.join("stance-splits");
+    let window: Size<Pixels> = size(px(1280.), px(720.));
 
     let mut splits = Splits::default();
+    splits.set(Split::Library, 9000.);
+    splits.set(Split::Inspector, 200.);
+    splits.set(Split::Timeline, 250.);
     splits.set(Split::Dock, 333.);
+    splits.set(Split::Bench, 200.);
     save_stance_splits_to(&splits, &path);
-    let loaded = load_stance_splits_from(&path);
+    let loaded = load_stance_splits_from(&path, window);
+    assert_eq!(
+        loaded.get(Split::Library),
+        Some(1280. * SIDE_MAX_FRAC),
+        "a library past its own ceiling should clamp to it on load"
+    );
+    assert_eq!(loaded.get(Split::Inspector), Some(200.));
+    assert_eq!(loaded.get(Split::Timeline), Some(250.));
     assert_eq!(loaded.get(Split::Dock), Some(333.));
-    assert_eq!(loaded.get(Split::Bench), None);
+    assert_eq!(loaded.get(Split::Bench), Some(200.));
+
+    // A bench saved below its own floor clamps up to it, the same ceiling
+    // logic mirrored on the one seam whose bound is a minimum.
+    let mut low_bench = Splits::default();
+    low_bench.set(Split::Bench, 1.);
+    save_stance_splits_to(&low_bench, &path);
+    let loaded = load_stance_splits_from(&path, window);
+    assert_eq!(loaded.get(Split::Bench), Some(BENCH_MIN_H));
 }
 
 /// The guard [`crate::split_drag_owes_save`] runs at the moment a drag ends
@@ -2158,18 +2184,18 @@ fn a_saved_seam_survives_a_reload() {
 /// wired to a live `MouseExitEvent` a `TestAppContext`-less test binary
 /// cannot raise -- see `tests/media.rs`'s own note on the same limit, and
 /// the harness drive `D2` in this session's report for the wiring itself).
-/// What *is* checkable here without a window: exactly the two persisted
+/// What *is* checkable here without a window: exactly the persisted
 /// seams owe that save, the same set `Split::PERSISTED` already names, and a
 /// drag that never started (`None`) owes nothing.
 #[test]
-fn only_the_two_persisted_seams_owe_a_save_when_a_drag_loses_the_window() {
+fn only_the_persisted_seams_owe_a_save_when_a_drag_loses_the_window() {
     use crate::{Split, player::timeline_edit::split_drag_owes_save};
 
     assert!(split_drag_owes_save(Some(Split::Dock)));
     assert!(split_drag_owes_save(Some(Split::Bench)));
-    assert!(!split_drag_owes_save(Some(Split::Library)));
-    assert!(!split_drag_owes_save(Some(Split::Inspector)));
-    assert!(!split_drag_owes_save(Some(Split::Timeline)));
+    assert!(split_drag_owes_save(Some(Split::Library)));
+    assert!(split_drag_owes_save(Some(Split::Inspector)));
+    assert!(split_drag_owes_save(Some(Split::Timeline)));
     assert!(!split_drag_owes_save(None));
 }
 
@@ -2178,9 +2204,14 @@ fn only_the_two_persisted_seams_owe_a_save_when_a_drag_loses_the_window() {
 #[test]
 fn a_missing_stance_splits_file_leaves_every_region_at_its_default() {
     use crate::{Split, load_stance_splits_from};
+    use gpui::{Pixels, Size, px, size};
 
     let dir = engine::scratch::Scratch::dir("edith-stance-splits-missing");
-    let splits = load_stance_splits_from(&dir.join("nothing-here"));
+    let window: Size<Pixels> = size(px(1280.), px(720.));
+    let splits = load_stance_splits_from(&dir.join("nothing-here"), window);
+    assert_eq!(splits.get(Split::Library), None);
+    assert_eq!(splits.get(Split::Inspector), None);
+    assert_eq!(splits.get(Split::Timeline), None);
     assert_eq!(splits.get(Split::Dock), None);
     assert_eq!(splits.get(Split::Bench), None);
 }
