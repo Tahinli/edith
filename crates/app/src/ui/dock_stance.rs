@@ -293,7 +293,7 @@ fn source_row(
                 true,
                 format!("Stopping the stand-in for {}…", row.name),
             ),
-            Some(Proxy::Asked) => (
+            Some(Proxy::Asked(_)) => (
                 "○",
                 false,
                 None,

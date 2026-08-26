@@ -86,7 +86,13 @@ pub(crate) enum Proxy {
     /// own state because it is what makes "how many are in flight" a number:
     /// the answer comes back on a worker, and until it does this file may still
     /// turn into an encode.
-    Asked,
+    ///
+    /// Carries the flag [`engine::proxy::generate_if_wanted`] polls at the door
+    /// and around the header read: the same shape [`Self::Making`] carries a
+    /// cancellable [`engine::proxy::Job`] with, one step earlier -- there is no
+    /// `Job` yet to hold, so the raw flag is what a stop asked during this
+    /// state has to set.
+    Asked(std::sync::Arc<std::sync::atomic::AtomicBool>),
     /// A file this machine cuts at speed as it is: no stand-in, and none
     /// wanted ([`engine::proxy::wanted`]).
     Native,

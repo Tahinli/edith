@@ -2084,3 +2084,28 @@ fn darkroom_source_rows_keep_proxy_add_and_media_audio_text_paths() {
         );
     }
 }
+
+/// DEBT #91: a click-to-stop while a stand-in's header is still being read
+/// must reach the flag the read itself polls (`engine::proxy::started`), not
+/// only relabel the row. Read off the source and not run, the way the row
+/// above it is -- there is no `TestAppContext` in this binary to construct a
+/// `Context<Player>` and call `toggle_proxy` on. On the state this fix
+/// replaced, `start_proxy_for` handed the header read a flag nothing outside
+/// it could reach and `Proxy::Asked` carried no field to store a stop into,
+/// so `library.find("Proxy::Asked(cancel)")` below has nothing to find.
+#[test]
+fn toggle_proxy_wakes_the_asked_phase_it_stops() {
+    let library = src_text("player/library.rs");
+    let start = &library[library.find("fn start_proxy_for(").expect("start_proxy_for")..];
+    assert!(
+        start.contains("generate_if_wanted(&path, &cancel)"),
+        "start_proxy_for no longer hands the header read a cancel flag anyone can reach"
+    );
+    let toggle = &library[library.find("fn toggle_proxy(").expect("toggle_proxy")..];
+    let asked_arm =
+        &toggle[toggle.find("Proxy::Asked(cancel)").expect("the Asked arm's own flag")..];
+    assert!(
+        asked_arm.contains("cancel.store(true"),
+        "a stop asked during Asked no longer sets the flag the header read polls"
+    );
+}
