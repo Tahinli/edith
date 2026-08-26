@@ -1077,13 +1077,6 @@ fn sources_tab(
         })
 }
 
-/// The Clip tab: the four verbs DESIGN §5 names, as ghosts, over whichever
-/// param-row card they open -- [`Player::eq_card`], [`Player::color_card`],
-/// [`Player::transform_card`], [`Player::speed_card`] verbatim, the same
-/// param-row rendering `inspector.rs`'s selection section already opens
-/// these onto. Drag-while-playing and every other gesture on a row is
-/// whatever that card already does; nothing about the gesture is reimplemented
-/// here.
 /// The transition duration row, in the darkroom's own idiom: the darkroom is
 /// the default surface (`main.rs`'s `OLD_GUI` gate), so a row that only ever
 /// drew in the legacy inspector (`ui::inspector::transition_duration_row`)
@@ -1099,7 +1092,7 @@ fn transition_row(player: &Player, cx: &mut Context<Player>) -> Option<impl Into
     let (label_text, frames, cap) =
         crate::ui::inspector::transition_of(lane.kind, clips.get(idx)?, clips.get(idx + 1))?;
     let label_style = label(type_scale::LABEL_ROW_PX, FontWeight::MEDIUM);
-    let step = |id: &'static str, glyph: &'static str, by: i32, cx: &mut Context<Player>| {
+    let step = |id: &'static str, label: &'static str, glyph: &'static str, by: i32, cx: &mut Context<Player>| {
         div()
             .id(id)
             .flex()
@@ -1111,7 +1104,7 @@ fn transition_row(player: &Player, cx: &mut Context<Player>) -> Option<impl Into
             .bg(rgb(DARK_RAISED()))
             .cursor_pointer()
             .hover(|s| s.text_color(rgb(INK1())))
-            .children(hitmap::control(id, id, true))
+            .children(hitmap::control(id, label, true))
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                 this.nudge_transition(lane, idx, by, cx);
             }))
@@ -1133,11 +1126,18 @@ fn transition_row(player: &Player, cx: &mut Context<Player>) -> Option<impl Into
                     .text_color(rgb(INK2()))
                     .child(format!("{label_text} {frames}f (of {cap}f offered)")),
             )
-            .child(step("transition-minus", "−", -1, cx))
-            .child(step("transition-plus", "+", 1, cx)),
+            .child(step("transition-minus", "Shorten transition", "−", -1, cx))
+            .child(step("transition-plus", "Lengthen transition", "+", 1, cx)),
     )
 }
 
+/// The Clip tab: the four verbs DESIGN §5 names, as ghosts, over whichever
+/// param-row card they open -- [`Player::eq_card`], [`Player::color_card`],
+/// [`Player::transform_card`], [`Player::speed_card`] verbatim, the same
+/// param-row rendering `inspector.rs`'s selection section already opens
+/// these onto. Drag-while-playing and every other gesture on a row is
+/// whatever that card already does; nothing about the gesture is reimplemented
+/// here.
 fn clip_tab(
     player: &Player,
     width: f32,

@@ -1390,7 +1390,7 @@ impl Player {
                             // starts, so this only fires on a press-release
                             // with no drag between.
                             .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
-                                if !event.modifiers().control {
+                                if !press_modifiers(event).control {
                                     this.select((lane, i), cx);
                                 }
                             }))
@@ -1775,7 +1775,7 @@ impl Player {
                             // A plain click collapses a multi-pick to this one
                             // caption, exactly as a clip's own box does above.
                             .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
-                                if !event.modifiers().control {
+                                if !press_modifiers(event).control {
                                     this.select((lane, i), cx);
                                 }
                             }))

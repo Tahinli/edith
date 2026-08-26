@@ -288,7 +288,7 @@ fn clip_box(
         // the press so a set-drag has something to move; this is where the
         // collapse a plain click promises actually lands.
         .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
-            if !event.modifiers().control {
+            if !press_modifiers(event).control {
                 this.select((lane, idx), cx);
             }
         }))
@@ -672,7 +672,7 @@ fn sub_box(
         // A plain click collapses a multi-pick to this one, exactly as a
         // clip's own box does -- see the comment there.
         .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
-            if !event.modifiers().control {
+            if !press_modifiers(event).control {
                 this.select((lane, idx), cx);
             }
         }))
