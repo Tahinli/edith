@@ -2179,3 +2179,63 @@ fn should_loop_restart_is_play_state_blind_the_pump_gates_it() {
          into-it -- that distinction is pump's is_playing() guard, not this"
     );
 }
+
+/// This binary has no `TestAppContext` to press a live escape through, so the
+/// guard reads the ordering `render.rs`'s key listener actually runs: every
+/// card/menu/list close returns before the fallthrough that dispatches
+/// `ActionId::Deselect` ever runs, so escape with one of them open closes it
+/// and never touches `self.selected` -- the picks made before the card opened
+/// are still there once it is gone.
+#[test]
+fn escape_closes_a_card_before_it_can_ever_reach_deselect() {
+    let render_rs = src_text("render.rs");
+    let dispatch = render_rs
+        .find("if let Some(action) = action {")
+        .expect("the keymap fallthrough that fires Deselect");
+    for (guard, label) in [
+        ("if this.keys_open {", "the keys overlay"),
+        ("if this.dock_filter_edit {", "the dock filter"),
+        (
+            "if this.param_card_key(key, event.keystroke.modifiers.shift, cx) {",
+            "a param card",
+        ),
+        (
+            "if escape_leaves_player_fullscreen(key, ctrl, this.player_fullscreen) {",
+            "player fullscreen",
+        ),
+        ("let clip_menu = this.context_menu.take().is_some();", "the clip/row menu or a list"),
+        (
+            "if key == ESCAPE && !ctrl && this.preview_session.is_some() {",
+            "an open preview",
+        ),
+    ] {
+        let at = render_rs
+            .find(guard)
+            .unwrap_or_else(|| panic!("{label}'s own escape guard moved or was renamed"));
+        assert!(
+            at < dispatch,
+            "{label}'s guard reads after the Deselect dispatch -- escape would \
+             clear the selection before this card ever got a look at the key"
+        );
+    }
+}
+
+/// The other half: with nothing on screen to claim the key, bare escape falls
+/// all the way through to `Player::act`, whose `ActionId::Deselect` arm is
+/// the one place `self.selected` is emptied by a bare stroke rather than by
+/// picking something else.
+#[test]
+fn escape_with_nothing_open_empties_the_selection() {
+    let actions_rs = src_text("player/actions.rs");
+    assert!(
+        actions_rs.contains("ActionId::Deselect => {")
+            && actions_rs.contains("self.selected = Selection::new();"),
+        "the Deselect arm no longer clears self.selected"
+    );
+    let k = keymap::Keymap::defaults();
+    assert_eq!(
+        k.lookup("escape", false),
+        Some(ActionId::Deselect),
+        "bare escape must still route to Deselect for that arm to ever run"
+    );
+}

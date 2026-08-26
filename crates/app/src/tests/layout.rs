@@ -2664,6 +2664,11 @@ fn every_action_has_a_darkroom_widget_home_or_explicit_owner() {
         ),
         (ActionId::Crossfade, "fade parity owns crossfade controls"),
         (ActionId::Dissolve, "fade parity owns dissolve controls"),
+        (
+            ActionId::Deselect,
+            "clicking empty timeline space already clears the selection with the mouse; \
+             bare escape is a keyboard-only accelerator for that existing door, not a new one",
+        ),
     ];
     let darkroom = [
         "ui/bench_stance.rs",
