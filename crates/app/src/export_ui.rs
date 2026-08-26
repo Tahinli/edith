@@ -903,17 +903,6 @@ pub(crate) const MBPS_MAX: u32 = 50;
 /// than being dropped keystroke by keystroke.
 pub(crate) const MBPS_DIGITS: usize = 3;
 
-/// A typed bitrate as the card takes it, or the reason it is not one. The words
-/// are the row's: they are what the field shows in place of its hint.
-pub(crate) fn commit_mbps(text: &str) -> Result<u32, String> {
-    match text.parse::<u32>() {
-        Ok(mbps) if (MBPS_MIN..=MBPS_MAX).contains(&mbps) => Ok(mbps),
-        Ok(0) => Err(format!("0 is not a rate — {MBPS_MIN}–{MBPS_MAX} Mbps")),
-        Ok(mbps) => Err(format!("{mbps} is past the {MBPS_MAX} Mbps ceiling")),
-        Err(_) => Err(format!("type a number — {MBPS_MIN}–{MBPS_MAX} Mbps")),
-    }
-}
-
 /// A clip's share of the lane. A timeline with no length reads as one full-width
 /// box rather than as NaN, which gpui would carry into layout.
 /// Why this timeline cannot be written in `format`, if it cannot.
