@@ -2905,14 +2905,26 @@ impl Parser {
         let v = (v * i64::from(div_factor)) as i32;
         let gamma0 = helpers::clip3(-32678, 32767, helpers::round2signed(v, div_shift)?);
 
-        let w = warp_params[3] * warp_params[4];
+        // --- edith patch: a malformed bitstream's warp params (Troy.mkv's
+        // AV1 track panicked here, "attempt to multiply with overflow") can
+        // put i32::MAX-adjacent values in warp_params[3]/[4]/div_factor --
+        // upstream trusted a conformant encoder never to. A checked multiply
+        // turns that into the parse error this function already returns for
+        // every other malformed field, instead of taking the whole process
+        // down. ---
+        let w = warp_params[3]
+            .checked_mul(warp_params[4])
+            .ok_or_else(|| "warp params overflow: w = warp_params[3] * warp_params[4]".to_string())?;
+
+        let wd = w
+            .checked_mul(div_factor)
+            .ok_or_else(|| "warp params overflow: w * div_factor".to_string())?;
+        // --- end edith patch ---
 
         let delta0 = helpers::clip3(
             -32768,
             32767,
-            warp_params[5]
-                - helpers::round2signed(w * div_factor, div_shift)?
-                - (1 << WARPEDMODEL_PREC_BITS),
+            warp_params[5] - helpers::round2signed(wd, div_shift)? - (1 << WARPEDMODEL_PREC_BITS),
         );
 
         let alpha =
@@ -4053,6 +4065,20 @@ mod tests {
     use crate::codec::av1::parser::{ObuAction, Parser, StreamFormat};
 
     use super::ObuType;
+
+    /// Repro for the panic hit on Troy.Director's.Cut.2004...AV1.mkv:
+    /// `warp_params[3] * warp_params[4]` (and its `* div_factor` beside it)
+    /// overflowed an `i32` on a malformed global-motion syntax and took the
+    /// whole process down with it -- `setup_shear` must answer a parse error
+    /// instead, exactly as it already does for every other malformed field.
+    #[test]
+    fn overflowing_warp_params_are_a_parse_error_not_a_panic() {
+        let overflowing = [0, 0, i32::MAX, i32::MAX, i32::MAX, i32::MAX];
+        assert!(
+            Parser::setup_shear(&overflowing).is_err(),
+            "a malformed global-motion syntax must fail the parse, not panic"
+        );
+    }
 
     /// Same as test-25fps.av1.ivf from Chromium
     const STREAM_TEST_25_FPS: &[u8] = include_bytes!("test_data/test-25fps.ivf.av1");

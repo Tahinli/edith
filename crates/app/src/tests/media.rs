@@ -6,9 +6,24 @@ use crate::player::library::{
     auto_proxies_pref_path, load_auto_proxies_pref, save_auto_proxies_pref,
 };
 use crate::subs::{
-    SUB_SIZE_RANGE, load_subtitle_style, save_subtitle_style, sub_line_h_for, subtitle_style_path,
+    SUB_SIZE_RANGE, audio_import_tail, load_subtitle_style, save_subtitle_style, sub_line_h_for,
+    subtitle_style_path,
 };
 use crate::ui::preview::{bgra_to_rgba, screenshot_path};
+
+/// The toast tail an audio import earns: rate, channel count and rounded
+/// length, in the words the IMPORTED line appends them in
+/// ([`Player::take_import`], [`Player::install_media`]). A film gets none of
+/// it -- the gate is the probed has-video answer, not the extension, so an
+/// audio-only container wearing .mp4 reads its numbers too.
+#[test]
+fn an_audio_import_names_its_rate_channels_and_length() {
+    let tail = audio_import_tail(&asset("test_tone.mp3"), false);
+    assert_eq!(tail, " — 44100 Hz, 2 ch, 3s", "{tail}");
+    assert_eq!(audio_import_tail(&asset("test_av.mp4"), true), "");
+    let mp4 = audio_import_tail(&asset("test_audio_only.mp4"), false);
+    assert_eq!(mp4, " — 44100 Hz, 1 ch, 3s", "{mp4}");
+}
 
 /// The import line's own state machine, driven the way a repaint drives
 /// it: the worker writes a stage, the poll notices it changed and restarts

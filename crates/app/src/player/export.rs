@@ -4,6 +4,17 @@
 use crate::*;
 
 impl Player {
+    /// What [`timeline_math::lane_refuses`] asks to decide a video lane's
+    /// refusal: the probed answer if `cache_media` has one yet, and the
+    /// extension's own guess -- the same one every door used before the
+    /// probe existed -- while it is still asking.
+    pub(crate) fn has_video(&self, path: &Path) -> bool {
+        self.has_video
+            .get(path)
+            .copied()
+            .unwrap_or_else(|| !engine::is_audio(path))
+    }
+
     /// Starts a peak decode -- and a stream probe -- for every source that has
     /// arrived since the last
     /// repaint. One call from the render rather than three at the doors,
@@ -42,6 +53,40 @@ impl Player {
                 let probed = probed.await;
                 this.update(cx, |this, cx| {
                     this.streams.insert(path, probed);
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+        }
+        // Whether a file's own header carries a picture at all, for the lane
+        // a drag may land on ([`Player::has_video`]). The two kinds whose
+        // extension already tells the truth (`engine::is_audio`,
+        // `engine::is_image`) are answered inline; the rest is the one case
+        // an extension can lie about -- a song muxed into an `.mp4` -- so it
+        // costs the same header open [`engine::decode::probe`] pays and goes
+        // off the render thread for the same reason.
+        for path in unseen_paths(session.sources(), &self.has_video) {
+            if engine::is_audio(&path) {
+                self.has_video.insert(path, false);
+                continue;
+            }
+            if engine::is_image(&path) {
+                self.has_video.insert(path, true);
+                continue;
+            }
+            self.has_video.insert(path.clone(), true);
+            let probed = cx.background_executor().spawn({
+                let path = path.clone();
+                async move {
+                    !matches!(engine::demux::Demuxer::open(&path),
+                        Err(e) if engine::demux::NoVideoTrack::is_it(&e))
+                }
+            });
+            cx.spawn(async move |this, cx| {
+                let probed = probed.await;
+                this.update(cx, |this, cx| {
+                    this.has_video.insert(path, probed);
                     cx.notify();
                 })
                 .ok();

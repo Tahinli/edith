@@ -24,7 +24,7 @@ use crate::clock::{ClockSource, PlaybackClock};
 use crate::color::ColorParams;
 use crate::colorspace::{ColorDescription, ContentLight};
 use crate::decode::{Backend, BackendCell, DecodeSession, Frame, Worker};
-use crate::demux::{Codec, Demuxer, VideoMeta};
+use crate::demux::{Codec, Demuxer, NoVideoTrack, VideoMeta};
 use crate::eq::EqParams;
 use crate::project::{
     Clip, Edge, GapSweep, Lane, LaneKind, Project, Rate, Source, Span, Speed, SubClip,
@@ -571,7 +571,7 @@ impl PlaybackSession {
         // Passthrough: a freshly opened file *is* the project resolution, so
         // there is nothing to place it on. Every later span goes through
         // `start_span`, which builds the canvas from the project.
-        let (meta, stream) = DecodeSession::open_worker(
+        let opened = DecodeSession::open_worker(
             &path,
             0,
             u32::MAX,
@@ -581,7 +581,17 @@ impl PlaybackSession {
             // The default rendition: a file just opened is a project nobody has
             // picked one for, exactly as it is a project nobody has graded.
             crate::tonemap::Preset::default(),
-        )?;
+        );
+        // `is_audio` above is the extension's word, and an extension can lie: a
+        // song muxed into an `.mp4` reads as a film until the header is actually
+        // walked. The demuxer's own `NoVideoTrack` is that walk saying there was
+        // never a picture in it, and the fallback is the same audio-only door the
+        // extension check would have taken up front -- not a fault, a type.
+        let (meta, stream) = match opened {
+            Ok(opened) => opened,
+            Err(e) if NoVideoTrack::is_it(&e) => return Self::open_audio_only(&path, audio_stream),
+            Err(e) => return Err(e),
+        };
         // A file is opened on its first audio stream by default, like
         // `Project::single` names it -- unless a caller through
         // `open_with_audio_stream` picked another.
@@ -924,7 +934,13 @@ impl PlaybackSession {
         } else {
             Demuxer::open(&first.path).map(|(_, d)| d.light()).unwrap_or_default()
         };
-        let (mut meta, stream) = match crate::is_audio(&first.path) {
+        // The extension's word, corrected below the moment the header disagrees
+        // with it (`NoVideoTrack`, the same fallback `open_stream` takes): every
+        // later question in this function about source 0 asks *this*, not
+        // `crate::is_audio` again, so a discovered song stays one for the rest
+        // of the scaffold.
+        let mut audio_only = crate::is_audio(&first.path);
+        let (mut meta, stream) = match audio_only {
             true => {
                 let (width, height, canvas_fps) = AUDIO_ONLY_CANVAS;
                 let frame_rate = saved_fps.unwrap_or(canvas_fps);
@@ -964,7 +980,7 @@ impl PlaybackSession {
                 )?;
                 (meta, stream)
             }
-            false => DecodeSession::open_worker(
+            false => match DecodeSession::open_worker(
                 &first.path,
                 0,
                 u32::MAX,
@@ -975,8 +991,30 @@ impl PlaybackSession {
                 // project (which is built below): this placeholder is what the
                 // window shows until the `seek` at the end reopens the span.
                 doc.tone,
-            )
-            .map_err(|e| format!("source {}: {e}", first.path.display()))?,
+            ) {
+                Ok(opened) => opened,
+                // A saved source whose extension named a film but whose header
+                // names no picture: the same door a fresh open falls to
+                // (`open_stream`), so a project first cut around a song muxed
+                // into an `.mp4` reloads instead of refusing on a track that was
+                // never there to begin with.
+                Err(e) if NoVideoTrack::is_it(&e) => {
+                    audio_only = true;
+                    let (width, height, canvas_fps) = AUDIO_ONLY_CANVAS;
+                    let frame_rate = saved_fps.unwrap_or(canvas_fps);
+                    let meta = VideoMeta {
+                        width,
+                        height,
+                        frame_rate,
+                        frame_count: audio_frames(&first.path, frame_rate)
+                            .map_err(|e| format!("source {}: {e}", first.path.display()))?,
+                        codec: Codec::H264,
+                        color: ColorDescription::default(),
+                    };
+                    (meta, DecodeSession::open_black(width, height, 1))
+                }
+                Err(e) => return Err(format!("source {}: {e}", first.path.display()).into()),
+            },
         };
         // The project's own resolution, which is source 0's picture unless the
         // file says otherwise -- every dialect before v7 had no way to say it,
@@ -994,7 +1032,7 @@ impl PlaybackSession {
         // ([`set_frame_rate`](Self::set_frame_rate)) comes back at it rather
         // than at the media's, which would leave every clip number counted in
         // frames the timeline no longer has.
-        let native_fps = match crate::is_audio(&first.path) {
+        let native_fps = match audio_only {
             true => AUDIO_ONLY_CANVAS.2,
             false if crate::is_image(&first.path) => IMAGE_ONLY_RATE,
             false => meta.frame_rate,
@@ -1006,7 +1044,7 @@ impl PlaybackSession {
         // their length above was counted in the timeline's frames already,
         // whatever those are. A file with pictures is read through [`Rate`] like
         // any other source when the project is cut at another rate.
-        let made_up = crate::is_audio(&first.path) || crate::is_image(&first.path);
+        let made_up = audio_only || crate::is_image(&first.path);
         let scaffold_rate = match made_up || native_fps == meta.frame_rate {
             true => Rate::REAL_TIME,
             false => Rate::from_fps(native_fps, meta.frame_rate)
@@ -3236,8 +3274,14 @@ impl PlaybackSession {
         // Both halves on this thread, which is what a caller with nothing else
         // to do wants; a front-end splits them across a worker instead
         // ([`probe_import`](Self::probe_import)).
-        let probe = Self::probe_import(self.import_gate(), path)?;
-        Ok(self.take_probe(path, probe))
+        // A container with sound but no picture is a song wearing a video
+        // extension -- the same fallback `open_stream` and the project
+        // scaffold make, so every door in agrees on what the file is.
+        match Self::probe_import(self.import_gate(), path) {
+            Ok(probe) => Ok(self.take_probe(path, probe)),
+            Err(e) if crate::demux::NoVideoTrack::is_it(&e) => self.import_audio(path),
+            Err(e) => Err(e),
+        }
     }
 
     /// Everything an import is *checked against*, taken off this timeline in

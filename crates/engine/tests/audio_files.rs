@@ -578,3 +578,36 @@ fn a_pasted_song_never_lands_on_the_video_lane() {
     assert_eq!(reloaded.lane_clips(Lane::V1).len(), video_after.len());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A song muxed into an `.mp4` -- the extension names a film, the header names
+/// no picture. `open` falls to the audio-only door on the demuxer's own
+/// `NoVideoTrack` rather than refusing "no H.264, HEVC, VP9 or AV1 video track
+/// in file", exactly as it would have if the file had been named `.mp3`.
+#[test]
+fn an_audio_only_file_wearing_an_mp4_extension_still_opens() {
+    let session = open(asset("test_audio_only.mp4"));
+    assert!(session.lane_clips(Lane::V1).is_empty(), "no picture anywhere");
+    assert_eq!(session.lane_clips(Lane::A1).len(), 1);
+    assert!((session.timeline_duration() - 3.0).abs() < 0.1);
+}
+
+/// The same fallback in [`PlaybackSession::open_project`]'s scaffold branch: a
+/// project whose first source is one of these files reloads instead of failing
+/// the open a save never had trouble with the first time.
+#[test]
+fn a_project_scaffolded_from_an_audio_only_mp4_reloads() {
+    let dir = Scratch::dir("ve_audio_only_mp4");
+    let mp4 = asset("test_audio_only.mp4");
+    let session = open(&mp4);
+    let project = dir.join("song_mp4.edith");
+    session.save_project(&project).expect("save");
+    drop(session);
+    let reloaded =
+        PlaybackSession::open_project(&project).expect("reload a project scaffolded from it");
+    reloaded.set_gain(0.0);
+    assert!(reloaded.lane_clips(Lane::V1).is_empty());
+    assert_eq!(reloaded.lane_clips(Lane::A1).len(), 1);
+    assert!((reloaded.timeline_duration() - 3.0).abs() < 0.1);
+    drop(reloaded);
+    let _ = std::fs::remove_dir_all(&dir);
+}

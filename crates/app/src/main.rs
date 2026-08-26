@@ -255,6 +255,14 @@ struct Player {
     /// `None` is a file with no picture to report (every source that is not an
     /// image, and one whose header would not read).
     sizes: HashMap<PathBuf, Option<(u32, u32)>>,
+    /// Whether a source's own header says it carries a picture at all,
+    /// probed once and kept: what [`Player::has_video`] reads for the lane a
+    /// drag may land on ([`timeline_math::lane_refuses`]). An extension can
+    /// lie -- a song muxed into an `.mp4` -- and only the header says the
+    /// truth (`engine::demux::NoVideoTrack`). Filled like `sizes`: presence
+    /// means "asked", and until the probe answers a file is read by its
+    /// extension, the same guess the ghost always made.
+    has_video: HashMap<PathBuf, bool>,
     /// Every frame of each source a decoder may be started from -- its sync
     /// points ([`engine::demux::sync_points`]), which are the frames a cut may
     /// be placed on for an export to *copy* the film instead of coding all of
@@ -770,6 +778,11 @@ struct Player {
 mod tests;
 
 fn main() {
+    // What a killed editor left behind: `.part` proxies from an encode that
+    // never got to unlink its own half-written file. Run once, here, before
+    // anything in this process could claim one of its own -- every `.part` on
+    // disk at this instant belongs to nobody still running.
+    engine::proxy::sweep_stale_parts();
     // A keymap file that cannot be read leaves the defaults in force, and takes
     // the notice slot ahead of an open or import refusal: it is about every key
     // the window has, and those refusals are on stderr either way.
@@ -905,6 +918,7 @@ fn main() {
                     thumbs: HashMap::new(),
                     proxies: HashMap::new(),
                     streams: HashMap::new(),
+                    has_video: HashMap::new(),
                     bitrates: HashMap::new(),
                     sizes: HashMap::new(),
                     syncs: HashMap::new(),
