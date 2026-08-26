@@ -298,9 +298,13 @@ struct Player {
     /// reason (a VA-API init), and kept for the life of the process because the
     /// answer cannot change while we run. `None` is "not asked yet".
     hw_caps: Option<SharedString>,
-    /// The copied clip. Frame ranges only, so it survives the clip it was taken
-    /// from being deleted -- and it outlives the selection.
-    clipboard: Option<Clip>,
+    /// The copied clip, or clips: frame ranges and the lane each was on, in
+    /// click order, so it survives the clip (or clips) it was taken from
+    /// being deleted -- and it outlives the selection. One entry for a plain
+    /// Copy, the whole ctrl-click set for one made over a selection; either
+    /// way [`Player::paste`] drops the set at the playhead keeping the gaps
+    /// and lanes between its members intact.
+    clipboard: Vec<(Lane, Clip)>,
     /// A drag that started on the ruler. Moves anywhere in the window scrub
     /// while it is set; the release commits the exact position.
     scrubbing: bool,
@@ -932,7 +936,7 @@ fn main() {
                     decoders: HashMap::new(),
                     export_seat: None,
                     hw_caps: None,
-                    clipboard: None,
+                    clipboard: Vec::new(),
                     scrubbing: false,
                     splits: load_stance_splits(),
                     split_drag: None,

@@ -4204,6 +4204,70 @@ impl Project {
         true
     }
 
+    /// [`paste`](Project::paste)'s general form: every `(lane, clip)` in
+    /// `items` lands on the lane it names, its head moved by the offset every
+    /// other item moves by too -- `at` less the earliest `start` among them,
+    /// so the set's own gaps and lane assignment survive the trip from
+    /// clipboard to bed unchanged, rather than collapsing onto `V1`/`A1` the
+    /// way a lone clip's copy does.
+    ///
+    /// All-or-nothing, and **refused** rather than opening room or splitting
+    /// a neighbour the way [`paste`](Project::paste) does for one clip:
+    /// a set-paste never ripples the bed, so a landing that overlaps so much
+    /// as one existing clip on its own lane refuses the whole set, changing
+    /// nothing -- the paste's own [`move_selection`](Project::move_selection)
+    /// clamps instead of refusing, but a paste has no drag to clamp against,
+    /// and a landing moved off the frame asked for is not what a paste means.
+    /// `items` empty, naming a lane or a source that is not there, or a clip
+    /// with `out_frame <= in_frame`, refuses too, before anything is touched.
+    ///
+    /// Exactly one history snapshot for the whole set, so one
+    /// [`Project::undo`] takes it back. Changes the timeline->source mapping
+    /// on every lane an item lands on: the caller must reseek.
+    pub fn paste_set(&mut self, at: u32, items: &[(Lane, Clip)]) -> bool {
+        let Some(anchor) = items.iter().map(|(_, c)| c.start).min() else {
+            return false;
+        };
+        // Resolved once, up front, off the lanes as they stand now: a lane or
+        // source that is not there, or a landing that would overlap a
+        // neighbour, refuses the whole set before any of it is written.
+        let mut landings: Vec<(usize, Clip)> = Vec::with_capacity(items.len());
+        for &(lane, clip) in items {
+            let Some(li) = self.index(lane) else {
+                return false;
+            };
+            if self.sources.get(clip.source).is_none() || clip.out_frame <= clip.in_frame {
+                return false;
+            }
+            let delta = i64::from(clip.start) - i64::from(anchor);
+            let Ok(start) = u32::try_from(i64::from(at) + delta) else {
+                return false;
+            };
+            let Some(end) = start.checked_add(clip.frames()) else {
+                return false;
+            };
+            if self.lanes[li]
+                .clips
+                .iter()
+                .any(|c| c.start < end && start < c.end())
+            {
+                return false;
+            }
+            landings.push((li, Clip { start, ..clip }));
+        }
+        self.snapshot();
+        for (li, mut clip) in landings {
+            clip.link = Some(self.new_link());
+            clip.fade_in = 0;
+            clip.fade_out = 0;
+            clip.transition_out = 0;
+            let clips = &mut self.lanes[li].clips;
+            let idx = clips.partition_point(|c| c.start < clip.start);
+            clips.insert(idx, clip);
+        }
+        true
+    }
+
     /// Lift the clip at `idx` out of `lane`, leaving a gap: black frames or
     /// silence, and nothing else moves. Refused only for an out-of-range index
     /// (which a lane that is not there always is) -- lifting the last placement
