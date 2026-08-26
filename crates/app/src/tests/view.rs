@@ -968,9 +968,9 @@ fn escape_is_the_only_key_a_focused_surface_uses_to_leave_the_ring() {
 }
 
 /// [`ActionId::FocusPanels`] is what starts the ring in the first place
-/// (`Player::act`'s `window.focus(&self.focus_dock)`) -- without a bound key
-/// reaching it, `next_surface`/`is_focus_cycle_key` above are unreachable
-/// dead code, exactly the defect this action closes.
+/// (`Player::act`'s `self.focus_surface(Surface::Dock, ..)`) -- without a
+/// bound key reaching it, `next_surface`/`is_focus_cycle_key` above are
+/// unreachable dead code, exactly the defect this action closes.
 #[test]
 fn focus_panels_is_bound_and_lands_on_the_dock() {
     use keymap::{ActionId, Keymap};

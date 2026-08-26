@@ -99,12 +99,22 @@ impl Player {
     /// exactly as the tab's own click does (`dock_stance::dock_tab`'s
     /// `on_click`), so the ring and a mouse click can't disagree about
     /// which tab was last chosen.
+    ///
+    /// The ring is darkroom-only UI -- the legacy tree never mounts
+    /// `focus_dock`/`focus_bench`/`focus_inspector` (only `track_focus`
+    /// sites live in this module and `dock_stance.rs`), so under
+    /// `OLD_GUI=1` a `window.focus` here would land on an unmounted
+    /// handle and kill the root key listener (`main.rs`'s fallback focus)
+    /// until the next mouse click. No-op there instead.
     pub(crate) fn focus_surface(
         &mut self,
         surface: Surface,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.darkroom {
+            return;
+        }
         if let Some(src_active) = surface_wants_src_active(surface) {
             self.dock_src_active = src_active;
             crate::ui::dock_stance::save(src_active);
