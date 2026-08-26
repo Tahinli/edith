@@ -1383,6 +1383,17 @@ impl Player {
                                     this.pick((lane, i), event.modifiers.control, cx);
                                 }),
                             )
+                            // A plain click collapses a multi-pick to this one
+                            // clip -- `pick` above deliberately keeps the whole
+                            // set on the press so a set-drag has something to
+                            // move; gpui drops the pending click once a drag
+                            // starts, so this only fires on a press-release
+                            // with no drag between.
+                            .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                                if !event.modifiers().control {
+                                    this.select((lane, i), cx);
+                                }
+                            }))
                             // The right button selects exactly as the left one
                             // does -- the menu acts on the clip it names, so
                             // opening one has to pick it -- and then hangs the
@@ -1761,6 +1772,13 @@ impl Player {
                                     this.pick((lane, i), event.modifiers.control, cx);
                                 }),
                             )
+                            // A plain click collapses a multi-pick to this one
+                            // caption, exactly as a clip's own box does above.
+                            .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                                if !event.modifiers().control {
+                                    this.select((lane, i), cx);
+                                }
+                            }))
                             // The right button marks it and hangs the menu at
                             // the pointer, the clip menu opened on the clip
                             // box's own rule -- the Delete row of it is this

@@ -654,6 +654,48 @@ fn a_selection_holds_its_picks_in_click_order_and_anchors_the_last() {
     assert_eq!(sel.anchor(), None);
 }
 
+/// `Player::pick`'s own decision, mirrored here against `Selection` alone
+/// (`pick` itself needs a `Context<Player>` this module has no window to
+/// build): a plain press on a clip already in a multi-pick must leave the
+/// set alone, since the press is where a set-drag begins -- collapsing here
+/// would make dragging a member of a selection move only that one clip.
+/// Collapsing to the one pressed belongs to a plain click, once it is a
+/// click and not a drag (`ui/bench_stance.rs`/`ui/timeline.rs`'s `on_click`).
+#[test]
+fn a_plain_press_on_an_already_picked_clip_keeps_the_set() {
+    use crate::Selection;
+
+    let (v, a, cap) = (
+        (Lane::V1, 0),
+        (Lane::A1, 0),
+        (Lane::new(LaneKind::Subtitle, 0), 0),
+    );
+    let mut sel = Selection::new();
+    sel.toggle(v);
+    sel.toggle(a);
+    sel.toggle(cap);
+    assert_eq!(sel.picks(), &[v, a, cap]);
+
+    let press = |sel: &mut Selection, target, ctrl| match ctrl {
+        true => sel.toggle(target),
+        false if sel.contains(target) => {}
+        false => sel.set_one(target),
+    };
+
+    press(&mut sel, a, false);
+    assert_eq!(
+        sel.picks(),
+        &[v, a, cap],
+        "a plain press on a member of the set keeps it, for a set-drag to move"
+    );
+
+    // A plain press on something outside the set still collapses to it --
+    // the ordinary single-select case.
+    let outside = (Lane::V1, 1);
+    press(&mut sel, outside, false);
+    assert_eq!(sel.picks(), &[outside]);
+}
+
 #[test]
 fn a_click_marks_the_whole_group_and_nothing_else() {
     let (v, a) = ((Lane::V1, 0), (Lane::A1, 0));
