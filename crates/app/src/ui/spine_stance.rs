@@ -302,6 +302,29 @@ pub(crate) fn render(player: &Player, cx: &mut Context<Player>) -> impl IntoElem
             ),
         ))
         .child(trim_control(player.loop_trim.is_some(), player, cx))
+        .child(pair(
+            // Trim-to-playhead (debt #42): the keyboard's own version of the
+            // pointer's drag-to-a-spot trim, beside the nudge pair it shares
+            // its primitive with.
+            glyph(
+                "spine-trim-in-playhead",
+                "[▮",
+                ActionId::TrimInToPlayhead,
+                false,
+                false,
+                player,
+                cx,
+            ),
+            glyph(
+                "spine-trim-out-playhead",
+                "▮]",
+                ActionId::TrimOutToPlayhead,
+                false,
+                false,
+                player,
+                cx,
+            ),
+        ))
         .child(glyph(
             "spine-loop-trim",
             "↻",

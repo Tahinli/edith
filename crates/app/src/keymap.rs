@@ -175,6 +175,16 @@ actions! {
     /// Loop-trim: loops around the subject cut while trimming it (DESIGN.md
     /// §6, "the modernized Avid trim mode").
     LoopTrim,
+    /// The keyboard's own version of the pointer's drag-the-edge-to-a-spot
+    /// trim (debt #42: trim used to be pointer-only): snaps the subject
+    /// cut's in point straight to the playhead, one press, one undo step --
+    /// [`ActionId::TrimIn`]'s frame-detent nudge covers the other case. Bare
+    /// `[`/`{`/ctrl+`[` are all spoken for (nudge, select-prev, sync point),
+    /// so this takes the next rung of the same bracket family: ctrl held on
+    /// the shifted bracket, `ctrl+{` (what ctrl+shift+[ actually types).
+    TrimInToPlayhead,
+    /// The pair's other half, the subject cut's out point, on `ctrl+}`.
+    TrimOutToPlayhead,
     /// Dissolves the selected video clip into its neighbour
     /// ([`Project::set_transition_out`]): two adjacent clips picked on one
     /// lane, or a single pick dissolved into the clip right after it. A
@@ -296,6 +306,8 @@ impl ActionId {
             ActionId::TrimIn => "Trim the subject cut's in point",
             ActionId::TrimOut => "Trim the subject cut's out point",
             ActionId::LoopTrim => "Loop-trim the subject cut",
+            ActionId::TrimInToPlayhead => "Trim the subject cut's in point to the playhead",
+            ActionId::TrimOutToPlayhead => "Trim the subject cut's out point to the playhead",
             ActionId::Dissolve => "Dissolve into the next clip",
             ActionId::Mix => "Mix: track volumes and the limiter…",
             ActionId::ToggleSnap => "Snap on / off (edges, the playhead, the start)",
@@ -377,6 +389,8 @@ impl ActionId {
             ActionId::TrimIn => "trim-in",
             ActionId::TrimOut => "trim-out",
             ActionId::LoopTrim => "loop-trim",
+            ActionId::TrimInToPlayhead => "trim-in-to-playhead",
+            ActionId::TrimOutToPlayhead => "trim-out-to-playhead",
             ActionId::Dissolve => "dissolve",
             ActionId::Mix => "mix",
             ActionId::ToggleSnap => "toggle-snap",
@@ -444,6 +458,8 @@ impl ActionId {
             | ActionId::TrimIn
             | ActionId::TrimOut
             | ActionId::LoopTrim
+            | ActionId::TrimInToPlayhead
+            | ActionId::TrimOutToPlayhead
             | ActionId::Dissolve => Category::Clips,
             // The project's own picture size is not a clip's business, and not
             // a file operation either: it is what the viewer is looking at.
@@ -1182,6 +1198,15 @@ impl Keymap {
                 // Loop-trim (DESIGN.md §6, "the modernized Avid trim mode"):
                 // bare "/" was free.
                 b(ActionId::LoopTrim, "/", false),
+                // Trim-to-playhead (debt #42): the whole bracket family is
+                // already spoken for -- bare `[`/`]` nudge, `{`/`}` walk the
+                // selection, ctrl+`[`/ctrl+`]` jump sync points -- so this
+                // takes the one rung left in the same family, ctrl held on
+                // the shifted bracket (`ctrl+{`/`ctrl+}`, what
+                // ctrl+shift+[/ctrl+shift+] actually type per this table's
+                // own shift note above).
+                b(ActionId::TrimInToPlayhead, "{", true),
+                b(ActionId::TrimOutToPlayhead, "}", true),
                 // Dissolve takes ctrl+x: the join it draws on the timeline is
                 // an X (widgets.rs, dissolve_glyph) -- "d" itself is taken
                 // both plain (Detach) and, in the keymap's own rebind test,
@@ -1491,7 +1516,7 @@ mod tests {
     #[test]
     fn every_default_stroke_reaches_its_action() {
         let k = Keymap::defaults();
-        assert_eq!(k.entries().len(), 76);
+        assert_eq!(k.entries().len(), 78);
         // The cut odometer: bare walks one, `<`/`>` (what shift+,/shift+.
         // actually type) strides ten.
         assert_eq!(k.lookup(".", false), Some(ActionId::WalkCutNext));
@@ -1502,6 +1527,9 @@ mod tests {
         // The trim pair, on its designed bare brackets (DESIGN.md §6).
         assert_eq!(k.lookup("[", false), Some(ActionId::TrimIn));
         assert_eq!(k.lookup("]", false), Some(ActionId::TrimOut));
+        // Trim-to-playhead (debt #42): the same family, one rung further.
+        assert_eq!(k.lookup("{", true), Some(ActionId::TrimInToPlayhead));
+        assert_eq!(k.lookup("}", true), Some(ActionId::TrimOutToPlayhead));
         assert_eq!(k.lookup("f11", false), Some(ActionId::Fullscreen));
         assert_eq!(k.lookup("w", false), Some(ActionId::Screenshot));
         assert_eq!(k.lookup("y", false), Some(ActionId::SubtitleStyle));

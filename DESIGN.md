@@ -142,6 +142,10 @@ The cut is the subject. Grammar (implement before any cosmetics):
 
 - `,` `.` — walk cuts (shift = stride 10). The cut readout is the odometer.
 - `[` `]` — no-aim trim of the subject cut, frame detents, works at any zoom (even 4px clips).
+- `ctrl+{` `ctrl+}` — trim-to-playhead (debt #42): snaps the subject cut's in/out edge straight to
+  the playhead, one press, one undo step -- the keyboard's own version of dragging the edge to a
+  spot instead of nudging it a detent at a time. Needs a subject cut with the playhead resting on
+  it, same as the pair above.
 - `/` — loop-trim: loop around the subject cut while trimming (the modernized Avid trim mode).
 - Two-up OUT|IN on the screen when resting on a cut.
 - `j k l` — shuttle; `s` — split; `↵` context-dependent commit; `esc` always retreats.
