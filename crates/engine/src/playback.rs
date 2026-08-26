@@ -1168,9 +1168,25 @@ impl PlaybackSession {
         // scaffold unless that one is a still ([`audio_source_of`]): opening a
         // PNG as the device is a session with no audio at all, however many
         // clips with sound are on its lanes.
-        let (audio, audio_disabled) = match audio_source_of(project.sources()) {
-            Some(source) => open_audio(&source.path, source.audio_stream),
-            None => (None, None),
+        //
+        // `audio_source_of` alone only rules out a still; it says nothing
+        // about whether the file it lands on actually *has* a track. A device
+        // pinned to the first candidate that opens silent (no track, or one
+        // the decoder refuses) would leave every later clip's sound unheard
+        // for the rest of the session, however many other sources on the
+        // timeline have real audio -- so this walks forward past a silent
+        // candidate to the first source that really opens a device, and keeps
+        // only the last attempt's reason when none of them do (a later
+        // source's silence is not worth reporting over an earlier one's).
+        let (audio, audio_disabled) = {
+            let mut opened = (None, None);
+            for source in project.sources().iter().filter(|s| !crate::is_image(&s.path)) {
+                opened = open_audio(&source.path, source.audio_stream);
+                if opened.0.is_some() {
+                    break;
+                }
+            }
+            opened
         };
         let mut session = Self {
             meta,
