@@ -63,6 +63,95 @@ impl Coeffs {
     }
 }
 
+/// One row band's worth of the conversion: `rows` are absolute row indices
+/// into `y`/`u`/`v` (chroma read at half resolution as ever), written into
+/// `out` from its own start (`out[0]` is the first row in `rows`). Pulled out
+/// of `i420_to_bgra`/`i420_to_bgra_with` so both can run it across disjoint
+/// row ranges on separate threads -- each row is independent (chroma only
+/// ever reads `row / 2`, never a neighbouring output row), so splitting the
+/// row loop changes nothing about what a pixel comes out as.
+fn convert_rows(
+    k: &Coeffs,
+    lut: Option<&crate::color::Lut>,
+    y: &[u8],
+    u: &[u8],
+    v: &[u8],
+    width: usize,
+    cw: usize,
+    rows: std::ops::Range<usize>,
+    out: &mut [u8],
+) {
+    for (i, row) in rows.enumerate() {
+        let y_row = row * width;
+        let c_row = (row / 2) * cw;
+        let o_row = i * width * 4;
+        for col in 0..width {
+            let ci = c_row + col / 2;
+            let (c, d, e) = match lut {
+                Some(lut) => (
+                    lut.y[y[y_row + col] as usize] as i32 - k.y_off,
+                    lut.u[u[ci] as usize] as i32 - 128,
+                    lut.v[v[ci] as usize] as i32 - 128,
+                ),
+                None => (
+                    y[y_row + col] as i32 - k.y_off,
+                    u[ci] as i32 - 128,
+                    v[ci] as i32 - 128,
+                ),
+            };
+
+            let r = ((k.y * c + k.rv * e + 128) >> 8).clamp(0, 255) as u8;
+            let g = ((k.y * c - k.gu * d - k.gv * e + 128) >> 8).clamp(0, 255) as u8;
+            let b = ((k.y * c + k.bu * d + 128) >> 8).clamp(0, 255) as u8;
+
+            let o = o_row + col * 4;
+            out[o] = b;
+            out[o + 1] = g;
+            out[o + 2] = r;
+            out[o + 3] = 255;
+        }
+    }
+}
+
+/// `convert_rows`, fanned out over as many threads as the machine has: rows
+/// split into one contiguous band per lane (`std::thread::scope`, the same
+/// pattern `HevcEnc::code_batch` uses, borrowing the planes rather than
+/// copying them), each lane writing straight into its own slice of `out`. A
+/// frame too short to be worth the spawn (or a machine that only reports one
+/// core) falls back to running the whole thing on the calling thread.
+fn convert_parallel(
+    k: &Coeffs,
+    lut: Option<&crate::color::Lut>,
+    y: &[u8],
+    u: &[u8],
+    v: &[u8],
+    width: usize,
+    height: usize,
+) -> Vec<u8> {
+    let cw = width.div_ceil(2);
+    let mut out = vec![0u8; width * height * 4];
+    let lanes = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(height);
+    if lanes <= 1 {
+        convert_rows(k, lut, y, u, v, width, cw, 0..height, &mut out);
+        return out;
+    }
+    let rows_per_lane = height.div_ceil(lanes);
+    std::thread::scope(|scope| {
+        let mut rest = &mut out[..];
+        let mut start = 0;
+        while start < height {
+            let end = (start + rows_per_lane).min(height);
+            let (chunk, remainder) = rest.split_at_mut((end - start) * width * 4);
+            rest = remainder;
+            scope.spawn(move || convert_rows(k, lut, y, u, v, width, cw, start..end, chunk));
+            start = end;
+        }
+    });
+    out
+}
+
 /// Converts a planar I420 frame (stride == width, chroma at half resolution)
 /// into tightly packed BGRA8. Returns `width * height * 4` bytes.
 pub fn i420_to_bgra(
@@ -74,30 +163,7 @@ pub fn i420_to_bgra(
     height: usize,
 ) -> Vec<u8> {
     let k = Coeffs::new(color);
-    let cw = width.div_ceil(2);
-    let mut out = vec![0u8; width * height * 4];
-
-    for row in 0..height {
-        let y_row = row * width;
-        let c_row = (row / 2) * cw;
-        for col in 0..width {
-            let c = y[y_row + col] as i32 - k.y_off;
-            let ci = c_row + col / 2;
-            let d = u[ci] as i32 - 128;
-            let e = v[ci] as i32 - 128;
-
-            let r = ((k.y * c + k.rv * e + 128) >> 8).clamp(0, 255) as u8;
-            let g = ((k.y * c - k.gu * d - k.gv * e + 128) >> 8).clamp(0, 255) as u8;
-            let b = ((k.y * c + k.bu * d + 128) >> 8).clamp(0, 255) as u8;
-
-            let o = (y_row + col) * 4;
-            out[o] = b;
-            out[o + 1] = g;
-            out[o + 2] = r;
-            out[o + 3] = 255;
-        }
-    }
-    out
+    convert_parallel(&k, None, y, u, v, width, height)
 }
 
 /// The same conversion with a segment's colour grade folded in: the grade is
@@ -121,30 +187,7 @@ pub fn i420_to_bgra_with(
     }
     let k = Coeffs::new(color);
     let lut = crate::color::Lut::new(params);
-    let cw = width.div_ceil(2);
-    let mut out = vec![0u8; width * height * 4];
-
-    for row in 0..height {
-        let y_row = row * width;
-        let c_row = (row / 2) * cw;
-        for col in 0..width {
-            let c = lut.y[y[y_row + col] as usize] as i32 - k.y_off;
-            let ci = c_row + col / 2;
-            let d = lut.u[u[ci] as usize] as i32 - 128;
-            let e = lut.v[v[ci] as usize] as i32 - 128;
-
-            let r = ((k.y * c + k.rv * e + 128) >> 8).clamp(0, 255) as u8;
-            let g = ((k.y * c - k.gu * d - k.gv * e + 128) >> 8).clamp(0, 255) as u8;
-            let b = ((k.y * c + k.bu * d + 128) >> 8).clamp(0, 255) as u8;
-
-            let o = (y_row + col) * 4;
-            out[o] = b;
-            out[o + 1] = g;
-            out[o + 2] = r;
-            out[o + 3] = 255;
-        }
-    }
-    out
+    convert_parallel(&k, Some(&lut), y, u, v, width, height)
 }
 
 #[cfg(test)]
