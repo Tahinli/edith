@@ -1103,8 +1103,9 @@ pub(crate) fn transition_of(
 
 /// The transition duration row: `transition_of` picks the anchor's
 /// transition and its cap, [`Player::nudge_transition`] does the clamped
-/// step -- only the paint is this tab's own (`ghost_verb`'s row height and
-/// ink tokens).
+/// step, [`Player::edit_transition`]/[`Player::commit_transition`] the
+/// type-in (DEBT #111) -- only the paint is this tab's own (`ghost_verb`'s
+/// row height and ink tokens).
 fn transition_row(player: &Player, cx: &mut Context<Player>) -> Option<impl IntoElement> {
     let (lane, idx) = player.selected.anchor()?;
     let session = player.session.as_ref()?;
@@ -1112,6 +1113,7 @@ fn transition_row(player: &Player, cx: &mut Context<Player>) -> Option<impl Into
     let (label_text, frames, cap) =
         transition_of(lane.kind, clips.get(idx)?, clips.get(idx + 1))?;
     let label_style = label(type_scale::LABEL_ROW_PX, FontWeight::MEDIUM);
+    let field = player.transition_edit.as_ref();
     let step = |id: &'static str, label: &'static str, glyph: &'static str, by: i32, cx: &mut Context<Player>| {
         div()
             .id(id)
@@ -1140,11 +1142,25 @@ fn transition_row(player: &Player, cx: &mut Context<Player>) -> Option<impl Into
             .px(px(8.))
             .child(
                 div()
+                    .id("transition-duration-field")
                     .flex_1()
                     .font(label_style.font)
                     .text_size(label_style.size)
                     .text_color(rgb(INK2()))
-                    .child(format!("{label_text} {frames}f (of {cap}f offered)")),
+                    .cursor_pointer()
+                    .children(hitmap::control(
+                        "transition-duration-field",
+                        "Transition duration, type-in",
+                        true,
+                    ))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.edit_transition(frames, cap);
+                        cx.notify();
+                    }))
+                    .child(match field {
+                        Some(edit) => edit.detail(),
+                        None => format!("{label_text} {frames}f (of {cap}f offered)"),
+                    }),
             )
             .child(step("transition-minus", "Shorten transition", "−", -1, cx))
             .child(step("transition-plus", "Lengthen transition", "+", 1, cx)),

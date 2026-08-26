@@ -1,6 +1,7 @@
 //! Editing the timeline itself: the cuts, the clipboard, the drags, the
 //! snapping and the trims.
 
+use crate::ui::widgets::NumberEdit;
 use crate::*;
 
 /// Whether a seam that just lost its drag owes a disk write -- exactly the
@@ -1650,9 +1651,6 @@ impl Player {
     /// lands at the successor's length instead of asking for more than
     /// there is.
     pub(crate) fn nudge_transition(&mut self, lane: Lane, idx: usize, step: i32, cx: &mut Context<Self>) {
-        if self.exporting().is_some() {
-            return;
-        }
         let Some(session) = &mut self.session else {
             return;
         };
@@ -1662,6 +1660,27 @@ impl Player {
             _ => return,
         };
         let frames = (current as i32 + step).max(0) as u32;
+        self.set_transition_frames(lane, idx, frames, cx);
+    }
+
+    /// The transition's absolute length, through the same setter the stepper
+    /// dispatches to (`set_transition_out`/`crossfade`, each already clamping
+    /// to the shorter neighbour's frames) -- the typed field
+    /// ([`Player::commit_transition`]) and the ± steps land a number the same
+    /// way, so undo and persistence never tell the two doors apart.
+    pub(crate) fn set_transition_frames(
+        &mut self,
+        lane: Lane,
+        idx: usize,
+        frames: u32,
+        cx: &mut Context<Self>,
+    ) {
+        if self.exporting().is_some() {
+            return;
+        }
+        let Some(session) = &mut self.session else {
+            return;
+        };
         let ok = match lane.kind {
             LaneKind::Video => session.set_transition_out(lane, idx, frames),
             LaneKind::Audio => session.crossfade(lane, idx, frames),
@@ -1670,6 +1689,31 @@ impl Player {
         if ok {
             self.mark_dirty();
             cx.notify();
+        }
+    }
+
+    /// Opens the transition duration's field on the frame count the row is
+    /// carrying -- the mouse door for DEBT #111's type-in, the row's own
+    /// click, `Player::edit_mbps`'s convention. `cap` is the same ceiling the
+    /// stepper is already clamped to (`transition_of`), so the field never
+    /// offers a number a step could not also land on.
+    pub(crate) fn edit_transition(&mut self, frames: u32, cap: u32) {
+        let digits = cap.to_string().chars().count() + 1;
+        self.transition_edit = Some(NumberEdit::new(frames, 0, cap, digits, "frames"));
+    }
+
+    /// The typed field's enter: clamps into the anchor's own range
+    /// ([`NumberEdit::commit_clamped`]) rather than refusing, because the
+    /// stepper this field stands in for already clamps silently -- a typed
+    /// number stricter than the mouse door would be a rule the field alone
+    /// enforces.
+    pub(crate) fn commit_transition(&mut self, cx: &mut Context<Self>) {
+        let Some(mut edit) = self.transition_edit.take() else {
+            return;
+        };
+        if let Some((lane, idx)) = self.selected.anchor() {
+            let frames = edit.commit_clamped();
+            self.set_transition_frames(lane, idx, frames, cx);
         }
     }
 
