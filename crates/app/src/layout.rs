@@ -398,12 +398,19 @@ pub(crate) enum Split {
 }
 
 impl Split {
-    /// The two persisted seams -- library/inspector/timeline stay
-    /// unpersisted, out of this diff's scope, same as before it. Read by
-    /// [`load_stance_splits`] and [`save_stance_splits`] together so the
-    /// two can never learn a different set of keys from each other, the
-    /// gap a sixth region would otherwise fall through silently.
-    const PERSISTED: [Split; 2] = [Split::Dock, Split::Bench];
+    /// Every seam that survives a restart -- all five regions, the file
+    /// itself the only store (view state stays out of `.edith`, the
+    /// settled convention). Read by [`load_stance_splits`] and
+    /// [`save_stance_splits`] together so the set can never learn a
+    /// different set of keys from each other, the gap a sixth region
+    /// would otherwise fall through silently.
+    pub(crate) const PERSISTED: [Split; 5] = [
+        Split::Library,
+        Split::Inspector,
+        Split::Timeline,
+        Split::Dock,
+        Split::Bench,
+    ];
 
     fn key(self) -> &'static str {
         match self {
@@ -518,23 +525,30 @@ impl Splits {
     }
 }
 
-/// Where the darkroom's own two dragged sizes live -- dock and bench, the
-/// only pair with a hand on them so far. Same small, silent round trip as
-/// [`crate::ui::dock_stance`]'s tab pick: unreadable or absent leaves both
+/// Where every seam's dragged size lives. Same small, silent round trip as
+/// [`crate::ui::dock_stance`]'s tab pick: unreadable or absent leaves a seam
 /// `None`, which [`split_size`] already reads as "give it the window's own
 /// share".
 pub(crate) fn stance_splits_config_path() -> std::path::PathBuf {
     crate::keymap::Keymap::config_path().with_file_name("stance-splits")
 }
 
-pub(crate) fn load_stance_splits() -> Splits {
-    load_stance_splits_from(&stance_splits_config_path())
+pub(crate) fn load_stance_splits(window: Size<Pixels>) -> Splits {
+    load_stance_splits_from(&stance_splits_config_path(), window)
 }
 
 /// One `split=pixels` line per touched seam, read from `path` -- factored out
 /// of [`load_stance_splits`] so a test can round-trip a scratch file instead
-/// of the real config.
-pub(crate) fn load_stance_splits_from(path: &std::path::Path) -> Splits {
+/// of the real config. `window` is the size the layout is about to be drawn
+/// at -- a file written by a wider or taller window can hold a seam past
+/// this one's own ceiling, so each value is clamped to it here, before it
+/// ever reaches [`Splits`]. [`split_size`] still re-clamps every frame on
+/// top of this, but that clamp needs a lane count and a scroll state
+/// nothing here has yet; this one runs on the three bounds that do not --
+/// [`SIDE_MAX_FRAC`], [`TIMELINE_MAX_SHARE`] and [`BENCH_MIN_H`] -- so a
+/// value this open never reaches even the first frame.
+pub(crate) fn load_stance_splits_from(path: &std::path::Path, window: Size<Pixels>) -> Splits {
+    let (w, h) = (f32::from(window.width), f32::from(window.height));
     let mut splits = Splits::default();
     if let Ok(text) = std::fs::read_to_string(path) {
         for line in text.lines() {
@@ -547,15 +561,19 @@ pub(crate) fn load_stance_splits_from(path: &std::path::Path) -> Splits {
             let Some(split) = Split::PERSISTED.into_iter().find(|s| s.key() == key) else {
                 continue;
             };
+            let px = match split {
+                Split::Library | Split::Inspector | Split::Dock => px.min(w * SIDE_MAX_FRAC),
+                Split::Timeline => px.min(h * TIMELINE_MAX_SHARE),
+                Split::Bench => px.max(BENCH_MIN_H),
+            };
             splits.set(split, px);
         }
     }
     splits
 }
 
-/// Writes the sizes a hand has actually dragged -- the legacy three stay
-/// unpersisted, as they already were before this diff (out of its scope).
-/// Walks [`Split::PERSISTED`] rather than a hand-written `if let` per field,
+/// Writes the sizes a hand has actually dragged, one line per seam a hand
+/// has touched. Walks [`Split::PERSISTED`] rather than a hand-written `if let` per field,
 /// so a region added there needs no second, separately-maintained list here.
 pub(crate) fn save_stance_splits(splits: &Splits) {
     save_stance_splits_to(splits, &stance_splits_config_path());
