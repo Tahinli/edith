@@ -298,9 +298,13 @@ struct Player {
     /// reason (a VA-API init), and kept for the life of the process because the
     /// answer cannot change while we run. `None` is "not asked yet".
     hw_caps: Option<SharedString>,
-    /// The copied clip. Frame ranges only, so it survives the clip it was taken
-    /// from being deleted -- and it outlives the selection.
-    clipboard: Option<Clip>,
+    /// The copied clip, or clips: frame ranges and the lane each was on, in
+    /// click order, so it survives the clip (or clips) it was taken from
+    /// being deleted -- and it outlives the selection. One entry for a plain
+    /// Copy, the whole ctrl-click set for one made over a selection; either
+    /// way [`Player::paste`] drops the set at the playhead keeping the gaps
+    /// and lanes between its members intact.
+    clipboard: Vec<(Lane, Clip)>,
     /// A drag that started on the ruler. Moves anywhere in the window scrub
     /// while it is set; the release commits the exact position.
     scrubbing: bool,
@@ -385,8 +389,11 @@ struct Player {
     /// over no lane: the shadow every proper editor draws under a drag. Set by
     /// the lane the pointer is actually over -- that is the one question the
     /// line above does not answer -- and drawn only while a drag is live, for
-    /// [`Player::snap_cue`]'s reason.
-    ghost: Option<Ghost>,
+    /// [`Player::snap_cue`]'s reason. More than one entry only while a
+    /// set-drag ([`Player::move_clip`]'s `set_move`) is carrying more than
+    /// the clip under the hand: every other pick draws its own shadow too, at
+    /// the same delta the anchor's is landing at ([`Player::preview_ghost`]).
+    ghost: Vec<Ghost>,
     /// The slot a track header being dragged is about to drop into, or `None`
     /// while the pointer is over no lane: the line drawn between two headers,
     /// for the reason [`Player::ghost`] draws a shadow -- where a gesture lands
@@ -935,9 +942,9 @@ fn main() {
                     decoders: HashMap::new(),
                     export_seat: None,
                     hw_caps: None,
-                    clipboard: None,
+                    clipboard: Vec::new(),
                     scrubbing: false,
-                    splits: load_stance_splits(),
+                    splits: load_stance_splits(bounds.size),
                     split_drag: None,
                     trim: None,
                     fade_drag: None,
@@ -948,7 +955,7 @@ fn main() {
                     sub_folded: HashSet::new(),
                     sub_lane: None,
                     snap_cue: None,
-                    ghost: None,
+                    ghost: Vec::new(),
                     lane_drop: None,
                     last_scrub: Instant::now(),
                     last_target: 0,

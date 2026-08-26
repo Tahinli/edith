@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::audio_cards::EQ_GRAPH_MAX_H;
+use crate::ui::inspector::transition_of;
 use std::sync::atomic::Ordering;
 
 /// FAULT 2's general shape (not just the source dot's menu): `overlaid()`
@@ -186,8 +187,9 @@ fn only_a_chord_gets_out_of_an_export() {
     assert!(!cancels_export("e", false, Some(ActionId::Export)));
     assert!(!cancels_export("space", false, Some(ActionId::Play)));
     assert!(!cancels_export("q", false, None));
-    // The default keymap is what the handler feeds this: the chord reaches the
-    // action, the bare key reaches nothing.
+    // The default keymap is what the handler feeds this: the chord reaches
+    // CancelExport, the bare key reaches Deselect instead -- neither of which
+    // this guard lets cancel a running export.
     let k = keymap::Keymap::defaults();
     assert!(cancels_export("escape", true, k.lookup("escape", true)));
     assert!(!cancels_export("escape", false, k.lookup("escape", false)));
@@ -1205,6 +1207,72 @@ fn a_typed_bitrate_is_a_field_and_not_a_key_capture() {
         "{detail}"
     );
     assert!(detail.starts_with("6▏"), "{detail}");
+}
+
+/// [`crate::ui::inspector::transition_of`]: the inspector's duration row
+/// appears only for an anchor that actually carries a dissolve or a
+/// crossfade, and the room it offers is capped at what the successor clip
+/// actually has -- the same clamp [`engine::project::Project::set_transition_out`]/
+/// [`engine::project::Project::crossfade`] enforce, read back here without
+/// either engine call so the row can never claim more than a step could land
+/// in.
+#[test]
+fn a_duration_row_shows_only_for_a_transition_and_its_room_is_the_successors() {
+    // `len` is the clip's own source length (`out_frame`, `in_frame` fixed at
+    // 0, `speed` 1x, so `Clip::frames()` reads back exactly `len`).
+    fn clip(start: u32, len: u32, transition_out: u32, fade_in: u32, fade_out: u32) -> Clip {
+        Clip {
+            start,
+            in_frame: 0,
+            out_frame: len,
+            source: 0,
+            link: None,
+            eq: None,
+            color: None,
+            transform: None,
+            fit: FitPolicy::default(),
+            speed: Speed::NORMAL,
+            fade_in,
+            fade_out,
+            transition_out,
+        }
+    }
+    // A plain cut carries neither field, so the row has nothing to show.
+    let plain = clip(0, 10, 0, 0, 0);
+    let plain_next = clip(10, 15, 0, 0, 0);
+    assert_eq!(transition_of(LaneKind::Video, &plain, Some(&plain_next)), None);
+
+    // A dissolve: video lane, `transition_out` set, an adjacent successor.
+    // The room offered is the shorter of the two -- here the successor's own
+    // 5-frame length, less than the anchor's 10.
+    let a = clip(0, 10, 4, 0, 0);
+    let b = clip(10, 5, 0, 0, 0);
+    assert_eq!(
+        transition_of(LaneKind::Video, &a, Some(&b)),
+        Some(("Dissolve", 4, 5))
+    );
+    // No successor, or a gap before one: no row, same as no transition.
+    assert_eq!(transition_of(LaneKind::Video, &a, None), None);
+    let gap = clip(11, 5, 0, 0, 0);
+    assert_eq!(transition_of(LaneKind::Video, &a, Some(&gap)), None);
+
+    // A crossfade: audio lane, both ends of the join set
+    // ([`Project::crossfade`]'s own signature) -- a one-sided fade (the
+    // successor's `fade_in` still 0) is not one, and stays a plain fade.
+    let a = clip(0, 10, 0, 0, 3);
+    let b = clip(10, 2, 0, 3, 0);
+    assert_eq!(
+        transition_of(LaneKind::Audio, &a, Some(&b)),
+        Some(("Crossfade", 3, 2)),
+        "capped at the successor's own 2-frame length, though 3 was asked for"
+    );
+    let one_sided = clip(10, 2, 0, 0, 0);
+    assert_eq!(transition_of(LaneKind::Audio, &a, Some(&one_sided)), None);
+
+    // A dissolve field on an audio lane, or a fade-only pair on a video
+    // lane, name no transition either -- each kind reads only its own lane.
+    let dissolving = clip(0, 10, 4, 0, 0);
+    assert_eq!(transition_of(LaneKind::Audio, &dissolving, Some(&b)), None);
 }
 
 #[test]

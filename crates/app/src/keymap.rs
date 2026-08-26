@@ -118,6 +118,9 @@ actions! {
     /// ctrl-click that builds a selection by hand, for the times everything
     /// wants selecting at once.
     SelectAll,
+    /// Bare escape with nothing else claiming it: empties a multi-clip
+    /// selection without touching picks, cards or fullscreen.
+    Deselect,
     Delete,
     Lift,
     Color,
@@ -262,6 +265,7 @@ impl ActionId {
             ActionId::SelectNext => "Select the next clip in the lane",
             ActionId::SelectPrev => "Select the previous clip in the lane",
             ActionId::SelectAll => "Select everything (every clip and caption)",
+            ActionId::Deselect => "Clear the selection",
             ActionId::Delete => "Delete",
             ActionId::Lift => "Lift (leave a gap)",
             ActionId::Color => "Colour…",
@@ -342,6 +346,7 @@ impl ActionId {
             ActionId::SelectNext => "select-next",
             ActionId::SelectPrev => "select-prev",
             ActionId::SelectAll => "select-all",
+            ActionId::Deselect => "deselect",
             ActionId::Delete => "delete",
             ActionId::Lift => "lift",
             ActionId::Color => "color",
@@ -421,6 +426,7 @@ impl ActionId {
             | ActionId::SelectNext
             | ActionId::SelectPrev
             | ActionId::SelectAll
+            | ActionId::Deselect
             | ActionId::Delete
             | ActionId::Lift
             | ActionId::Color
@@ -1067,6 +1073,10 @@ impl Keymap {
                 // below had to move off ctrl+a: a stroke that universal was
                 // never really the removal's to keep.
                 b(ActionId::SelectAll, "a", true),
+                // Bare escape, last in the precedence chain behind every card,
+                // search and fullscreen close (render.rs) -- just empties the
+                // selection when nothing else claims the key.
+                b(ActionId::Deselect, "escape", false),
                 b(ActionId::Delete, "x", false),
                 b(ActionId::Delete, "delete", false),
                 b(ActionId::Lift, "l", false),
@@ -1519,7 +1529,7 @@ mod tests {
     #[test]
     fn every_default_stroke_reaches_its_action() {
         let k = Keymap::defaults();
-        assert_eq!(k.entries().len(), 75);
+        assert_eq!(k.entries().len(), 76);
         // The cut odometer: bare walks one, `<`/`>` (what shift+,/shift+.
         // actually type) strides ten.
         assert_eq!(k.lookup(".", false), Some(ActionId::WalkCutNext));
@@ -1603,9 +1613,9 @@ mod tests {
         assert_eq!(k.lookup("=", false), Some(ActionId::VolumeUp));
         assert_eq!(k.lookup("-", false), Some(ActionId::VolumeDown));
         assert_eq!(k.lookup("+", false), None);
-        // The chord, and *only* the chord: bare escape reaches no action at all.
+        // The chord cancels an export; bare escape falls through to Deselect.
         assert_eq!(k.lookup("escape", true), Some(ActionId::CancelExport));
-        assert_eq!(k.lookup("escape", false), None);
+        assert_eq!(k.lookup("escape", false), Some(ActionId::Deselect));
         // The modifier is half the chord: ctrl+e is not e.
         assert_eq!(k.lookup("e", true), None);
         assert_eq!(k.lookup("space", true), None);

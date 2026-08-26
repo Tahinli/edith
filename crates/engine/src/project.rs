@@ -3591,23 +3591,71 @@ impl Project {
     /// is on, and a drop that changes neither lane nor frame, which is a clip
     /// picked up and put back down, i.e. a click.
     pub fn move_clip(&mut self, from: Lane, idx: usize, to: Lane, start: u32) -> bool {
+        self.move_selection(&[(from, idx)], from, idx, to, start)
+    }
+
+    /// [`move_clip`](Self::move_clip)'s general form: every pick in `picks`
+    /// (each with its own link group, exactly as [`group_of`](Self::group_of)
+    /// reads it) travels the same distance as the clip at `idx` of `from`,
+    /// which alone changes lane, onto `to`. One clamp across the whole set
+    /// ([`move_room`](Self::move_room)) is what makes this all-or-nothing: a
+    /// neighbour that boxes in *any* member narrows the delta every member
+    /// moves by, and a member with no room at all (`lo > hi`) refuses the
+    /// whole set rather than moving the rest and leaving that one behind.
+    /// `move_clip` is this with a selection of one -- the dragged clip's own
+    /// group and nothing else -- so a drag on a clip outside the selection is
+    /// byte-identical to before this existed.
+    pub fn move_selection(
+        &mut self,
+        picks: &[(Lane, usize)],
+        from: Lane,
+        idx: usize,
+        to: Lane,
+        start: u32,
+    ) -> bool {
         let (Some(dest), Some(clip)) = (self.index(to), self.lane(from).get(idx).copied()) else {
             return false;
         };
         if from.kind != to.kind {
             return false;
         }
-        let members = self.group_of(from, idx).expect("the clip was found");
         let held = self.index(from).expect("the clip was found on it");
-        // The two halves of one group would land on one span of one lane, which
-        // is the one thing a link may never mean. Refused rather than clamped:
-        // the partner moves the same distance, so there is no room for it
-        // anywhere on that lane.
+        // Every pick's own group, unioned: the whole selection moves as one,
+        // and a pick's link partners (not themselves picked) come along with
+        // it exactly as a lone drag's do.
+        let mut members = Members::default();
+        for &(lane, i) in picks {
+            let Some(group) = self.group_of(lane, i) else {
+                continue;
+            };
+            for m in group.clips {
+                if !members.clips.contains(&m) {
+                    members.clips.push(m);
+                }
+            }
+            for m in group.subs {
+                if !members.subs.contains(&m) {
+                    members.subs.push(m);
+                }
+            }
+        }
+        if !members.clips.contains(&(held, idx)) {
+            members.clips.push((held, idx));
+        }
+        // The two halves of *the dragged clip's own* group would land on one
+        // span of one lane, which is the one thing a link may never mean --
+        // checked against that group alone, not the whole moving set: an
+        // unlinked fellow pick already sitting on `dest` is no conflict at
+        // all, since it travels by the same delta and `move_room` below
+        // leaves it the room to. Refused rather than clamped: the partner
+        // moves the same distance, so there is no room for it anywhere on
+        // that lane.
+        let own_group = self.group_of(from, idx).expect("the clip was found");
         if dest != held
-            && members
+            && own_group
                 .clips
                 .iter()
-                .chain(&members.subs)
+                .chain(&own_group.subs)
                 .any(|&(l, _)| l == dest)
         {
             return false;
@@ -4152,6 +4200,70 @@ impl Project {
             }
             debug_assert!(sorted_disjoint(&data.clips));
             debug_assert!(subs_sorted_disjoint(&data.subs));
+        }
+        true
+    }
+
+    /// [`paste`](Project::paste)'s general form: every `(lane, clip)` in
+    /// `items` lands on the lane it names, its head moved by the offset every
+    /// other item moves by too -- `at` less the earliest `start` among them,
+    /// so the set's own gaps and lane assignment survive the trip from
+    /// clipboard to bed unchanged, rather than collapsing onto `V1`/`A1` the
+    /// way a lone clip's copy does.
+    ///
+    /// All-or-nothing, and **refused** rather than opening room or splitting
+    /// a neighbour the way [`paste`](Project::paste) does for one clip:
+    /// a set-paste never ripples the bed, so a landing that overlaps so much
+    /// as one existing clip on its own lane refuses the whole set, changing
+    /// nothing -- the paste's own [`move_selection`](Project::move_selection)
+    /// clamps instead of refusing, but a paste has no drag to clamp against,
+    /// and a landing moved off the frame asked for is not what a paste means.
+    /// `items` empty, naming a lane or a source that is not there, or a clip
+    /// with `out_frame <= in_frame`, refuses too, before anything is touched.
+    ///
+    /// Exactly one history snapshot for the whole set, so one
+    /// [`Project::undo`] takes it back. Changes the timeline->source mapping
+    /// on every lane an item lands on: the caller must reseek.
+    pub fn paste_set(&mut self, at: u32, items: &[(Lane, Clip)]) -> bool {
+        let Some(anchor) = items.iter().map(|(_, c)| c.start).min() else {
+            return false;
+        };
+        // Resolved once, up front, off the lanes as they stand now: a lane or
+        // source that is not there, or a landing that would overlap a
+        // neighbour, refuses the whole set before any of it is written.
+        let mut landings: Vec<(usize, Clip)> = Vec::with_capacity(items.len());
+        for &(lane, clip) in items {
+            let Some(li) = self.index(lane) else {
+                return false;
+            };
+            if self.sources.get(clip.source).is_none() || clip.out_frame <= clip.in_frame {
+                return false;
+            }
+            let delta = i64::from(clip.start) - i64::from(anchor);
+            let Ok(start) = u32::try_from(i64::from(at) + delta) else {
+                return false;
+            };
+            let Some(end) = start.checked_add(clip.frames()) else {
+                return false;
+            };
+            if self.lanes[li]
+                .clips
+                .iter()
+                .any(|c| c.start < end && start < c.end())
+            {
+                return false;
+            }
+            landings.push((li, Clip { start, ..clip }));
+        }
+        self.snapshot();
+        for (li, mut clip) in landings {
+            clip.link = Some(self.new_link());
+            clip.fade_in = 0;
+            clip.fade_out = 0;
+            clip.transition_out = 0;
+            let clips = &mut self.lanes[li].clips;
+            let idx = clips.partition_point(|c| c.start < clip.start);
+            clips.insert(idx, clip);
         }
         true
     }
