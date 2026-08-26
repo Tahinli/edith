@@ -173,7 +173,7 @@ impl Player {
             // starts. Lands on the cycle's first stop (`stance::SURFACE_CYCLE`
             // -- the dock); a second Tab from there walks it same as ever.
             ActionId::FocusPanels => {
-                window.focus(&self.focus_dock);
+                self.focus_surface(crate::ui::stance::Surface::Dock, window, cx);
             }
             // Nothing to cancel while nothing is exporting; the export guard in
             // the key handler is what answers this one while there is.
