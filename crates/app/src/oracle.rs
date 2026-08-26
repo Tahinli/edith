@@ -302,6 +302,18 @@ pub(crate) fn enable(action: ActionId, ctx: Ctx) -> Enable {
         {
             Enable::No("no subject cut")
         }
+        // Trim-to-playhead (debt #42): the keyboard's own version of the
+        // pointer's drag-the-edge-to-a-spot trim, so it needs the two things
+        // that gesture needs -- a subject cut, and the playhead actually
+        // resting somewhere on it, or the "spot" the edge would snap to is
+        // not on the clip at all.
+        ActionId::TrimInToPlayhead | ActionId::TrimOutToPlayhead => match ctx.clip {
+            None => Enable::No("no subject cut"),
+            Some((clip, _)) if ctx.playhead < clip.start || ctx.playhead > clip.end() => {
+                Enable::No("playhead is outside the subject cut")
+            }
+            _ => Enable::Yes,
+        },
         ActionId::Paste if !ctx.clipboard => Enable::No("nothing copied yet"),
         // Nothing to draw over the picture, so nothing to switch off: the
         // library says how subtitles arrive, and this row would flip a state
