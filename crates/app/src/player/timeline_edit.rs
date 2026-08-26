@@ -1550,6 +1550,38 @@ impl Player {
         cx.notify();
     }
 
+    /// Widens or narrows the transition the anchor already carries, one
+    /// frame at a step, from the inspector's duration row -- ctrl+f/ctrl+x
+    /// stay the toggle that seeds a fresh one at one second; this is what
+    /// moves it afterwards. The engine clamps both kinds to what the two
+    /// clips actually offer ([`Project::set_transition_out`],
+    /// [`Project::crossfade`]), so a step past the successor's own length
+    /// lands at the successor's length instead of asking for more than
+    /// there is.
+    pub(crate) fn nudge_transition(&mut self, lane: Lane, idx: usize, step: i32, cx: &mut Context<Self>) {
+        if self.exporting().is_some() {
+            return;
+        }
+        let Some(session) = &mut self.session else {
+            return;
+        };
+        let current = match lane.kind {
+            LaneKind::Video => session.transition_out_of(lane, idx),
+            LaneKind::Audio => session.lane_clips(lane).get(idx).map_or(0, |c| c.fade_out),
+            _ => return,
+        };
+        let frames = (current as i32 + step).max(0) as u32;
+        let ok = match lane.kind {
+            LaneKind::Video => session.set_transition_out(lane, idx, frames),
+            LaneKind::Audio => session.crossfade(lane, idx, frames),
+            _ => false,
+        };
+        if ok {
+            self.mark_dirty();
+            cx.notify();
+        }
+    }
+
     /// The clip as the drag is showing it: an edge under the pointer moves its
     /// own box, and the boxes of everything linked to it, before anything is
     /// committed. Display only -- the project is not touched until the release.
