@@ -17,6 +17,58 @@ use crate::ui::timeband_stance;
 use crate::ui::type_scale::{self, Typeset};
 use crate::*;
 
+/// Keyboard focus v1: the three regions Tab/Shift-Tab cycle a painted ring
+/// through -- the bench, the dock's Sources tab (library) and the dock's
+/// Clip tab (inspector), the darkroom's own stand-ins for "timeline",
+/// "library" and "inspector" (there is no separate inspector *region* in
+/// this tree -- MOCK-SPEC's Clip tab, `dock_stance::clip_tab`, is it).
+/// `Player::focus` (the root handle every keybind hangs off) is not a
+/// member: Tab already means "select the clip under the playhead"
+/// (`ActionId::Select`, `keymap.rs`) at the root, unchanged here, and only
+/// starts meaning "enter the ring" once one of these three already holds
+/// focus.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Surface {
+    Dock,
+    Bench,
+    Inspector,
+}
+
+/// Fixed cycle order: dock, bench, inspector.
+const SURFACE_CYCLE: [Surface; 3] = [Surface::Dock, Surface::Bench, Surface::Inspector];
+
+/// Tab (`backward` false) or Shift-Tab (`backward` true) from `current`,
+/// wrapping at either end of [`SURFACE_CYCLE`].
+pub(crate) fn next_surface(current: Surface, backward: bool) -> Surface {
+    let i = SURFACE_CYCLE.iter().position(|&s| s == current).unwrap();
+    let n = SURFACE_CYCLE.len();
+    SURFACE_CYCLE[if backward { (i + n - 1) % n } else { (i + 1) % n }]
+}
+
+/// The one key a surface's own `on_key_down` answers. Everything else is
+/// left alone on purpose, unhandled and un-stopped, so it bubbles to the
+/// root's fallback handler exactly as an unfocused key already does
+/// (`window.rs`'s key dispatch walks the focused node's ancestors in
+/// `Bubble` phase and stops only at `cx.stop_propagation()` -- the three
+/// surface handlers call that solely from this branch, gpui-0.2.2
+/// `window.rs:3897-3906`).
+pub(crate) fn is_focus_cycle_key(key: &str) -> bool {
+    key == "tab"
+}
+
+impl Player {
+    /// The `FocusHandle` a [`Surface`] paints its ring on and Tab/Shift-Tab
+    /// moves to next -- one door, so `next_surface`'s answer and the handle
+    /// `window.focus` is given cannot name two different surfaces.
+    pub(crate) fn focus_handle(&self, surface: Surface) -> &FocusHandle {
+        match surface {
+            Surface::Dock => &self.focus_dock,
+            Surface::Bench => &self.focus_bench,
+            Surface::Inspector => &self.focus_inspector,
+        }
+    }
+}
+
 /// Left rail, full height (DESIGN §5).
 pub(crate) const SPINE_W: f32 = 56.;
 /// Fixed strip under the screen: timecode, transport, cut readout, contact
@@ -533,9 +585,24 @@ fn time_band(player: &mut Player, position: f64, cx: &mut Context<Player>) -> im
 /// Height comes from [`Player::split_px`] now, not the fixed [`BENCH_H`]:
 /// the seam [`crate::ui::stance::render`] mounts above this region is what
 /// answers "ui fields are not stretchable" for the bench.
-fn bench(player: &mut Player, bench_h: f32, cx: &mut Context<Player>) -> impl IntoElement {
+fn bench(
+    player: &mut Player,
+    bench_h: f32,
+    window: &mut Window,
+    cx: &mut Context<Player>,
+) -> impl IntoElement {
+    let focused = player.focus_bench.is_focused(window);
     div()
         .id("stance-bench")
+        .track_focus(&player.focus_bench)
+        .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+            if is_focus_cycle_key(event.keystroke.key.as_str()) {
+                let next = next_surface(Surface::Bench, event.keystroke.modifiers.shift);
+                window.focus(this.focus_handle(next));
+                cx.stop_propagation();
+                cx.notify();
+            }
+        }))
         .flex_none()
         .h(px(bench_h))
         // §4: lanes take 0 radius.
@@ -543,6 +610,12 @@ fn bench(player: &mut Player, bench_h: f32, cx: &mut Context<Player>) -> impl In
         .bg(rgb(DARK_CANVAS()))
         .border_t_1()
         .border_color(rgba(DARK_SEAM()))
+        // The ring (DESIGN §4's "1px, lamp-adjacent" convention -- the same
+        // `.border_1().border_color(...)` a picked bench clip already uses):
+        // painted on this outer frame, never on a row, and only while this
+        // surface itself -- not a picked clip inside it -- holds the focus
+        // ring Tab/Shift-Tab moves ([`next_surface`]).
+        .when(focused, |d| d.border_1().border_color(rgb(STROKE_FOCUS())))
         .flex()
         .flex_col()
         .px(px(12.))
@@ -739,6 +812,7 @@ fn dock(
     player: &Player,
     dock_w: f32,
     window_size: Size<Pixels>,
+    window: &mut Window,
     cx: &mut Context<Player>,
 ) -> impl IntoElement {
     div()
@@ -751,7 +825,7 @@ fn dock(
         .border_color(rgba(DARK_SEAM()))
         .flex()
         .flex_col()
-        .child(dock_stance::render(player, dock_w, window_size, cx))
+        .child(dock_stance::render(player, dock_w, window_size, window, cx))
 }
 
 /// A zero-size element whose only job is `window.on_mouse_event`'s door:
@@ -982,7 +1056,7 @@ pub(crate) fn render(
                 .child(screen(player, position, window, cx))
                 .child(time_band(player, position, cx))
                 .child(divider(Split::Bench, cx))
-                .child(bench(player, bench_h, cx))
+                .child(bench(player, bench_h, window, cx))
                 .child(ledger(player, position))
                 .when_some(player.notices.back().cloned(), |el, n| {
                     el.child(notice_plate(n, bench_h))
@@ -1033,7 +1107,7 @@ pub(crate) fn render(
                 }),
         )
         .child(divider(Split::Dock, cx))
-        .child(dock(player, dock_w, window_size, cx))
+        .child(dock(player, dock_w, window_size, window, cx))
         // The library row menu mounts on the ROOT, not inside
         // `stance-centre` like the clip menu beside it: it is opened from a
         // dock row, so its anchor is a window x past the centre column's own
