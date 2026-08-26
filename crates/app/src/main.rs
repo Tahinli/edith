@@ -385,8 +385,11 @@ struct Player {
     /// over no lane: the shadow every proper editor draws under a drag. Set by
     /// the lane the pointer is actually over -- that is the one question the
     /// line above does not answer -- and drawn only while a drag is live, for
-    /// [`Player::snap_cue`]'s reason.
-    ghost: Option<Ghost>,
+    /// [`Player::snap_cue`]'s reason. More than one entry only while a
+    /// set-drag ([`Player::move_clip`]'s `set_move`) is carrying more than
+    /// the clip under the hand: every other pick draws its own shadow too, at
+    /// the same delta the anchor's is landing at ([`Player::preview_ghost`]).
+    ghost: Vec<Ghost>,
     /// The slot a track header being dragged is about to drop into, or `None`
     /// while the pointer is over no lane: the line drawn between two headers,
     /// for the reason [`Player::ghost`] draws a shadow -- where a gesture lands
@@ -942,7 +945,7 @@ fn main() {
                     sub_folded: HashSet::new(),
                     sub_lane: None,
                     snap_cue: None,
-                    ghost: None,
+                    ghost: Vec::new(),
                     lane_drop: None,
                     last_scrub: Instant::now(),
                     last_target: 0,
