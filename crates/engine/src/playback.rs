@@ -4065,6 +4065,16 @@ fn audio_matches_probed(
     if probe.map(|p| p.channels) == first.map(|p| p.channels) {
         return Ok(());
     }
+    // A mono file joins a wider timeline: [`crate::audio::widen`] duplicates
+    // its one channel into every channel the timeline carries, the inverse of
+    // the [`crate::audio::downmix`] a wider file already folds through. The
+    // reverse -- a wider file onto a mono timeline -- stays refused below;
+    // nothing here narrows a source, only the decoder's own downmix does.
+    if let (Some(p), Some(b)) = (probe, first) {
+        if p.channels == 1 && b.channels > 1 {
+            return Ok(());
+        }
+    }
     // ...and a *silent* file joins whatever the timeline is: it contributes
     // silence over its span, which is the very thing both audio paths already
     // synthesise for a gap ([`AudioSession::open_multi_streams_speed`] plays

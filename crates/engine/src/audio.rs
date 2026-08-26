@@ -473,8 +473,12 @@ impl AudioSession {
             // very interpolator a speeded clip already goes through, so it plays
             // at the pitch it was recorded at over the seconds it was placed for.
             // The layout still is -- one output device carries one width, and
-            // everything wider than a pair is already folded to one.
-            if track.channels() != meta.channels {
+            // everything wider than a pair is already folded to one. A mono
+            // source is the one exception (DEBT #46): [`widen`] duplicates it
+            // into every channel below, the same as [`PlaybackSession`]'s own
+            // gate ([`crate::playback::audio_matches_probed`]) now allows.
+            if track.channels() != meta.channels && !(track.channels() == 1 && meta.channels > 1)
+            {
                 return Err(format!(
                     "source {source} is {} ch, the timeline is {} ch",
                     track.channels(),
@@ -2045,6 +2049,24 @@ fn downmix(samples: &mut Vec<f32>, from: usize) {
     samples.truncate(samples.len() / from * 2);
 }
 
+/// The inverse of [`downmix`]: a mono buffer duplicated into every channel of
+/// a wider timeline, in place. `from` is the width the decoder actually
+/// handed back (already folded to 1 or 2 by [`downmix`] at its own door) and
+/// `to` is the timeline's own width ([`mix`]'s `channels`); anything that is
+/// not exactly the mono-into-wider case is left untouched -- a source already
+/// at `to`, and a source wider than `to`, which stays [`downmix`]'s refusal
+/// (DEBT #46: only 1-ch -> N-ch became legal, not the reverse).
+fn widen(samples: &mut Vec<f32>, from: usize, to: usize) {
+    if from != 1 || to <= 1 {
+        return;
+    }
+    let mut out = Vec::with_capacity(samples.len() * to);
+    for &s in samples.iter() {
+        out.extend(std::iter::repeat_n(s, to));
+    }
+    *samples = out;
+}
+
 /// One source's AC-3 track: the same mp4 sample tables the AAC track is read
 /// from, decoded through `oxideav-ac3` and **downmixed to stereo by the decoder
 /// itself** (ATSC A/52 §7.8, `channels: Some(2)`), because one output device and
@@ -3163,6 +3185,9 @@ fn run(mut w: Worker) {
                 eprintln!("audio decode error at sample {id}: {e}");
                 break;
             }
+            // decoder.decode already folded to track.channels(); widen the mono
+            // case up to the timeline's own width before dividing by it below.
+            widen(&mut interleaved, usize::from(track.channels()), channels);
             let next = pos + (interleaved.len() / channels) as u64;
             if !emit(
                 &mut interleaved,
@@ -3318,6 +3343,7 @@ fn run_ac3(
         // The library's §7.8 downmix already handles everything but its own 2.1
         // passthrough, which comes out at 3 and is folded here like any width.
         downmix(&mut interleaved, usize::from(track.channels));
+        widen(&mut interleaved, usize::from(track.channels), channels);
         let next = pos + samples;
         if !emit(
             &mut interleaved,
@@ -3382,6 +3408,7 @@ fn run_mkv_ac3(
         };
         // ...and the 2.1 passthrough folded here, as on the mp4 side.
         downmix(&mut interleaved, usize::from(track.channels));
+        widen(&mut interleaved, usize::from(track.channels), channels);
         let next = pos + samples;
         if !emit(
             &mut interleaved,
@@ -3455,6 +3482,10 @@ fn run_sym(
             eprintln!("audio decode error at sample {pos}: {e}");
             return true;
         }
+        // decoder.decode already folded to track.channels ([`SymDecoder::decode`],
+        // [`downmix`]); widen the mono case up to the timeline's own width
+        // before anything below divides by it.
+        widen(&mut interleaved, usize::from(track.channels), channels);
         let next = pos + (interleaved.len() / channels) as u64;
         at = Some(next);
         // Reborrowed per packet: the filter memory has to carry across the

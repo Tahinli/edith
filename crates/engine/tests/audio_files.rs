@@ -693,3 +693,53 @@ fn a_project_scaffolded_from_an_audio_only_mp4_reloads() {
     drop(reloaded);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// DEBT #46: a mono source used to be refused outright by a stereo timeline
+/// ("audio 1 ch does not match the timeline's 2 ch") -- the only layout gate
+/// left after the 2026-08-12 convert-at-import work. It now up-mixes,
+/// [`engine::audio::widen`] duplicating the one channel into both of a stereo
+/// timeline's, mirroring the [`engine::audio::downmix`] a wider source already
+/// folds through at the decoder's door. Reverted to before that fix, this test
+/// fails at `import_and_place` itself: `place_stream_at` returns
+/// `Err("audio 1 ch does not match the timeline's 2 ch")` instead of landing
+/// the clip, because `widen` and the `audio_matches_probed` mono exception
+/// did not exist.
+#[test]
+fn a_mono_source_up_mixes_onto_a_stereo_timeline() {
+    let dir = Scratch::dir("ve_audio_upmix");
+    let mut session = open(asset("test_tone.mp3")); // a 3 s stereo timeline
+    // 44100 Hz, 1 ch AAC -- no rate to resample, only the layout in question.
+    import_and_place(&mut session, &asset("test_audio_only.mp4"));
+    assert_eq!(session.lane_clips(Lane::A1).len(), 2);
+    assert!((session.timeline_duration() - 6.0).abs() < 0.1);
+
+    let wav = dir.join("upmix.wav");
+    wait(&session.export_to_with(
+        &wav,
+        &ExportSettings {
+            format: Format::Wav,
+            ..ExportSettings::default()
+        },
+    ))
+    .expect("wav export of the up-mixed timeline");
+    let (rate, channels, samples) = decode(&wav);
+    assert_eq!((rate, channels), (44100, 2));
+
+    // Inside the mono clip's own span (the second half of the timeline): left
+    // and right must carry the identical signal `widen` duplicated, and it
+    // must not be silence -- a bug in `widen` could zero the buffer instead of
+    // filling it.
+    let start = (3.5 * f64::from(rate)) as usize;
+    let end = (5.5 * f64::from(rate)) as usize;
+    let mut peak = 0.0f32;
+    for frame in start..end {
+        let (l, r) = (samples[frame * 2], samples[frame * 2 + 1]);
+        assert!(
+            (l - r).abs() < 1e-6,
+            "frame {frame}: left {l} and right {r} must carry the up-mixed mono signal"
+        );
+        peak = peak.max(l.abs());
+    }
+    assert!(peak > 0.01, "the up-mixed span is silent: peak {peak}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -1199,13 +1199,12 @@ fn import_refuses_what_does_not_match() {
         .remove_source(&asset("test_tone_48k.wav"), 0)
         .expect("...and the row it made comes back off");
 
-    // What is still refused, and all that is: one output device carries one
-    // layout, and a mono track is not the stereo pair this timeline plays.
-    let err = session
+    // A mono track is no longer a refusal either (DEBT #46): [`engine::audio`]
+    // duplicates its one channel into both of this stereo timeline's, the same
+    // way a wider file is already folded down to it.
+    session
         .import(&asset("test_ac3.mp4"))
-        .expect_err("a mono track cannot join a stereo timeline")
-        .to_string();
-    assert_eq!(err, "audio 1 ch does not match the timeline's 2 ch");
+        .expect("a mono track up-mixes onto a stereo timeline");
 
     assert!(
         session.import(&asset("no_such_file.mp4")).is_err(),
@@ -1214,8 +1213,8 @@ fn import_refuses_what_does_not_match() {
     assert_eq!(session.clip_spans().len(), 1, "an import places nothing");
     assert_eq!(
         session.sources().len(),
-        rows + 1,
-        "only the silent file was taken in"
+        rows + 2,
+        "the silent file and the mono file were both taken in"
     );
     assert!((session.timeline_duration() - 5.0).abs() < 1e-9);
 
