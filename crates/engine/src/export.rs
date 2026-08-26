@@ -2334,6 +2334,33 @@ fn publish_seats(
     *shared.encoders.lock().unwrap() = Some(format!("{seat} · {audio}"));
 }
 
+/// Hands a mix that finished mixing early to the mp4 it belongs in, the
+/// moment both exist: `late` may land before the first coded picture has
+/// opened `muxer` at all, so this is tried both right where the mix lands
+/// and after every picture written afterwards, and does nothing once
+/// `*fed` says an earlier try already succeeded. Declaring the track and
+/// queuing its packets here is what lets [`crate::mux::Mp4Muxer`]'s own
+/// hold interleave them under the pictures still to come, rather than the
+/// track landing all at once after the picture is done.
+fn feed_late_audio(
+    muxer: &mut Option<Muxer>,
+    late: &Option<ExportAudio>,
+    fed: &mut bool,
+) -> crate::Result<()> {
+    if *fed {
+        return Ok(());
+    }
+    let (Some(track), Some(Muxer::Mp4(mp4))) = (late.as_ref(), muxer.as_mut()) else {
+        return Ok(());
+    };
+    mp4.add_audio_track(&params_of(track))?;
+    for packet in &track.packets {
+        mp4.write_audio_packet(&packet.bytes)?;
+    }
+    *fed = true;
+    Ok(())
+}
+
 fn params_of(track: &ExportAudio) -> AudioParams {
     AudioParams {
         freq_index: track.params.freq_index,
@@ -2554,10 +2581,16 @@ fn run(
     // the sound landed -- the one number that says whether the two passes
     // really overlapped, in the same voice as `encode_audio`'s own timers.
     let picture_started = std::time::Instant::now();
-    // The sound, once the pass beside this one has finished with it: an mp4
-    // declares its audio track and writes its packets after the picture, so
-    // this is where they arrive.
+    // The sound, once the pass beside this one has finished with it: joined
+    // here the moment it lands rather than only after the picture, so
+    // `feed_late_audio` below can hand it to the muxer while pictures are
+    // still being coded and let `Mp4Muxer`'s own hold interleave the two
+    // ([`crate::mux::Mp4Muxer`]).
     let mut late: Option<ExportAudio> = None;
+    // Set once `late`'s track has been handed to the muxer -- so the final
+    // join below, which still exists for a mix that never lands mid-picture,
+    // knows not to declare the track or write its packets a second time.
+    let mut audio_fed = false;
     let mut muxer = None;
     let mut done = 0u32;
     let black = Black::new(meta);
@@ -2718,6 +2751,7 @@ fn run(
                     "export audio: done {:.1} s into the picture",
                     picture_started.elapsed().as_secs_f64()
                 );
+                feed_late_audio(&mut muxer, &late, &mut audio_fed)?;
             }
             let want = source_at(done_here);
             // How many timeline frames from here show that same picture: one at
@@ -2826,6 +2860,11 @@ fn run(
                         au,
                         key,
                     )?;
+                    // Retried here rather than only where the mix lands: the
+                    // very first coded picture is what creates `muxer`, and a
+                    // mix that lands before it (a short film, or a slow first
+                    // frame) has nothing to hand it to until now.
+                    feed_late_audio(&mut muxer, &late, &mut audio_fed)?;
                 }
                 done += 1;
                 // Forwards only: an audio pass still running beside this one
@@ -2898,6 +2937,10 @@ fn run(
                     );
                     track
                 }
+                // `late` was already handed to `mp4` inside the picture loop
+                // ([`feed_late_audio`]) unless the mix never landed there, in
+                // which case it is still `None` and there was nothing to feed.
+                None if audio_fed => None,
                 None => late,
             };
             if let Some(track) = &track {
