@@ -272,6 +272,143 @@ impl Render for OverlayTip {
     }
 }
 
+/// A number being typed into a row that has no text field of its own: the
+/// digits so far, the range and digit cap that row enforces, and once a
+/// commit has been refused, why. Text-field semantics on a card that has no
+/// text field -- typing, backspace, arrows that step, enter that commits and
+/// escape that gives up -- held as state and driven by the root's key
+/// handler, since nothing in these rows takes gpui focus. Shared by the
+/// export card's custom bitrate field and the transition duration row
+/// (DEBT #111) -- one implementation, each caller its own range and unit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct NumberEdit {
+    pub(crate) text: String,
+    pub(crate) refusal: Option<String>,
+    min: u32,
+    max: u32,
+    digits: usize,
+    unit: &'static str,
+}
+
+impl NumberEdit {
+    /// Starts on the number the row already carries, so backspace edits it
+    /// rather than the field opening empty over a value that is still in
+    /// force. Zero is no number at all -- it is what the row opens at, before
+    /// anyone has typed one.
+    pub(crate) fn new(value: u32, min: u32, max: u32, digits: usize, unit: &'static str) -> Self {
+        NumberEdit {
+            text: match value {
+                0 => String::new(),
+                v => v.to_string(),
+            },
+            refusal: None,
+            min,
+            max,
+            digits,
+            unit,
+        }
+    }
+
+    /// A digit against what is there. The one past the row's digit cap is
+    /// refused *out loud*: a keystroke dropped in silence is how the old
+    /// digit capture left a row showing a number the user had already typed
+    /// past.
+    pub(crate) fn digit(&mut self, digit: u32) {
+        if self.text.chars().count() >= self.digits {
+            self.refusal = Some(format!("{} digits is already past the ceiling", self.digits));
+            return;
+        }
+        match char::from_digit(digit, 10) {
+            Some(c) => {
+                self.text.push(c);
+                self.refusal = None;
+            }
+            None => self.refusal = Some("digits only".into()),
+        }
+    }
+
+    /// Erases the last digit, and the refusal with it: the number on screen has
+    /// changed, so the reason the old one was refused no longer describes it.
+    pub(crate) fn backspace(&mut self) {
+        self.text.pop();
+        self.refusal = None;
+    }
+
+    /// The arrows, which is how a number gets picked rather than typed. Steps
+    /// from what is in the field -- an empty one starts at the floor, so the
+    /// first press up is the row's minimum and not a jump to some remembered
+    /// value -- and stays inside the range, because a step is a walk through
+    /// the legal numbers rather than a way out of them.
+    pub(crate) fn step(&mut self, by: i32) {
+        let at = self
+            .text
+            .parse::<i32>()
+            .unwrap_or(self.min as i32 - by.signum());
+        self.text = (at + by)
+            .clamp(self.min as i32, self.max as i32)
+            .to_string();
+        self.refusal = None;
+    }
+
+    /// The number, or `None` with the reason recorded where the row will read
+    /// it. Never clamped: a row that clamps a typed number to its ceiling
+    /// without saying so is writing a number the user never typed. For a row
+    /// whose own stepper already clamps silently, use [`Self::commit_clamped`]
+    /// instead -- refusing there would be a stricter rule than the mouse door
+    /// enforces.
+    pub(crate) fn commit(&mut self) -> Option<u32> {
+        match self.text.parse::<u32>() {
+            Ok(v) if (self.min..=self.max).contains(&v) => {
+                self.refusal = None;
+                Some(v)
+            }
+            Ok(0) => {
+                self.refusal = Some(format!(
+                    "0 is not a value — {}–{} {}",
+                    self.min, self.max, self.unit
+                ));
+                None
+            }
+            Ok(v) => {
+                self.refusal = Some(format!("{v} is past the {} {} ceiling", self.max, self.unit));
+                None
+            }
+            Err(_) => {
+                self.refusal = Some(format!(
+                    "type a number — {}–{} {}",
+                    self.min, self.max, self.unit
+                ));
+                None
+            }
+        }
+    }
+
+    /// The number, clamped into range instead of refused -- for a row whose
+    /// own stepper already clamps silently (the transition duration's setter
+    /// clamps to the clips' shared length), so a typed number lands exactly
+    /// where that same stepper would have walked it to. Always succeeds.
+    pub(crate) fn commit_clamped(&mut self) -> u32 {
+        let v = self.text.parse::<u32>().unwrap_or(self.min);
+        self.refusal = None;
+        v.clamp(self.min, self.max)
+    }
+
+    /// What the row shows while it is being typed into: the digits, the caret
+    /// that says they are landing *here*, and either the refusal or the two
+    /// keys that end the edit.
+    pub(crate) fn detail(&self) -> String {
+        format!(
+            "{}▏ {} — {}",
+            self.text,
+            self.unit,
+            match &self.refusal {
+                Some(why) => why.as_str(),
+                None => "enter commits · esc cancels",
+            }
+        )
+    }
+}
+
 /// What a window with no file open is waiting for. Both ways in are already
 /// built -- the whole window is the drop target and the Import chooser takes a
 /// project as readily as media -- so this only has to say so.

@@ -562,6 +562,12 @@ struct Player {
     /// keyboard), so the field is a modal state on the player exactly as a
     /// waiting rebind row is, and the root's handler is what types into it.
     mbps_edit: Option<NumberEdit>,
+    /// The Clip tab's transition duration row, the same way (DEBT #111):
+    /// the anchor clip's frame count while it is being typed, `None` when
+    /// nobody is. Opened on the row's own click, closed on the same field's
+    /// enter/esc the export card's field already answers to
+    /// ([`Player::param_card_key`]).
+    transition_edit: Option<NumberEdit>,
     /// What the *sound* is coded at, in kbps, for every format that encodes it
     /// -- the AAC inside a video export as much as an MP3. Kept across closes
     /// like the picture's quality, and starts at the figure this program wrote
@@ -1024,6 +1030,7 @@ fn main() {
                     quality: Quality::Medium,
                     custom_mbps: 0,
                     mbps_edit: None,
+                    transition_edit: None,
                     // ...and the rate the sound has always been written at.
                     audio_kbps: DEFAULT_AUDIO_KBPS,
                     // Picture and sound, which is what an export was before

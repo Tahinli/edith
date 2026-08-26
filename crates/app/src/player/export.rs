@@ -1,6 +1,7 @@
 //! What is cached about the media and the machine, and the export the
 //! two of them decide.
 
+use crate::ui::widgets::NumberEdit;
 use crate::*;
 
 impl Player {
@@ -579,7 +580,13 @@ impl Player {
     /// bitrate it had.
     pub(crate) fn edit_mbps(&mut self) {
         self.quality = Quality::Custom;
-        self.mbps_edit = Some(NumberEdit::new(self.custom_mbps));
+        self.mbps_edit = Some(NumberEdit::new(
+            self.custom_mbps,
+            MBPS_MIN,
+            MBPS_MAX,
+            MBPS_DIGITS,
+            "Mbps",
+        ));
     }
 
     /// The card's Destination row: the desktop's save dialog, on a background
