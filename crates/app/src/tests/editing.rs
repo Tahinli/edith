@@ -1797,6 +1797,94 @@ fn a_clip_trimmed_by_its_edge_plays_less_of_its_file() {
     assert_eq!(session.lane_clips(Lane::V1)[0], whole);
 }
 
+/// Trim-to-playhead (debt #42): [`Player::trim_cut_to_playhead`] reads
+/// `frame_at(session.now(), fps)` and calls exactly the [`PlaybackSession::
+/// trim_clip`] primitive [`Player::commit_trim`]'s pointer path does, so
+/// this exercises that same door at the playhead's own frame -- the clip's
+/// start moves to where the playhead rests, one undo step takes it back.
+#[test]
+fn trim_to_playhead_moves_the_selected_clips_edge_and_undoes_in_one_step() {
+    use engine::project::Edge;
+
+    let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+    session.set_gain(0.0);
+    let whole = session.lane_clips(Lane::V1)[0];
+    let fps = session.meta().frame_rate;
+
+    // Playhead mid-clip, a second in on a five-second timeline.
+    session.seek(1.0);
+    let playhead = frame_at(session.now(), fps);
+    assert!(playhead > whole.start && playhead < whole.end(), "mid-clip");
+
+    // Trim-in: the head follows the playhead, same as a pointer drag would
+    // stop there.
+    assert!(session.trim_clip(Lane::V1, 0, Edge::Start, playhead));
+    assert_eq!(session.lane_clips(Lane::V1)[0].start, playhead);
+    assert!(session.undo(), "one step for the whole press");
+    assert_eq!(session.lane_clips(Lane::V1)[0], whole, "the head is back");
+
+    // Trim-out: the same door, the tail this time.
+    session.seek(4.0);
+    let playhead = frame_at(session.now(), fps);
+    assert!(playhead > whole.start && playhead < whole.end(), "mid-clip");
+    assert!(session.trim_clip(Lane::V1, 0, Edge::End, playhead));
+    assert_eq!(session.lane_clips(Lane::V1)[0].end(), playhead);
+    assert!(session.undo(), "one step for the whole press");
+    assert_eq!(session.lane_clips(Lane::V1)[0], whole, "the tail is back");
+}
+
+/// The oracle side of trim-to-playhead (debt #42): needs a subject cut *and*
+/// the playhead actually resting on it, unlike the nudge pair above it which
+/// only needs a cut -- the "spot" a keyless drag would snap to has to be on
+/// the clip at all.
+#[test]
+fn trim_to_playhead_needs_a_subject_cut_with_the_playhead_on_it() {
+    let clip = Clip {
+        fade_in: 0,
+        fade_out: 0,
+        transition_out: 0,
+        start: 100,
+        in_frame: 0,
+        out_frame: 60,
+        source: 0,
+        link: None,
+        eq: None,
+        color: None,
+        transform: None,
+        fit: FitPolicy::default(),
+        speed: Speed::NORMAL,
+    };
+    assert_eq!(
+        enable(
+            ActionId::TrimInToPlayhead,
+            Ctx {
+                timeline: true,
+                ..Ctx::default()
+            }
+        ),
+        Enable::No("no subject cut"),
+        "nothing marked"
+    );
+    let off = Ctx {
+        clip: Some((clip, Lane::V1)),
+        playhead: 5,
+        timeline: true,
+        ..Ctx::default()
+    };
+    assert_eq!(
+        enable(ActionId::TrimOutToPlayhead, off),
+        Enable::No("playhead is outside the subject cut")
+    );
+    let on = Ctx {
+        clip: Some((clip, Lane::V1)),
+        playhead: clip.start,
+        timeline: true,
+        ..Ctx::default()
+    };
+    assert_eq!(enable(ActionId::TrimInToPlayhead, on), Enable::Yes);
+    assert_eq!(enable(ActionId::TrimOutToPlayhead, on), Enable::Yes);
+}
+
 /// The move-a-clip-between-tracks path through the door the drop uses
 /// ([`Player::move_clip`] calls exactly this): the clip changes row, the
 /// *picture* comes from the new row afterwards -- which is what "it plays
