@@ -776,6 +776,12 @@ struct Player {
     /// Wall clock of the first displayed frame -- the real-speed measurement.
     started: Option<Instant>,
     focus: FocusHandle,
+    /// The three focus-ring surfaces (`ui::stance::Surface`) Tab/Shift-Tab
+    /// cycles between once one of them holds focus -- `focus` above stays
+    /// the fallback none of these keys ever leave.
+    focus_dock: FocusHandle,
+    focus_bench: FocusHandle,
+    focus_inspector: FocusHandle,
 }
 
 #[cfg(test)]
@@ -1057,6 +1063,9 @@ fn main() {
                     dropped: 0,
                     started: None,
                     focus: cx.focus_handle(),
+                    focus_dock: cx.focus_handle(),
+                    focus_bench: cx.focus_handle(),
+                    focus_inspector: cx.focus_handle(),
                 });
                 // Nothing else takes focus, and without it the key listener
                 // above is never reached.

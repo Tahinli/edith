@@ -221,6 +221,12 @@ actions! {
     /// this window is EDITOR." Always answerable, same as `Theme`: it is
     /// about the editor and the project's own numbers, not about a clip.
     Settings,
+    /// Moves the keyboard ring onto the dock (`ui::stance::Surface::Dock`,
+    /// the cycle's first stop): the door into keyboard-only navigation
+    /// (`ui::stance`'s Tab/Shift-Tab ring), which nothing else in the app
+    /// opens. Bare Tab stays [`ActionId::Select`] at the root the whole time
+    /// -- this only starts the ring, it never steals the clip-selection key.
+    FocusPanels,
 }
 
 impl ActionId {
@@ -303,6 +309,7 @@ impl ActionId {
             ActionId::Screenshot => "Save the frame on screen as a PNG",
             ActionId::SubtitleStyle => "Subtitle style: font and size…",
             ActionId::Settings => "Settings: project and editor…",
+            ActionId::FocusPanels => "Move keyboard focus between panels",
         }
     }
 
@@ -383,6 +390,7 @@ impl ActionId {
             ActionId::Screenshot => "screenshot",
             ActionId::SubtitleStyle => "subtitle-style",
             ActionId::Settings => "settings",
+            ActionId::FocusPanels => "focus-panels",
         }
     }
 
@@ -467,7 +475,11 @@ impl ActionId {
             | ActionId::Fullscreen
             // The settings page: it changes no clip and no lane, only the
             // project's own numbers and this window's preferences.
-            | ActionId::Settings => Category::View,
+            | ActionId::Settings
+            // Moves the ring, not a clip or a lane: the same "how one is
+            // looking/reaching, not what is being edited" shape as the rest
+            // of this heading.
+            | ActionId::FocusPanels => Category::View,
             ActionId::Cut
             | ActionId::Regroup
             | ActionId::Detach
@@ -1232,6 +1244,13 @@ impl Keymap {
                 // bare "," is WalkCutPrev, and nothing else answers to the
                 // ctrl chord.
                 b(ActionId::Settings, ",", true),
+                // The standard pane-cycle key on every desktop that has one
+                // (browsers, IDEs) -- free here, and Tab itself cannot spell
+                // this: bare Tab is already [`ActionId::Select`] at the root
+                // (a bare-key rebind would steal clip selection), and its
+                // shift pair is unspellable in this table's chord (`ctrl`
+                // only, see [`ActionId::Select`]'s own comment above).
+                b(ActionId::FocusPanels, "f6", false),
             ],
         }
     }
@@ -1510,7 +1529,7 @@ mod tests {
     #[test]
     fn every_default_stroke_reaches_its_action() {
         let k = Keymap::defaults();
-        assert_eq!(k.entries().len(), 75);
+        assert_eq!(k.entries().len(), 76);
         // The cut odometer: bare walks one, `<`/`>` (what shift+,/shift+.
         // actually type) strides ten.
         assert_eq!(k.lookup(".", false), Some(ActionId::WalkCutNext));
