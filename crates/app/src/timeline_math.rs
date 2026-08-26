@@ -362,15 +362,37 @@ pub(crate) fn should_loop_restart(frame: u32, window: Option<(u32, u32)>) -> boo
     window.is_some_and(|(_, hi)| frame >= hi)
 }
 
+/// Which window is actually looping, in priority order: the i/o range
+/// ([`Player::range`]) beats the subject-cut trim ([`Player::loop_trim`])
+/// beats the whole timeline -- but only once *something* is already armed
+/// (`loop_on` or `loop_trim`). A bare in/out mark with neither on is an
+/// export mark first, not a loop request, so it answers `None` here and
+/// never restarts anything on its own.
+pub(crate) fn active_loop_window(
+    loop_on: bool,
+    range: Option<(u32, u32)>,
+    loop_trim: Option<(u32, u32)>,
+) -> Option<(u32, u32)> {
+    if !loop_on && loop_trim.is_none() {
+        return None;
+    }
+    range.or(loop_trim)
+}
+
 /// Where a play resumes from on crossing into [`Transport::Ended`]
-/// (`Player::pump`): the loop-trim window's own near edge when one is armed,
-/// *even when its far edge is the film's own last frame* -- half of all cuts
-/// in a two-clip film sit on the final clip (DESIGN.md §6), so that coincidence
-/// is not an edge case and must not read as "reached the end, stop". Falls
-/// back to the whole-timeline loop's top, and `None` -- neither armed --
-/// restarts nothing, which is the halt this crossing otherwise means.
-pub(crate) fn loop_restart_frame(loop_on: bool, loop_trim: Option<(u32, u32)>) -> Option<u32> {
-    match loop_trim {
+/// (`Player::pump`): the active window's own near edge
+/// ([`active_loop_window`]) when one is armed, *even when its far edge is
+/// the film's own last frame* -- half of all cuts in a two-clip film sit on
+/// the final clip (DESIGN.md §6), so that coincidence is not an edge case
+/// and must not read as "reached the end, stop". Falls back to the
+/// whole-timeline loop's top, and `None` -- nothing armed -- restarts
+/// nothing, which is the halt this crossing otherwise means.
+pub(crate) fn loop_restart_frame(
+    loop_on: bool,
+    range: Option<(u32, u32)>,
+    loop_trim: Option<(u32, u32)>,
+) -> Option<u32> {
+    match active_loop_window(loop_on, range, loop_trim) {
         Some((lo, _)) => Some(lo),
         None => loop_on.then_some(0),
     }
