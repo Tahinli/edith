@@ -639,7 +639,15 @@ fn notice_plate(message: SharedString, bench_h: f32) -> impl IntoElement {
             gpui::FontWeight::MEDIUM,
         ))
         .text_color(rgb(INK1()))
-        .child(message)
+        // `div()` is a flex row by default, and a bare text child measures
+        // its min-content as the *whole line* (`TextLayout::layout` only
+        // wraps against a `Definite` available width, which a flex item's
+        // content-sizing pass never supplies). `w_full`/`max_w` on the
+        // plate itself only bounds the *container* -- the text still never
+        // sees a definite width to wrap against unless it is a `flex_1`
+        // child, which is handed the container's resolved width. Same fix
+        // as `overlays.rs`'s notice bar (`div().flex_1().min_w(...)`).
+        .child(div().flex_1().child(message))
 }
 
 /// Thin strip at the bottom of the centre column: project identity, last
