@@ -74,18 +74,15 @@ fn a_picked_audio_stream_lands_saves_and_comes_back() {
     assert_eq!(loaded.sources(), session.sources());
     assert_eq!(loaded.timeline_duration(), session.timeline_duration());
 
-    // And the refusals, in the engine's own words: a stream that cannot share
-    // one output device with the timeline, and a file that is not on it.
+    // And the refusal left, in the engine's own words: a file that is not on
+    // this timeline. Its *layout* (stream 1 is mono, the timeline stereo) is no
+    // longer one (DEBT #46): the mono stream up-mixes onto both channels.
     let other = copy_in(&dir, "test_multiaudio.mp4");
     let mut session = PlaybackSession::open(&other).expect("open the fixture");
     session.set_gain(0.0);
-    // Its rate would be conformed now; its *layout* is what one output device
-    // cannot have two of, and the refusal says which.
-    let err = session
+    session
         .place_stream_at(0.0, &other, 1, None)
-        .expect_err("a mono stream cannot join a stereo timeline")
-        .to_string();
-    assert_eq!(err, "audio 1 ch does not match the timeline's 2 ch");
+        .expect("a mono stream up-mixes onto a stereo timeline");
     assert!(
         session
             .place_stream_at(0.0, &media, 1, None)
@@ -93,7 +90,11 @@ fn a_picked_audio_stream_lands_saves_and_comes_back() {
             .to_string()
             .contains("not on this timeline")
     );
-    assert_eq!(session.sources().len(), 1, "a refusal added a source");
+    assert_eq!(
+        session.sources().len(),
+        2,
+        "the mono stream landed, the not-a-source refusal added nothing more"
+    );
     std::fs::remove_dir_all(&dir).expect("cleanup");
 }
 
@@ -814,8 +815,14 @@ fn malformed_files_are_numbered_errors_and_never_panics() {
 #[test]
 fn a_source_that_no_longer_matches_the_timeline_is_refused_in_import_words() {
     let dir = scratch("mismatch");
-    copy_in(&dir, "test_av.mp4");
-    std::fs::copy(asset("test_ac3.mp4"), dir.join("test_av2.mp4")).expect("substitute");
+    // `test_av.mp4` -- source 0, which sets the timeline's norm -- is
+    // substituted with the mono fixture, so the norm this reload settles on is
+    // mono; `test_av2.mp4` stays the real, stereo file. A mono source onto a
+    // wider timeline up-mixes now (DEBT #46), but the reverse does not: a
+    // stereo source is still wider than the mono timeline it would join, and
+    // that is the one layout mismatch left to refuse.
+    std::fs::copy(asset("test_ac3.mp4"), dir.join("test_av.mp4")).expect("substitute");
+    copy_in(&dir, "test_av2.mp4");
     let path = dir.join("swapped.edith");
     std::fs::write(
         &path,
@@ -826,17 +833,15 @@ fn a_source_that_no_longer_matches_the_timeline_is_refused_in_import_words() {
         .err()
         .expect("a source that stopped matching must not open")
         .to_string();
-    // The suffix is `import`'s own refusal, word for word. The substitute is
-    // mono, which is the shape of what is left: one output device carries one
-    // layout. A resolution of its own is placed on the project canvas, a frame
-    // rate of its own is read through `Rate`, a *sample* rate of its own is
-    // resampled at the decoder's door, a codec of its own opens its own decoder
-    // and a file with no sound plays silence -- none of those is a refusal any
-    // more.
+    // The suffix is `import`'s own refusal, word for word. A resolution of its
+    // own is placed on the project canvas, a frame rate of its own is read
+    // through `Rate`, a *sample* rate of its own is resampled at the decoder's
+    // door, a codec of its own opens its own decoder and a file with no sound
+    // plays silence -- none of those is a refusal any more.
     assert_eq!(
         err,
         format!(
-            "source {}: audio 1 ch does not match the timeline's 2 ch",
+            "source {}: audio 2 ch does not match the timeline's 1 ch",
             dir.join("test_av2.mp4").display()
         )
     );
