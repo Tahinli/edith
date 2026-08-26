@@ -651,11 +651,15 @@ pub(crate) fn landing(
 /// cannot go. Asked twice: by the ghost tinting itself as refused on the way
 /// down, and by the insert that commits ([`Player::insert_source`]), so what is
 /// shown as impossible is exactly what is refused.
-pub(crate) fn lane_refuses(path: &Path, lane: Lane) -> Option<String> {
+///
+/// `has_video` is [`Player::has_video`]'s answer for `path`: the probed truth
+/// where the header has been read, and an extension's guess otherwise -- never
+/// `engine::is_audio` alone, which a song muxed into an `.mp4` lies to.
+pub(crate) fn lane_refuses(path: &Path, lane: Lane, has_video: bool) -> Option<String> {
     let name = file_name(path);
     let label = lane.label();
     match lane.kind {
-        LaneKind::Video if engine::is_audio(path) => Some(format!(
+        LaneKind::Video if !has_video => Some(format!(
             "NOT ON {label} — {name} has no picture; drop it on an audio lane"
         )),
         LaneKind::Audio if engine::is_image(path) => Some(format!(

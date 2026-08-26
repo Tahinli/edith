@@ -980,7 +980,7 @@ impl Player {
             // A path with no source entry has no colour of its own, and the
             // shadow wears the lane's own instead of borrowing another file's.
             tint: file_tint(self.sources(), path).unwrap_or(BG_RAISED()),
-            refused: lane_refuses(path, to).is_some(),
+            refused: lane_refuses(path, to, self.has_video(path)).is_some(),
         };
         self.set_ghost(vec![ghost], cx);
     }

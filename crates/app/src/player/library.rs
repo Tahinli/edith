@@ -97,7 +97,7 @@ impl Player {
         // ([`lane_refuses`]). The Add button names no lane and so is never
         // refused here -- where a file goes when nobody says is the engine's
         // choice, in `place_stream_at`, not one made twice here.
-        if let Some(why) = onto.and_then(|lane| lane_refuses(path, lane)) {
+        if let Some(why) = onto.and_then(|lane| lane_refuses(path, lane, self.has_video(path))) {
             self.notify_user(why.into());
             cx.notify();
             return;
@@ -325,6 +325,7 @@ impl Player {
         self.bitrates.clear();
         self.sizes.clear();
         self.syncs.clear();
+        self.has_video.clear();
         // Scanned off sources that are not in the library any more.
         self.silence_levels.clear();
         // ...and every background read still chasing one of them: cancelled
@@ -805,6 +806,13 @@ impl Player {
     /// library standing in are two different things to be looking at. Empty
     /// where no film here wants one, which is the ordinary case.
     pub(crate) fn proxy_tail(&self) -> String {
+        // No session, no library row could be making anything: a prior
+        // session's jobs (never cleared out of `self.proxies` on close, since
+        // a proxy is derived and re-checked from disk on next open rather
+        // than tracked per session) must not print as this one's progress.
+        if self.session.is_none() {
+            return String::new();
+        }
         let making = self.proxies.values().filter_map(|p| match p {
             Proxy::Making(job) => Some(job.progress()),
             _ => None,
@@ -1073,8 +1081,13 @@ impl Player {
         // ([`engine::PlaybackSession::import`]); a window whose timeline went
         // away while the worker read falls to the slow door below, which is the
         // one that can still open one.
+        // A refusal that only says "no picture" is not a refusal here: the
+        // slow door below re-reads the file and lands it as audio, the same
+        // fallback every other door in makes.
+        let no_video = matches!(&probe, Some(Err(e)) if engine::demux::NoVideoTrack::is_it(e));
         let registered = match (self.session.as_mut(), probe) {
             (Some(session), Some(Ok(probe))) => Some(session.import_probed(path, probe)),
+            (Some(session), Some(Err(_))) if no_video => Some(session.import(path)),
             (Some(_), Some(Err(refused))) => Some(Err(refused)),
             (Some(session), None) => Some(session.import(path)),
             (None, _) => None,
@@ -1091,8 +1104,9 @@ impl Player {
                     .and_then(|session| subtitle_tail(session, subs))
                     .unwrap_or_default();
                 format!(
-                    "IMPORTED {} to the library — drag it onto a lane to place it{tail}",
-                    file_name(path)
+                    "IMPORTED {} to the library — drag it onto a lane to place it{tail}{}",
+                    file_name(path),
+                    audio_import_tail(path, self.has_video(path) && !no_video)
                 )
             }
             // Named, because two files can fail in one launch and the queue now
@@ -1186,7 +1200,11 @@ impl Player {
                         format!("IMPORTED {name} to the library — drag it onto a lane to place it")
                     }
                 };
-                format!("{what}{}{subs}", silent.unwrap_or_default())
+                let audio = match place {
+                    true => String::new(),
+                    false => audio_import_tail(path, self.has_video(path)),
+                };
+                format!("{what}{}{subs}{audio}", silent.unwrap_or_default())
             }
             Err(e) => format!("OPEN FAILED: {e}"),
         }

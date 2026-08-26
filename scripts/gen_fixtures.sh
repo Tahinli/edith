@@ -526,4 +526,10 @@ ffmpeg -y -f lavfi -i "testsrc2=size=320x240:rate=30:duration=2" \
     -f lavfi -i "sine=frequency=440:duration=60" \
     -map 0:v -map 1:a -c:v libx264 -profile:v baseline -pix_fmt yuv420p \
     -c:a aac -b:a 64k assets/test_short_video_long_audio.mp4
+# A song wearing a film's extension: AAC audio, no video track, muxed into an
+# `.mp4` -- the shape a phone's voice memo or a stripped remux takes, and the
+# one `crate::is_audio` cannot see (`tests/audio_files.rs`).
+ffmpeg -y -f lavfi -i "sine=frequency=440:duration=3" \
+    -c:a aac -b:a 128k assets/test_audio_only.mp4
+
 echo "fixtures written to assets/"

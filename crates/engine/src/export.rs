@@ -494,6 +494,13 @@ pub fn start(
         encoders: Mutex::new(None),
     });
     let worker = Arc::clone(&shared);
+    // A second handle to the same slot, held outside the caught body below --
+    // what settles it if that body never gets to its own [`settle`] call at
+    // all, because a codec parser deep inside `run` panicked instead of
+    // returning the parse error it should have. Without this a panic there
+    // strands the slot: [`ExportHandle::is_finished`] never flips, and a
+    // proxy or export that hit a malformed frame sits in "Making" forever.
+    let panic_worker = Arc::clone(&worker);
     let out = out.to_path_buf();
     // `<out>.part`, appended rather than substituted: the temporary of
     // `a.export.mp4` is `a.export.mp4.part`, which no other export claims.
@@ -501,6 +508,7 @@ pub fn start(
     part.push(".part");
     let part = PathBuf::from(part);
     let spawned = thread::Builder::new().name("export".into()).spawn(move || {
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // Every file this export will read, named before a byte of one is.
         // These are the project's own sources and can be nothing else: a
         // stand-in ([`crate::proxy`]) is a substitution playback makes when it
@@ -579,6 +587,20 @@ pub fn start(
             let _ = std::fs::remove_file(&part);
         }
         settle(&worker, result);
+        }));
+        if let Err(payload) = caught {
+            // The body above panicked before it could settle its own slot --
+            // the panic message becomes the outcome, so a caller sees a
+            // failure and a notice rather than a bar that never moves again.
+            let message = payload
+                .downcast_ref::<&str>()
+                .map(ToString::to_string)
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".to_string());
+            if !panic_worker.finished.load(Ordering::Acquire) {
+                settle(&panic_worker, Err(format!("export worker panicked: {message}").into()));
+            }
+        }
     });
     if let Err(e) = spawned {
         settle(&shared, Err(e.into()));

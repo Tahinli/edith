@@ -110,26 +110,34 @@ fn a_lane_refuses_the_files_it_cannot_hold_before_the_release_says_so() {
     let still = Path::new("/media/card.png");
     let movie = Path::new("/media/take.mp4");
     assert_eq!(
-        lane_refuses(sound, video).as_deref(),
+        lane_refuses(sound, video, false).as_deref(),
         Some("NOT ON V1 — take.mp3 has no picture; drop it on an audio lane")
     );
     assert_eq!(
-        lane_refuses(still, audio).as_deref(),
+        lane_refuses(still, audio, true).as_deref(),
         Some("NOT ON A1 — card.png is a still image; drop it on a video lane")
     );
     // ...and every lane a file *can* go on says nothing at all, which is a
     // ghost drawn in the file's own colour.
-    assert_eq!(lane_refuses(sound, audio), None);
-    assert_eq!(lane_refuses(still, video), None);
-    assert_eq!(lane_refuses(movie, video), None);
+    assert_eq!(lane_refuses(sound, audio, false), None);
+    assert_eq!(lane_refuses(still, video, true), None);
+    assert_eq!(lane_refuses(movie, video, true), None);
     // A file with a picture is not refused by an audio lane here: the
     // engine takes its sound onto one, and the words for a video-only file
     // are its own.
-    assert_eq!(lane_refuses(movie, audio), None);
+    assert_eq!(lane_refuses(movie, audio, true), None);
+    // The extension lies and the probe corrects it: a song muxed into an
+    // `.mp4` still names a video lane refused, in the exact words the .mp3
+    // twin above got -- `has_video` is what decides it now, not the suffix.
+    assert_eq!(
+        lane_refuses(movie, video, false).as_deref(),
+        Some("NOT ON V1 — take.mp4 has no picture; drop it on an audio lane")
+    );
     // ...and a subtitle lane holds none of the three: a caption comes off the
     // Subtitles list, which is where the refusal points.
-    for file in [sound, still, movie] {
-        let why = lane_refuses(file, Lane::S1).expect("a subtitle lane takes no media");
+    for (file, has_video) in [(sound, false), (still, true), (movie, true)] {
+        let why =
+            lane_refuses(file, Lane::S1, has_video).expect("a subtitle lane takes no media");
         assert!(why.starts_with("NOT ON S1 — "), "{why}");
         assert!(why.contains("Subtitles list"), "{why}");
     }
