@@ -109,27 +109,6 @@ pub(crate) enum Proxy {
     Failed,
 }
 
-impl Proxy {
-    /// What the library row says about it, or nothing at all for a file that
-    /// never wanted one -- a row per source is not the place to announce that
-    /// nothing is happening.
-    pub(crate) fn detail(&self) -> String {
-        match self {
-            Self::Asked | Self::Native => String::new(),
-            // Rounded down: a bar that says 100% while the encoder is still
-            // writing is the one number a progress line must never show.
-            Self::Making(job) => format!("proxy {}%", (job.progress() * 100.) as u32),
-            // Its own word while the worker is still winding down: "no proxy"
-            // the instant the × is clicked would be a claim about a file that
-            // is at that moment still being written.
-            Self::Cancelling(_) => "proxy stopping…".to_string(),
-            Self::Cancelled => "no proxy — stopped".to_string(),
-            Self::Ready => "proxy".to_string(),
-            Self::Failed => "no proxy".to_string(),
-        }
-    }
-}
-
 /// The import a worker is reading, as the line above the panel shows it. No
 /// fraction anywhere: neither read reports how far into the file it has come,
 /// so what is honest is the file's name, the stage, and two clocks -- one that

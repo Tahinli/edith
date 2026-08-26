@@ -1077,20 +1077,40 @@ fn sources_tab(
         })
 }
 
-/// The transition duration row, in the darkroom's own idiom: the darkroom is
-/// the default surface (`main.rs`'s `OLD_GUI` gate), so a row that only ever
-/// drew in the legacy inspector (`ui::inspector::transition_duration_row`)
-/// was a control a shipped user could never reach after a dissolve
-/// (ctrl+x) or crossfade (ctrl+f). Same facts as that row --
-/// [`ui::inspector::transition_of`] picks the anchor's transition and its cap,
-/// [`Player::nudge_transition`] does the clamped step -- only the paint is
-/// this tab's own (`ghost_verb`'s row height and ink tokens, not legacy grey).
+/// The transition a clip carries into its immediate successor, if any -- a
+/// dissolve on a video lane ([`Clip::transition_out`]) or a crossfade on an
+/// audio lane, told apart from a plain one-sided fade drag by
+/// [`Project::crossfade`]'s own signature: both ends of the join set
+/// together, not just this clip's tail. `cap` is what the pair actually
+/// offers -- the shorter of the two clips' own lengths -- the same ceiling
+/// [`Project::set_transition_out`]/[`Project::crossfade`] clamp to, so the
+/// row this feeds never claims more room than a step could land in.
+pub(crate) fn transition_of(
+    lane_kind: LaneKind,
+    clip: &Clip,
+    next: Option<&Clip>,
+) -> Option<(&'static str, u32, u32)> {
+    let next = next.filter(|n| n.start == clip.end())?;
+    let cap = clip.frames().min(next.frames());
+    match lane_kind {
+        LaneKind::Video if clip.transition_out > 0 => Some(("Dissolve", clip.transition_out, cap)),
+        LaneKind::Audio if clip.fade_out > 0 && next.fade_in > 0 => {
+            Some(("Crossfade", clip.fade_out, cap))
+        }
+        _ => None,
+    }
+}
+
+/// The transition duration row: `transition_of` picks the anchor's
+/// transition and its cap, [`Player::nudge_transition`] does the clamped
+/// step -- only the paint is this tab's own (`ghost_verb`'s row height and
+/// ink tokens).
 fn transition_row(player: &Player, cx: &mut Context<Player>) -> Option<impl IntoElement> {
     let (lane, idx) = player.selected.anchor()?;
     let session = player.session.as_ref()?;
     let clips = session.lane_clips(lane);
     let (label_text, frames, cap) =
-        crate::ui::inspector::transition_of(lane.kind, clips.get(idx)?, clips.get(idx + 1))?;
+        transition_of(lane.kind, clips.get(idx)?, clips.get(idx + 1))?;
     let label_style = label(type_scale::LABEL_ROW_PX, FontWeight::MEDIUM);
     let step = |id: &'static str, label: &'static str, glyph: &'static str, by: i32, cx: &mut Context<Player>| {
         div()

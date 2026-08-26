@@ -6,64 +6,17 @@ use crate::*;
 use std::path::{Path, PathBuf};
 
 impl Player {
-    /// The one thing that says a preview is up rather than the timeline: a
-    /// banner over the top of the picture, and a click of its own -- the
-    /// keyboard has `esc`, and a hand with only a mouse needs a way out too.
+    /// The darkroom's own preview indicator (MOCK-SPEC.md): a plate
+    /// (canvas-on-panel, §4), mono for what the film says, and a ghost
+    /// `Stop` wearing its `esc` chord rather than a bordered button -- no
+    /// fill, no border, hover lifts one step like every other ghost in the
+    /// room.
     ///
-    /// Legacy-only now (DEFECT 2, MOCK-SPEC.md): this is a full-width band
-    /// drawn *on* the frame, which DESIGN §5 forbids for the darkroom
-    /// ("nothing else over the picture, ever"). [`Player::preview_plate`] is
-    /// the darkroom's own restyle of the same information, built as a flex
-    /// sibling so the picture's own box shrinks for it rather than being
-    /// painted over -- the same fix `two_up`'s doc comment describes for the
-    /// OUT|IN plates. `OLD_GUI=1` keeps drawing this banner unchanged.
-    pub(crate) fn preview_badge(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        (!self.darkroom && self.preview_session.is_some()).then(|| {
-            div()
-                .absolute()
-                .top_0()
-                .left_0()
-                .right_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .gap(px(8.))
-                .p(px(4.))
-                .bg(rgba(SUB_SHADE()))
-                .text_size(px(11.))
-                .text_color(rgb(FG_PRIMARY()))
-                .child("PREVIEW — not on the timeline")
-                .child(
-                    div()
-                        .id("preview-stop")
-                        .px(px(6.))
-                        .rounded(px(3.))
-                        .cursor_pointer()
-                        .bg(rgb(BG_RAISED()))
-                        .hover(|s| s.bg(rgb(BG_HOVER())))
-                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.close_preview(cx)))
-                        .children(hitmap::control("preview.stop", "Stop preview", true))
-                        .child("Stop (esc)"),
-                )
-        })
-    }
-
-    /// The darkroom's own preview indicator (DEFECT 2, MOCK-SPEC.md): a
-    /// plate (canvas-on-panel, §4), mono for what the film says, and a ghost
-    /// `Stop` wearing its `esc` chord rather than the legacy bordered
-    /// button -- no fill, no border, hover lifts one step like every other
-    /// ghost in the room.
-    ///
-    /// corner-cut: built and unit-shaped but **not yet mounted** -- it needs
-    /// to sit as a flex sibling of the picture inside `ui::stance::screen`
-    /// (the box `two_up`'s own doc comment already fixed this exact way for
-    /// the OUT|IN plates), which is `stance.rs`, out of this task's file
-    /// ownership while another builder has it open concurrently. `#[allow
-    /// It is mounted in `ui::stance::screen` as a flex sibling below the
-    /// picture's own child, the way `two_up` is, so the frame's box shrinks to
-    /// make room rather than being drawn over.
+    /// Mounted in `ui::stance::screen` as a flex sibling below the picture's
+    /// own child, the way `two_up` is, so the frame's box shrinks to make
+    /// room rather than being drawn over.
     pub(crate) fn preview_plate(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        (self.darkroom && self.preview_session.is_some()).then(|| {
+        self.preview_session.is_some().then(|| {
             div()
                 .id("preview-plate")
                 .flex_none()
@@ -414,13 +367,10 @@ impl Player {
     /// the layout box is not) keeps the strip's room reserved instead of
     /// collapsing it, which is what let the picture's own `flex_1` above it
     /// resize on every cut walk (404px resting on a cut, 335px a frame off
-    /// one, springing back on the very next). Only `!self.darkroom` still
-    /// returns `None`: the legacy tree never reserved this room and does not
-    /// start now.
+    /// one, springing back on the very next). The darkroom is the only room
+    /// now, so the sole remaining `None` cases are off a cut or with
+    /// nothing marked.
     pub(crate) fn two_up(&self) -> Option<impl IntoElement> {
-        if !self.darkroom {
-            return None;
-        }
         let resting = (|| {
             let (lane, idx) = self.selected.anchor()?;
             let session = self.session.as_ref()?;
@@ -493,30 +443,6 @@ impl Player {
                 .child(plate("OUT", out_label))
                 .child(plate("IN", in_label)),
         )
-    }
-
-    /// What is decoding the picture right now, for the transport line: the
-    /// backend is the running worker's own (it is written where a hardware
-    /// session falls back to software, so this follows reality), and the codec
-    /// comes from the clip under the playhead. Empty when nothing is playing --
-    /// the question is about what is happening, not about what would.
-    pub(crate) fn live_decode(&self, position: f64, playing: bool) -> String {
-        let Some(session) = self.session.as_ref().filter(|_| playing) else {
-            return String::new();
-        };
-        let backend = session.decode_backend();
-        let codec = session
-            .video_clip_at(position)
-            .and_then(|(lane, idx)| session.lane_clips(lane).get(idx).map(|clip| clip.source))
-            .and_then(|source| session.sources().get(source))
-            .and_then(|source| self.decoders.get(&source.path).copied().flatten())
-            .and_then(|(codec, _)| codec);
-        match backend {
-            // Neither is a decode, and saying "SW" of them would be a lie.
-            Backend::Gap => "gap · nothing to decode".to_string(),
-            Backend::Still => "still · one decode, held".to_string(),
-            _ => format!("{} decode", decode_label(codec, backend)),
-        }
     }
 }
 

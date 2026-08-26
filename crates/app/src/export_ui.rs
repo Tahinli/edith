@@ -262,19 +262,6 @@ pub(crate) const FORMATS: [(&[Format], &str, &str, &str); 8] = [
     (&[], "", "VP9", "AV1 above replaces it"),
 ];
 
-/// The codec row a key picks, landed in the container already chosen: pressing
-/// `a` after an mp4 gives AV1 *in mp4*, because a box decided once is not a
-/// question again. A letter of the row's own name, spelled out in the table
-/// rather than taken from the initial (`MP4` and `MP3` share one). Never a
-/// digit -- those are the bitrate field's. `None` for every other stroke, the rows
-/// that cannot be picked included.
-pub(crate) fn format_key(key: &str, current: Format) -> Option<Format> {
-    FORMATS
-        .into_iter()
-        .filter(|(_, stroke, ..)| !stroke.is_empty() && stroke.eq_ignore_ascii_case(key))
-        .find_map(|(row, ..)| same_box(row, current))
-}
-
 /// The boxes one codec may be written into, in the order its container row
 /// cycles them. Empty for a codec this program cannot write at all.
 pub(crate) fn containers(format: Format) -> &'static [Format] {
@@ -304,14 +291,6 @@ pub(crate) fn next_container(format: Format) -> Format {
     row.get((at + 1) % row.len().max(1))
         .copied()
         .unwrap_or(format)
-}
-
-/// The next rate the Sound row offers, wrapping -- what its key does, and what
-/// the row itself names so the stroke is never a guess. [`next_container`]'s
-/// shape, for the same reason: one place decides what "next" means.
-pub(crate) fn next_audio_kbps(kbps: u32) -> u32 {
-    let at = AUDIO_KBPS.iter().position(|&k| k == kbps).unwrap_or(0);
-    AUDIO_KBPS[(at + 1) % AUDIO_KBPS.len()]
 }
 
 /// Why the quality rows say nothing about this format, or `None` where they
@@ -1026,17 +1005,6 @@ pub(crate) fn commit_mbps(text: &str) -> Result<u32, String> {
         Ok(mbps) => Err(format!("{mbps} is past the {MBPS_MAX} Mbps ceiling")),
         Err(_) => Err(format!("type a number — {MBPS_MIN}–{MBPS_MAX} Mbps")),
     }
-}
-
-/// Whether a stroke gets out of a running export. `ctrl+escape` does -- a chord
-/// and not the bare key, which used to end an hour of encoding on the stroke a
-/// hand reaches for to shut a menu it has already shut. Bare escape does nothing
-/// at all here: the progress card is not dismissable, so there is nothing left
-/// for it to mean. Whatever the keymap has on cancel works too, so rebinding it
-/// adds a way rather than replacing this one -- and that binding is what the
-/// card shows.
-pub(crate) fn cancels_export(key: &str, ctrl: bool, action: Option<ActionId>) -> bool {
-    (ctrl && key == ESCAPE) || action == Some(ActionId::CancelExport)
 }
 
 /// A clip's share of the lane. A timeline with no length reads as one full-width

@@ -240,56 +240,6 @@ pub(crate) fn keys_rows() -> Vec<KeyRow> {
     rows
 }
 
-/// [`keys_rows`] with a search applied: the rows whose label or whose stroke
-/// carries `needle`, and the heading each one lives under. A heading with
-/// nothing left beneath it goes with them -- an empty "Playback" over a gap
-/// reads as a list that lost its rows rather than as a search that found none.
-///
-/// Each row keeps the index it has in the unfiltered list, so an element id is
-/// the same one before and after a keystroke: filtering is a look at the list,
-/// and gpui's per-element state is keyed on that id.
-///
-/// Case-insensitive substring, on both columns: people look for an action by
-/// what it does ("vol") and for a stroke by what they pressed ("ctrl").
-pub(crate) fn keys_filter(needle: &str, keymap: &Keymap) -> Vec<(usize, KeyRow)> {
-    let needle = needle.trim().to_lowercase();
-    let rows = keys_rows().into_iter().enumerate();
-    if needle.is_empty() {
-        return rows.collect();
-    }
-    // A chord matches on whole keys, not substrings -- "f1" must not drag in
-    // "f11". A needle that spells a combination still matches the whole chord.
-    let hit = |label: &str, chord: &str| {
-        let chord = chord.to_lowercase();
-        label.to_lowercase().contains(&needle)
-            || chord.split([' ', '+']).any(|part| part == needle)
-            || (needle.contains(['+', ' ']) && chord.contains(&needle))
-    };
-    let mut out: Vec<(usize, KeyRow)> = Vec::new();
-    // The heading above the row being looked at, until a row under it earns it
-    // a place -- then it goes in once, ahead of that row.
-    let mut pending: Option<(usize, KeyRow)> = None;
-    for (i, row) in rows {
-        match &row {
-            KeyRow::Head(_) => pending = Some((i, row)),
-            KeyRow::Act(action) => {
-                if hit(action.label(), &keymap.display(*action)) {
-                    out.extend(pending.take());
-                    out.push((i, row));
-                }
-            }
-            KeyRow::Fixed(f) => {
-                let fixed = &keymap::FIXED[*f];
-                if hit(fixed.label, &fixed.chord) {
-                    out.extend(pending.take());
-                    out.push((i, row));
-                }
-            }
-        }
-    }
-    out
-}
-
 /// The character a stroke types into the actions card's search box, if it types
 /// one. gpui reports a printable key as itself and the space bar by name
 /// (platform.rs:866), and everything else -- the arrows, the function keys --

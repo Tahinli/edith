@@ -361,42 +361,6 @@ pub(crate) fn library_w(window_w: f32) -> f32 {
         .min(window_w / 3.)
 }
 
-/// What is left of a library column this wide for a row's *words*: the panel's
-/// padding on both sides, the tint bar, the gap after it and the row's own right
-/// inset. Every row in the column -- media and subtitle -- is built to this
-/// shape, so one number answers for both.
-pub(crate) fn row_text_w(width: f32) -> f32 {
-    // 8 px of panel padding each side, then the bar, the gap after it and the
-    // row's own right inset -- the numbers the rows are built with.
-    width - 16. - SWATCH_W - 6. - 6.
-}
-
-/// A name cut to what a column this wide can hold, out of the *middle*. Two
-/// files off one release differ in their last characters and nowhere else --
-/// "…Episode 01" against "…02" -- so a name cut from the right is the same
-/// name twice and the list stops naming anything. The width decides how much
-/// survives, not a number of characters somebody guessed: a wider window spells
-/// more of the file out, and the floor still keeps both ends.
-///
-/// The element truncates for real; this only decides where what is lost comes
-/// out of.
-pub(crate) fn clip_middle(name: &str, width: f32) -> String {
-    let budget = ((width / LIST_CHAR_W) as usize).max(LIST_CLIP_MIN);
-    let chars: Vec<char> = name.chars().collect();
-    if chars.len() <= budget {
-        return name.to_string();
-    }
-    // The gap costs a character, and what is left of the odd one goes to the
-    // tail: the tail is the half that tells two of them apart.
-    let head = (budget - 1) / 2;
-    let tail = budget - 1 - head;
-    format!(
-        "{}…{}",
-        chars[..head].iter().collect::<String>(),
-        chars[chars.len() - tail..].iter().collect::<String>()
-    )
-}
-
 /// What the window is called: the program, and what is open in it. The name is
 /// what the header shows, so an empty window says the program alone rather than
 /// "no file open — edith".

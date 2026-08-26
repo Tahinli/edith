@@ -178,7 +178,8 @@ capability is genuinely absent — otherwise it is a bug, not a message. A verb 
   verbs; source dot: ink acts). Plate styling, chords on every row, destructive verbs below a
   rule line. Never a junk drawer.
 - **`?` held** dims the room one fill step and surfaces chords *in place* beside their controls;
-  release restores. No modal cheat-sheet; learning stays geographic. The film keeps playing.
+  release restores, and a click on the scrim also dismisses it. Hold-to-peek, not a latch;
+  learning stays geographic. The film keeps playing.
 
   **Amendment (2026-08-20), explicit per this section's own rule:** the geographic reading above
   is only partly built and edith currently ships the fallback instead — named here rather than

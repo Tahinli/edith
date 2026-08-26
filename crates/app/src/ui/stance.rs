@@ -1,7 +1,7 @@
-//! DESIGN.md §5 -- the stance: fixed geography, drawn by default now
-//! (`OLD_GUI=1` opts back into the legacy four-region tree), whole here
-//! rather than folded into that tree so the two can be told apart, and
-//! swapped, with a single `if` in `render.rs`.
+//! DESIGN.md §5 -- the stance: fixed geography, the only room now the
+//! legacy four-region tree is gone (`self.darkroom` no longer branches
+//! anything in `render.rs`), whole here as its own module rather than
+//! folded into that tree.
 //!
 //! This step lays out the six regions and nothing else: correct geometry,
 //! correct surfaces, a section-head label per region. No content, no
@@ -99,22 +99,12 @@ impl Player {
     /// exactly as the tab's own click does (`dock_stance::dock_tab`'s
     /// `on_click`), so the ring and a mouse click can't disagree about
     /// which tab was last chosen.
-    ///
-    /// The ring is darkroom-only UI -- the legacy tree never mounts
-    /// `focus_dock`/`focus_bench`/`focus_inspector` (only `track_focus`
-    /// sites live in this module and `dock_stance.rs`), so under
-    /// `OLD_GUI=1` a `window.focus` here would land on an unmounted
-    /// handle and kill the root key listener (`main.rs`'s fallback focus)
-    /// until the next mouse click. No-op there instead.
     pub(crate) fn focus_surface(
         &mut self,
         surface: Surface,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.darkroom {
-            return;
-        }
         if let Some(src_active) = surface_wants_src_active(surface) {
             self.dock_src_active = src_active;
             crate::ui::dock_stance::save(src_active);
@@ -202,16 +192,11 @@ pub(crate) fn maximized_card_top(viewport_h: f32, bench_h: f32) -> f32 {
 /// room *below the floor* instead means it never needs more than that room,
 /// so `menu_at` never has a reason to walk it back up; a list still taller
 /// than the room scrolls inside its own plate, same as the keys overlay.
-/// Darkroom only -- the legacy tree has no fixed split to clamp against.
 pub(crate) fn menu_floor(
     at: Point<Pixels>,
     viewport: Size<Pixels>,
-    darkroom: bool,
     bench_h: f32,
 ) -> (Point<Pixels>, Size<Pixels>) {
-    if !darkroom {
-        return (at, viewport);
-    }
     let floor = below_picture_floor(f32::from(viewport.height), bench_h);
     let at = point(at.x, px(f32::from(at.y).max(floor)));
     let room = size(viewport.width, px(f32::from(viewport.height) - floor));
@@ -233,7 +218,7 @@ mod menu_floor_tests {
     fn a_menu_taller_than_the_footprint_stays_pinned_to_the_floor_not_walked_back_over_it() {
         let viewport = size(px(1280.), px(720.));
         let floor = below_picture_floor(f32::from(viewport.height), BENCH_H);
-        let (at, room) = menu_floor(point(px(300.), px(20.)), viewport, true, BENCH_H);
+        let (at, room) = menu_floor(point(px(300.), px(20.)), viewport, BENCH_H);
         assert_eq!(f32::from(at.y), floor);
         // 396px of rows (the charter's measured menu height) does not fit in
         // the 316px footprint room, so it must be capped to it, not the
@@ -394,8 +379,14 @@ fn section_head(label: &str) -> impl IntoElement {
 /// A ghost command (DESIGN §4): borderless glyph (`ink2`) + dim chord
 /// (`ink3`), read live off the keymap so a rebind can never leave the spine
 /// showing a stroke that no longer fires it.
-fn ghost(player: &Player, glyph: &str, action: ActionId) -> impl IntoElement {
+fn ghost(
+    player: &Player,
+    glyph: &str,
+    action: ActionId,
+    cx: &mut Context<Player>,
+) -> impl IntoElement {
     div()
+        .id("keys")
         .flex_none()
         .flex()
         .flex_col()
@@ -403,6 +394,11 @@ fn ghost(player: &Player, glyph: &str, action: ActionId) -> impl IntoElement {
         .gap(px(2.))
         .py(px(6.))
         .rounded(px(3.))
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(DARK_RAISED())).text_color(rgb(INK1())))
+        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+            this.act(action, window, cx)
+        }))
         .type_style(type_scale::label(
             type_scale::LABEL_ROW_PX,
             gpui::FontWeight::MEDIUM,
@@ -434,8 +430,11 @@ fn ghost(player: &Player, glyph: &str, action: ActionId) -> impl IntoElement {
 /// on the press (bypassing the modal `overlaid()` guard, which would
 /// otherwise swallow the second `?` down while the first is still up) and
 /// its `on_key_up` closes it on release, so this is the room dimming one
-/// fill step for as long as the key is held, never a latch (DESIGN §9: "no
-/// modal cheat-sheet").
+/// fill step for as long as the key is held, never a latch (DESIGN §9:
+/// hold-to-peek, click also dismisses). The scrim also closes on a press,
+/// same contract every other card's scrim answers, so a hand that lets go
+/// of `?` before reading the list still has a door out without touching the
+/// keyboard again.
 ///
 /// corner-cut, named explicitly in DESIGN §9's own 2026-08-20 amendment
 /// rather than silently shipped against the section's original text: it
@@ -445,7 +444,7 @@ fn ghost(player: &Player, glyph: &str, action: ActionId) -> impl IntoElement {
 /// Ceiling: DESIGN §12 step 7's full geographic pass (each region draws its
 /// own rows while held) -- §9's amendment names the 56 actions still
 /// without a home.
-fn keys_overlay(player: &Player) -> impl IntoElement {
+fn keys_overlay(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
     div()
         .id("stance-keys-overlay")
         .absolute()
@@ -455,6 +454,18 @@ fn keys_overlay(player: &Player) -> impl IntoElement {
         .h(px(BENCH_H + LEDGER_H))
         .bg(rgba(SCRIM()))
         .flex()
+        // Click also dismisses (DESIGN §9): the hold-`?`-release above is
+        // the fast door, this is the same scrim-press-closes contract every
+        // other card's scrim answers, so a hand that let go of `?` before
+        // reading the list still has a way to shut it without the keyboard.
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                this.close_card();
+                cx.notify();
+                cx.stop_propagation();
+            }),
+        )
         .child(
             div()
                 .id("stance-keys-list")
@@ -467,6 +478,7 @@ fn keys_overlay(player: &Player) -> impl IntoElement {
                 .bg(rgb(DARK_PANEL()))
                 .border_1()
                 .border_color(rgba(DARK_SEAM()))
+                .on_mouse_down(MouseButton::Left, swallow)
                 .flex()
                 .flex_col()
                 .gap(px(3.))
@@ -558,7 +570,7 @@ fn spine(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
         .gap(px(4.))
         .child(section_head("spine"))
         .child(spine_stance::render(player, cx))
-        .child(ghost(player, "?", ActionId::ShowActions))
+        .child(ghost(player, "?", ActionId::ShowActions, cx))
 }
 
 /// The picture region: top of the centre column, takes the remaining space,
@@ -1017,14 +1029,13 @@ pub(crate) fn render(
                 cx.notify();
                 return;
             }
-            // Same modal guard the legacy handler's rebinding/keys_open/
-            // export_open/colour/transform/speed/EQ/silence/mix/
-            // subtitle-style/menu chain (`render.rs`) amounts to, read as
-            // one bool instead of re-copied field by field: while a card, a
-            // rebind capture, or a menu owns the keyboard, the darkroom
-            // stance yields to it exactly as the legacy tree does. This is
-            // the fix for the stance's `Home`-inside-the-Colour-card
-            // misfire.
+            // Same modal guard the legacy handler's keys_open/export_open/
+            // colour/transform/speed/EQ/silence/mix/subtitle-style/menu
+            // chain (`render.rs`) amounts to, read as one bool instead of
+            // re-copied field by field: while a card or a menu owns the
+            // keyboard, the darkroom stance yields to it exactly as the
+            // legacy tree does. This is the fix for the stance's
+            // `Home`-inside-the-Colour-card misfire.
             //
             // `exporting()` alone is deliberately left out of this list
             // (`Player::card_open` is `modal()` minus it): a running export
@@ -1038,8 +1049,7 @@ pub(crate) fn render(
             // branch, and the six it leaves live (Theme, Fullscreen,
             // SubtitleStyle, CancelExport, ...) are exactly the ones meant
             // to keep working.
-            if this.rebinding.is_some()
-                || this.card_open()
+            if this.card_open()
                 || this.context_menu.is_some()
                 || this.library_menu.is_some()
                 || this.picker.is_some()
@@ -1048,7 +1058,6 @@ pub(crate) fn render(
                 // the same list `overlaid`/`modal` read) -- blocking every
                 // key while a card is open must not also lock the card open.
                 if key == ESCAPE {
-                    this.rebinding = None;
                     this.close_card();
                 }
                 // FAULT 2, general shape: `context_menu`/`library_menu`/
@@ -1125,7 +1134,7 @@ pub(crate) fn render(
                 .when_some(player.notices.back().cloned(), |el, n| {
                     el.child(notice_plate(n, bench_h))
                 })
-                .when(player.keys_open, |el| el.child(keys_overlay(player)))
+                .when(player.keys_open, |el| el.child(keys_overlay(player, cx)))
                 .when(player.settings_open, |el| {
                     el.child(settings_stance::render(player, window_size, cx))
                 })

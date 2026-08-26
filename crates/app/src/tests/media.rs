@@ -587,11 +587,6 @@ fn every_codec_row_is_offered_or_says_why_not() {
         // that cannot has one: the card is drivable without a pointer.
         assert_eq!(!row.is_empty(), !stroke.is_empty(), "{label}");
         if let Some(&first) = row.first() {
-            assert_eq!(
-                format_key(stroke, first),
-                Some(first),
-                "{label} keys to itself"
-            );
             assert!(
                 stroke.parse::<u32>().is_err(),
                 "{label} takes a digit the bitrate needs"
@@ -620,29 +615,6 @@ fn every_codec_row_is_offered_or_says_why_not() {
             "{key} is already the card's own"
         );
     }
-    assert_eq!(
-        format_key("a", Format::Mp4),
-        Some(Format::Av1Mp4),
-        "the box already chosen is kept"
-    );
-    assert_eq!(
-        format_key("a", Format::Wav),
-        Some(Format::Av1),
-        "and a codec with no such box takes its first"
-    );
-    assert_eq!(format_key("h", Format::Av1Mp4), Some(Format::HevcMp4));
-    assert_eq!(format_key("p", Format::Mp4), Some(Format::Mp3));
-    assert_eq!(
-        format_key("m", Format::Mp3),
-        Some(Format::Mp4),
-        "not MP3, which is p"
-    );
-    assert_eq!(
-        format_key("x", Format::Mp4),
-        None,
-        "a stroke no row carries"
-    );
-    assert_eq!(format_key("o", Format::Mp4), Some(Format::Ogg));
     // The one codec left that this program reads and cannot write is a row
     // of its own, refused by name rather than absent: VP9, because AV1 is
     // the row that replaced it. Its reason travels with it, in the row or in
@@ -921,17 +893,6 @@ fn the_subtitle_plate_and_lanes_fit_the_smallest_window() {
     // is a target and binds `HIT_MIN` like every other lane's -- the whole
     // reason it is a lane and no longer a 16 px strip.
     assert!(LANE_H >= HIT_MIN);
-    // The library's own list of tracks scrolls past three rather than
-    // taking the media list's room.
-    assert_eq!(SUB_ROWS_H / ROW_H, 3.);
-    assert!(ROW_H >= HIT_MIN, "a subtitle row is clicked to pick it");
-    // A header is always drawn with more than one file, floor included: the
-    // list scrolls past `SUB_ROWS_H` instead of a short window losing the
-    // name saying whose tracks these are.
-    assert!(SUB_HEAD_H + 2. * ROW_H <= SUB_ROWS_H);
-    // A header folds its group on a click now, so it binds `HIT_MIN` like
-    // every other target rather than being let off it as a bare label.
-    assert!(SUB_HEAD_H >= HIT_MIN);
 }
 
 /// The subtitle style file, round-tripped through a scratch config directory
@@ -1040,48 +1001,6 @@ fn the_cue_line_height_scales_with_its_size() {
     for size in [SUB_SIZE_RANGE.0, SUB_TEXT, SUB_SIZE_RANGE.1] {
         assert!(sub_line_h_for(size) >= size);
     }
-}
-
-/// What the rows of both lists do with a name too long for the column: two
-/// episodes off one release differ in their last two characters, and a name
-/// cut from the right is the same row twice.
-#[test]
-fn a_long_name_is_cut_out_of_its_middle_so_two_episodes_stay_two_rows() {
-    let (a, b) = (
-        "A Long Release Name Of A Series 01",
-        "A Long Release Name Of A Series 02",
-    );
-    // The two call sites at the narrowest the column ever is: a media row's
-    // name gets the row's whole width, a subtitle row's file prefix gets a
-    // share of it because the language has to fit beside it.
-    let media = row_text_w(LIBRARY_MIN_W);
-    let prefix = media * SUB_STEM_SHARE;
-    for width in [media, prefix] {
-        assert!(width > 0., "the floor leaves a row no words at all");
-        assert_ne!(
-            clip_middle(a, width),
-            clip_middle(b, width),
-            "{width}px: two episodes read as one row"
-        );
-        // Both ends survive: the release's name at the front, the number
-        // that tells them apart at the back.
-        assert!(clip_middle(a, width).starts_with(&a[..2]));
-        assert!(clip_middle(a, width).ends_with("01"));
-        assert!(clip_middle(a, width).contains('…'));
-        // Never wider than the column can hold, gap included.
-        assert!(clip_middle(a, width).chars().count() <= (width / 6.) as usize + 1);
-    }
-    // A name the width holds is left exactly as it is -- no gap, nothing
-    // dropped -- and so is a name at any width once the column is wide.
-    assert_eq!(clip_middle("eng.srt", 400.), "eng.srt");
-    assert_eq!(clip_middle(a, 4000.), a);
-    // Nothing panics at a width no column ever has, and something of both
-    // ends is still there.
-    assert_eq!(clip_middle(a, 0.).chars().count(), 5);
-    assert!(clip_middle(a, 0.).ends_with('1'));
-    // Counted in characters and not bytes: a name in another script is cut
-    // between its letters, not through one.
-    assert_eq!(clip_middle("ααααααααααααααα", 24.), "αα…αα");
 }
 
 /// The two doors subtitles arrive through, end to end on the fixtures: a

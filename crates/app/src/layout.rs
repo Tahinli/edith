@@ -21,32 +21,8 @@ pub(crate) const PANEL_H: f32 = 220.;
 /// timeline that pushes the video off the window is not a timeline.
 pub(crate) const LANES_MAX: usize = 6;
 pub(crate) const LANE_H: f32 = 48.;
-/// A caption lane's own height, thinner than a media one: a subtitle box
-/// carries a name, a rate badge and the cue band under it
-/// ([`Player::lane_row`]) and none of a clip's waveform or its full-height
-/// plate, so the strip that used to draw the whole row's worth of nothing is
-/// the regression this constant undoes.
-///
-/// Floored at [`HIT_MIN`] rather than the 20 px a first pass at "thin" landed
-/// on: the header's show/hide eye is the row's one surviving click target
-/// once the remove button moves off it onto the right button
-/// ([`Player::lane_row`]), and that eye fills the row's full height -- so
-/// anything under `HIT_MIN` here is a WCAG 2.5.8 target shrunk to chase a
-/// pixel count, not a thinner lane. This is the whole gap between the two
-/// harness variants the task asked for: 20 is not shippable at all, 24 is,
-/// so 24 is the only variant landed.
-pub(crate) const SUB_LANE_H: f32 = HIT_MIN;
-/// The lane header column: wide enough for `V1`/`A1` and fixed, so both lanes
-/// and the ruler above them start at the same pixel and are the same width --
-/// one x-to-time mapping for the whole timeline. `HEADER_GAP` is part of that
-/// offset and is therefore shared by all three rows.
-pub(crate) const HEADER_W: f32 = 40.;
-pub(crate) const HEADER_GAP: f32 = 4.;
 /// The label row inside a clip; a waveform paints under it, never through it.
 pub(crate) const LABEL_H: f32 = 15.;
-/// A clip narrower than this shows no name: two characters and an ellipsis say
-/// nothing that the tint has not already said, and cost the picture a smear.
-pub(crate) const LABEL_MIN_W: f32 = 36.;
 /// Peak buckets per second of source. Fixed and modest on purpose: `peaks`
 /// allocates one bucket per window, so a rate taken from anything the user can
 /// influence is an allocation bomb -- and 40 is already finer than the pixels a
@@ -82,24 +58,11 @@ pub(crate) const HIT_MIN: f32 = 24.;
 pub(crate) const LIBRARY_FRAC: f32 = 0.2;
 pub(crate) const LIBRARY_MIN_W: f32 = 120.;
 pub(crate) const LIBRARY_MAX_W: f32 = 220.;
-/// A library row: a name over its duration, two lines and a click target, so
-/// `HIT_MIN` binds it like every other one.
-pub(crate) const ROW_H: f32 = 32.;
-/// The tint swatch down the left of a row: the same colour that source's clips
-/// wear in the lanes, which is the whole of the panel<->timeline association.
-pub(crate) const SWATCH_W: f32 = 4.;
-/// How far the encode has come, drawn under the stop square on a library row.
-/// Inside a `HIT_MIN` cell with a little air each side, so the bar never reaches
-/// the edge of the target it belongs to.
-pub(crate) const PROXY_BAR_W: f32 = HIT_MIN - 10.;
 pub(crate) const CONTROL_H: f32 = 28.;
 /// The volume slider beside its button: a hundred steps across it, so a pixel
 /// is finer than a step and the drag reads as continuous.
 pub(crate) const VOLUME_W: f32 = 110.;
 pub(crate) const RULER_HIT_H: f32 = HIT_MIN;
-/// Wide enough for `HH:MM:SS:FF / HH:MM:SS:FF`, and fixed so changing digits
-/// cannot push the layout around.
-pub(crate) const TIME_W: f32 = 200.;
 /// The keybindings card: a row per action, a title and a status line, inside a
 /// 360 px tall window. The rows are click targets, so `HIT_MIN` binds them too.
 /// Wider than the export card, and for the same reason that one is wider than
@@ -110,16 +73,6 @@ pub(crate) const TIME_W: f32 = 200.;
 /// than overprinting. Still inside the 640 px floor.
 pub(crate) const KEYS_W: f32 = 480.;
 pub(crate) const KEYS_ROW_H: f32 = HIT_MIN;
-/// How much of the row list is on screen at once; past this it scrolls. What
-/// keeps the card inside the smallest window no matter how many actions the
-/// editor grows -- ten rows fit here, and the eleventh is a scroll away.
-pub(crate) const KEYS_ROWS_H: f32 = 10. * KEYS_ROW_H;
-/// The same for the export card, which carries two summary lines and a button
-/// under its list and so has less room: a section header, six codecs, the
-/// container, five qualities and the destination are more rows than a 360 px
-/// window holds. Eight on screen, which is the whole format section and its
-/// header -- what a user picks first is never behind a scroll.
-pub(crate) const EXPORT_ROWS_H: f32 = 8. * KEYS_ROW_H;
 /// The export card is wider than the keybindings one: its rows carry a key, a
 /// name *and* what the choice means, and the two summary lines under them state
 /// the whole file. At `KEYS_W` every one of those wrapped to two lines, which is
@@ -130,12 +83,6 @@ pub(crate) const EXPORT_W: f32 = 420.;
 /// in the export card says what picks it, so the card is drivable by keyboard
 /// without a legend to memorise.
 pub(crate) const EXPORT_KEY_W: f32 = 26.;
-/// Everything in the export card that is *not* the row list: the title, the
-/// status line, the head and tail of the summary, the button, the gaps between
-/// them and the padding around the lot. What the list may be is the window
-/// minus this -- and never less than [`EXPORT_ROWS_H`], which is the number
-/// that makes the card fit the 360 px floor.
-pub(crate) const EXPORT_FIXED_H: f32 = 17. + 28. + 15. + 30. + CONTROL_H + 4. + 10. + 24.;
 /// The menu a right-click on a clip opens: wide enough for the longest label
 /// beside the stroke that does the same thing, with the click targets `HIT_MIN`
 /// binds like every other list here.
@@ -170,26 +117,10 @@ pub(crate) fn sub_bottom(bars_h: f32) -> f32 {
 /// the track is empty. The silence preview's marks are floored by it too -- they
 /// are the same kind of thing, a picture of where something is and no target.
 pub(crate) const SUB_CUE_MIN_W: f32 = 2.;
-/// How much of the subtitle list in the library column is on screen at once,
-/// past which it scrolls -- the media list above it is what keeps the height.
-pub(crate) const SUB_ROWS_H: f32 = 3. * ROW_H;
-/// The row naming the file a block of tracks came out of. Always drawn where
-/// there is more than one file -- the list already scrolls past `SUB_ROWS_H`,
-/// so a short window loses tracks under the fold rather than the name saying
-/// whose they are. A click folds it, so it binds `HIT_MIN` like every other
-/// target.
-pub(crate) const SUB_HEAD_H: f32 = HIT_MIN;
-/// How much of a subtitle row's width the file's name in front of the label may
-/// take. Half: which file and which language are both worth reading, and a name
-/// given the whole row is a row where the language is what gets truncated.
-pub(crate) const SUB_STEM_SHARE: f32 = 0.5;
 /// Roughly how wide one character of an 11 px list row is. Generous on purpose:
 /// the element truncates for real, and a budget that overshoots would have the
 /// element cut the tail off after [`clip_middle`] had already kept it.
 pub(crate) const LIST_CHAR_W: f32 = 6.;
-/// The fewest characters a clipped name is cut to, however narrow the column
-/// gets: past this there is nothing on either side of the gap to read.
-pub(crate) const LIST_CLIP_MIN: usize = 5;
 /// How long the export card's Subtitles line may get before it counts tracks
 /// instead of naming them ([`subtitle_plan`]). Three lines of that row's value
 /// box, at [`LIST_CHAR_W`] to a character: [`EXPORT_W`] less the row's padding
@@ -214,70 +145,6 @@ pub(crate) fn lanes_h(lanes: usize) -> f32 {
         0 => 0.,
         n => n as f32 * LANE_H + (n - 1) as f32 * 8.,
     }
-}
-
-/// How tall one lane row is: [`LANE_H`] for a media track, [`SUB_LANE_H`] for
-/// a caption one -- the one place that answer is decided, since
-/// [`lanes_h_mixed`], [`lanes_shown_mixed`] and [`rows_below_mixed`] all walk
-/// off it and a track drawn at one height and measured at another is a fold
-/// line that lands on the wrong row.
-pub(crate) fn lane_h(kind: LaneKind) -> f32 {
-    match kind {
-        LaneKind::Subtitle => SUB_LANE_H,
-        LaneKind::Video | LaneKind::Audio => LANE_H,
-    }
-}
-
-/// [`lanes_h`] for a real stack of lanes rather than a bare count: a project
-/// with a caption track in it is shorter than that many `LANE_H` rows, and
-/// the column, the fold and the affordance below it all have to agree on
-/// exactly how much shorter, or "N more below" is answering a box nothing
-/// draws at.
-pub(crate) fn lanes_h_mixed(kinds: &[LaneKind]) -> f32 {
-    match kinds.len() {
-        0 => 0.,
-        n => kinds.iter().copied().map(lane_h).sum::<f32>() + (n - 1) as f32 * 8.,
-    }
-}
-
-/// [`lanes_shown`] for a real stack: the largest prefix of `kinds` whose
-/// drawn height still fits `box_h`, on the same boundary [`lanes_shown`]
-/// draws it at (`lanes_h(k) <= box_h`) -- so a uniform stack answers exactly
-/// what [`lanes_shown`] already did, and a mixed one answers the row count
-/// its own heights actually reach.
-pub(crate) fn lanes_shown_mixed(kinds: &[LaneKind], box_h: f32) -> usize {
-    (0..=kinds.len())
-        .rev()
-        .find(|&k| lanes_h_mixed(&kinds[..k]) <= box_h)
-        .unwrap_or(0)
-        .max(1)
-}
-
-/// [`rows_below`] for a real stack: `scrolled` read against each row's own
-/// top rather than a uniform `LANE_H + 8` stride, so a column with a thin
-/// caption track in it still says the true count once that track has
-/// scrolled by.
-pub(crate) fn rows_below_mixed(kinds: &[LaneKind], box_h: f32, scrolled: f32) -> usize {
-    // Row `k`'s own top, in the same units `scrolled` is given in: nothing
-    // for the first row, and every row before it plus the gap that follows
-    // each one for the rest.
-    let top = |k: usize| -> f32 {
-        match k {
-            0 => 0.,
-            k => lanes_h_mixed(&kinds[..k]) + 8.,
-        }
-    };
-    let past = (0..=kinds.len())
-        .min_by(|&a, &b| {
-            (scrolled - top(a))
-                .abs()
-                .partial_cmp(&(scrolled - top(b)).abs())
-                .unwrap()
-        })
-        .unwrap_or(0);
-    kinds
-        .len()
-        .saturating_sub(past + lanes_shown_mixed(kinds, box_h))
 }
 
 /// The same question for a column whose rows are not one height -- the
@@ -341,14 +208,6 @@ pub(crate) const TIMELINE_SHARE: f32 = 171. / 360.;
 /// The edit toolbar directly above the timeline: one control's height in its
 /// own padding, fixed so nothing in it can push the timeline down.
 pub(crate) const TOOLBAR_H: f32 = CONTROL_H + 16.;
-
-/// The top bar: the project's name on the left, the two file actions on the
-/// right. Fixed for the reason [`HEADER_H`] is.
-pub(crate) const TOPBAR_H: f32 = 36.;
-
-/// The transport strip under the picture -- play, timecode, volume -- where a
-/// player's own controls live in every consumer editor.
-pub(crate) const TRANSPORT_H: f32 = CONTROL_H + 12.;
 
 /// One press of a zoom key, or one notch of ctrl+wheel.
 pub(crate) const ZOOM_STEP: f32 = 1.25;
