@@ -164,7 +164,7 @@ impl Player {
                 // A copied clip names its source by *index*, and every index
                 // past the one that went has just moved down: without this the
                 // next paste puts some other file on the timeline.
-                self.clipboard = clipboard_after_remove(self.clipboard, idx);
+                self.clipboard = clipboard_after_remove(std::mem::take(&mut self.clipboard), idx);
                 self.reset_after_reseek();
                 // The last row leaves a session naming no file: nothing to
                 // play, nothing to save and nothing to show, which is the empty
@@ -305,7 +305,7 @@ impl Player {
         self.image = None;
         // The drawn cue with it, and its tile for the same reason as above.
         self.sub_image = None;
-        self.clipboard = None;
+        self.clipboard.clear();
         self.selected.clear();
         self.selected_asset = None;
         // The subtitle rows go with the timeline they were on, and so does the
@@ -1486,7 +1486,7 @@ impl Player {
                 self.name = file_name(path).into();
                 // A copied clip names its source by index, which means a
                 // different file -- or none -- in another project.
-                self.clipboard = None;
+                self.clipboard.clear();
                 self.selected.clear();
                 // A menu can be up while a project is dropped on the window --
                 // the scrim swallows clicks, never a drop -- and its index
