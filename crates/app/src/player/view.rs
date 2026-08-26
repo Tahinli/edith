@@ -16,12 +16,19 @@ impl Player {
     }
 
     /// A press with ctrl held: the pick joins the selection, or leaves it if
-    /// it was already in -- the toggle that assembles a group by hand. Without
-    /// ctrl this is exactly [`Player::select`], which is why every box on the
-    /// bed asks this one and lets the modifier decide.
+    /// it was already in -- the toggle that assembles a group by hand.
+    /// Without ctrl, a press on a member of an existing multi-pick keeps the
+    /// whole set rather than collapsing it -- collapsing here would make a
+    /// set-drag unreachable, since the drag begins on this very press. A
+    /// plain press anywhere else is exactly [`Player::select`]. Collapsing to
+    /// the one pressed clip belongs to the click that follows, once it is
+    /// plain a press and not the start of a drag (see the boxes' own
+    /// `on_click`), which is why every box on the bed asks this one for the
+    /// press and its own click listener for the collapse.
     pub(crate) fn pick(&mut self, target: (Lane, usize), ctrl: bool, cx: &mut Context<Self>) {
         match ctrl {
             true => self.selected.toggle(target),
+            false if self.selected.contains(target) => {}
             false => self.selected.set_one(target),
         }
         cx.notify();
