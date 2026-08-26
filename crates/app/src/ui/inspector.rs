@@ -121,6 +121,19 @@ impl Player {
                 let sub = self.session.as_ref()?.sub_lane(lane).get(idx).copied()?;
                 Some((lane, sub))
             });
+        // The transition the anchor's clip carries into its successor, if
+        // any -- a dissolve on a video lane ([`Clip::transition_out`]) or a
+        // crossfade on an audio lane, told apart from a plain one-sided fade
+        // by [`Project::crossfade`]'s own signature: both ends of the join
+        // set together. `cap` is what the pair actually offers, the same
+        // ceiling the engine's own setters clamp to, so the row never claims
+        // more room than a step could land in.
+        let transition = self.selected.anchor().and_then(|(lane, idx)| {
+            let session = self.session.as_ref()?;
+            let clips = session.lane_clips(lane);
+            let (label, frames, cap) = transition_of(lane.kind, clips.get(idx)?, clips.get(idx + 1))?;
+            Some((lane, idx, label, frames, cap))
+        });
         // A multi-selection is named for its anchor and counted: what the
         // panel shows is the anchor's settings, and the count says there is
         // more in hand than the panel is showing.
@@ -190,6 +203,14 @@ impl Player {
                     .text_color(rgb(FG_SECONDARY()))
                     .child(detail),
             )
+            // The duration field: a value and its own two steppers, the
+            // shape `mbps_steppers` already draws for the export card's
+            // bitrate -- present only while the anchor carries a transition,
+            // since a row for a number that means nothing is a row lying
+            // about what is selected.
+            .when_some(transition, |d, (lane, idx, label, frames, cap)| {
+                d.child(self.transition_duration_row(lane, idx, label, frames, cap, cx))
+            })
             .child(
                 div()
                     .flex()
@@ -266,6 +287,56 @@ impl Player {
                         cx.listener(|this, _: &ClickEvent, _, cx| this.delete_selected(cx)),
                     )),
             )
+    }
+
+    /// The duration row a transition-carrying anchor grows under
+    /// `selection_section`'s detail line: `frames` as the engine counts it,
+    /// flanked by the −/+ steppers [`Player::mbps_steppers`] already draws
+    /// for the export card's bitrate row -- a field, not the drag handle
+    /// `659770a` deliberately shrank the join's hit target away from. Each
+    /// press nudges by one frame ([`Player::nudge_transition`]); the engine's
+    /// own setters clamp to `cap`, so a run of presses past what the
+    /// successor offers stops there rather than erroring.
+    fn transition_duration_row(
+        &self,
+        lane: Lane,
+        idx: usize,
+        label: &'static str,
+        frames: u32,
+        cap: u32,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let step = |id: &'static str, glyph: &'static str, by: i32, cx: &mut Context<Self>| {
+            div()
+                .id(id)
+                .flex()
+                .w(px(HIT_MIN))
+                .h(px(HIT_MIN))
+                .items_center()
+                .justify_center()
+                .rounded(px(3.))
+                .bg(rgb(BG_RAISED()))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(BG_HOVER())))
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.nudge_transition(lane, idx, by, cx);
+                }))
+                .child(glyph)
+        };
+        div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .child(
+                div()
+                    .flex_1()
+                    .text_size(px(11.))
+                    .text_color(rgb(FG_SECONDARY()))
+                    .child(format!("{label} {frames}f (of {cap}f offered)")),
+            )
+            .child(step("transition-down", "−", -1, cx))
+            .child(step("transition-up", "+", 1, cx))
     }
 
     /// The settings that are the *project's* rather than any clip's: the canvas
@@ -415,6 +486,35 @@ impl Player {
                         cx.listener(|this, _: &ClickEvent, _, cx| this.open_subtitle_style(cx)),
                     )),
             )
+    }
+}
+
+/// The transition a clip carries into its immediate successor, if any -- a
+/// dissolve on a video lane ([`Clip::transition_out`]) or a crossfade on an
+/// audio lane, told apart from a plain one-sided fade drag by
+/// [`Project::crossfade`]'s own signature: both ends of the join set
+/// together, not just this clip's tail. `cap` is what the pair actually
+/// offers -- the shorter of the two clips' own lengths -- the same ceiling
+/// [`Project::set_transition_out`]/[`Project::crossfade`] clamp to, so the
+/// row this feeds never claims more room than a step could land in.
+///
+/// Free of `Context` and of [`PlaybackSession`] alike, so it is testable
+/// without either -- this test binary has neither a `TestAppContext` nor
+/// real media to open one with (`split_drag_owes_save`'s own reason for
+/// being pulled out the same way).
+pub(crate) fn transition_of(
+    lane_kind: LaneKind,
+    clip: &Clip,
+    next: Option<&Clip>,
+) -> Option<(&'static str, u32, u32)> {
+    let next = next.filter(|n| n.start == clip.end())?;
+    let cap = clip.frames().min(next.frames());
+    match lane_kind {
+        LaneKind::Video if clip.transition_out > 0 => Some(("Dissolve", clip.transition_out, cap)),
+        LaneKind::Audio if clip.fade_out > 0 && next.fade_in > 0 => {
+            Some(("Crossfade", clip.fade_out, cap))
+        }
+        _ => None,
     }
 }
 
