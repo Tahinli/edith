@@ -170,6 +170,18 @@ impl Player {
             - 2. * SPLIT_W;
         let clock_w = TIME_W.min(room - 140.).max(96.);
         let slider = room >= TRANSPORT_ROOMY;
+        // Which window the loop button actually restarts, in the same
+        // priority [`active_loop_window`] picks it in: the marked i/o range
+        // once something is armed, the subject-cut trim next, the whole
+        // timeline last.
+        let armed = self.loop_on || self.loop_trim.is_some();
+        let loop_hint = if armed && self.range.is_some() {
+            "restarts from the marked in point on reaching the marked out point, instead of stopping"
+        } else if self.loop_trim.is_some() {
+            "restarts from the subject cut's own start on reaching its end, instead of stopping"
+        } else {
+            "restarts from the top on reaching the end, instead of stopping"
+        };
         div()
             .flex_none()
             .h(px(TRANSPORT_H))
@@ -213,7 +225,7 @@ impl Player {
                 },
                 None,
                 "Loop",
-                "restarts from the top on reaching the end, instead of stopping",
+                loop_hint,
                 ActionId::Loop,
                 cx.listener(|this, _: &ClickEvent, window, cx| {
                     this.act(ActionId::Loop, window, cx)
