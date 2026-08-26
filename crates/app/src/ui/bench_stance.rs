@@ -281,6 +281,17 @@ fn clip_box(
                 this.pick((lane, idx), event.modifiers.control, cx);
             }),
         )
+        // A plain click (press and release with no drag between -- gpui
+        // drops the pending click once a drag starts, see `on_drag` below)
+        // collapses a multi-pick down to the one clicked, the same way
+        // `select` does. `pick` above deliberately keeps the whole set on
+        // the press so a set-drag has something to move; this is where the
+        // collapse a plain click promises actually lands.
+        .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+            if !event.modifiers().control {
+                this.select((lane, idx), cx);
+            }
+        }))
         // The right button selects exactly as the left one does -- the menu
         // acts on the clip it names -- then hangs the clip menu at the
         // pointer (DESIGN §9's "verbs of the thing under the cursor"). Same
@@ -658,6 +669,13 @@ fn sub_box(
                 this.pick((lane, idx), event.modifiers.control, cx);
             }),
         )
+        // A plain click collapses a multi-pick to this one, exactly as a
+        // clip's own box does -- see the comment there.
+        .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+            if !event.modifiers().control {
+                this.select((lane, idx), cx);
+            }
+        }))
         // Same door a clip's box opens its menu by (DESIGN §9).
         .on_mouse_down(
             MouseButton::Right,
