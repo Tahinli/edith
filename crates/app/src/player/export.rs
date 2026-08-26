@@ -414,7 +414,6 @@ impl Player {
         // was waiting in. Nor may a half-typed number: the card opens on the
         // bitrate it will write, never on digits left behind by a closed one.
         self.keys_open = false;
-        self.rebinding = None;
         self.mbps_edit = None;
         cx.notify();
     }
@@ -465,34 +464,6 @@ impl Player {
         self.set_format(next_container(self.format));
     }
 
-    /// The quality rows by keyboard, wrapping. Refused by name where the format
-    /// has no bitrate to pick: a key that silently does nothing is the card
-    /// looking broken.
-    pub(crate) fn cycle_quality(&mut self) {
-        if let Some(why) = bitrate_refusal(self.format) {
-            self.notify_user(why.into());
-            return;
-        }
-        let at = Quality::ALL
-            .iter()
-            .position(|&q| q == self.quality)
-            .unwrap_or(0);
-        self.quality = Quality::ALL[(at + 1) % Quality::ALL.len()];
-    }
-
-    /// The sound's rate by keyboard, wrapping through the offered ones -- the
-    /// picture's quality row for the other half of the file. Refused by name
-    /// where this timeline in this format has no rate to pick, exactly as
-    /// [`Player::cycle_quality`] is: a key that silently does nothing is the
-    /// card looking broken.
-    pub(crate) fn cycle_audio_kbps(&mut self) {
-        if let Some(why) = self.audio_rate_refusal() {
-            self.notify_user(why.into());
-            return;
-        }
-        self.audio_kbps = next_audio_kbps(self.audio_kbps);
-    }
-
     /// Which encoder an export of this project would write the picture with
     /// ([`engine::export::EncoderSeat`]). The session's, because it is saved
     /// with the project -- there is no card-local copy to drift from it -- and
@@ -513,22 +484,6 @@ impl Player {
             self.notify_user(format!("Encoder: {}", encoder_label(seat)).into());
         }
         cx.notify();
-    }
-
-    /// The seat by keyboard, wrapping through the three -- the Sound row's
-    /// rule, for the row beside it. Refused by name with no timeline: a key
-    /// that silently does nothing is the card looking broken.
-    pub(crate) fn cycle_encoder(&mut self, cx: &mut Context<Self>) {
-        let Some(session) = &self.session else {
-            self.notify_user("no timeline to export — open a file first".into());
-            cx.notify();
-            return;
-        };
-        let at = EncoderSeat::ALL
-            .iter()
-            .position(|&s| s == session.encoder_seat())
-            .unwrap_or(0);
-        self.apply_encoder(EncoderSeat::ALL[(at + 1) % EncoderSeat::ALL.len()], cx);
     }
 
     /// Why the sound row is not a choice right now, the engine answering about

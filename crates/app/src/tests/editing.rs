@@ -2304,17 +2304,6 @@ fn a_project_that_makes_no_proxies_by_itself_starts_none_until_it_is_cut_on_them
 }
 
 #[test]
-fn the_add_button_is_dead_unless_it_would_do_something() {
-    let picked = (PathBuf::from("/m/0.mp4"), 0);
-    assert!(can_add(Some(&picked), true, false));
-    // Nothing picked, nothing to put it on, or an export reading the very
-    // edit list this would change.
-    assert!(!can_add(None, true, false));
-    assert!(!can_add(Some(&picked), false, false));
-    assert!(!can_add(Some(&picked), true, true));
-}
-
-#[test]
 fn the_media_column_never_takes_the_picture_over() {
     for window in [360., 640., 1280., 1920., 3840.] {
         let w = crate::library_w(window);
@@ -2326,10 +2315,6 @@ fn the_media_column_never_takes_the_picture_over() {
     }
     // It yields: a narrower window gives the list less, never the same.
     assert!(crate::library_w(640.) < crate::library_w(1280.));
-    // Rows are clickable, so WCAG 2.5.8 binds them like every other target,
-    // and a name over a timecode has to fit inside one.
-    assert!(ROW_H >= HIT_MIN);
-    assert!(SWATCH_W < LIBRARY_MIN_W);
 }
 
 #[test]
@@ -2460,28 +2445,30 @@ fn should_loop_restart_is_play_state_blind_the_pump_gates_it() {
 /// are still there once it is gone.
 #[test]
 fn escape_closes_a_card_before_it_can_ever_reach_deselect() {
-    let render_rs = src_text("render.rs");
-    let dispatch = render_rs
-        .find("if let Some(action) = action {")
+    // The legacy handler this test named (`render.rs`) is gone; the same
+    // ordering now lives in the darkroom's own root key handler
+    // (`ui::stance::render`'s `on_key_down`). Player fullscreen is no
+    // longer a "picture-only" layout escape leaves a special way -- it is
+    // real OS fullscreen now (`ActionId::Fullscreen`, toggled on `f11`),
+    // so that guard has nothing left to name here.
+    let stance_rs = src_text("ui/stance.rs");
+    let dispatch = stance_rs
+        .find("if let Some(action) = this.keymap.lookup(key, ctrl) {")
         .expect("the keymap fallthrough that fires Deselect");
     for (guard, label) in [
-        ("if this.keys_open {", "the keys overlay"),
         ("if this.dock_filter_edit {", "the dock filter"),
         (
             "if this.param_card_key(key, event.keystroke.modifiers.shift, cx) {",
             "a param card",
         ),
-        (
-            "if escape_leaves_player_fullscreen(key, ctrl, this.player_fullscreen) {",
-            "player fullscreen",
-        ),
-        ("let clip_menu = this.context_menu.take().is_some();", "the clip/row menu or a list"),
+        ("if this.card_open()", "a card (keys overlay/export/eq/color/...)"),
+        ("|| this.context_menu.is_some()", "the clip/row menu or a list"),
         (
             "if key == ESCAPE && !ctrl && this.preview_session.is_some() {",
             "an open preview",
         ),
     ] {
-        let at = render_rs
+        let at = stance_rs
             .find(guard)
             .unwrap_or_else(|| panic!("{label}'s own escape guard moved or was renamed"));
         assert!(

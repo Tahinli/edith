@@ -869,24 +869,6 @@ fn a_clip_is_drawn_the_same_width_whatever_else_is_on_the_timeline() {
 /// that tells two zooms apart.
 #[test]
 fn the_zoom_button_says_how_much_is_on_the_bed() {
-    assert_eq!(span_label(4.5), "4.5s");
-    assert_eq!(span_label(22.5), "22s");
-    assert_eq!(span_label(90.), "1.5m");
-    assert_eq!(span_label(3600.), "1.0h");
-    // The span a five hour timeline is zoomed all the way out to.
-    assert_eq!(span_label(5. * 3600. * 1.05), "5.2h");
-    // Before the first paint there is no bed and so no answer to give.
-    assert_eq!(span_label(0.), "—");
-    assert_eq!(span_label(f64::NAN), "—");
-    // A span under a second is a span: the tightest zoom is
-    // `ZOOM_MIN_FRAMES` across the bed, which on 240 fps slow-motion is
-    // 0.03s, and "0.0s" would be the pill saying nothing is on the bed.
-    for fps in [60., 120., 240., 1000.] {
-        let label = span_label(ZOOM_MIN_FRAMES / fps);
-        assert_ne!(label, "0.0s", "{fps} fps");
-        assert_ne!(label, "0.00s", "{fps} fps");
-    }
-    assert_eq!(span_label(ZOOM_MIN_FRAMES / 240.), "0.03s");
     // A frame of quiet at 60 fps, which the silence card says out loud.
     assert_eq!(secs_label(1. / 60.), "0.02s");
     assert_eq!(secs_label(4.5), "4.5s");

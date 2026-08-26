@@ -2,13 +2,6 @@
 
 use crate::*;
 
-/// One clip's audio, drawn as a filled min/max envelope inside whatever box it
-/// is given. Peaks are the source's whole envelope; `from`/`to` are the source
-/// seconds this clip plays, so a cut clip shows its own stretch of the file.
-pub(crate) fn waveform(peaks: Arc<Vec<(f32, f32)>>, from: f64, to: f64) -> impl IntoElement {
-    waveform_ink(peaks, from, to, FG_SECONDARY())
-}
-
 /// `ClickEvent::modifiers()` answers the mouse-*up* modifiers (gpui-0.2.2
 /// `interactive.rs`), so releasing ctrl before the button lands undoes a
 /// ctrl-held toggle decided on mouse-down. This reads the *press* modifiers
@@ -203,79 +196,6 @@ pub(crate) fn control(
 /// colour sliders both make. Only the level -- mute is the button beside it, so
 /// a muted slider still shows what unmuting comes back to, drawn dim.
 ///
-/// Dimmed and inert without a timeline, like every other control that would
-/// have nothing to act on.
-pub(crate) fn volume_slider(
-    volume: Volume,
-    bar: Rc<Cell<Bounds<Pixels>>>,
-    enabled: bool,
-    cx: &mut Context<Player>,
-) -> impl IntoElement {
-    div()
-        .id("volume-bar")
-        .relative()
-        .flex_none()
-        .w(px(VOLUME_W))
-        .h(px(CONTROL_H))
-        .flex()
-        .items_center()
-        .tooltip(|_, cx| {
-            cx.new(|_| Tip("Volume — drag to set the level; the button mutes".into()))
-                .into()
-        })
-        .when(!enabled, |d| d.opacity(0.4).cursor_not_allowed())
-        .when(enabled, |d| {
-            d.cursor_pointer()
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                        this.volume_dragging = true;
-                        this.drag_volume(event.position.x, cx);
-                    }),
-                )
-                .child(bounds_probe(bar))
-        })
-        .child(
-            div()
-                .w_full()
-                .h(px(4.))
-                .rounded(px(2.))
-                .bg(rgb(BG_RAISED()))
-                .child(
-                    div()
-                        .h_full()
-                        .w(relative(volume.along()))
-                        .rounded(px(2.))
-                        .bg(rgb(if volume.muted {
-                            FG_SECONDARY()
-                        } else {
-                            ACCENT_PRIMARY()
-                        })),
-                ),
-        )
-}
-
-/// The line between two groups of buttons.
-/// What a group of buttons is *for*, printed in front of it. A toolbar of
-/// twelve unlabelled boxes is a toolbar nobody reads twice; three named groups
-/// are three things to skip.
-pub(crate) fn group_label(name: &'static str) -> impl IntoElement {
-    div()
-        .flex_none()
-        .text_size(px(10.))
-        .text_color(rgb(FG_SECONDARY()))
-        .child(name)
-}
-
-pub(crate) fn separator() -> impl IntoElement {
-    div()
-        .flex_none()
-        .mx(px(4.))
-        .w(px(1.))
-        .h(px(18.))
-        .bg(rgb(BG_HOVER()))
-}
-
 /// Whether a card or a menu is drawn over the window, as the hover labels see
 /// it: written once a frame by [`Player::render`], read by every [`Tip`] before
 /// it paints.
@@ -352,39 +272,6 @@ impl Render for OverlayTip {
     }
 }
 
-/// Scissors: two blades crossed. Drawn this way and not as a split clip because
-/// two bars is what the transport wears when it is playing -- the one glyph a
-/// cut must never be mistaken for.
-pub(crate) fn cut_glyph() -> impl IntoElement {
-    canvas(
-        |_, _, _| (),
-        |bounds, _, window, _| {
-            let (o, s) = (bounds.origin, bounds.size);
-            let mut path = PathBuilder::stroke(px(1.5));
-            path.move_to(point(o.x + s.width * 0.15, o.y + s.height));
-            path.line_to(point(o.x + s.width * 0.9, o.y + s.height * 0.1));
-            path.move_to(point(o.x + s.width * 0.85, o.y + s.height));
-            path.line_to(point(o.x + s.width * 0.1, o.y + s.height * 0.1));
-            if let Ok(path) = path.build() {
-                window.paint_path(path, rgb(FG_PRIMARY()));
-            }
-        },
-    )
-    .w(px(13.))
-    .h(px(13.))
-}
-
-/// A lid over a bin.
-pub(crate) fn delete_glyph() -> impl IntoElement {
-    div()
-        .flex()
-        .flex_col()
-        .items_center()
-        .gap(px(2.))
-        .child(div().w(px(13.)).h(px(2.)).bg(rgb(FG_PRIMARY())))
-        .child(div().w(px(9.)).h(px(9.)).bg(rgb(FG_PRIMARY())))
-}
-
 /// What a window with no file open is waiting for. Both ways in are already
 /// built -- the whole window is the drop target and the Import chooser takes a
 /// project as readily as media -- so this only has to say so.
@@ -401,40 +288,4 @@ pub(crate) fn empty_hint() -> impl IntoElement {
                 .text_size(px(11.))
                 .child("or click Import in the media list"),
         )
-}
-
-/// Two bars while playing, a triangle in every other state -- paused, nothing
-/// open, and played out, where the button's next act is to start over rather
-/// than to stop something. Drawn, so there is no icon font and no glyph
-/// coverage to depend on.
-pub(crate) fn transport_glyph(state: Transport) -> impl IntoElement {
-    let playing = state.is_playing();
-    div()
-        .flex()
-        .items_center()
-        .gap(px(4.))
-        .when(playing, |d| {
-            d.child(div().w(px(3.)).h(px(12.)).bg(rgb(FG_PRIMARY())))
-                .child(div().w(px(3.)).h(px(12.)).bg(rgb(FG_PRIMARY())))
-        })
-        .when(!playing, |d| {
-            d.child(
-                canvas(
-                    |_, _, _| (),
-                    |bounds, _, window, _| {
-                        let (o, s) = (bounds.origin, bounds.size);
-                        let mut path = PathBuilder::fill();
-                        path.move_to(o);
-                        path.line_to(point(o.x + s.width, o.y + s.height / 2.));
-                        path.line_to(point(o.x, o.y + s.height));
-                        path.close();
-                        if let Ok(path) = path.build() {
-                            window.paint_path(path, rgb(FG_PRIMARY()));
-                        }
-                    },
-                )
-                .w(px(11.))
-                .h(px(13.)),
-            )
-        })
 }

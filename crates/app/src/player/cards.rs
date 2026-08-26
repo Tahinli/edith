@@ -1313,8 +1313,6 @@ impl Player {
     pub(crate) fn close_card(&mut self) {
         self.keys_open = false;
         self.settings_open = false;
-        self.keys_search.clear();
-        self.rebinding = None;
         self.export_open = false;
         // The two things typed *into* the export card go with it: a field left
         // open would take the next keystroke for a card that is gone.
@@ -1740,6 +1738,30 @@ impl Player {
                 self.set_sub_family(Some(family), cx);
             }
             return true;
+        }
+        // The export card's custom bitrate field: the mouse door is the
+        // steppers and the row's own click (`Player::edit_mbps`), but the
+        // `0–9`/backspace/enter/esc chords `keymap::FIXED` already
+        // advertises need a keyboard door too, or a hand with no mouse
+        // could open the field and never fill it in.
+        if self.export_open {
+            if let Some(edit) = &mut self.mbps_edit {
+                if key == ESCAPE {
+                    self.mbps_edit = None;
+                } else if key == "enter" {
+                    if let Some(mbps) = edit.commit() {
+                        self.custom_mbps = mbps;
+                        self.mbps_edit = None;
+                    }
+                } else if key == "backspace" {
+                    edit.backspace();
+                } else if let Ok(digit) = key.parse::<u32>() {
+                    edit.digit(digit);
+                } else {
+                    return false;
+                }
+                return true;
+            }
         }
         false
     }

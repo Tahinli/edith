@@ -446,9 +446,3 @@ pub(crate) fn menu_at(at: Point<Pixels>, viewport: Size<Pixels>, height: f32) ->
     )
 }
 
-/// Whether the Add button does anything: a row picked, a timeline to put it on,
-/// and no export reading that timeline. A button that would do nothing is dimmed
-/// and takes no click, like every other one here.
-pub(crate) fn can_add(picked: Option<&(PathBuf, usize)>, timeline: bool, exporting: bool) -> bool {
-    picked.is_some() && timeline && !exporting
-}

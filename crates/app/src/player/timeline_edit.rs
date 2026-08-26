@@ -47,16 +47,11 @@ impl Player {
             // notice per keystroke would turn the ledger into a firehose,
             // exactly what §8's "one at a time" is against; a single `s` is
             // not that.
-            // The legacy room has no ledger reading this queue and never
-            // notified on a split before -- gated so that room's behaviour
-            // stays exactly as it was.
             let cut = session.cut_at(f64::from(at) / self.fps);
-            if self.darkroom {
-                if cut {
-                    self.notify_user("SPLIT".into());
-                } else {
-                    self.notify_user("NOTHING TO SPLIT — the playhead is already on a cut".into());
-                }
+            if cut {
+                self.notify_user("SPLIT".into());
+            } else {
+                self.notify_user("NOTHING TO SPLIT — the playhead is already on a cut".into());
             }
         }
         self.selected.clear();
@@ -862,29 +857,6 @@ impl Player {
         live_idx(session.lane_clips(drag.lane), drag.idx, drag.clip)
     }
 
-    /// The line while the clip is still in the hand: the very answer
-    /// [`Player::drop_frame`] will commit, worked out on every move of the drag,
-    /// so what the eye was promised is where the release puts it. A pointer that
-    /// has wandered off the bed promises nothing.
-    pub(crate) fn preview_drop(
-        &mut self,
-        from: Lane,
-        idx: usize,
-        x: Pixels,
-        cx: &mut Context<Self>,
-    ) {
-        let cue = self.drop_frame(from, idx, x).and_then(|(_, cue)| cue);
-        self.set_cue(cue, x, cx);
-    }
-
-    /// The same line for a library row on its way to a lane: it goes down at
-    /// the frame it is let go on ([`Player::place_frame`]), so that frame is
-    /// what snaps and what is drawn.
-    pub(crate) fn preview_place(&mut self, x: Pixels, cx: &mut Context<Self>) {
-        let cue = self.place_frame(x).1;
-        self.set_cue(cue, x, cx);
-    }
-
     /// The shadow the clip in the hand would fill, on the lane the pointer is
     /// over: its head where [`Player::drop_frame`] says the release will put it
     /// -- the same call the drop makes, so the box drawn and the box committed
@@ -1143,37 +1115,6 @@ impl Player {
             .filter(|mark| mark.abs_diff(raw) <= tol)
             .min_by_key(|mark| mark.abs_diff(raw))
             .unwrap_or(raw)
-    }
-
-    /// Whether the playhead is standing exactly on one: what the timeline's own
-    /// line says out loud, so "a cut here is copied" is on screen before the cut
-    /// rather than discovered in the export card afterwards.
-    ///
-    /// Asked every repaint, so it walks the *playhead* into each clip's source
-    /// and looks it up in that source's own sorted grid -- where
-    /// [`Player::sync_frames`] builds the whole list, which is a film's worth of
-    /// marks to allocate and sort sixty times a second.
-    pub(crate) fn on_sync_point(&self) -> bool {
-        let Some(session) = &self.session else {
-            return false;
-        };
-        let now = frame_at(session.now(), self.fps);
-        let sources = session.sources();
-        session.lanes().into_iter().any(|lane| {
-            lane.kind == LaneKind::Video
-                && session.lane_clips(lane).iter().any(|clip| {
-                    clip.speed.is_normal()
-                        && (clip.start..clip.start + (clip.out_frame - clip.in_frame))
-                            .contains(&now)
-                        && sources
-                            .get(clip.source)
-                            .and_then(|entry| self.syncs.get(&entry.path))
-                            .is_some_and(|keys| {
-                                keys.binary_search(&(clip.in_frame + (now - clip.start)))
-                                    .is_ok()
-                            })
-                })
-        })
     }
 
     /// Puts the playhead on the sync point before or after it -- the keyboard's

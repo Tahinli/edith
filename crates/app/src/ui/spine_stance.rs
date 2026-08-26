@@ -311,20 +311,6 @@ pub(crate) fn render(player: &Player, cx: &mut Context<Player>) -> impl IntoElem
             player,
             cx,
         ))
-        // ToggleSnap (homeless per this task's audit): editing-adjacent --
-        // it decides where a drag lands (keymap.rs's own category puts it
-        // under Editing, not View) -- so it earns the CUT group beside the
-        // trim/loop-trim it changes the feel of, not the quiet ROOM cluster
-        // below. Active fill mirrors loop-trim's own on/off convention.
-        .child(glyph(
-            "spine-toggle-snap",
-            "Sn",
-            ActionId::ToggleSnap,
-            player.snap,
-            false,
-            player,
-            cx,
-        ))
         // VIEW group, added this task: ZoomIn/ZoomOut/ZoomFit (keymap.rs) had
         // real, already-working handlers (`Player::zoom`/`zoom_fit`, wired
         // into the legacy `ui/toolbar.rs`) but no home anywhere in the
@@ -359,6 +345,20 @@ pub(crate) fn render(player: &Player, cx: &mut Context<Player>) -> impl IntoElem
             "⊡",
             ActionId::ZoomFit,
             false,
+            false,
+            player,
+            cx,
+        ))
+        // ToggleSnap: decides where a drag lands, which is what the eye
+        // reads the zoom scale against -- placed as the VIEW group's last
+        // row, beside the zoom controls above it, rather than off in CUT
+        // where nothing else answers "what scale/behaviour am I looking
+        // at". Active fill mirrors loop-trim's own on/off convention.
+        .child(glyph(
+            "snap",
+            "Sn",
+            ActionId::ToggleSnap,
+            player.snap,
             false,
             player,
             cx,

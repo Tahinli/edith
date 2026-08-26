@@ -107,352 +107,6 @@ impl Player {
         )
     }
 
-    /// A notice holds its own bar, full width, until it is answered: any key
-    /// retires it (the key handler) and so does a click on it. Its own surface
-    /// because the message is the point -- a failure cut to the timecode's slot
-    /// is a failure nobody read.
-    ///
-    /// The export's own line is more than a message: it names a file that is
-    /// now on disk, so the same click that retires it shows that file in the
-    /// desktop's file manager.
-    pub(crate) fn notice_bar(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        let notice = self.notices.front().cloned()?;
-        // The path travels with the text it was written for: a later notice
-        // holds the bar and the click is a plain dismissal again.
-        let exported = self
-            .exported
-            .clone()
-            .filter(|_| notice.starts_with(EXPORT_DONE));
-        // How many are waiting behind this one, said out loud: a queue nobody is
-        // told about is a queue whose second message reads as the first one
-        // failing to go away.
-        let behind = self.notices.len() - 1;
-        let hint = match (exported.is_some(), behind) {
-            (true, _) => "click — open file location".to_string(),
-            (false, 0) => "click or press any key to dismiss".to_string(),
-            (false, 1) => "click or press any key — 1 more message behind this".to_string(),
-            (false, n) => format!("click or press any key — {n} more messages behind this"),
-        };
-        // What the message *is*, by colour, before it is read: the words the
-        // editor shouts a failure in are the ones it opens with, so the bar can
-        // colour itself off the same text every one of them already carries.
-        let tone = notice_tone(&notice);
-        Some(
-            div()
-                .id("notice")
-                .when(exported.is_some(), |d| {
-                    d.tooltip(|_, cx| {
-                        cx.new(|_| {
-                            Tip("Open file location — shows the export in the file manager".into())
-                        })
-                        .into()
-                    })
-                })
-                .flex_none()
-                .flex()
-                // The hint keeps its own width, and at the 640x360 floor the
-                // picture region is narrower than the hint alone: with both on
-                // one line the message was squeezed to nothing and wrapped a
-                // character per line -- a notice rendered as a column of
-                // letters. Wrapping puts the hint on its own line instead, so
-                // the message keeps the whole width and the queue counter
-                // stays on screen under it.
-                .flex_wrap()
-                .items_start()
-                .gap(px(12.))
-                .px(px(12.))
-                .py(px(6.))
-                .bg(rgb(BG_RAISED()))
-                // The tone is a stripe down the leading edge rather than the
-                // whole bar's colour: a full red bar at every refusal is an
-                // alarm, and most of these are answers.
-                .border_l(px(3.))
-                .border_color(rgb(tone))
-                .cursor_pointer()
-                .hover(|s| s.bg(rgb(BG_HOVER())))
-                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                    // Another process starting: off the UI thread, and it
-                    // outlives the notice it was asked from.
-                    if let Some(path) = exported.clone() {
-                        cx.background_executor()
-                            .spawn(async move { show_in_file_manager(&path) })
-                            .detach();
-                    }
-                    this.dismiss_notice();
-                    cx.notify();
-                }))
-                // Shrinkable, because a gpui text element measures its
-                // min-content as the *whole line* (`TextLayout::layout` only
-                // wraps against a definite width) -- without a `min_w` the
-                // message would refuse to shrink at all and run off the region
-                // instead. With a floor under it, it shrinks to that floor,
-                // which pushes the hint onto its own line and leaves the
-                // message the width it needs to wrap like a sentence.
-                .child(div().flex_1().min_w(px(NOTICE_MIN_W)).child(notice))
-                .child(
-                    div()
-                        .flex_none()
-                        .text_size(px(11.))
-                        .text_color(rgb(FG_SECONDARY()))
-                        .child(hint),
-                ),
-        )
-    }
-
-    /// Every binding, and the way to change one: a row per entry, click it and
-    /// the next stroke becomes its chord. Over the whole window, because while
-    /// it is up nothing under it may answer -- the scrim stops the clicks
-    /// (gpui dispatches mouse listeners topmost-first, window.rs:3705) and the
-    /// key handler's own branch stops the strokes.
-    ///
-    /// Plain divs, like every control here: nothing in it takes focus, so the
-    /// root is still the one reading the keyboard -- which is exactly what a
-    /// waiting row depends on.
-    pub(crate) fn keys_overlay(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        if !self.keys_open {
-            return None;
-        }
-        // The way out, spelled the way the rows spell a chord.
-        let out = keymap::Chord {
-            key: ESCAPE.to_string(),
-            ctrl: false,
-        }
-        .pretty();
-        // Every action there is, under its heading, and the strokes the modal
-        // cards answer to beside them -- `keys_rows` is the whole of the order
-        // and every word in it comes off the registry.
-        //
-        // A row is two targets, not one: its label *does* the action, which is
-        // the pointer's way to the ones no button carries, and its stroke
-        // changes that stroke. An action with two strokes reads as one line
-        // ("x or delete") and a rebind replaces that whole set.
-        let mut rows: Vec<AnyElement> = Vec::new();
-        let row = || {
-            div()
-                .flex()
-                // The floor, not the height: a row that needed two lines
-                // would otherwise paint over the one under it -- which it did
-                // anyway until this said `flex_none`, a row inside a capped
-                // scrolling list being shrunk to fit by default (the export
-                // card's rows had the same shape and the same overlap).
-                .flex_none()
-                .min_h(px(KEYS_ROW_H))
-                .items_center()
-                .justify_between()
-                .gap(px(12.))
-                .px(px(6.))
-                .rounded(px(3.))
-        };
-        let found = keys_filter(&self.keys_search, &self.keymap);
-        // What the search box says: the typed text, and how much of the list is
-        // left under it -- a filter that found nothing has to say so, or the
-        // card reads as a list that lost its rows.
-        let search = if self.keys_search.is_empty() {
-            "search: type to filter · ↑ ↓ scroll the list · a click away closes".to_string()
-        } else {
-            let rows = found
-                .iter()
-                .filter(|(_, r)| !matches!(r, KeyRow::Head(_)))
-                .count();
-            match rows {
-                0 => format!(
-                    "search: {} — nothing matches · {out} clears",
-                    self.keys_search
-                ),
-                n => format!("search: {} — {n} shown · {out} clears", self.keys_search),
-            }
-        };
-        for (i, key_row) in found {
-            rows.push(match key_row {
-                KeyRow::Head(category) => div()
-                    .flex_none()
-                    .px(px(6.))
-                    .pt(px(4.))
-                    .text_size(px(11.))
-                    .text_color(rgb(FG_SECONDARY()))
-                    .child(category.label())
-                    .into_any_element(),
-                KeyRow::Act(action) => {
-                    let capturing = self.rebinding == Some(action);
-                    // Why the label half will not answer, if it will not: the
-                    // registry's one answer, the same the clip menu dims by.
-                    let refusal = self.enable(action, None);
-                    let out = out.clone();
-                    row()
-                        .when(capturing, |d| d.bg(rgb(BG_SELECTED())))
-                        .child(
-                            div()
-                                .id(("do", i))
-                                .flex_1()
-                                .min_w(px(0.))
-                                .flex()
-                                .min_h(px(KEYS_ROW_H))
-                                .items_center()
-                                // One line, cut where the stroke's column
-                                // starts: a label longer than the room it has
-                                // printed straight over the stroke beside it,
-                                // and two overprinted words are less readable
-                                // than one truncated one.
-                                .truncate()
-                                .child(action.label())
-                                .children(hitmap::action(action, refusal.yes()))
-                                // The reason rides on the label rather than in
-                                // the stroke column, which the rebind half
-                                // needs whatever the editor's state is: an
-                                // action nobody can ask for right now is still
-                                // one whose key may be changed.
-                                .when_some(refusal.why(), |d, why| {
-                                    let why: SharedString = why.into();
-                                    d.tooltip(move |_, cx| cx.new(|_| Tip(why.clone())).into())
-                                })
-                                .when(!refusal.yes(), |d| d.opacity(0.4).cursor_not_allowed())
-                                .when(refusal.yes(), |d| {
-                                    d.cursor_pointer()
-                                        .hover(|s| s.bg(rgb(BG_HOVER())))
-                                        .on_click(cx.listener(
-                                            move |this, _: &ClickEvent, window, cx| {
-                                                // The card goes first: several of
-                                                // these open a card of their own,
-                                                // and every edit moves the indices
-                                                // the menus are holding.
-                                                this.keys_open = false;
-                                                this.rebinding = None;
-                                                this.act(action, window, cx);
-                                                cx.notify();
-                                            },
-                                        ))
-                                }),
-                        )
-                        .child(
-                            // corner-cut: the column is as wide as the stroke it
-                            // prints, so a one-character chord gives this half a
-                            // hit area under the 24px WCAG 2.5.8 floor -- tall
-                            // enough, narrow. Upgrade: a min_w of HIT_MIN here.
-                            div()
-                                .id(("bind", i))
-                                .flex_none()
-                                .flex()
-                                .min_h(px(KEYS_ROW_H))
-                                .items_center()
-                                .cursor_pointer()
-                                .hover(|s| s.bg(rgb(BG_HOVER())))
-                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                    this.rebinding = Some(action);
-                                    cx.notify();
-                                }))
-                                .child(if capturing {
-                                    div()
-                                        .text_color(rgb(FG_SECONDARY()))
-                                        .child(format!("press a key — {out} cancels"))
-                                } else {
-                                    div().child(self.keymap.display(action))
-                                }),
-                        )
-                        .into_any_element()
-                }
-                KeyRow::Fixed(f) => {
-                    let f = &keymap::FIXED[f];
-                    row()
-                        .child(f.label)
-                        // Dim, and no hover: this one is not a row you can click.
-                        .child(div().text_color(rgb(FG_SECONDARY())).child(f.chord.clone()))
-                        .into_any_element()
-                }
-            });
-        }
-        Some(
-            scrim()
-                .flex()
-                .justify_center()
-                .items_center()
-                // The picture behind is out of reach, and looks it. The press is
-                // swallowed here so a button under the scrim cannot take it --
-                // and it closes the card on the way, which is the pointer's exit
-                // from every card here ([`Player::close_card`]).
-                .bg(rgba(SCRIM()))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                        this.close_card();
-                        cx.notify();
-                        cx.stop_propagation();
-                    }),
-                )
-                .child(
-                    div()
-                        .w(px(KEYS_W))
-                        .on_mouse_down(MouseButton::Left, swallow)
-                        .flex()
-                        .flex_col()
-                        .gap(px(2.))
-                        .p(px(12.))
-                        .rounded(px(6.))
-                        .bg(rgb(BG_RAISED()))
-                        // Title and instruction are two children, never one
-                        // wrapping line: a fixed-height slot whose text wrapped
-                        // painted its second line over the first row.
-                        .child(div().flex_none().px(px(6.)).child("Actions & keys"))
-                        // One status line, under the title where the eye starts.
-                        // A refusal takes it over -- it is the more urgent of the
-                        // two, and the notice bar it would otherwise appear in is
-                        // under the scrim.
-                        //
-                        // The row list below is capped and scrolls, so neither a
-                        // wrapped refusal here nor another action added to `ALL`
-                        // can push the card past a 360 px window any more.
-                        .child(
-                            div()
-                                .flex_none()
-                                .px(px(6.))
-                                .text_size(px(11.))
-                                .text_color(rgb(FG_SECONDARY()))
-                                .child(self.notices.front().cloned().unwrap_or_else(|| {
-                                    "click an action to do it · click its key to change it".into()
-                                })),
-                        )
-                        // The search box: no focus and no text field -- the
-                        // card's key handler is the field, exactly as the
-                        // export card's bitrate is typed into it. Its own line
-                        // above the list, so the rows below it are always the
-                        // answer to what it says.
-                        .child(
-                            div()
-                                .flex_none()
-                                .px(px(6.))
-                                .text_size(px(11.))
-                                .text_color(rgb(FG_SECONDARY()))
-                                .child(search),
-                        )
-                        // Capped and scrolling rather than as tall as the action
-                        // list happens to be: the list grows with the editor,
-                        // the smallest window does not.
-                        .child(
-                            div()
-                                .id("keys-rows")
-                                .flex()
-                                .flex_col()
-                                .gap(px(2.))
-                                .max_h(px(KEYS_ROWS_H))
-                                // The line the list scrolls under: a row half
-                                // out of the viewport sat against the search
-                                // line with nothing between them, and read as a
-                                // row painted over the heading rather than as a
-                                // list with more above it.
-                                .mt(px(4.))
-                                .border_t_1()
-                                .border_color(rgb(BG_PANEL()))
-                                .pt(px(4.))
-                                .overflow_y_scroll()
-                                // The wheel's offset and the arrow keys' are
-                                // the same one, so the two cannot disagree
-                                // about where the list is.
-                                .track_scroll(&self.keys_scroll)
-                                .children(rows),
-                        ),
-                ),
-        )
-    }
-
     /// The menu a right-click on a clip opens: what that clip can be given,
     /// each item beside the stroke that does the very same thing, and a
     /// turn-over side that says what the clip *is*. An item that would do
@@ -484,10 +138,7 @@ impl Player {
         let secs = |frames: u32| timecode(f64::from(frames) / self.fps, self.fps);
         // DESIGN §9/§3: a menu row is a plate row, Archivo at the room's
         // 10.5px row size -- `ink2`, dimmed to `ink3` on the disabled ones
-        // below by the same `.opacity` every row already carried. Gated on
-        // `self.darkroom` so `OLD_GUI=1` keeps its own unstyled rows exactly
-        // as they draw today.
-        let darkroom = self.darkroom;
+        // below by the same `.opacity` every row already carried.
         let row = move |n: usize| {
             div()
                 .id(("menu", n))
@@ -500,7 +151,7 @@ impl Player {
                 .gap(px(12.))
                 .px(px(6.))
                 .rounded(px(3.))
-                .when(darkroom, |d| {
+                .map(|d| {
                     d.type_style(type_scale::label(
                         type_scale::LABEL_ROW_PX,
                         gpui::FontWeight::MEDIUM,
@@ -513,7 +164,7 @@ impl Player {
         // than a room verb goes through this rather than the row's ambient
         // Archivo.
         let chord_style = |d: Div| -> Div {
-            d.when(darkroom, |d| {
+            d.map(|d| {
                 d.type_style(type_scale::mono(
                     type_scale::CHORD_METADATA_MIN_PX,
                     gpui::FontWeight::MEDIUM,
@@ -731,17 +382,11 @@ impl Player {
         // §5/§11 check 6: the picture is never covered. A right-click high on
         // the window would otherwise hang the menu at the pointer, straight
         // over the screen -- clamped below it into the bench/ledger/dock
-        // footprint instead, darkroom only (the legacy tree has no such
-        // fixed split to clamp against). The list is sized against that same
+        // footprint instead. The list is sized against that same
         // footprint (`room`), not the whole window, so a menu taller than
         // the footprint scrolls inside its own plate instead of walking its
         // clamped top edge back up over the picture ([`menu_floor`]).
-        let (at, room) = menu_floor(
-            menu.at,
-            viewport,
-            self.darkroom,
-            self.split_px(Split::Bench, viewport),
-        );
+        let (at, room) = menu_floor(menu.at, viewport, self.split_px(Split::Bench, viewport));
         let list_h = menu_rows_h(rows.len(), room);
         let (x, y) = menu_at(at, viewport, MENU_PAD * 2. + list_h);
         let full: SharedString = source
@@ -774,7 +419,7 @@ impl Player {
                     // One plate shape for all three hanging menus
                     // ([`menu_plate`]) -- the id is still this menu's own, so
                     // the details side keeps its tooltip.
-                    menu_plate("menu-card", x, y, darkroom)
+                    menu_plate("menu-card", x, y)
                         // Painted after the scrim, so this listener runs first
                         // (gpui bubbles mouse events in reverse, window.rs:3705)
                         // and a press meant for an item never closes the menu
@@ -818,7 +463,6 @@ impl Player {
         cx: &mut Context<Self>,
     ) -> Option<impl IntoElement> {
         let picker = self.picker?;
-        let darkroom = self.darkroom;
         let theme_picker = picker.of == Pick::Theme;
         let rows: Vec<AnyElement> = self
             .choices(picker.of)
@@ -842,7 +486,7 @@ impl Player {
                     .gap(px(12.))
                     .px(px(6.))
                     .rounded(px(3.))
-                    .when(darkroom, |d| {
+                    .map(|d| {
                         d.type_style(type_scale::label(
                             type_scale::LABEL_ROW_PX,
                             gpui::FontWeight::MEDIUM,
@@ -859,27 +503,19 @@ impl Player {
                     // plate grammar `context_card`/`library_card` already
                     // draw: one `raised` fill step for hover, `ink1` for the
                     // row in force, no second grey.
-                    .hover(|s| s.bg(rgb(if darkroom { DARK_RAISED() } else { BG_HOVER() })))
+                    .hover(|s| s.bg(rgb(DARK_RAISED())))
                     // The mark is a glyph as well as a highlight, like the
                     // export card's rows: a background alone is gone under a
                     // hover and invisible to anyone who cannot tell the two
                     // greys apart (WCAG 1.4.1).
                     .when(picked, |d| {
-                        d.bg(rgb(if darkroom {
-                            DARK_RAISED()
-                        } else {
-                            BG_SELECTED()
-                        }))
-                        .when(darkroom, |d| d.text_color(rgb(INK1())))
+                        d.bg(rgb(DARK_RAISED())).map(|d| d.text_color(rgb(INK1())))
                     })
                     // Where the keyboard is, said after the mark so the cursor
                     // is visible on the picked row too -- and as a border in
                     // the darkroom (DESIGN §4's 1px `ink1` focus ring) rather
                     // than a second grey nobody can tell from the first.
-                    .when(n == picker.sel, |d| match darkroom {
-                        true => d.border_1().border_color(rgb(INK1())),
-                        false => d.bg(rgb(BG_HOVER())),
-                    })
+                    .when(n == picker.sel, |d| d.border_1().border_color(rgb(INK1())))
                     .child(
                         div()
                             .flex()
@@ -899,13 +535,8 @@ impl Player {
                             .text_size(px(11.))
                             // On the picked row the dim ink sits on the
                             // highlight, where it is only 3.3:1 (WCAG 1.4.3).
-                            .text_color(rgb(match (darkroom, picked) {
-                                (true, true) => INK2(),
-                                (true, false) => INK3(),
-                                (false, true) => FG_PRIMARY(),
-                                (false, false) => FG_SECONDARY(),
-                            }))
-                            .when(darkroom, |d| {
+                            .text_color(rgb(if picked { INK2() } else { INK3() }))
+                            .map(|d| {
                                 d.type_style(type_scale::mono(
                                     type_scale::CHORD_METADATA_MIN_PX,
                                     gpui::FontWeight::MEDIUM,
@@ -925,12 +556,7 @@ impl Player {
             .collect();
         // The window's own room, and the list scrolls only where the window has
         // none -- the clip menu's rule, one function for both.
-        let (at, room) = menu_floor(
-            picker.at,
-            viewport,
-            darkroom,
-            self.split_px(Split::Bench, viewport),
-        );
+        let (at, room) = menu_floor(picker.at, viewport, self.split_px(Split::Bench, viewport));
         let list_h = menu_rows_h(rows.len(), room);
         let (x, y) = menu_at(at, viewport, MENU_PAD * 2. + list_h);
         Some(
@@ -954,7 +580,7 @@ impl Player {
                     }),
                 )
                 .child(
-                    menu_plate("picker-card", x, y, darkroom)
+                    menu_plate("picker-card", x, y)
                         // Painted after the scrim, so this listener runs first
                         // and a press meant for a row never closes the list out
                         // from under its own click (`context_card`).

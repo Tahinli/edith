@@ -7,17 +7,6 @@ use crate::*;
 /// eight is more than a user will ever answer in a row.
 pub(crate) const NOTICES_MAX: usize = 8;
 
-/// The narrowest a notice's *message* is allowed to be squeezed before its hint
-/// gives up the line and drops below it.
-///
-/// The bar is a message beside a hint, and at the 640x360 floor the picture
-/// region it hangs under is narrower than the hint alone -- so the message was
-/// squeezed to nothing and wrapped one character per line, which is a failure
-/// rendered as a column of letters. Wide enough that a line of it is a phrase
-/// rather than a word ladder, and narrow enough to still fit beside the hint in
-/// any window worth putting two things on a line in.
-pub(crate) const NOTICE_MIN_W: f32 = 180.;
-
 /// The whole of the queue's policy, where it can be read at once and tested
 /// without a window: dedupe against the back, a ceiling, oldest out first --
 /// except an export's own outcome, which jumps to the front. [`Player::notify_user`]
