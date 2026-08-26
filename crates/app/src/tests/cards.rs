@@ -984,11 +984,17 @@ fn the_sound_row_carries_its_rate_into_both_kinds_of_file() {
     assert!(audio_rate_choices(7).iter().all(|(.., picked)| !picked));
 }
 
+/// The shape [`NumberEdit`] is opened in for a bitrate: `(value, MBPS_MIN,
+/// MBPS_MAX, MBPS_DIGITS, "Mbps")`, same as `Player::edit_mbps`.
+fn mbps_edit(value: u32) -> NumberEdit {
+    NumberEdit::new(value, MBPS_MIN, MBPS_MAX, MBPS_DIGITS, "Mbps")
+}
+
 #[test]
 fn a_typed_bitrate_is_a_field_and_not_a_key_capture() {
     // It opens on the number in force, so backspace edits that number
     // rather than the field starting empty over a bitrate still being used.
-    let mut edit = NumberEdit::new(12);
+    let mut edit = mbps_edit(12);
     assert_eq!(edit.text, "12");
     edit.backspace();
     edit.digit(8);
@@ -996,11 +1002,11 @@ fn a_typed_bitrate_is_a_field_and_not_a_key_capture() {
     assert_eq!(edit.commit(), Some(18));
     // A card nobody has typed a number into opens empty: zero is not a
     // bitrate anyone chose.
-    assert_eq!(NumberEdit::new(0).text, "");
+    assert_eq!(mbps_edit(0).text, "");
 
     // Out of range is refused *in words* and the digits stay put: clamping
     // 55 to 50 would write a bitrate the user never typed.
-    let mut edit = NumberEdit::new(0);
+    let mut edit = mbps_edit(0);
     for digit in [5, 5] {
         edit.digit(digit);
     }
@@ -1022,7 +1028,7 @@ fn a_typed_bitrate_is_a_field_and_not_a_key_capture() {
     assert_eq!(commit_mbps("1"), Ok(MBPS_MIN));
     assert_eq!(commit_mbps("50"), Ok(MBPS_MAX));
     assert!(commit_mbps("51").is_err());
-    let mut edit = NumberEdit::new(0);
+    let mut edit = mbps_edit(0);
     for digit in [9, 9, 9, 9] {
         edit.digit(digit);
     }
@@ -1035,18 +1041,18 @@ fn a_typed_bitrate_is_a_field_and_not_a_key_capture() {
 
     // The arrows step inside the range and stop at both ends: a walk
     // through the legal numbers, never a way out of them.
-    let mut edit = NumberEdit::new(0);
+    let mut edit = mbps_edit(0);
     edit.step(1);
     assert_eq!(edit.text, MBPS_MIN.to_string(), "empty starts at the floor");
     edit.step(-1);
     assert_eq!(edit.text, MBPS_MIN.to_string());
-    let mut edit = NumberEdit::new(MBPS_MAX);
+    let mut edit = mbps_edit(MBPS_MAX);
     edit.step(1);
     assert_eq!(edit.text, MBPS_MAX.to_string());
     edit.step(-1);
     assert_eq!(edit.text, (MBPS_MAX - 1).to_string());
     // A step past a refused number clears the refusal with it.
-    let mut edit = NumberEdit::new(0);
+    let mut edit = mbps_edit(0);
     edit.digit(5);
     edit.digit(5);
     assert_eq!(edit.commit(), None);
@@ -1056,12 +1062,46 @@ fn a_typed_bitrate_is_a_field_and_not_a_key_capture() {
 
     // The hint the field shows when there is nothing to refuse names both
     // ways out of it.
-    let detail = NumberEdit::new(6).detail();
+    let detail = mbps_edit(6).detail();
     assert!(
         detail.contains("enter") && detail.contains("esc"),
         "{detail}"
     );
     assert!(detail.starts_with("6▏"), "{detail}");
+}
+
+/// DEBT #111: the transition duration row's field is the same [`NumberEdit`]
+/// opened `(frames, 0, cap, ..)`, the shape [`Player::edit_transition`]
+/// builds it in -- but it clamps on commit instead of refusing, because the
+/// row's own stepper (`Player::nudge_transition`, backed by
+/// `set_transition_out`/`crossfade`) already clamps to `cap` in silence, and
+/// a typed number holding itself to a stricter rule than the mouse door
+/// would be a field disagreeing with its own stepper.
+#[test]
+fn a_typed_transition_duration_clamps_like_its_own_stepper() {
+    let cap = 24;
+    let digits = cap.to_string().chars().count() + 1;
+    // Opens on the frame count already in force, same as the bitrate field.
+    let mut edit = NumberEdit::new(10, 0, cap, digits, "frames");
+    assert_eq!(edit.text, "10");
+    // A number past the cap clamps to it rather than being refused -- the
+    // stepper's own ceiling, reached by a different door.
+    edit.backspace();
+    edit.backspace();
+    for digit in [9, 9] {
+        edit.digit(digit);
+    }
+    assert_eq!(edit.text, "99");
+    assert_eq!(
+        edit.commit_clamped(),
+        cap,
+        "clamped to the same cap the stepper stops at"
+    );
+    assert_eq!(edit.refusal, None, "clamping is not a refusal");
+    // Empty commits to the floor, not a parse failure -- there is no number
+    // typed that is not zero or more frames.
+    let mut edit = NumberEdit::new(0, 0, cap, digits, "frames");
+    assert_eq!(edit.commit_clamped(), 0);
 }
 
 /// [`crate::ui::dock_stance::transition_of`]: the dock's duration row
