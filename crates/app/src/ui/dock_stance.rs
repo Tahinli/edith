@@ -1084,6 +1084,60 @@ fn sources_tab(
 /// these onto. Drag-while-playing and every other gesture on a row is
 /// whatever that card already does; nothing about the gesture is reimplemented
 /// here.
+/// The transition duration row, in the darkroom's own idiom: the darkroom is
+/// the default surface (`main.rs`'s `OLD_GUI` gate), so a row that only ever
+/// drew in the legacy inspector (`ui::inspector::transition_duration_row`)
+/// was a control a shipped user could never reach after a dissolve
+/// (ctrl+x) or crossfade (ctrl+f). Same facts as that row --
+/// [`ui::inspector::transition_of`] picks the anchor's transition and its cap,
+/// [`Player::nudge_transition`] does the clamped step -- only the paint is
+/// this tab's own (`ghost_verb`'s row height and ink tokens, not legacy grey).
+fn transition_row(player: &Player, cx: &mut Context<Player>) -> Option<impl IntoElement> {
+    let (lane, idx) = player.selected.anchor()?;
+    let session = player.session.as_ref()?;
+    let clips = session.lane_clips(lane);
+    let (label_text, frames, cap) =
+        crate::ui::inspector::transition_of(lane.kind, clips.get(idx)?, clips.get(idx + 1))?;
+    let label_style = label(type_scale::LABEL_ROW_PX, FontWeight::MEDIUM);
+    let step = |id: &'static str, glyph: &'static str, by: i32, cx: &mut Context<Player>| {
+        div()
+            .id(id)
+            .flex()
+            .w(px(HIT_MIN))
+            .h(px(HIT_MIN))
+            .items_center()
+            .justify_center()
+            .rounded(px(3.))
+            .bg(rgb(DARK_RAISED()))
+            .cursor_pointer()
+            .hover(|s| s.text_color(rgb(INK1())))
+            .children(hitmap::control(id, id, true))
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                this.nudge_transition(lane, idx, by, cx);
+            }))
+            .child(glyph)
+    };
+    Some(
+        div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .h(px(CONTROL_H))
+            .px(px(8.))
+            .child(
+                div()
+                    .flex_1()
+                    .font(label_style.font)
+                    .text_size(label_style.size)
+                    .text_color(rgb(INK2()))
+                    .child(format!("{label_text} {frames}f (of {cap}f offered)")),
+            )
+            .child(step("transition-minus", "−", -1, cx))
+            .child(step("transition-plus", "+", 1, cx)),
+    )
+}
+
 fn clip_tab(
     player: &Player,
     width: f32,
@@ -1210,6 +1264,7 @@ fn clip_tab(
                     cx.listener(|this, _: &ClickEvent, _, cx| this.cycle_fit(cx)),
                 )),
         )
+        .children(transition_row(player, cx))
         .child(
             div()
                 .id("dock-clip-rows")
