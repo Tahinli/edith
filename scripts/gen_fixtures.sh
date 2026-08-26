@@ -489,6 +489,13 @@ ffmpeg -y -f lavfi -i "sine=frequency=440:duration=3:sample_rate=48000" \
     -f lavfi -i "anullsrc=r=48000:cl=quad:d=3" \
     -filter_complex "[0:a][1:a][2:a][3:a][4:a]join=inputs=5:channel_layout=7.1:map=0.0-FL|4.0-FR|1.0-FC|2.0-LFE|4.1-BL|4.2-BR|4.3-SL|3.0-SR[a]" \
     -map "[a]" -c:a libopus -b:a 320k assets/test_opus_71.mka
+# ...and standalone AC-3 in an `.mka`: the same syntax `test_ac3.mkv` carries,
+# with no picture at all, which is DEBT #64's shape -- an AC-3 soundtrack
+# ripped to its own Matroska file rather than left beside a video track. Read
+# through the same [`MkvAc3Track`] door `.mkv` uses (`crate::demux::is_matroska`
+# admits `.mka`), not symphonia, which has no AC-3 decoder.
+ffmpeg -y -f lavfi -i "sine=frequency=440:duration=2:sample_rate=44100" \
+    -c:a ac3 -b:a 192k -ac 2 assets/test_ac3.mka
 # Still-image fixture: the source with a picture and no timeline in it. Two
 # bands rather than one colour, so a test can tell top from bottom (a flipped
 # decode) and red from blue (a swapped channel order); 640x360, which is 16:9

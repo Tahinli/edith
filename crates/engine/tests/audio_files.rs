@@ -110,6 +110,29 @@ fn every_container_decodes_the_same_three_second_tone() {
     }
 }
 
+/// DEBT #64: an AC-3 soundtrack ripped to its own `.mka`, with no video track
+/// at all. `crate::demux::is_matroska` already admits `.mka` (it has since
+/// 810ded2, 2026-08-12), so `Track::open` already takes this file down the
+/// same [`MkvAc3Track`] door `test_ac3.mkv` uses -- the debt's routing gap was
+/// already closed, this was just never proven by a fixture. If `is_matroska`
+/// ever lost `.mka` again, this file would fall through to `SymTrack`, whose
+/// `mkv` reader has no AC-3 decoder, and `decode` below would panic on "the
+/// fixture has audio". 2 s of 440 Hz at 44.1k stereo, unpulsed (a plain sine,
+/// not the CONTAINERS envelope), so a non-silent sample anywhere in the
+/// middle is enough.
+#[test]
+fn an_ac3_track_with_no_picture_opens_out_of_an_mka() {
+    let (rate, channels, samples) = decode(&asset("test_ac3.mka"));
+    assert_eq!((rate, channels), (44100, 2), "test_ac3.mka");
+    let secs = samples.len() as f64 / f64::from(rate) / f64::from(channels);
+    assert!((secs - 2.0).abs() < 0.2, "test_ac3.mka: {secs:.3} s, want 2.0");
+    let mid = samples.len() / 2;
+    let peak = samples[mid..][..channels as usize * 64]
+        .iter()
+        .fold(0.0f32, |peak, s| peak.max(s.abs()));
+    assert!(peak > 0.01, "test_ac3.mka: decoded to silence, peak {peak}");
+}
+
 /// The length a placement is built from, which is the only frame count a file
 /// with no picture has.
 #[test]
