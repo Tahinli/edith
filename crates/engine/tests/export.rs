@@ -911,6 +911,87 @@ fn assert_no_single_stream_span_over(path: &Path, seconds: f64) {
     }
 }
 
+/// The first `pts_time` ffprobe reports for stream kind `select` ("v" or
+/// "a") in `path` -- just enough of [`assert_no_single_stream_span_over`]'s
+/// ffprobe call, restricted to one stream, to check A/V sync independently of
+/// the interleave order.
+fn first_pts(path: &Path, select: &str) -> f64 {
+    let output = std::process::Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            select,
+            "-show_entries",
+            "packet=pts_time",
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(path)
+        .output()
+        .expect("run ffprobe");
+    assert!(
+        output.status.success(),
+        "ffprobe failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find(|line| !line.is_empty())
+        .expect("stream has at least one packet")
+        .parse()
+        .expect("pts_time")
+}
+
+/// An mp4 export used to write every video sample and only then the whole
+/// audio track: byte-correct, and silent for as long as the picture took on
+/// any player that reads the file as it streams in rather than seeking to the
+/// end first. This proves the interleave holds on the real, threaded export
+/// path end to end -- `mp4_interleaves_a_mix_that_lands_early_under_the_rest_of_the_picture`
+/// above pins the same boundary by writing straight to `Mp4Muxer`, forcing the
+/// mix to land early rather than racing the mixer thread for it.
+#[test]
+fn mp4_audio_interleaves_with_the_picture() {
+    let _seat = pin_software();
+    let source = asset("test_av.mp4");
+    let mut session = PlaybackSession::open(&source).expect("open source");
+    // A cut, so the audio copy runs as two segments and the join is real --
+    // the same edit `exports_audio_alongside_the_video` makes, reused here so
+    // the interleave is proven on a timeline that was actually cut, not a
+    // straight passthrough.
+    assert!(session.cut_at(2.0));
+    session.pause();
+    let timeline = session.timeline_duration();
+    let out = out_path("interleave-e2e");
+
+    let handle = session.export_to(&out);
+    wait(&handle, Duration::from_secs(600)).expect("export");
+
+    // A/V sync: the first audio sample starts at movie time zero either way --
+    // interleaving moves *where in the file* a packet sits, never what `stts`
+    // says it plays at.
+    assert_eq!(first_pts(&out, "a"), 0.0, "first audio pts is media time zero");
+
+    assert_no_single_stream_span_over(&out, 2.0);
+
+    // Nothing else about the file moved: same duration, same sample counts,
+    // to within the packet the two sibling tests above already allow.
+    let (video_meta, _) = engine::demux::Demuxer::open(&out).unwrap();
+    assert_eq!(video_meta.frame_count, 150, "video track unaffected by interleaving");
+    let (audio_meta, chunks) = engine::AudioSession::open(&out)
+        .unwrap()
+        .expect("export has an audio track");
+    assert_eq!((audio_meta.sample_rate, audio_meta.channels), (44_100, 2));
+    let decoded: usize = chunks.into_iter().map(|c| c.samples.len()).sum();
+    let wanted = timeline * f64::from(audio_meta.sample_rate);
+    assert!(
+        (decoded as f64 / f64::from(audio_meta.channels) - wanted).abs() < 3.0 * 1024.0,
+        "audio length {decoded} drifted from {wanted} samples of timeline"
+    );
+
+    std::fs::remove_file(&out).unwrap();
+}
+
 /// A timeline whose *first* second of sound was lifted. A reader drops the
 /// first packet of an AAC track as encoder priming, so a track that opens on a
 /// hole has to carry one extra packet of silence for it to drop -- without it
