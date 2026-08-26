@@ -46,14 +46,17 @@ impl Player {
         let Some(session) = self.preview_session.as_mut().or(self.session.as_mut()) else {
             return;
         };
-        // Loop-trim (DESIGN.md §6): the transport is kept inside the subject
-        // cut's own span while the mode is on, so a trim can be heard and
-        // seen without a manual replay after every nudge. Checked off the
-        // engine's own clock, not a frame counter this pump keeps -- the
-        // same `now()` [`Player::step`] reads.
-        if session.is_playing() && should_loop_restart(frame_at(session.now(), fps), self.loop_trim)
+        // Loop-trim and the i/o range (DESIGN.md §6): the transport is kept
+        // inside the active window while one is armed, so a trim or a marked
+        // range can be heard and seen without a manual replay after every
+        // nudge. The range wins over the trim when both are set
+        // ([`active_loop_window`]). Checked off the engine's own clock, not
+        // a frame counter this pump keeps -- the same `now()`
+        // [`Player::step`] reads.
+        let loop_window = active_loop_window(self.loop_on, self.range, self.loop_trim);
+        if session.is_playing() && should_loop_restart(frame_at(session.now(), fps), loop_window)
         {
-            let start = self.loop_trim.map_or(0, |(lo, _)| lo);
+            let start = loop_window.map_or(0, |(lo, _)| lo);
             session.seek(f64::from(start) / fps);
         }
         // Whether the span now decoding has yet to hand over a picture, read
@@ -172,6 +175,10 @@ impl Player {
             // whole-timeline loop already used, so that race has nothing
             // left to win: reaching the end while *either* loop is armed
             // restarts rather than halts, regardless of which one owns it.
+            // A bare i/o range never arms this crossing on its own -- it is
+            // an export mark first ([`active_loop_window`]) -- so `range`
+            // only ever widens `armed` through the `loop_on`/`loop_trim`
+            // terms already here, never past them.
             let armed = self.loop_on || self.loop_trim.is_some();
             if crosses_into_loop(was, Transport::Ended, armed) {
                 // The same door the restart button and key use
@@ -179,7 +186,8 @@ impl Player {
                 // spends only on a repaint -- the pump is already inside one.
                 // One seam of a one-frame seam: the restart is a fresh seek
                 // and its reopen, not a gapless splice.
-                let start = loop_restart_frame(self.loop_on, self.loop_trim).unwrap_or(0);
+                let start =
+                    loop_restart_frame(self.loop_on, self.range, self.loop_trim).unwrap_or(0);
                 if let Some(session) = self.active_session_mut() {
                     session.seek(f64::from(start) / fps);
                 }
@@ -246,7 +254,7 @@ impl Player {
         // ...and the shadow a drag is drawn under promises a landing on a lane
         // this edit has just reshaped. The next move of the drag draws it
         // again; until then it says nothing.
-        self.ghost = None;
+        self.ghost.clear();
     }
 
     /// Jumps the timeline.
@@ -474,20 +482,45 @@ mod tests {
     }
 
     /// `loop_restart_frame` picks the seek target the crossing above plays
-    /// from: the trim window's near edge when one is armed (it wins over the
-    /// whole-timeline loop when both happen to be set), the top of the
-    /// timeline for the whole-timeline loop alone, and no restart at all
-    /// with neither armed.
+    /// from: the i/o range's near edge when one is armed and set (it wins
+    /// over both the trim window and the whole-timeline loop), the trim
+    /// window's near edge next, the top of the timeline for the
+    /// whole-timeline loop alone, and no restart at all with nothing armed.
     #[test]
     fn loop_restart_frame_prefers_the_trim_window_then_the_whole_timeline_then_nothing() {
-        assert_eq!(loop_restart_frame(false, Some((30, 60))), Some(30));
+        assert_eq!(loop_restart_frame(false, None, Some((30, 60))), Some(30));
         assert_eq!(
-            loop_restart_frame(true, Some((30, 60))),
+            loop_restart_frame(true, None, Some((30, 60))),
             Some(30),
             "the trim window wins over the whole-timeline loop"
         );
-        assert_eq!(loop_restart_frame(true, None), Some(0));
-        assert_eq!(loop_restart_frame(false, None), None);
+        assert_eq!(loop_restart_frame(true, None, None), Some(0));
+        assert_eq!(loop_restart_frame(false, None, None), None);
+        // The i/o range beats the trim window when both are set...
+        assert_eq!(
+            loop_restart_frame(true, Some((10, 20)), Some((30, 60))),
+            Some(10),
+            "the marked range wins over the subject-cut trim"
+        );
+        // ...and a range alone, with loop off and no trim, never arms a
+        // restart at all -- it is an export mark first.
+        assert_eq!(
+            loop_restart_frame(false, Some((10, 20)), None),
+            None,
+            "a bare i/o range must not start looping un-looped playback"
+        );
+        // Clearing the range falls back to the trim window, then to the
+        // whole timeline.
+        assert_eq!(
+            loop_restart_frame(true, None, Some((30, 60))),
+            Some(30),
+            "clearing the range falls back to the trim window"
+        );
+        assert_eq!(
+            loop_restart_frame(true, None, None),
+            Some(0),
+            "clearing both the range and the trim falls back to the whole timeline"
+        );
     }
 
     /// The bug this session fixed: a loop-trim window whose far edge (60)
@@ -509,7 +542,7 @@ mod tests {
             Transport::Ended,
             armed
         ));
-        assert_eq!(loop_restart_frame(loop_on, loop_trim), Some(30));
+        assert_eq!(loop_restart_frame(loop_on, None, loop_trim), Some(30));
     }
 
     /// A loop window sitting entirely before the film's end never reaches
