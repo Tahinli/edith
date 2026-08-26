@@ -489,7 +489,7 @@ impl Player {
         }
         self.mark_dirty();
         self.snap_cue = None;
-        self.ghost = None;
+        self.ghost.clear();
         let at = self.place_frame(x).0;
         // What the mark is on, before the lane is renumbered: a caption's start
         // frame is its name on its lane ([`sub_mark`]).
@@ -577,7 +577,7 @@ impl Player {
         }
         self.mark_dirty();
         self.snap_cue = None;
-        self.ghost = None;
+        self.ghost.clear();
         let Some(idx) = self.dragged_sub(drag) else {
             return;
         };
@@ -753,7 +753,7 @@ impl Player {
             tint: CLIP_TEXT(),
             refused: to.kind != LaneKind::Subtitle,
         };
-        self.set_ghost(Some(ghost), cx);
+        self.set_ghost(vec![ghost], cx);
     }
 
     /// The same for a palette row on its way down: it lands at the frame it is
@@ -773,7 +773,7 @@ impl Player {
             tint: CLIP_TEXT(),
             refused: to.kind != LaneKind::Subtitle,
         };
-        self.set_ghost(Some(ghost), cx);
+        self.set_ghost(vec![ghost], cx);
     }
 
     /// Where a clip let go at window `x` over lane `to` wants its head: the
@@ -863,6 +863,15 @@ impl Player {
     /// are one answer -- and its own length at this zoom. A lane of the other
     /// kind refuses the drop ([`Project::move_clip`]), and the shadow says so
     /// before the release does.
+    ///
+    /// When the dragged clip is itself one of a multi-pick selection (the same
+    /// `set_move` test [`Player::move_clip`] commits by), every other pick
+    /// draws its own shadow too, at the delta the anchor above is landing at --
+    /// [`Project::move_selection`]'s own clamp is not reread here, so a wall
+    /// that would narrow the group's travel is seen only at the release, not
+    /// in the shadow; the anchor's own room is still exact; corner-cut, ceiling
+    /// a shadow a member or two too wide on a tight bed, upgrade is exposing
+    /// `move_room` to preview against.
     pub(crate) fn preview_ghost(
         &mut self,
         drag: &ClipDrag,
@@ -870,17 +879,46 @@ impl Player {
         x: Pixels,
         cx: &mut Context<Self>,
     ) {
-        let ghost = self
-            .dragged(drag)
-            .and_then(|idx| self.drop_frame(drag.lane, idx, x))
-            .map(|(start, _)| Ghost {
-                lane: to,
-                start,
-                frames: drag.clip.frames(),
-                tint: self.clip_tint(drag.clip.source),
-                refused: drag.lane.kind != to.kind,
-            });
-        self.set_ghost(ghost, cx);
+        let Some(idx) = self.dragged(drag) else {
+            self.set_ghost(Vec::new(), cx);
+            return;
+        };
+        let Some((start, _)) = self.drop_frame(drag.lane, idx, x) else {
+            self.set_ghost(Vec::new(), cx);
+            return;
+        };
+        let anchor = Ghost {
+            lane: to,
+            start,
+            frames: drag.clip.frames(),
+            tint: self.clip_tint(drag.clip.source),
+            refused: drag.lane.kind != to.kind,
+        };
+        let mut ghosts = vec![anchor];
+        if self.selected.contains((drag.lane, idx)) && self.selected.len() > 1 {
+            let delta = i64::from(start) - i64::from(drag.clip.start);
+            for &(lane, i) in self.selected.picks() {
+                if (lane, i) == (drag.lane, idx) {
+                    continue;
+                }
+                let Some(clip) = self
+                    .session
+                    .as_ref()
+                    .and_then(|session| session.lane_clips(lane).get(i).copied())
+                else {
+                    continue;
+                };
+                let want = (i64::from(clip.start) + delta).max(0) as u32;
+                ghosts.push(Ghost {
+                    lane,
+                    start: want,
+                    frames: clip.frames(),
+                    tint: self.clip_tint(clip.source),
+                    refused: anchor.refused,
+                });
+            }
+        }
+        self.set_ghost(ghosts, cx);
     }
 
     /// The line the track in the hand would drop into, on the row the pointer
@@ -944,7 +982,7 @@ impl Player {
             tint: file_tint(self.sources(), path).unwrap_or(BG_RAISED()),
             refused: lane_refuses(path, to).is_some(),
         };
-        self.set_ghost(Some(ghost), cx);
+        self.set_ghost(vec![ghost], cx);
     }
 
     /// Sets the shadow, or takes it away, repainting only when it moved -- the
@@ -952,7 +990,7 @@ impl Player {
     /// root and set again by the lane under the pointer, in that order (gpui
     /// runs the capture phase parent-first), so a pointer over no lane at all
     /// leaves nothing drawn.
-    pub(crate) fn set_ghost(&mut self, ghost: Option<Ghost>, cx: &mut Context<Self>) {
+    pub(crate) fn set_ghost(&mut self, ghost: Vec<Ghost>, cx: &mut Context<Self>) {
         if ghost != self.ghost {
             self.ghost = ghost;
             cx.notify();

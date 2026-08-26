@@ -1124,6 +1124,8 @@ fn lane_row(
                 .children(
                     player
                         .ghost
+                        .iter()
+                        .copied()
                         .filter(|g| g.lane == lane && cx.has_active_drag())
                         .map(|g| {
                             div()
