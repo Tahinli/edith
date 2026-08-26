@@ -309,11 +309,54 @@ impl ToneMapper {
         if y.len() < width * height || u.len() < cw * ch || v.len() < cw * ch {
             return;
         }
+        let y = &mut y[..width * height];
+        let u = &mut u[..cw * ch];
+        let v = &mut v[..cw * ch];
+
+        // One lane's worth of bands is independent of every other's -- a band
+        // reads only its own chroma samples and its own two luma rows -- so
+        // the band loop below (`map_bands`) fans out over the machine's cores
+        // the same way `HevcEnc::code_batch` does: `std::thread::scope`,
+        // borrowing the planes rather than copying them, one contiguous run
+        // of bands per lane. A frame with fewer chroma rows than cores, or a
+        // machine that only reports one, just runs the whole thing here.
+        let lanes = std::thread::available_parallelism()
+            .map_or(1, |n| n.get())
+            .min(ch);
+        if lanes <= 1 {
+            self.map_bands(y, u, v, width, cw);
+            return;
+        }
+        let bands_per_lane = ch.div_ceil(lanes);
+        std::thread::scope(|scope| {
+            let (mut y_rest, mut u_rest, mut v_rest) = (y, u, v);
+            let mut band = 0;
+            while band < ch {
+                let take = bands_per_lane.min(ch - band);
+                // The last lane's last band is one row short on an odd
+                // frame, which is the only reason `y`'s chunk isn't simply
+                // `take * 2 * width`.
+                let y_len = (take * 2 * width).min(y_rest.len());
+                let u_len = take * cw;
+                let (y_chunk, y_remain) = y_rest.split_at_mut(y_len);
+                let (u_chunk, u_remain) = u_rest.split_at_mut(u_len);
+                let (v_chunk, v_remain) = v_rest.split_at_mut(u_len);
+                (y_rest, u_rest, v_rest) = (y_remain, u_remain, v_remain);
+                scope.spawn(move || self.map_bands(y_chunk, u_chunk, v_chunk, width, cw));
+                band += take;
+            }
+        });
+    }
+
+    /// One contiguous run of bands: the loop `map` used to run over the whole
+    /// frame, unchanged, just handed a slice that may be the whole plane or
+    /// one lane's share of it.
+    fn map_bands(&self, y: &mut [u8], u: &mut [u8], v: &mut [u8], width: usize, cw: usize) {
         // Row slices rather than indices: the plane bounds are checked once per
         // band, not once per sample, which is most of the difference between
         // this and a frame's time budget.
-        let bands = y[..width * height].chunks_mut(2 * width);
-        let chroma_rows = u[..cw * ch].chunks_mut(cw).zip(v[..cw * ch].chunks_mut(cw));
+        let bands = y.chunks_mut(2 * width);
+        let chroma_rows = u.chunks_mut(cw).zip(v.chunks_mut(cw));
         for (band, (u_row, v_row)) in bands.zip(chroma_rows) {
             // The bottom half is empty on an odd frame's last band.
             let (top, bottom) = band.split_at_mut(width.min(band.len()));
