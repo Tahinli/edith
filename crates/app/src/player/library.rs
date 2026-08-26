@@ -621,10 +621,15 @@ impl Player {
     /// film's stand-in has asked, and is told by the row how far it has got.
     pub(crate) fn start_proxy_for(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
         let path = path.to_path_buf();
-        self.proxies.insert(path.clone(), Proxy::Asked);
+        // The same flag [`engine::proxy::generate_if_wanted`] polls at the door
+        // and around the header read: a click on the row while the header is
+        // still being walked ([`Player::toggle_proxy`]'s `Asked` arm) sets it,
+        // so the walk unwinds mid-read instead of running to completion.
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.proxies.insert(path.clone(), Proxy::Asked(cancel.clone()));
         let started = cx.background_executor().spawn({
             let path = path.clone();
-            async move { engine::proxy::generate_if_wanted(&path) }
+            async move { engine::proxy::generate_if_wanted(&path, &cancel) }
         });
         cx.spawn(async move |this, cx| {
             let started = started.await;
@@ -636,7 +641,7 @@ impl Player {
                 // half of a click made during the ask is an encoder nothing in
                 // the map can reach -- and it finishes minutes later and puts
                 // back the stand-in somebody switched off.
-                let stopped = !matches!(this.proxies.get(&path), Some(Proxy::Asked));
+                let stopped = !matches!(this.proxies.get(&path), Some(Proxy::Asked(_)));
                 let state = match started {
                     // Cancelled and *held*, exactly as a stop of a running one
                     // is: the worker's own answer is what settles it, so an
@@ -710,7 +715,11 @@ impl Player {
             Some(Proxy::Making(_)) => self.cancel_proxy(path, cx),
             // Already winding down: the second click on a stop is nothing.
             Some(Proxy::Cancelling(_)) => {}
-            Some(Proxy::Asked) => {
+            Some(Proxy::Asked(cancel)) => {
+                // Wakes the header read mid-walk ([`engine::proxy::started`]):
+                // without this the stop only ever landed once the read had
+                // already run to completion on its own (DEBT #91).
+                cancel.store(true, std::sync::atomic::Ordering::Release);
                 engine::proxy::set_off(path, true);
                 self.proxies.insert(path.to_path_buf(), Proxy::Cancelled);
                 let text = format!("STOPPING the stand-in for {}…", file_name(path));
@@ -860,7 +869,7 @@ impl Player {
     pub(crate) fn in_flight_proxies(&self) -> usize {
         self.proxies
             .values()
-            .filter(|p| matches!(p, Proxy::Asked | Proxy::Making(_) | Proxy::Cancelling(_)))
+            .filter(|p| matches!(p, Proxy::Asked(_) | Proxy::Making(_) | Proxy::Cancelling(_)))
             .count()
     }
 
