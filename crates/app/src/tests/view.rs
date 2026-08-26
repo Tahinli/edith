@@ -891,3 +891,45 @@ fn the_zoom_button_says_how_much_is_on_the_bed() {
     assert_eq!(secs_label(1. / 60.), "0.02s");
     assert_eq!(secs_label(4.5), "4.5s");
 }
+
+/// Keyboard focus v1 (`ui::stance::{Surface, next_surface, is_focus_cycle_key}`):
+/// Tab walks dock -> bench -> inspector -> dock, wrapping; Shift-Tab walks
+/// it backward. No gpui window harness exists in this crate to drive a real
+/// `KeyDownEvent` through -- this exercises the exact pure function every
+/// surface's `on_key_down` calls, which is where the cycle order actually
+/// lives.
+#[test]
+fn tab_cycles_dock_bench_inspector_and_wraps() {
+    use crate::ui::stance::{Surface, next_surface};
+
+    assert_eq!(next_surface(Surface::Dock, false), Surface::Bench);
+    assert_eq!(next_surface(Surface::Bench, false), Surface::Inspector);
+    assert_eq!(next_surface(Surface::Inspector, false), Surface::Dock);
+
+    // Shift-Tab is the exact reverse at every step.
+    assert_eq!(next_surface(Surface::Dock, true), Surface::Inspector);
+    assert_eq!(next_surface(Surface::Inspector, true), Surface::Bench);
+    assert_eq!(next_surface(Surface::Bench, true), Surface::Dock);
+}
+
+/// The root fallback guarantee (main.rs:1054's "every keybind hangs off the
+/// root FocusHandle"): a surface's own `on_key_down` answers Tab/Shift-Tab
+/// and nothing else -- `cx.stop_propagation()` is only ever reached from
+/// that one branch (`ui::stance::is_focus_cycle_key`), so every other key,
+/// still-pressed while a surface is focused, is left un-stopped and bubbles
+/// up the dispatch tree to the root's own `on_key_down`
+/// (gpui-0.2.2 `window.rs`'s `dispatch_key_down_up_event`, `Bubble` phase,
+/// walks the focused node's ancestors and stops only at
+/// `cx.stop_propagation()` -- verified by reading that function, not
+/// assumed). This asserts the gate itself: only "tab" is ever intercepted,
+/// so a keybind like space (play/pause) or "s" (split) is provably never
+/// swallowed by a focused surface.
+#[test]
+fn only_tab_is_intercepted_by_a_focused_surface_everything_else_reaches_root() {
+    use crate::ui::stance::is_focus_cycle_key;
+
+    assert!(is_focus_cycle_key("tab"));
+    for key in ["space", "escape", "s", "c", "left", "right", "enter", "delete", "?"] {
+        assert!(!is_focus_cycle_key(key), "{key} must bubble to the root");
+    }
+}

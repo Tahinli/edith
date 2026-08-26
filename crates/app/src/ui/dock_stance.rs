@@ -12,6 +12,7 @@
 //! [`clip_middle`]...), only the anatomy around them is new.
 
 use crate::ui::hitmap;
+use crate::ui::stance::{Surface, is_focus_cycle_key, next_surface};
 use crate::ui::type_scale::{self, Typeset, head, label, mono};
 use crate::*;
 use gpui::FontWeight;
@@ -817,7 +818,12 @@ fn subtitle_palette(player: &Player, cx: &mut Context<Player>) -> Option<AnyElem
 /// filter, sort chips, rows, IMPORT, hint -- none of it the legacy
 /// Media/Audio/Text panel `library.rs` draws. That panel's row facts
 /// ([`library_rows`]) are still what every row here is built from.
-fn sources_tab(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
+fn sources_tab(
+    player: &Player,
+    window: &mut Window,
+    cx: &mut Context<Player>,
+) -> impl IntoElement {
+    let focused = player.focus_dock.is_focused(window);
     let sources = player
         .session
         .as_ref()
@@ -862,6 +868,11 @@ fn sources_tab(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
     let filter_text: SharedString = player.dock_filter.clone().into();
     div()
         .id("dock-sources")
+        .track_focus(&player.focus_dock)
+        .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+            cycle_on_key_down(Surface::Dock)(this, event, window, cx)
+        }))
+        .when(focused, |d| d.border_1().border_color(rgb(STROKE_FOCUS())))
         .flex_1()
         .min_h(px(0.))
         .flex()
@@ -1077,8 +1088,10 @@ fn clip_tab(
     player: &Player,
     width: f32,
     window_size: Size<Pixels>,
+    window: &mut Window,
     cx: &mut Context<Player>,
 ) -> impl IntoElement {
+    let focused = player.focus_inspector.is_focused(window);
     // The room actually given here, not the window's: `eq_card_w`/
     // `card_max_w` are asked "how wide may I draw" and answered with the
     // *whole viewport's* width when handed `window_size` verbatim -- but this
@@ -1099,6 +1112,11 @@ fn clip_tab(
         && !player.subtitle_style_open;
     div()
         .id("dock-clip")
+        .track_focus(&player.focus_inspector)
+        .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+            cycle_on_key_down(Surface::Inspector)(this, event, window, cx)
+        }))
+        .when(focused, |d| d.border_1().border_color(rgb(STROKE_FOCUS())))
         .flex_1()
         .min_h(px(0.))
         .flex()
@@ -1257,6 +1275,7 @@ pub(crate) fn render(
     player: &Player,
     width: f32,
     window_size: Size<Pixels>,
+    window: &mut Window,
     cx: &mut Context<Player>,
 ) -> impl IntoElement {
     let src_active = player.dock_src_active;
@@ -1279,7 +1298,26 @@ pub(crate) fn render(
                 .child(dock_tab("dock-tab-clip", "CLIP", !src_active, cx)),
         )
         .child(match src_active {
-            true => sources_tab(player, cx).into_any_element(),
-            false => clip_tab(player, width, window_size, cx).into_any_element(),
+            true => sources_tab(player, window, cx).into_any_element(),
+            false => clip_tab(player, width, window_size, window, cx).into_any_element(),
         })
+}
+
+/// The Tab/Shift-Tab handler shared by the dock's two tabs (`sources_tab`'s
+/// "dock/library" and `clip_tab`'s "inspector") -- only [`is_focus_cycle_key`]
+/// is ever answered here; every other key is left un-stopped so it bubbles
+/// to the room's root handler (`ui::stance::render`'s `on_key_down`), which
+/// is the one every other keybind, Tab included when nothing in the ring
+/// has focus yet, still hangs off.
+fn cycle_on_key_down(
+    surface: Surface,
+) -> impl Fn(&mut Player, &KeyDownEvent, &mut Window, &mut Context<Player>) + 'static {
+    move |this, event, window, cx| {
+        if is_focus_cycle_key(event.keystroke.key.as_str()) {
+            let next = next_surface(surface, event.keystroke.modifiers.shift);
+            window.focus(this.focus_handle(next));
+            cx.stop_propagation();
+            cx.notify();
+        }
+    }
 }
