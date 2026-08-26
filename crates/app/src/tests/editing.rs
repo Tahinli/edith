@@ -1461,26 +1461,31 @@ fn group_reaches_the_sound_before_a_video_layer_over_it() {
 /// refused file cannot leave a row behind.
 #[test]
 fn a_refused_import_leaves_no_row_and_an_accepted_one_is_whole() {
-    let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+    // A mono timeline: since a mono track up-mixes onto a wider timeline
+    // (`engine::audio::widen`), the refusal left standing is the reverse --
+    // a wider file cannot join a mono timeline, nothing narrows a source.
+    let mut session = PlaybackSession::open(asset("test_ac3.mp4")).expect("open the fixture");
     // Silent like the engine suite: this opens the real device.
     session.set_gain(0.0);
     assert_eq!(session.sources().len(), 1);
     // 640x360 joins now (the project canvas places it), and so does a file
     // with no sound (it plays silence over its span). What is left is one
-    // output device: a mono track cannot join a stereo timeline.
+    // output device: a stereo track cannot join a mono timeline.
     let refusal = session
-        .import(&asset("test_ac3.mp4"))
-        .expect_err("a mono track must not join a stereo timeline")
+        .import(&asset("test_av.mp4"))
+        .expect_err("a stereo track must not join a mono timeline")
         .to_string();
     assert!(refusal.contains("audio"), "refusal must name it: {refusal}");
     assert_eq!(session.sources().len(), 1, "a refusal added a row");
-    // An accepted one does add a row, and it reads as the whole file: 4 s
+    // An accepted one does add a row, and it reads as the whole file: 3 s
     // at 30 fps, its own length and not one taken off the lanes.
-    session.import(&asset("test_av2.mp4")).expect("av2 matches");
+    session
+        .import(&asset("test_audio_only.mp4"))
+        .expect("mono matches mono");
     assert_eq!(session.sources().len(), 2);
     let second = session.sources()[1].path.clone();
-    assert_eq!(session.file_frames(&second), 120);
-    assert_eq!(timecode(120. / 30., 30.), "00:00:04:00");
+    assert_eq!(session.file_frames(&second), 90);
+    assert_eq!(timecode(90. / 30., 30.), "00:00:03:00");
 }
 
 /// What the Add button and a dropped row both do, minus the pointer: the
