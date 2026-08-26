@@ -4201,12 +4201,16 @@ mod tests {
     /// about the file -- and the same walk without it still opens.
     #[test]
     fn a_cancelled_walk_gives_up_and_says_so() {
-        let Some(path) = matroska_fixtures().into_iter().next() else {
+        // The first fixture the *video* demuxer accepts: the sweep also finds
+        // audio-only `.mka`, which `MkvDemuxer::open` rightly refuses.
+        let Some((path, lazy)) = matroska_fixtures()
+            .into_iter()
+            .find_map(|p| MkvDemuxer::open(&p).ok().map(|(_, lazy)| (p, lazy)))
+        else {
             eprintln!("no Matroska fixture: the cancel walk is not measured");
             return;
         };
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
-        let (_, lazy) = MkvDemuxer::open(&path).expect(&name);
         let (segment, number) = (lazy.segment, lazy.number);
         let mut file = File::open(&path).expect(&name);
 
