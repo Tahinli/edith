@@ -850,11 +850,15 @@ impl Player {
             .snap_cue
             .filter(|_| self.trim.is_some() || cx.has_active_drag())
             .map(|frame| scale.px_at(f64::from(frame) / self.fps));
-        // The shadow, on the one lane the pointer is over -- and, like the line,
-        // only while the drag that asked for it is still in flight.
-        let ghost = self
+        // The shadow (or shadows, on a set-drag -- [`Player::preview_ghost`]),
+        // on the one lane each names -- and, like the line, only while the
+        // drag that asked for it is still in flight.
+        let ghost: Vec<Ghost> = self
             .ghost
-            .filter(|g| g.lane == lane && cx.has_active_drag());
+            .iter()
+            .copied()
+            .filter(|g| g.lane == lane && cx.has_active_drag())
+            .collect();
         let clips = self
             .session
             .as_ref()
@@ -1919,7 +1923,7 @@ impl Player {
                     // under a drag. Over the clips (it is translucent, so what
                     // it would cover shows through) and under the line, which
                     // marks the frame this box merely fills.
-                    .children(ghost.map(|g| {
+                    .children(ghost.into_iter().map(|g| {
                         div()
                             .absolute()
                             .top_0()

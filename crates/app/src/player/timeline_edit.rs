@@ -250,18 +250,26 @@ impl Player {
         cx.notify();
     }
 
-    /// Copies the selected clip. Nothing on screen changes, so no notify.
+    /// Copies the selection: one entry for a plain click, the whole
+    /// ctrl-click set -- every pick, its own lane and its own frames -- for
+    /// one made over more than a clip. Out of the lane each was clicked in:
+    /// the audio half of a group is a different clip from the video one, and
+    /// copying the wrong lane's frames is a paste of the wrong thing. Nothing
+    /// on screen changes, so no notify. Empty rather than touched at all for
+    /// a selection naming nothing any more, so a stale Copy leaves the
+    /// clipboard exactly as a stale Paste would find it.
     pub(crate) fn copy_selected(&mut self) {
-        let session = self.session.as_ref();
-        // Out of the lane it was clicked in: the audio half of a group is a
-        // different clip from the video one, and copying the wrong lane's
-        // frames is a paste of the wrong thing.
-        if let Some(clip) = self
+        let Some(session) = self.session.as_ref() else {
+            return;
+        };
+        let picks: Vec<(Lane, Clip)> = self
             .selected
-            .anchor()
-            .and_then(|(lane, idx)| session?.lane_clips(lane).get(idx).copied())
-        {
-            self.clipboard = Some(clip);
+            .picks()
+            .iter()
+            .filter_map(|&(lane, idx)| Some((lane, session.lane_clips(lane).get(idx).copied()?)))
+            .collect();
+        if !picks.is_empty() {
+            self.clipboard = picks;
         }
     }
 
@@ -288,17 +296,37 @@ impl Player {
         (picks, links)
     }
 
-    /// Drops the copied clip in at the playhead. The engine reseeks itself, so
-    /// like a delete this owes the flag reset -- and the selection, whose index
-    /// the insert has just moved.
+    /// Drops the copied clip -- or the whole copied set -- in at the
+    /// playhead. A single clipboard entry takes the door it always has
+    /// ([`PlaybackSession::paste_at`]): across `V1`/`A1`, splitting whatever
+    /// it lands inside of and rippling the room open, byte-identical to
+    /// before a set could be copied at all. More than one takes
+    /// [`PlaybackSession::paste_set_at`] instead: every member lands on the
+    /// lane it was copied off, at the same distance from the others it had on
+    /// the bed it was copied from, refused whole rather than opening room --
+    /// see [`Project::paste_set`] for why a set-paste cannot ripple. The
+    /// engine reseeks itself either way, so like a delete this owes the flag
+    /// reset -- and the selection, whose index the insert has just moved.
     pub(crate) fn paste(&mut self, cx: &mut Context<Self>) {
-        let pasted = match (&mut self.session, self.clipboard) {
-            (Some(session), Some(clip)) => session.paste_at(session.now(), clip),
+        let pasted = match (&mut self.session, self.clipboard.as_slice()) {
+            (Some(session), [(_, clip)]) => session.paste_at(session.now(), *clip),
+            (Some(session), items) if !items.is_empty() => {
+                session.paste_set_at(session.now(), items)
+            }
             _ => false,
         };
         if pasted {
             self.selected.clear();
             self.reset_after_reseek();
+        } else if self.clipboard.len() > 1 {
+            // The set-paste's own refusal, worded like a set-drag's
+            // ([`Player::move_clip`]) -- a single-clip paste stays silent on
+            // failure exactly as it always has.
+            self.notify_user(
+                "NOT PASTED — another clip already covers where one of the copied clips would \
+                 land"
+                    .into(),
+            );
         }
         cx.notify();
     }
@@ -310,6 +338,13 @@ impl Player {
     /// nothing is said about it. The engine reseeks, so all this owes is the
     /// flag reset -- and the selection, whose index was that lane's own and now
     /// names a different clip there.
+    ///
+    /// A dragged clip that is *itself* one of the selection's picks carries the
+    /// whole selection with it: every other pick moves the same frame delta,
+    /// all-or-nothing ([`PlaybackSession::move_selection_to`]), and the picks
+    /// survive the move -- their indices remapped rather than cleared, since a
+    /// pick that travels still names the clip it named before. A clip dragged
+    /// from outside the selection moves alone, exactly as it always has.
     pub(crate) fn move_clip(
         &mut self,
         from: Lane,
@@ -330,10 +365,23 @@ impl Player {
         ) else {
             return;
         };
-        let moved = self
-            .session
-            .as_mut()
-            .is_some_and(|session| session.move_clip_to(from, idx, to, start));
+        let set_move = self.selected.contains((from, idx)) && self.selected.len() > 1;
+        let picks: Vec<(Lane, usize)> = self.selected.picks().to_vec();
+        // Every pick's own start, read before the move touches anything -- the
+        // only way to find a pick again afterwards, since a lane change or an
+        // insert can move the index it was named by.
+        let pre_starts: Vec<Option<u32>> = picks
+            .iter()
+            .map(|&(lane, i)| {
+                self.session
+                    .as_ref()
+                    .and_then(|session| session.lane_clips(lane).get(i).map(|c| c.start))
+            })
+            .collect();
+        let moved = self.session.as_mut().is_some_and(|session| match set_move {
+            true => session.move_selection_to(&picks, from, idx, to, start),
+            false => session.move_clip_to(from, idx, to, start),
+        });
         let (kind, lanes) = match from.kind {
             LaneKind::Video => ("picture", "video"),
             LaneKind::Audio => ("sound", "audio"),
@@ -343,7 +391,18 @@ impl Player {
         };
         match moved {
             true => {
-                self.selected.clear();
+                // Every pick named a `(lane, ...)` by index into that lane's
+                // clips, sorted by start -- exactly what an insert or a lane
+                // change reorders. Re-read by the frame each pick's clip now
+                // starts at (recorded before the move moved anything), so the
+                // selection survives naming the clips it named, not the slots
+                // they used to sit in.
+                if set_move {
+                    self.selected =
+                        self.remap_selection(&picks, &pre_starts, from, idx, to, was, start);
+                } else {
+                    self.selected.clear();
+                }
                 self.reset_after_reseek();
             }
             // The three ways a drag is refused, told apart by what the
@@ -360,6 +419,15 @@ impl Player {
             // Picked up and put back down where it was: a click, and a click
             // says nothing.
             false if from == to && start == was => {}
+            false if set_move => self.notify_user(
+                format!(
+                    "NOT MOVED — {} clips selected, and another clip already covers where one of \
+                     them would land on {}",
+                    picks.len(),
+                    to.label()
+                )
+                .into(),
+            ),
             false => self.notify_user(
                 format!(
                     "NOT MOVED — another clip already covers those frames on {}",
@@ -369,6 +437,50 @@ impl Player {
             ),
         }
         cx.notify();
+    }
+
+    /// What a selection's picks are called after a set-move that shifted every
+    /// one of them by `landed - was` timeline frames (the delta the dragged
+    /// clip's own head travelled, which every pick travelled too -- see
+    /// [`Project::move_selection`]): the clip a pick named is found again by
+    /// where it now starts, on the lane it stays on (or `to`, for the one
+    /// that changed lane), rather than by the index it had, which a lane
+    /// change or an insert can have moved. A pick whose clip cannot be found
+    /// there any more (a bad index handed in) is dropped rather than guessed
+    /// at.
+    fn remap_selection(
+        &self,
+        picks: &[(Lane, usize)],
+        pre_starts: &[Option<u32>],
+        from: Lane,
+        dragged: usize,
+        to: Lane,
+        was: u32,
+        landed: u32,
+    ) -> Selection {
+        let mut out = Selection::new();
+        let Some(session) = self.session.as_ref() else {
+            return out;
+        };
+        let delta = i64::from(landed) - i64::from(was);
+        for (&pick, &old_start) in picks.iter().zip(pre_starts) {
+            let Some(old_start) = old_start else {
+                continue;
+            };
+            let want = (i64::from(old_start) + delta) as u32;
+            // Every pick but the dragged clip itself stays on the lane it was
+            // already on; only the exact clip the hand let go of changed
+            // lane, so only its own pick is found on `to` rather than `from`.
+            let now_lane = if pick == (from, dragged) { to } else { pick.0 };
+            if let Some(found) = session
+                .lane_clips(now_lane)
+                .iter()
+                .position(|c| c.start == want)
+            {
+                out.add((now_lane, found));
+            }
+        }
+        out
     }
 
     /// The whole of a palette track as a placement: from its own first
@@ -405,7 +517,7 @@ impl Player {
         }
         self.mark_dirty();
         self.snap_cue = None;
-        self.ghost = None;
+        self.ghost.clear();
         let at = self.place_frame(x).0;
         // What the mark is on, before the lane is renumbered: a caption's start
         // frame is its name on its lane ([`sub_mark`]).
@@ -493,7 +605,7 @@ impl Player {
         }
         self.mark_dirty();
         self.snap_cue = None;
-        self.ghost = None;
+        self.ghost.clear();
         let Some(idx) = self.dragged_sub(drag) else {
             return;
         };
@@ -669,7 +781,7 @@ impl Player {
             tint: CLIP_TEXT(),
             refused: to.kind != LaneKind::Subtitle,
         };
-        self.set_ghost(Some(ghost), cx);
+        self.set_ghost(vec![ghost], cx);
     }
 
     /// The same for a palette row on its way down: it lands at the frame it is
@@ -689,7 +801,7 @@ impl Player {
             tint: CLIP_TEXT(),
             refused: to.kind != LaneKind::Subtitle,
         };
-        self.set_ghost(Some(ghost), cx);
+        self.set_ghost(vec![ghost], cx);
     }
 
     /// Where a clip let go at window `x` over lane `to` wants its head: the
@@ -779,6 +891,15 @@ impl Player {
     /// are one answer -- and its own length at this zoom. A lane of the other
     /// kind refuses the drop ([`Project::move_clip`]), and the shadow says so
     /// before the release does.
+    ///
+    /// When the dragged clip is itself one of a multi-pick selection (the same
+    /// `set_move` test [`Player::move_clip`] commits by), every other pick
+    /// draws its own shadow too, at the delta the anchor above is landing at --
+    /// [`Project::move_selection`]'s own clamp is not reread here, so a wall
+    /// that would narrow the group's travel is seen only at the release, not
+    /// in the shadow; the anchor's own room is still exact; corner-cut, ceiling
+    /// a shadow a member or two too wide on a tight bed, upgrade is exposing
+    /// `move_room` to preview against.
     pub(crate) fn preview_ghost(
         &mut self,
         drag: &ClipDrag,
@@ -786,17 +907,46 @@ impl Player {
         x: Pixels,
         cx: &mut Context<Self>,
     ) {
-        let ghost = self
-            .dragged(drag)
-            .and_then(|idx| self.drop_frame(drag.lane, idx, x))
-            .map(|(start, _)| Ghost {
-                lane: to,
-                start,
-                frames: drag.clip.frames(),
-                tint: self.clip_tint(drag.clip.source),
-                refused: drag.lane.kind != to.kind,
-            });
-        self.set_ghost(ghost, cx);
+        let Some(idx) = self.dragged(drag) else {
+            self.set_ghost(Vec::new(), cx);
+            return;
+        };
+        let Some((start, _)) = self.drop_frame(drag.lane, idx, x) else {
+            self.set_ghost(Vec::new(), cx);
+            return;
+        };
+        let anchor = Ghost {
+            lane: to,
+            start,
+            frames: drag.clip.frames(),
+            tint: self.clip_tint(drag.clip.source),
+            refused: drag.lane.kind != to.kind,
+        };
+        let mut ghosts = vec![anchor];
+        if self.selected.contains((drag.lane, idx)) && self.selected.len() > 1 {
+            let delta = i64::from(start) - i64::from(drag.clip.start);
+            for &(lane, i) in self.selected.picks() {
+                if (lane, i) == (drag.lane, idx) {
+                    continue;
+                }
+                let Some(clip) = self
+                    .session
+                    .as_ref()
+                    .and_then(|session| session.lane_clips(lane).get(i).copied())
+                else {
+                    continue;
+                };
+                let want = (i64::from(clip.start) + delta).max(0) as u32;
+                ghosts.push(Ghost {
+                    lane,
+                    start: want,
+                    frames: clip.frames(),
+                    tint: self.clip_tint(clip.source),
+                    refused: anchor.refused,
+                });
+            }
+        }
+        self.set_ghost(ghosts, cx);
     }
 
     /// The line the track in the hand would drop into, on the row the pointer
@@ -860,7 +1010,7 @@ impl Player {
             tint: file_tint(self.sources(), path).unwrap_or(BG_RAISED()),
             refused: lane_refuses(path, to).is_some(),
         };
-        self.set_ghost(Some(ghost), cx);
+        self.set_ghost(vec![ghost], cx);
     }
 
     /// Sets the shadow, or takes it away, repainting only when it moved -- the
@@ -868,7 +1018,7 @@ impl Player {
     /// root and set again by the lane under the pointer, in that order (gpui
     /// runs the capture phase parent-first), so a pointer over no lane at all
     /// leaves nothing drawn.
-    pub(crate) fn set_ghost(&mut self, ghost: Option<Ghost>, cx: &mut Context<Self>) {
+    pub(crate) fn set_ghost(&mut self, ghost: Vec<Ghost>, cx: &mut Context<Self>) {
         if ghost != self.ghost {
             self.ghost = ghost;
             cx.notify();
