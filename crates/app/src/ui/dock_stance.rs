@@ -12,7 +12,7 @@
 //! [`clip_middle`]...), only the anatomy around them is new.
 
 use crate::ui::hitmap;
-use crate::ui::stance::{Surface, is_focus_cycle_key, next_surface};
+use crate::ui::stance::{Surface, is_focus_cycle_key, is_focus_exit_key, next_surface};
 use crate::ui::type_scale::{self, Typeset, head, label, mono};
 use crate::*;
 use gpui::FontWeight;
@@ -1313,9 +1313,17 @@ fn cycle_on_key_down(
     surface: Surface,
 ) -> impl Fn(&mut Player, &KeyDownEvent, &mut Window, &mut Context<Player>) + 'static {
     move |this, event, window, cx| {
-        if is_focus_cycle_key(event.keystroke.key.as_str()) {
+        let key = event.keystroke.key.as_str();
+        if is_focus_cycle_key(key) {
             let next = next_surface(surface, event.keystroke.modifiers.shift);
             window.focus(this.focus_handle(next));
+            cx.stop_propagation();
+            cx.notify();
+        } else if is_focus_exit_key(key) {
+            // Same exit as `stance.rs`'s bench handler: leaves the ring for
+            // the root handle rather than letting escape bubble to whatever
+            // the root does with it.
+            window.focus(&this.focus);
             cx.stop_propagation();
             cx.notify();
         }
