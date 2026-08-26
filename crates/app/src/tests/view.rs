@@ -891,3 +891,93 @@ fn the_zoom_button_says_how_much_is_on_the_bed() {
     assert_eq!(secs_label(1. / 60.), "0.02s");
     assert_eq!(secs_label(4.5), "4.5s");
 }
+
+/// Keyboard focus v1 (`ui::stance::{Surface, next_surface, is_focus_cycle_key}`):
+/// Tab walks dock -> bench -> inspector -> dock, wrapping; Shift-Tab walks
+/// it backward. No gpui window harness exists in this crate to drive a real
+/// `KeyDownEvent` through -- this exercises the exact pure function every
+/// surface's `on_key_down` calls, which is where the cycle order actually
+/// lives.
+#[test]
+fn tab_cycles_dock_bench_inspector_and_wraps() {
+    use crate::ui::stance::{Surface, next_surface};
+
+    assert_eq!(next_surface(Surface::Dock, false), Surface::Bench);
+    assert_eq!(next_surface(Surface::Bench, false), Surface::Inspector);
+    assert_eq!(next_surface(Surface::Inspector, false), Surface::Dock);
+
+    // Shift-Tab is the exact reverse at every step.
+    assert_eq!(next_surface(Surface::Dock, true), Surface::Inspector);
+    assert_eq!(next_surface(Surface::Inspector, true), Surface::Bench);
+    assert_eq!(next_surface(Surface::Bench, true), Surface::Dock);
+}
+
+/// The defect this closes: the dock mounts only one of its two tabs at a
+/// time (`dock_stance::render`'s `match src_active`), so focusing
+/// `focus_dock`/`focus_inspector` while the other tab is showing lands on a
+/// handle with no tree node -- gpui then dispatches no key listener at all,
+/// keyboard input is dead until a mouse click. `Player::focus_surface`
+/// (`ui::stance.rs`) flips the tab first via this pure decision so the
+/// surface being entered is always the one mounted.
+#[test]
+fn surface_wants_src_active_mounts_the_tab_before_focus_lands_on_it() {
+    use crate::ui::stance::{Surface, surface_wants_src_active};
+
+    assert_eq!(surface_wants_src_active(Surface::Dock), Some(true));
+    assert_eq!(surface_wants_src_active(Surface::Inspector), Some(false));
+    // Bench has no dock tab of its own -- entering it must not disturb
+    // whichever tab the dock was last left on.
+    assert_eq!(surface_wants_src_active(Surface::Bench), None);
+}
+
+/// The root fallback guarantee (main.rs:1054's "every keybind hangs off the
+/// root FocusHandle"): a surface's own `on_key_down` answers Tab/Shift-Tab
+/// and nothing else -- `cx.stop_propagation()` is only ever reached from
+/// that one branch (`ui::stance::is_focus_cycle_key`), so every other key,
+/// still-pressed while a surface is focused, is left un-stopped and bubbles
+/// up the dispatch tree to the root's own `on_key_down`
+/// (gpui-0.2.2 `window.rs`'s `dispatch_key_down_up_event`, `Bubble` phase,
+/// walks the focused node's ancestors and stops only at
+/// `cx.stop_propagation()` -- verified by reading that function, not
+/// assumed). This asserts the gate itself: only "tab" is ever intercepted,
+/// so a keybind like space (play/pause) or "s" (split) is provably never
+/// swallowed by a focused surface.
+#[test]
+fn only_tab_is_intercepted_by_a_focused_surface_everything_else_reaches_root() {
+    use crate::ui::stance::is_focus_cycle_key;
+
+    assert!(is_focus_cycle_key("tab"));
+    for key in ["space", "escape", "s", "c", "left", "right", "enter", "delete", "?"] {
+        assert!(!is_focus_cycle_key(key), "{key} must bubble to the root");
+    }
+}
+
+/// The ring's other door, escape: [`ui::stance::is_focus_exit_key`] is the
+/// one branch a focused surface's `on_key_down` calls to hand focus back to
+/// the root (`Player::focus`) instead of letting escape bubble there on its
+/// own -- same pure-function-level check as the Tab gate above, since this
+/// crate has no window harness to drive a real `KeyDownEvent` through.
+#[test]
+fn escape_is_the_only_key_a_focused_surface_uses_to_leave_the_ring() {
+    use crate::ui::stance::is_focus_exit_key;
+
+    assert!(is_focus_exit_key("escape"));
+    for key in ["tab", "space", "s", "c", "left", "right", "enter", "delete", "?"] {
+        assert!(!is_focus_exit_key(key), "{key} must not exit the ring");
+    }
+}
+
+/// [`ActionId::FocusPanels`] is what starts the ring in the first place
+/// (`Player::act`'s `window.focus(&self.focus_dock)`) -- without a bound key
+/// reaching it, `next_surface`/`is_focus_cycle_key` above are unreachable
+/// dead code, exactly the defect this action closes.
+#[test]
+fn focus_panels_is_bound_and_lands_on_the_dock() {
+    use keymap::{ActionId, Keymap};
+
+    let k = Keymap::defaults();
+    assert_eq!(k.lookup("f6", false), Some(ActionId::FocusPanels));
+    // Bare Tab must still mean Select at the root -- FocusPanels must not
+    // have stolen it.
+    assert_eq!(k.lookup("tab", false), Some(ActionId::Select));
+}

@@ -105,6 +105,7 @@ palette! {
     SCRIM: u32,
     SCRIM_LIGHT: u32,
     STROKE_DIVIDER: u32,
+    STROKE_FOCUS: u32,
     STROKE_SELECTED: u32,
     FG_PRIMARY: u32,
     FG_SECONDARY: u32,
@@ -348,6 +349,7 @@ pub mod cool {
 
     // -- strokes ----------------------------------------------------------------
     pub const STROKE_DIVIDER: u32 = 0x2a3442;
+    pub const STROKE_FOCUS: u32 = 0xffd166;
     pub const STROKE_SELECTED: u32 = 0x22d3ee;
 
     // -- text -------------------------------------------------------------------
@@ -439,6 +441,7 @@ pub mod warm {
 
     // -- strokes ----------------------------------------------------------------
     pub const STROKE_DIVIDER: u32 = 0x3a322e;
+    pub const STROKE_FOCUS: u32 = 0xffc38a;
     pub const STROKE_SELECTED: u32 = ACCENT_PRIMARY;
 
     // -- text -------------------------------------------------------------------
@@ -523,6 +526,7 @@ pub mod forest {
 
     // -- strokes ----------------------------------------------------------------
     pub const STROKE_DIVIDER: u32 = 0x25362c;
+    pub const STROKE_FOCUS: u32 = 0xffd166;
     pub const STROKE_SELECTED: u32 = ACCENT_PRIMARY;
 
     // -- text -------------------------------------------------------------------
@@ -606,6 +610,7 @@ pub mod violet {
 
     // -- strokes ----------------------------------------------------------------
     pub const STROKE_DIVIDER: u32 = 0x2e3150;
+    pub const STROKE_FOCUS: u32 = 0xfde68a;
     pub const STROKE_SELECTED: u32 = ACCENT_PRIMARY;
 
     // -- text -------------------------------------------------------------------
@@ -684,6 +689,7 @@ pub mod rose {
 
     // -- strokes ----------------------------------------------------------------
     pub const STROKE_DIVIDER: u32 = 0x332f33;
+    pub const STROKE_FOCUS: u32 = 0xfcd34d;
     pub const STROKE_SELECTED: u32 = ACCENT_PRIMARY;
 
     // -- text -------------------------------------------------------------------
@@ -764,6 +770,7 @@ pub mod amber {
 
     // -- strokes ----------------------------------------------------------------
     pub const STROKE_DIVIDER: u32 = 0x35352f;
+    pub const STROKE_FOCUS: u32 = 0x7dd3fc;
     pub const STROKE_SELECTED: u32 = ACCENT_PRIMARY;
 
     // -- text -------------------------------------------------------------------
@@ -842,6 +849,7 @@ pub mod ocean {
 
     // -- strokes ----------------------------------------------------------------
     pub const STROKE_DIVIDER: u32 = 0x1e2d42;
+    pub const STROKE_FOCUS: u32 = 0xffd166;
     pub const STROKE_SELECTED: u32 = ACCENT_PRIMARY;
 
     // -- text -------------------------------------------------------------------
@@ -921,6 +929,7 @@ pub mod ice {
 
     // -- strokes ----------------------------------------------------------------
     pub const STROKE_DIVIDER: u32 = 0x223140;
+    pub const STROKE_FOCUS: u32 = 0xfcd34d;
     pub const STROKE_SELECTED: u32 = ACCENT_PRIMARY;
 
     // -- text -------------------------------------------------------------------
@@ -998,6 +1007,7 @@ pub mod orchid {
 
     // -- strokes ----------------------------------------------------------------
     pub const STROKE_DIVIDER: u32 = 0x33203f;
+    pub const STROKE_FOCUS: u32 = 0x7dd3fc;
     pub const STROKE_SELECTED: u32 = ACCENT_PRIMARY;
 
     // -- text -------------------------------------------------------------------
@@ -1084,6 +1094,7 @@ pub mod nord {
 
     // -- strokes ----------------------------------------------------------------
     pub const STROKE_DIVIDER: u32 = 0x434c5e;
+    pub const STROKE_FOCUS: u32 = 0xd08770;
     pub const STROKE_SELECTED: u32 = ACCENT_PRIMARY;
 
     // -- text -------------------------------------------------------------------
@@ -1173,6 +1184,7 @@ pub mod gruvbox {
 
     // -- strokes ----------------------------------------------------------------
     pub const STROKE_DIVIDER: u32 = 0x504945;
+    pub const STROKE_FOCUS: u32 = 0x83a598;
     pub const STROKE_SELECTED: u32 = ACCENT_PRIMARY;
 
     // -- text -------------------------------------------------------------------
@@ -1253,6 +1265,7 @@ pub mod dracula {
 
     // -- strokes ----------------------------------------------------------------
     pub const STROKE_DIVIDER: u32 = 0x44475a;
+    pub const STROKE_FOCUS: u32 = 0x8be9fd;
     pub const STROKE_SELECTED: u32 = ACCENT_PRIMARY;
 
     // -- text -------------------------------------------------------------------
@@ -1348,6 +1361,7 @@ pub mod darkroom {
 
     // -- strokes --------------------------------------------------------------
     pub const STROKE_DIVIDER: u32 = 0x22262b;
+    pub const STROKE_FOCUS: u32 = INK1;
     /// "Focus/selection ring = 1px ink1 (lamp-adjacent, not coloured)."
     pub const STROKE_SELECTED: u32 = INK1;
 
