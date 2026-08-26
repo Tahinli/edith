@@ -250,18 +250,26 @@ impl Player {
         cx.notify();
     }
 
-    /// Copies the selected clip. Nothing on screen changes, so no notify.
+    /// Copies the selection: one entry for a plain click, the whole
+    /// ctrl-click set -- every pick, its own lane and its own frames -- for
+    /// one made over more than a clip. Out of the lane each was clicked in:
+    /// the audio half of a group is a different clip from the video one, and
+    /// copying the wrong lane's frames is a paste of the wrong thing. Nothing
+    /// on screen changes, so no notify. Empty rather than touched at all for
+    /// a selection naming nothing any more, so a stale Copy leaves the
+    /// clipboard exactly as a stale Paste would find it.
     pub(crate) fn copy_selected(&mut self) {
-        let session = self.session.as_ref();
-        // Out of the lane it was clicked in: the audio half of a group is a
-        // different clip from the video one, and copying the wrong lane's
-        // frames is a paste of the wrong thing.
-        if let Some(clip) = self
+        let Some(session) = self.session.as_ref() else {
+            return;
+        };
+        let picks: Vec<(Lane, Clip)> = self
             .selected
-            .anchor()
-            .and_then(|(lane, idx)| session?.lane_clips(lane).get(idx).copied())
-        {
-            self.clipboard = Some(clip);
+            .picks()
+            .iter()
+            .filter_map(|&(lane, idx)| Some((lane, session.lane_clips(lane).get(idx).copied()?)))
+            .collect();
+        if !picks.is_empty() {
+            self.clipboard = picks;
         }
     }
 
@@ -288,17 +296,37 @@ impl Player {
         (picks, links)
     }
 
-    /// Drops the copied clip in at the playhead. The engine reseeks itself, so
-    /// like a delete this owes the flag reset -- and the selection, whose index
-    /// the insert has just moved.
+    /// Drops the copied clip -- or the whole copied set -- in at the
+    /// playhead. A single clipboard entry takes the door it always has
+    /// ([`PlaybackSession::paste_at`]): across `V1`/`A1`, splitting whatever
+    /// it lands inside of and rippling the room open, byte-identical to
+    /// before a set could be copied at all. More than one takes
+    /// [`PlaybackSession::paste_set_at`] instead: every member lands on the
+    /// lane it was copied off, at the same distance from the others it had on
+    /// the bed it was copied from, refused whole rather than opening room --
+    /// see [`Project::paste_set`] for why a set-paste cannot ripple. The
+    /// engine reseeks itself either way, so like a delete this owes the flag
+    /// reset -- and the selection, whose index the insert has just moved.
     pub(crate) fn paste(&mut self, cx: &mut Context<Self>) {
-        let pasted = match (&mut self.session, self.clipboard) {
-            (Some(session), Some(clip)) => session.paste_at(session.now(), clip),
+        let pasted = match (&mut self.session, self.clipboard.as_slice()) {
+            (Some(session), [(_, clip)]) => session.paste_at(session.now(), *clip),
+            (Some(session), items) if !items.is_empty() => {
+                session.paste_set_at(session.now(), items)
+            }
             _ => false,
         };
         if pasted {
             self.selected.clear();
             self.reset_after_reseek();
+        } else if self.clipboard.len() > 1 {
+            // The set-paste's own refusal, worded like a set-drag's
+            // ([`Player::move_clip`]) -- a single-clip paste stays silent on
+            // failure exactly as it always has.
+            self.notify_user(
+                "NOT PASTED — another clip already covers where one of the copied clips would \
+                 land"
+                    .into(),
+            );
         }
         cx.notify();
     }
