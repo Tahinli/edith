@@ -22,7 +22,7 @@ use super::{
     SPEED_PRESETS, SPEED_STEP, STATUS_ERROR, STATUS_SUCCESS, STATUS_WARNING, SUB_PLAN_CHARS,
     Source, Speed, StreamInfo, TIMELINE_SHARE, Transport, VOLUME_W, Volume, WAVE_BPS, WAVE_COL,
     WAVE_COLS_MAX, Wave, ZOOM_MIN_FRAMES, active_lane, band_label, bitrate_detail, bitrate_refusal,
-    clipboard_after_remove, color_snap, commit_mbps, containers, enable, enable_lane, envelope,
+    clipboard_after_remove, color_snap, containers, enable, enable_lane, envelope,
     eq_card_w, eq_freq, eq_freq_label, eq_graph_h, eq_spectrum, eq_x, eq_y, estimated_bytes,
     export_path, export_settings, format_line, format_refusal, fps_choices, fps_label, frac_along,
     frac_down, frame_at, frame_rate_ladder, histogram, inserted_band, is_project, keymap,

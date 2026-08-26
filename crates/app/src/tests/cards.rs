@@ -1022,12 +1022,20 @@ fn a_typed_bitrate_is_a_field_and_not_a_key_capture() {
     assert_eq!(edit.commit(), Some(5));
 
     // Empty, zero, and past the digit cap: each its own reason, none of
-    // them silent.
-    assert!(commit_mbps("").is_err());
-    assert!(commit_mbps("0").unwrap_err().contains("not a rate"));
-    assert_eq!(commit_mbps("1"), Ok(MBPS_MIN));
-    assert_eq!(commit_mbps("50"), Ok(MBPS_MAX));
-    assert!(commit_mbps("51").is_err());
+    // them silent -- asserted on the widget itself, the door the card uses.
+    let mut edit = mbps_edit(0);
+    assert_eq!(edit.commit(), None, "empty is not a number");
+    let mut edit = mbps_edit(0);
+    edit.digit(0);
+    assert_eq!(edit.commit(), None);
+    assert!(edit.refusal.clone().expect("zero says why").contains("0 is not a value"));
+    assert_eq!(mbps_edit(MBPS_MIN).commit(), Some(MBPS_MIN));
+    assert_eq!(mbps_edit(MBPS_MAX).commit(), Some(MBPS_MAX));
+    let mut edit = mbps_edit(0);
+    for digit in [5, 1] {
+        edit.digit(digit);
+    }
+    assert_eq!(edit.commit(), None, "51 is past the ceiling");
     let mut edit = mbps_edit(0);
     for digit in [9, 9, 9, 9] {
         edit.digit(digit);
