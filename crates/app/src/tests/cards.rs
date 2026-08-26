@@ -186,8 +186,9 @@ fn only_a_chord_gets_out_of_an_export() {
     assert!(!cancels_export("e", false, Some(ActionId::Export)));
     assert!(!cancels_export("space", false, Some(ActionId::Play)));
     assert!(!cancels_export("q", false, None));
-    // The default keymap is what the handler feeds this: the chord reaches the
-    // action, the bare key reaches nothing.
+    // The default keymap is what the handler feeds this: the chord reaches
+    // CancelExport, the bare key reaches Deselect instead -- neither of which
+    // this guard lets cancel a running export.
     let k = keymap::Keymap::defaults();
     assert!(cancels_export("escape", true, k.lookup("escape", true)));
     assert!(!cancels_export("escape", false, k.lookup("escape", false)));
