@@ -9,6 +9,18 @@ pub(crate) fn waveform(peaks: Arc<Vec<(f32, f32)>>, from: f64, to: f64) -> impl 
     waveform_ink(peaks, from, to, FG_SECONDARY())
 }
 
+/// `ClickEvent::modifiers()` answers the mouse-*up* modifiers (gpui-0.2.2
+/// `interactive.rs`), so releasing ctrl before the button lands undoes a
+/// ctrl-held toggle decided on mouse-down. This reads the *press* modifiers
+/// instead -- the ones a ctrl-click decision (multi-pick, no collapse) was
+/// actually made under.
+pub(crate) fn press_modifiers(event: &ClickEvent) -> gpui::Modifiers {
+    match event {
+        ClickEvent::Mouse(m) => m.down.modifiers,
+        ClickEvent::Keyboard(_) => gpui::Modifiers::default(),
+    }
+}
+
 /// As [`waveform`], but in a caller-picked ink rather than the fixed
 /// secondary foreground -- the darkroom bench's own audio clips draw their
 /// envelope in the source's ink (DESIGN §5), which the legacy timeline never
