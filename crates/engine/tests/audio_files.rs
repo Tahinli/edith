@@ -11,9 +11,9 @@
 use std::path::{Path, PathBuf};
 
 use engine::export::{ExportSettings, Format};
-use engine::project::Lane;
+use engine::project::{Lane, LaneKind};
 use engine::scratch::Scratch;
-use engine::{AudioSession, Clip, PlaybackSession};
+use engine::{AudioSession, Clip, PlaybackSession, Project};
 
 /// The fixtures `scripts/gen_fixtures.sh` writes: 3 s of 440 Hz left / 880 Hz
 /// right at 44.1k stereo, under a 1 Hz volume pulse -- the same tone
@@ -355,6 +355,88 @@ fn an_audio_only_project_saves_reloads_and_exports_its_sound() {
         (1920, 1080)
     );
     assert!(reloaded.lane_clips(Lane::V1).is_empty());
+    drop(reloaded);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// DEBT #45: the device the timeline plays through used to be opened once, on
+/// the first non-image source ([`audio_source_of`] in `playback.rs`) -- with
+/// no check that the source it landed on has a usable audio track at all. A
+/// timeline whose *first* source is silent (`test_baseline.mp4` has no audio
+/// track) therefore never reopened on a later source that does, and stayed
+/// silent for the whole session however many other sources had sound.
+///
+/// No PipeWire daemon lives in this sandbox (`AoSession::probe()` is false
+/// here), so the device itself cannot be tapped for samples -- this reaches
+/// past it instead, onto the one signal `open_audio` still hands back with no
+/// device at all: [`PlaybackSession::audio_disabled_reason`]. `test_dts.mkv`'s
+/// track has a header (so it is chosen over a source with none) but no
+/// decoder (so opening it, unlike the silent baseline, is a reason worth
+/// giving) -- the old code never got there, and reports nothing.
+#[test]
+fn a_silent_first_source_does_not_stop_the_scan_for_one_with_sound() {
+    let dir = Scratch::dir("ve_silent_first_source");
+    let path0 = asset("test_baseline.mp4");
+    let path1 = asset("test_dts.mkv");
+    let (meta0, _) = engine::demux::Demuxer::open(&path0).expect("open the baseline fixture");
+    let (meta1, _) = engine::demux::Demuxer::open(&path1).expect("open the dts fixture");
+
+    // `Project`, not `PlaybackSession::import`: the session-level import gate
+    // would itself refuse a real track landing on a silent timeline
+    // (`audio_matches_probed`, a different corner of the same debt) before
+    // this test ever reaches `open_project`.
+    let mut project = Project::single(&path0, meta0.frame_count);
+    let source1 = project.import(&path1, 0);
+    let lane2 = project.add_lane(LaneKind::Video);
+    let clip = Clip {
+        fade_in: 0,
+        fade_out: 0,
+        transition_out: 0,
+        start: 0,
+        in_frame: 0,
+        out_frame: meta1.frame_count,
+        source: source1,
+        link: None,
+        eq: None,
+        color: None,
+        fit: Default::default(),
+        speed: engine::Speed::NORMAL,
+        transform: None,
+    };
+    assert!(project.place(lane2, 0, clip), "the second source lands");
+
+    let (sources, lanes, eq, color, transform) = project.without_orphan_sources();
+    let file = dir.join("silent_first.edith");
+    engine::edith::save(
+        &file,
+        &sources,
+        &lanes,
+        &project.lane_gains(),
+        &project.lane_subs(),
+        project.subtitles(),
+        &eq,
+        &color,
+        &transform,
+        (meta0.width, meta0.height),
+        None,
+        project.tone(),
+        false,
+        true,
+        engine::export::EncoderSeat::default(),
+        project.limiter(),
+        None,
+        0,
+    )
+    .expect("save");
+
+    let reloaded = PlaybackSession::open_project(&file).expect("reopen");
+    assert!(
+        reloaded
+            .audio_disabled_reason()
+            .is_some_and(|r| r.contains("A_DTS")),
+        "the scan for a source with sound never reached test_dts.mkv: {:?}",
+        reloaded.audio_disabled_reason()
+    );
     drop(reloaded);
     let _ = std::fs::remove_dir_all(&dir);
 }
