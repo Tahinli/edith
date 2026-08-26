@@ -31,7 +31,7 @@ static PROXY_FILM: Mutex<()> = Mutex::new(());
 
 use engine::export::ExportSettings;
 use engine::hw::HwEncoder;
-use engine::mux::{Mp4Muxer, VideoParams, parameter_sets};
+use engine::mux::{AudioParams, Mp4Muxer, VideoParams, parameter_sets};
 use engine::project::{Lane, Source, Speed};
 use engine::scale::FitPolicy;
 use engine::scratch::Scratch;
@@ -780,6 +780,135 @@ fn synthetic(index: u32, width: usize, height: usize) -> (Vec<u8>, Vec<u8>, Vec<
         vec![64u8.wrapping_add(index as u8); cw * ch],
         vec![192u8.wrapping_sub(index as u8); cw * ch],
     )
+}
+
+/// One throwaway IDR slice NAL -- not a real picture (nothing here decodes
+/// it), just something `Mp4Muxer::write_video_au` accepts and ffprobe can
+/// see as one packet on the video track.
+fn fake_au(n: u8) -> Vec<u8> {
+    vec![0, 0, 1, 0x65, n, n.wrapping_add(1), 0xA5]
+}
+
+/// `Mp4Muxer` holds coded pictures back until the sound can be interleaved
+/// under them ([`Mp4Muxer::hold`], mux.rs), so that a streaming reader sees
+/// both tracks advancing together rather than the whole picture and only
+/// then the whole track. This pins the boundary the muxer's own doc comment
+/// on `hold` states in words: how tightly the two interleave depends on
+/// *when* the mix lands relative to the picture, which on a real export is a
+/// race against a mixer thread this test does not want to run. So it forces
+/// the landing itself -- writing straight to `Mp4Muxer`, exactly the shape
+/// `export::run`'s `feed_late_audio` uses it in (a burst of video, then the
+/// whole mix handed over in one tight loop, then the rest of the picture) --
+/// rather than the real threaded export.
+#[test]
+fn mp4_interleaves_a_mix_that_lands_early_under_the_rest_of_the_picture() {
+    let out = out_path("interleave");
+    let (width, height, fps) = (64u32, 64u32, 30.0);
+    let (sps, pps) = ([0x67, 0x42, 0x00, 0x1E], [0x68, 0xCE, 0x3C, 0x80]);
+    let mut muxer = Mp4Muxer::create(
+        &out,
+        &VideoParams {
+            width,
+            height,
+            frame_rate: fps,
+            sps: &sps,
+            pps: &pps,
+        },
+        None,
+    )
+    .expect("create");
+
+    // 15 frames (0.5 s) of a head start for the picture -- the file always
+    // wrote this stretch video-only, mix or no mix, and this test is about
+    // the file *after* it.
+    for i in 0..15u8 {
+        muxer.write_video_au(&fake_au(i)).expect("write video");
+    }
+    muxer
+        .add_audio_track(&AudioParams {
+            freq_index: 3, // mp4::SampleFreqIndex::Freq48000
+            chan_conf: 2,  // ChannelConfig::Stereo
+            sample_rate: 48_000,
+            opus_pre_skip: None,
+        })
+        .expect("declare audio");
+    // The whole mix, handed over in one tight loop exactly as
+    // `export::feed_late_audio` does: 200 packets of 1024/48000 s each is
+    // ~4.27 s, well past the picture's 0.5 s head start, so releasing it
+    // correctly needs the *rest* of the picture below to pace it out.
+    let silence = [0x21, 0x10, 0x04, 0x60, 0x8c, 0x1c];
+    for _ in 0..200u32 {
+        muxer.write_audio_packet(&silence).expect("write audio");
+    }
+    // The rest of the picture: 135 more frames, 4.5 s, what the mix above is
+    // paced against.
+    for i in 15..150u8 {
+        muxer.write_video_au(&fake_au(i)).expect("write video");
+    }
+    muxer.write_subtitles(&[]).expect("no subtitles");
+    muxer.finish().expect("finish");
+
+    assert_no_single_stream_span_over(&out, 2.0);
+    std::fs::remove_file(&out).unwrap();
+}
+
+/// Reads `path`'s packets back with ffprobe (pts + byte position) and fails
+/// if any run of file-order-consecutive same-stream packets spans more media
+/// time than `seconds` -- the numeric shape of "no byte-span longer than 2 s
+/// of media contains packets from only one stream".
+fn assert_no_single_stream_span_over(path: &Path, seconds: f64) {
+    let output = std::process::Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "packet=stream_index,pts_time,pos",
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(path)
+        .output()
+        .expect("run ffprobe");
+    assert!(
+        output.status.success(),
+        "ffprobe failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut packets: Vec<(i64, u32, f64)> = text
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let mut fields = line.split(',');
+            let stream: u32 = fields.next().unwrap().parse().unwrap();
+            let pts: f64 = fields.next().unwrap().parse().unwrap();
+            let pos: i64 = fields.next().unwrap().parse().unwrap();
+            (pos, stream, pts)
+        })
+        .collect();
+    assert!(packets.len() > 10, "ffprobe saw only {} packets", packets.len());
+    packets.sort_by_key(|&(pos, ..)| pos);
+
+    let streams: std::collections::HashSet<u32> = packets.iter().map(|&(_, s, _)| s).collect();
+    assert_eq!(
+        streams.len(),
+        2,
+        "expected one video and one audio stream, ffprobe saw {streams:?}"
+    );
+
+    let (mut run_stream, mut run_start) = (packets[0].1, packets[0].2);
+    for &(_, stream, pts) in &packets[1..] {
+        if stream != run_stream {
+            run_stream = stream;
+            run_start = pts;
+            continue;
+        }
+        let span = pts - run_start;
+        assert!(
+            span <= seconds,
+            "a run of stream {run_stream} packets alone spans {span:.2} s (from {run_start:.2} s) -- over the {seconds} s bound"
+        );
+    }
 }
 
 /// A timeline whose *first* second of sound was lifted. A reader drops the

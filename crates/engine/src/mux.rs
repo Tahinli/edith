@@ -15,6 +15,7 @@
 //! as the `tx3g` timed text `mp4 0.14` *can* spell ([`Mp4Muxer::write_subtitles`])
 //! and Matroska as `S_TEXT/UTF8` blocks, so neither is a file whose words were.
 
+use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -41,6 +42,13 @@ const AAC_PACKET_SAMPLES: u32 = 1024;
 /// block's timestamp is written at ([`TIMESTAMP_SCALE_NS`]), so a cue lands on
 /// the same instant whichever of the two containers carries it.
 const SUB_TIMESCALE: u32 = 1_000;
+/// How much coded picture [`Mp4Muxer`] holds unwritten waiting for the sound
+/// to catch up ([`Mp4Muxer::hold`]) before it gives up and flushes video-only.
+/// Two seconds is the ceiling `export`'s own progress granularity already
+/// tolerates (`AUDIO_BAND`), and it bounds the hold's memory to two seconds
+/// of coded pictures -- kilobytes, not the tens of megabytes a whole film's
+/// worth would be.
+const HOLD_SECONDS: u64 = 2;
 
 const NAL_IDR: u8 = 5;
 const NAL_SEI: u8 = 6;
@@ -105,6 +113,41 @@ pub struct Mp4Muxer {
     /// beside the sample entry. Empty where no track carries a title, which is
     /// every file that has no subtitles at all.
     sub_names: Vec<String>,
+    /// Coded pictures not yet handed to the writer, oldest first -- how the
+    /// overlapped audio pass gets to land *under* the picture instead of
+    /// after all of it: every `write_video_au`/`write_coded_sample` queues
+    /// here and [`drain`](Mp4Muxer::drain) interleaves it against
+    /// [`audio_queue`](Mp4Muxer::audio_queue) by presentation time, so the
+    /// two tracks' bytes end up beside each other in `mdat` rather than one
+    /// whole track then the other. `(bytes, is_sync)`.
+    ///
+    /// NONDETERMINISM: how tightly the two interleave depends on when the
+    /// mix thread's join lands relative to the picture loop -- a mix that
+    /// finishes before this hold fills stays byte-interleaved from the
+    /// start; a mix that lands late only interleaves the tail. A test on
+    /// this has to pin that landing (force the join before frame N in a
+    /// fixture) rather than race the real mixer thread.
+    hold: VecDeque<(Vec<u8>, bool)>,
+    /// `hold`'s span, in the video track's own ticks -- flushed video-only
+    /// once it passes [`HOLD_SECONDS`], so a mix that never lands (or lands
+    /// very late) cannot stall the encode behind an unbounded queue.
+    hold_ticks: u64,
+    /// AAC packets handed over by [`write_audio_packet`](Mp4Muxer::write_audio_packet)
+    /// before `drain` has caught up to them -- normally empty the instant
+    /// after that call returns; only grows past one packet where the whole
+    /// track lands in one call while the hold is still short (a picture that
+    /// finished before its own sound).
+    audio_queue: VecDeque<Vec<u8>>,
+    /// Ticks, in the audio track's own rate, already written to the file --
+    /// `drain`'s clock for comparing against `flushed_video_ticks`.
+    audio_ticks: u64,
+    /// Ticks, in the video track's own timescale, already written to the
+    /// file (as opposed to merely queued in `hold`).
+    flushed_video_ticks: u64,
+    /// The audio track's sample rate, once [`add_audio_track`](Mp4Muxer::add_audio_track)
+    /// has declared one -- `drain`'s clock for `audio_ticks`. 0 until then,
+    /// which is also exactly when `audio_queue` can have nothing in it.
+    audio_rate: u32,
 }
 
 /// A `ColourInformationBox` payload, ISO/IEC 14496-12 §12.1.5: the `nclx` tag
@@ -278,6 +321,12 @@ impl Mp4Muxer {
             timescale,
             frames: 0,
             sub_names: Vec::new(),
+            hold: VecDeque::new(),
+            hold_ticks: 0,
+            audio_queue: VecDeque::new(),
+            audio_ticks: 0,
+            flushed_video_ticks: 0,
+            audio_rate: 0,
         };
         if let Some(audio) = audio {
             muxer.add_audio_track(audio)?;
@@ -326,6 +375,7 @@ impl Mp4Muxer {
             }),
         })?;
         self.has_audio = true;
+        self.audio_rate = sample_rate;
         Ok(())
     }
 
@@ -343,18 +393,7 @@ impl Mp4Muxer {
     /// (they are already in `avcC`); an IDR slice marks the sample as a sync point.
     pub fn write_video_au(&mut self, annex_b: &[u8]) -> crate::Result<()> {
         let (bytes, is_sync) = annex_b_to_avcc(annex_b)?;
-        self.writer.write_sample(
-            VIDEO_TRACK,
-            &Mp4Sample {
-                start_time: 0, // ignored by the writer; timing is duration-accumulated
-                duration: self.frame_duration,
-                rendering_offset: 0, // no B-frames on either encode path
-                is_sync,
-                bytes: Bytes::from(bytes),
-            },
-        )?;
-        self.frames += 1;
-        Ok(())
+        self.queue_video(bytes, is_sync)
     }
 
     /// One coded picture already framed the way its sample carries it: an AV1
@@ -367,27 +406,82 @@ impl Mp4Muxer {
         if obus.is_empty() {
             return Err("an empty coded picture".into());
         }
-        self.writer.write_sample(
-            VIDEO_TRACK,
-            &Mp4Sample {
-                start_time: 0,
-                duration: self.frame_duration,
-                rendering_offset: 0,
-                is_sync: key,
-                bytes: Bytes::copy_from_slice(obus),
-            },
-        )?;
-        self.frames += 1;
+        self.queue_video(obus.to_vec(), key)
+    }
+
+    /// Queues one coded picture and tries to advance the interleave --
+    /// shared by [`write_video_au`](Mp4Muxer::write_video_au) and
+    /// [`write_coded_sample`](Mp4Muxer::write_coded_sample), which differ
+    /// only in how the bytes were framed before they got here.
+    fn queue_video(&mut self, bytes: Vec<u8>, is_sync: bool) -> crate::Result<()> {
+        self.hold.push_back((bytes, is_sync));
+        self.hold_ticks += u64::from(self.frame_duration);
+        self.drain()
+    }
+
+    /// Advances the interleave as far as it currently can, called after
+    /// every single sample either track hands over: for as long as both
+    /// queues have something in them, writes whichever track's next sample
+    /// has the earlier presentation time -- which is what makes the release
+    /// of a mix that landed all at once ([`write_audio_packet`](Mp4Muxer::write_audio_packet)
+    /// fed in one tight loop) paced by how much *video* keeps arriving to
+    /// match it against, rather than dumped in one uninterrupted run the
+    /// moment it lands.
+    ///
+    /// Video queued with nothing to interleave against yet -- no audio
+    /// track, or one declared but not fed this far ahead -- is left held,
+    /// unless the hold has grown past [`HOLD_SECONDS`], which gives up
+    /// waiting and writes video-only to relieve it (a mix that never lands,
+    /// or one running well behind the picture). Audio queued with no video
+    /// to interleave against is always left held: nothing bounds how far
+    /// *behind* the sound the picture may run, but every path that can end
+    /// the file ([`finish`](Mp4Muxer::finish), [`write_subtitles`](Mp4Muxer::write_subtitles))
+    /// drains it in full first.
+    fn drain(&mut self) -> crate::Result<()> {
+        loop {
+            match (self.hold.front(), self.audio_queue.front()) {
+                (Some(_), Some(_)) => {
+                    let video_pts = self.flushed_video_ticks as f64 / f64::from(self.timescale);
+                    let audio_pts = self.audio_ticks as f64 / f64::from(self.audio_rate);
+                    if audio_pts <= video_pts {
+                        self.flush_audio_front()?;
+                    } else {
+                        self.flush_video_front()?;
+                    }
+                }
+                (Some(_), None) if self.hold_ticks > HOLD_SECONDS * u64::from(self.timescale) => {
+                    self.flush_video_front()?;
+                }
+                (Some(_), None) | (None, Some(_)) | (None, None) => break,
+            }
+        }
         Ok(())
     }
 
-    /// One raw AAC packet (no ADTS header), copied verbatim from the source --
-    /// or one of the hand-written silent ones a gap is filled with. Every AAC-LC
-    /// access unit is [`AAC_PACKET_SAMPLES`] frames, gap or not.
-    pub fn write_audio_packet(&mut self, bytes: &[u8]) -> crate::Result<()> {
-        if !self.has_audio {
-            return Err("audio packet written to a video-only file".into());
-        }
+    fn flush_video_front(&mut self) -> crate::Result<()> {
+        let Some((bytes, is_sync)) = self.hold.pop_front() else {
+            return Ok(());
+        };
+        self.hold_ticks -= u64::from(self.frame_duration);
+        self.writer.write_sample(
+            VIDEO_TRACK,
+            &Mp4Sample {
+                start_time: 0, // ignored by the writer; timing is duration-accumulated
+                duration: self.frame_duration,
+                rendering_offset: 0, // no B-frames on either encode path
+                is_sync,
+                bytes: Bytes::from(bytes),
+            },
+        )?;
+        self.frames += 1;
+        self.flushed_video_ticks += u64::from(self.frame_duration);
+        Ok(())
+    }
+
+    fn flush_audio_front(&mut self) -> crate::Result<()> {
+        let Some(bytes) = self.audio_queue.pop_front() else {
+            return Ok(());
+        };
         self.writer.write_sample(
             AUDIO_TRACK,
             &Mp4Sample {
@@ -397,10 +491,52 @@ impl Mp4Muxer {
                 // Every AAC packet is a sync point; saying so per-sample would emit
                 // an `stss` listing all of them, while no `stss` means the same thing.
                 is_sync: false,
-                bytes: Bytes::copy_from_slice(bytes),
+                bytes: Bytes::from(bytes),
             },
         )?;
+        self.audio_ticks += u64::from(AAC_PACKET_SAMPLES);
         Ok(())
+    }
+
+    /// Everything either queue has left, in presentation order regardless of
+    /// the hold cap -- called from [`finish`](Mp4Muxer::finish), where there
+    /// is no more picture coming for a short hold to wait on.
+    fn drain_all(&mut self) -> crate::Result<()> {
+        loop {
+            match (self.hold.front(), self.audio_queue.front()) {
+                (Some(_), Some(_)) => {
+                    let video_pts = self.flushed_video_ticks as f64 / f64::from(self.timescale);
+                    let audio_pts = self.audio_ticks as f64 / f64::from(self.audio_rate);
+                    if audio_pts <= video_pts {
+                        self.flush_audio_front()?;
+                    } else {
+                        self.flush_video_front()?;
+                    }
+                }
+                (Some(_), None) => self.flush_video_front()?,
+                (None, Some(_)) => self.flush_audio_front()?,
+                (None, None) => break,
+            }
+        }
+        Ok(())
+    }
+
+    /// One raw AAC packet (no ADTS header), copied verbatim from the source --
+    /// or one of the hand-written silent ones a gap is filled with. Every AAC-LC
+    /// access unit is [`AAC_PACKET_SAMPLES`] frames, gap or not.
+    ///
+    /// Queues rather than writes straight through: a caller feeding packets
+    /// while the picture is still running (the overlapped export path,
+    /// [`crate::export::run`]) gets them woven into the file under the
+    /// pictures still queued in [`hold`](Mp4Muxer::hold) instead of parked
+    /// until the picture ends, which is the whole point of calling this
+    /// before the picture loop is done rather than after.
+    pub fn write_audio_packet(&mut self, bytes: &[u8]) -> crate::Result<()> {
+        if !self.has_audio {
+            return Err("audio packet written to a video-only file".into());
+        }
+        self.audio_queue.push_back(bytes.to_vec());
+        self.drain()
     }
 
     /// The soft subtitle tracks this file carries, written after the picture and
@@ -432,6 +568,11 @@ impl Mp4Muxer {
         if subs.is_empty() {
             return Ok(());
         }
+        // `self.frames` below counts only pictures already handed to the
+        // writer, and the interleave above can still be holding some back:
+        // drained first, or a text track written under a short hold would
+        // end short of the picture that has not landed yet.
+        self.drain_all()?;
         // Where the picture ends, in the text track's own tick: the last sample
         // runs out to it, so the track covers the film rather than stopping at
         // the last thing anybody says.
@@ -478,6 +619,10 @@ impl Mp4Muxer {
     }
 
     pub fn finish(mut self) -> crate::Result<()> {
+        // Whatever the hold and the audio queue still carry: nothing further
+        // is coming for either to wait on, so this drains both fully rather
+        // than leaving a video-only tail queued.
+        self.drain_all()?;
         self.writer.write_end()?;
         let Self {
             writer,
