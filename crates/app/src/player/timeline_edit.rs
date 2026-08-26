@@ -310,6 +310,13 @@ impl Player {
     /// nothing is said about it. The engine reseeks, so all this owes is the
     /// flag reset -- and the selection, whose index was that lane's own and now
     /// names a different clip there.
+    ///
+    /// A dragged clip that is *itself* one of the selection's picks carries the
+    /// whole selection with it: every other pick moves the same frame delta,
+    /// all-or-nothing ([`PlaybackSession::move_selection_to`]), and the picks
+    /// survive the move -- their indices remapped rather than cleared, since a
+    /// pick that travels still names the clip it named before. A clip dragged
+    /// from outside the selection moves alone, exactly as it always has.
     pub(crate) fn move_clip(
         &mut self,
         from: Lane,
@@ -330,10 +337,23 @@ impl Player {
         ) else {
             return;
         };
-        let moved = self
-            .session
-            .as_mut()
-            .is_some_and(|session| session.move_clip_to(from, idx, to, start));
+        let set_move = self.selected.contains((from, idx)) && self.selected.len() > 1;
+        let picks: Vec<(Lane, usize)> = self.selected.picks().to_vec();
+        // Every pick's own start, read before the move touches anything -- the
+        // only way to find a pick again afterwards, since a lane change or an
+        // insert can move the index it was named by.
+        let pre_starts: Vec<Option<u32>> = picks
+            .iter()
+            .map(|&(lane, i)| {
+                self.session
+                    .as_ref()
+                    .and_then(|session| session.lane_clips(lane).get(i).map(|c| c.start))
+            })
+            .collect();
+        let moved = self.session.as_mut().is_some_and(|session| match set_move {
+            true => session.move_selection_to(&picks, from, idx, to, start),
+            false => session.move_clip_to(from, idx, to, start),
+        });
         let (kind, lanes) = match from.kind {
             LaneKind::Video => ("picture", "video"),
             LaneKind::Audio => ("sound", "audio"),
@@ -343,7 +363,18 @@ impl Player {
         };
         match moved {
             true => {
-                self.selected.clear();
+                // Every pick named a `(lane, ...)` by index into that lane's
+                // clips, sorted by start -- exactly what an insert or a lane
+                // change reorders. Re-read by the frame each pick's clip now
+                // starts at (recorded before the move moved anything), so the
+                // selection survives naming the clips it named, not the slots
+                // they used to sit in.
+                if set_move {
+                    self.selected =
+                        self.remap_selection(&picks, &pre_starts, from, idx, to, was, start);
+                } else {
+                    self.selected.clear();
+                }
                 self.reset_after_reseek();
             }
             // The three ways a drag is refused, told apart by what the
@@ -360,6 +391,15 @@ impl Player {
             // Picked up and put back down where it was: a click, and a click
             // says nothing.
             false if from == to && start == was => {}
+            false if set_move => self.notify_user(
+                format!(
+                    "NOT MOVED — {} clips selected, and another clip already covers where one of \
+                     them would land on {}",
+                    picks.len(),
+                    to.label()
+                )
+                .into(),
+            ),
             false => self.notify_user(
                 format!(
                     "NOT MOVED — another clip already covers those frames on {}",
@@ -369,6 +409,50 @@ impl Player {
             ),
         }
         cx.notify();
+    }
+
+    /// What a selection's picks are called after a set-move that shifted every
+    /// one of them by `landed - was` timeline frames (the delta the dragged
+    /// clip's own head travelled, which every pick travelled too -- see
+    /// [`Project::move_selection`]): the clip a pick named is found again by
+    /// where it now starts, on the lane it stays on (or `to`, for the one
+    /// that changed lane), rather than by the index it had, which a lane
+    /// change or an insert can have moved. A pick whose clip cannot be found
+    /// there any more (a bad index handed in) is dropped rather than guessed
+    /// at.
+    fn remap_selection(
+        &self,
+        picks: &[(Lane, usize)],
+        pre_starts: &[Option<u32>],
+        from: Lane,
+        dragged: usize,
+        to: Lane,
+        was: u32,
+        landed: u32,
+    ) -> Selection {
+        let mut out = Selection::new();
+        let Some(session) = self.session.as_ref() else {
+            return out;
+        };
+        let delta = i64::from(landed) - i64::from(was);
+        for (&pick, &old_start) in picks.iter().zip(pre_starts) {
+            let Some(old_start) = old_start else {
+                continue;
+            };
+            let want = (i64::from(old_start) + delta) as u32;
+            // Every pick but the dragged clip itself stays on the lane it was
+            // already on; only the exact clip the hand let go of changed
+            // lane, so only its own pick is found on `to` rather than `from`.
+            let now_lane = if pick == (from, dragged) { to } else { pick.0 };
+            if let Some(found) = session
+                .lane_clips(now_lane)
+                .iter()
+                .position(|c| c.start == want)
+            {
+                out.add((now_lane, found));
+            }
+        }
+        out
     }
 
     /// The whole of a palette track as a placement: from its own first

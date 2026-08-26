@@ -1897,6 +1897,141 @@ fn a_track_can_be_added_dropped_on_edited_and_taken_back() {
     assert_eq!(format_refusal(&session, Format::Mp4), None);
 }
 
+/// [`PlaybackSession::move_selection_to`], the door a selection drag uses
+/// ([`Player::move_clip`]'s set path): three picks across two lanes, one of
+/// them the dragged clip, all travel the *same* frame delta in one call --
+/// the same all-or-nothing clamp [`Project::move_room`] already gave a
+/// linked group, generalised to an arbitrary selection.
+#[test]
+fn a_selection_drag_moves_every_pick_by_the_same_delta() {
+    use engine::project::LaneKind;
+
+    let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+    session.set_gain(0.0);
+    let path = session.sources()[0].path.clone();
+    session.import(&asset("test_av2.mp4")).expect("av2 matches");
+    let second = session.sources()[1].path.clone();
+
+    // clip0 on V1 at the fixture's own start; clip1 on V1 ten seconds in,
+    // appended to the open bed and rippling nothing.
+    assert!(session
+        .place_stream_at(10.0, &second, 0, None)
+        .expect("av2 is on this timeline"));
+    let clip0 = session.lane_clips(Lane::V1)[0];
+    let clip1 = session.lane_clips(Lane::V1)[1];
+    assert_eq!((clip0.start, clip1.start), (0, 300));
+
+    // clipC on a second video row, well past both of the above.
+    let v2 = session.add_lane(LaneKind::Video);
+    assert!(session
+        .place_stream_at(20.0, &path, 0, Some(v2))
+        .expect("test_av.mp4 is on this timeline"));
+    let clip_c = session.lane_clips(v2)[0];
+    assert_eq!(clip_c.start, 600);
+
+    let picks = [(Lane::V1, 0), (Lane::V1, 1), (v2, 0)];
+    // Drag clip1 fifty frames along its own lane -- the other two picks own
+    // no neighbours of their own here, so nothing narrows the room and the
+    // full fifty-frame ask goes through for all three.
+    assert!(session.move_selection_to(&picks, Lane::V1, 1, Lane::V1, clip1.start + 50));
+    assert_eq!(session.lane_clips(Lane::V1)[0].start, clip0.start + 50);
+    assert_eq!(session.lane_clips(Lane::V1)[1].start, clip1.start + 50);
+    assert_eq!(session.lane_clips(v2)[0].start, clip_c.start + 50);
+    // Every pick still names the clip it named: found again by the frame it
+    // now starts at -- exactly the lookup `Player::remap_selection` makes
+    // once the move lands, which is what keeps a set-move's selection alive
+    // rather than clearing it.
+    assert_eq!(
+        session.lane_clips(Lane::V1)[0],
+        Clip { start: clip0.start + 50, ..clip0 }
+    );
+    assert_eq!(
+        session.lane_clips(v2)[0],
+        Clip { start: clip_c.start + 50, ..clip_c }
+    );
+
+    assert!(session.undo(), "one step for the whole set-move");
+    assert_eq!(session.lane_clips(Lane::V1)[0].start, clip0.start);
+    assert_eq!(session.lane_clips(Lane::V1)[1].start, clip1.start);
+    assert_eq!(session.lane_clips(v2)[0].start, clip_c.start);
+}
+
+/// One pick with nowhere to go refuses the whole set: the walk onto another
+/// clip's own span that already refuses a lone drag
+/// (`move_clip_keeps_the_frames_and_refuses_the_rest`, in this crate's own
+/// engine tests) refuses a selection drag exactly the same way, and every
+/// *other* pick -- which had all the room in the world -- stays exactly
+/// where it was rather than moving on its own.
+#[test]
+fn a_selection_drag_refuses_as_one_set_when_any_pick_cannot_land() {
+    use engine::project::LaneKind;
+
+    let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+    session.set_gain(0.0);
+    let path = session.sources()[0].path.clone();
+    session.import(&asset("test_av2.mp4")).expect("av2 matches");
+    let second = session.sources()[1].path.clone();
+
+    assert!(session
+        .place_stream_at(10.0, &second, 0, None)
+        .expect("av2 is on this timeline"));
+    let clip0 = session.lane_clips(Lane::V1)[0];
+    let clip1 = session.lane_clips(Lane::V1)[1];
+
+    let v2 = session.add_lane(LaneKind::Video);
+    assert!(session
+        .place_stream_at(0.0, &path, 0, Some(v2))
+        .expect("test_av.mp4 is on this timeline"));
+    let clip_c = session.lane_clips(v2)[0];
+    // A clip clip1 is not picked, blocking the road on V2 the drag is about
+    // to try: clip1 dragged onto V2 lands its head inside this one.
+    assert!(session
+        .place_stream_at(10.0, &second, 0, Some(v2))
+        .expect("av2 is on this timeline"));
+    let blocker = session.lane_clips(v2)[1];
+    assert_eq!(blocker.start, 300);
+
+    let picks = [(Lane::V1, 0), (Lane::V1, 1), (v2, 0)];
+    // Dragged onto V2 at a frame inside the blocker: refused outright, the
+    // way a lone drag onto another clip already is.
+    assert!(!session.move_selection_to(
+        &picks,
+        Lane::V1,
+        1,
+        v2,
+        blocker.start + 10
+    ));
+    // Nothing moved -- not clip1 clamped short of the blocker, and not the
+    // two picks that had all the room to spare.
+    assert_eq!(session.lane_clips(Lane::V1)[0], clip0);
+    assert_eq!(session.lane_clips(Lane::V1)[1], clip1);
+    assert_eq!(session.lane_clips(v2)[0], clip_c);
+    assert_eq!(session.lane_clips(v2)[1], blocker);
+}
+
+/// The refactor `move_clip` -> `move_selection` owes: a clip dragged from
+/// outside the selection (or with nothing else selected) moves exactly as it
+/// always has -- `move_clip_to`'s own door and `move_selection_to`'s
+/// selection-of-one both walk the same code, so they cannot drift apart.
+#[test]
+fn a_lone_clip_drag_is_unchanged_by_the_selection_path() {
+    use engine::project::LaneKind;
+
+    let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+    session.set_gain(0.0);
+    let v2 = session.add_lane(LaneKind::Video);
+
+    assert!(session.move_clip_to(Lane::V1, 0, v2, 0), "V1 -> V2");
+    assert!(session.lane_clips(Lane::V1).is_empty());
+    assert_eq!(session.lane_clips(v2).len(), 1);
+
+    // The other kind of lane is refused exactly as before.
+    assert!(!session.move_clip_to(v2, 0, Lane::A1, 0));
+    // A drop back where it was picked up is a click, still refused.
+    let clip = session.lane_clips(v2)[0];
+    assert!(!session.move_clip_to(v2, 0, v2, clip.start));
+}
+
 /// A caption grouped with a clip on an *added* lane closes its lane's hole
 /// too, not just the first pair's: the same law commit `cdc53a6` gave `V1`
 /// (`whole_take` -> `Project::delete_members`) has to hold from every anchor
