@@ -201,6 +201,11 @@ impl Player {
             ActionId::TrimIn => self.nudge_cut(Edge::Start, 1, cx),
             ActionId::TrimOut => self.nudge_cut(Edge::End, -1, cx),
             ActionId::LoopTrim => self.toggle_loop_trim(cx),
+            // Trim-to-playhead (debt #42): the same `Edge::Start`/`Edge::End`
+            // split as the nudge pair above, at the playhead's frame instead
+            // of a one-frame detent.
+            ActionId::TrimInToPlayhead => self.trim_cut_to_playhead(Edge::Start, cx),
+            ActionId::TrimOutToPlayhead => self.trim_cut_to_playhead(Edge::End, cx),
         }
     }
 
@@ -592,6 +597,38 @@ impl Player {
             self.reset_after_reseek();
             // Loop-trim follows the edge it is trimming: the whole point of
             // the mode is hearing the cut as it moves.
+            if self.loop_trim.is_some() {
+                self.loop_trim = self.cut_span(lane, idx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Trim-to-playhead (debt #42): the keyboard's own version of the
+    /// pointer's drag-the-edge-to-a-spot trim ([`Player::trim_to`] /
+    /// [`Player::commit_trim`]) -- same [`PlaybackSession::trim_clip`]
+    /// primitive either path ends at, so a hand on the keyboard gets the
+    /// same undo step and the same room clamp a drag gets, just aimed at
+    /// the playhead instead of wherever the pointer stopped. The oracle
+    /// already refused this with no subject cut or a playhead off it, so an
+    /// anchor and a frame are here to read.
+    pub(crate) fn trim_cut_to_playhead(&mut self, edge: Edge, cx: &mut Context<Self>) {
+        let Some((lane, idx)) = self.selected.anchor() else {
+            return;
+        };
+        let Some(session) = &self.session else {
+            return;
+        };
+        let to = frame_at(session.now(), self.fps);
+        self.mark_dirty();
+        let trimmed = self
+            .session
+            .as_mut()
+            .is_some_and(|s| s.trim_clip(lane, idx, edge, to));
+        if trimmed {
+            self.reset_after_reseek();
+            // Loop-trim follows the edge it is trimming, same as the nudge
+            // pair above.
             if self.loop_trim.is_some() {
                 self.loop_trim = self.cut_span(lane, idx);
             }
