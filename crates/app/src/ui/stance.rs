@@ -56,6 +56,15 @@ pub(crate) fn is_focus_cycle_key(key: &str) -> bool {
     key == "tab"
 }
 
+/// The other key a surface's own `on_key_down` answers: leaves the ring for
+/// the root handle (`Player::focus`) rather than letting the stroke bubble
+/// there itself -- same one-door reason as [`is_focus_cycle_key`], so the
+/// bench and both dock tabs cannot answer "what closes the ring" two
+/// different ways.
+pub(crate) fn is_focus_exit_key(key: &str) -> bool {
+    key == "escape"
+}
+
 impl Player {
     /// The `FocusHandle` a [`Surface`] paints its ring on and Tab/Shift-Tab
     /// moves to next -- one door, so `next_surface`'s answer and the handle
@@ -596,9 +605,19 @@ fn bench(
         .id("stance-bench")
         .track_focus(&player.focus_bench)
         .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-            if is_focus_cycle_key(event.keystroke.key.as_str()) {
+            let key = event.keystroke.key.as_str();
+            if is_focus_cycle_key(key) {
                 let next = next_surface(Surface::Bench, event.keystroke.modifiers.shift);
                 window.focus(this.focus_handle(next));
+                cx.stop_propagation();
+                cx.notify();
+            } else if is_focus_exit_key(key) {
+                // Leaves the ring rather than deleting it: the root handle
+                // gets focus back, and a second escape there is what does
+                // whatever escape means at the root (nothing, today) --
+                // this must not itself bubble, or the root's own handler
+                // never sees a stroke that stayed a ring exit.
+                window.focus(&this.focus);
                 cx.stop_propagation();
                 cx.notify();
             }

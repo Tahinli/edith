@@ -924,7 +924,10 @@ fn the_clip_menu_dims_what_the_playhead_is_not_on_and_stays_in_the_window() {
         let allowed = action == ActionId::CancelExport
             || action == ActionId::Theme
             || action == ActionId::Fullscreen
-            || action == ActionId::SubtitleStyle;
+            || action == ActionId::SubtitleStyle
+            // Moving the ring touches no edit list either -- same kind of
+            // thing as Fullscreen right above it.
+            || action == ActionId::FocusPanels;
         assert_eq!(
             whole(action, busy).yes(),
             allowed,

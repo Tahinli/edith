@@ -933,3 +933,33 @@ fn only_tab_is_intercepted_by_a_focused_surface_everything_else_reaches_root() {
         assert!(!is_focus_cycle_key(key), "{key} must bubble to the root");
     }
 }
+
+/// The ring's other door, escape: [`ui::stance::is_focus_exit_key`] is the
+/// one branch a focused surface's `on_key_down` calls to hand focus back to
+/// the root (`Player::focus`) instead of letting escape bubble there on its
+/// own -- same pure-function-level check as the Tab gate above, since this
+/// crate has no window harness to drive a real `KeyDownEvent` through.
+#[test]
+fn escape_is_the_only_key_a_focused_surface_uses_to_leave_the_ring() {
+    use crate::ui::stance::is_focus_exit_key;
+
+    assert!(is_focus_exit_key("escape"));
+    for key in ["tab", "space", "s", "c", "left", "right", "enter", "delete", "?"] {
+        assert!(!is_focus_exit_key(key), "{key} must not exit the ring");
+    }
+}
+
+/// [`ActionId::FocusPanels`] is what starts the ring in the first place
+/// (`Player::act`'s `window.focus(&self.focus_dock)`) -- without a bound key
+/// reaching it, `next_surface`/`is_focus_cycle_key` above are unreachable
+/// dead code, exactly the defect this action closes.
+#[test]
+fn focus_panels_is_bound_and_lands_on_the_dock() {
+    use keymap::{ActionId, Keymap};
+
+    let k = Keymap::defaults();
+    assert_eq!(k.lookup("f6", false), Some(ActionId::FocusPanels));
+    // Bare Tab must still mean Select at the root -- FocusPanels must not
+    // have stolen it.
+    assert_eq!(k.lookup("tab", false), Some(ActionId::Select));
+}
