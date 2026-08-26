@@ -12,7 +12,7 @@ use crate::*;
 /// from a live `MouseExitEvent` still cannot be, and is proven by driving
 /// instead.
 pub(crate) fn split_drag_owes_save(split: Option<Split>) -> bool {
-    matches!(split, Some(Split::Dock) | Some(Split::Bench))
+    split.is_some_and(|split| Split::PERSISTED.contains(&split))
 }
 
 impl Player {
@@ -1750,9 +1750,9 @@ impl Player {
                 Some(MouseButton::Left) => self.drag_split(split, event.position, window, cx),
                 // Released outside the window: the up below never came, so this
                 // is where the gesture ends. The size is already written to
-                // `self.splits`, but the darkroom's two persisted seams still
-                // owe the save `drag_release` would have paid -- without it
-                // the drag holds for the session and reverts on restart.
+                // `self.splits`, but a persisted seam still owes the save
+                // `drag_release` would have paid -- without it the drag
+                // holds for the session and reverts on restart.
                 _ => {
                     self.split_drag = None;
                     if split_drag_owes_save(Some(split)) {
@@ -1889,10 +1889,10 @@ impl Player {
         }
         if let Some(split) = self.split_drag.take() {
             self.drag_split(split, event.position, window, cx);
-            // The darkroom's own two seams outlive the window: written once,
-            // on the release that ends the gesture, the same small-file
-            // round trip `ui::dock_stance`'s tab pick uses -- not on every
-            // sample in between, which `drag_move` above never owed a write.
+            // Every seam outlives the window: written once, on the release
+            // that ends the gesture, the same small-file round trip
+            // `ui::dock_stance`'s tab pick uses -- not on every sample in
+            // between, which `drag_move` above never owed a write.
             if split_drag_owes_save(Some(split)) {
                 save_stance_splits(&self.splits);
             }
