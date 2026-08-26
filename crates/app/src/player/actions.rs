@@ -354,7 +354,7 @@ impl Player {
             }),
             playhead: frame_at(session.now(), self.fps),
             timeline: true,
-            clipboard: self.clipboard.is_some(),
+            clipboard: !self.clipboard.is_empty(),
             subtitles: !session.subtitles().is_empty(),
             playable: !nothing_to_play(self.active_session()),
             exporting: self.exporting().is_some(),

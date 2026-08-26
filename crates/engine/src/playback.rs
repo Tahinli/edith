@@ -2953,6 +2953,16 @@ impl PlaybackSession {
         self.edit(Dirty::Both, |p| p.paste(at, clip))
     }
 
+    /// [`paste_at`](Self::paste_at)'s general form: [`Project::paste_set`]'s
+    /// door, clamped to the timeline's own end the same way -- a set let go
+    /// past the last frame lands there rather than carrying black in front of
+    /// it, exactly as a lone clip's paste does.
+    pub fn paste_set_at(&mut self, timeline_secs: f64, items: &[(Lane, Clip)]) -> bool {
+        let at = secs_to_frame(timeline_secs, self.meta.frame_rate)
+            .min(self.project.timeline_frames());
+        self.edit(Dirty::Both, |p| p.paste_set(at, items))
+    }
+
     /// Places the whole of `path` played on its audio `stream` at
     /// `timeline_secs`, the way [`paste_at`](Self::paste_at) places a copy --
     /// the door a library row goes through, and the only way a stream other
