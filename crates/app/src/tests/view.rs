@@ -912,6 +912,24 @@ fn tab_cycles_dock_bench_inspector_and_wraps() {
     assert_eq!(next_surface(Surface::Bench, true), Surface::Dock);
 }
 
+/// The defect this closes: the dock mounts only one of its two tabs at a
+/// time (`dock_stance::render`'s `match src_active`), so focusing
+/// `focus_dock`/`focus_inspector` while the other tab is showing lands on a
+/// handle with no tree node -- gpui then dispatches no key listener at all,
+/// keyboard input is dead until a mouse click. `Player::focus_surface`
+/// (`ui::stance.rs`) flips the tab first via this pure decision so the
+/// surface being entered is always the one mounted.
+#[test]
+fn surface_wants_src_active_mounts_the_tab_before_focus_lands_on_it() {
+    use crate::ui::stance::{Surface, surface_wants_src_active};
+
+    assert_eq!(surface_wants_src_active(Surface::Dock), Some(true));
+    assert_eq!(surface_wants_src_active(Surface::Inspector), Some(false));
+    // Bench has no dock tab of its own -- entering it must not disturb
+    // whichever tab the dock was last left on.
+    assert_eq!(surface_wants_src_active(Surface::Bench), None);
+}
+
 /// The root fallback guarantee (main.rs:1054's "every keybind hangs off the
 /// root FocusHandle"): a surface's own `on_key_down` answers Tab/Shift-Tab
 /// and nothing else -- `cx.stop_propagation()` is only ever reached from

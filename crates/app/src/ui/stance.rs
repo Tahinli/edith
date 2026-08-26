@@ -65,6 +65,22 @@ pub(crate) fn is_focus_exit_key(key: &str) -> bool {
     key == "escape"
 }
 
+/// The dock mounts only one of its two tabs at a time
+/// (`dock_stance::render`'s `match src_active`), so `focus_dock` only has a
+/// tree node under Sources and `focus_inspector` only under Clip -- focusing
+/// the unmounted one leaves gpui with a focused handle no node answers to,
+/// and every key dies until the next mouse click. Answers "does entering
+/// `surface` require flipping the dock tab first", pure so it's testable
+/// without a `Window`: `Some(true)`/`Some(false)` is the `dock_src_active`
+/// the surface needs mounted, `None` (bench) means leave the tab alone.
+pub(crate) fn surface_wants_src_active(surface: Surface) -> Option<bool> {
+    match surface {
+        Surface::Dock => Some(true),
+        Surface::Inspector => Some(false),
+        Surface::Bench => None,
+    }
+}
+
 impl Player {
     /// The `FocusHandle` a [`Surface`] paints its ring on and Tab/Shift-Tab
     /// moves to next -- one door, so `next_surface`'s answer and the handle
@@ -75,6 +91,26 @@ impl Player {
             Surface::Bench => &self.focus_bench,
             Surface::Inspector => &self.focus_inspector,
         }
+    }
+
+    /// One door onto every ring move: flips the dock tab first
+    /// ([`surface_wants_src_active`]) so `surface`'s handle is always
+    /// mounted before `window.focus` lands on it, then persists the flip
+    /// exactly as the tab's own click does (`dock_stance::dock_tab`'s
+    /// `on_click`), so the ring and a mouse click can't disagree about
+    /// which tab was last chosen.
+    pub(crate) fn focus_surface(
+        &mut self,
+        surface: Surface,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(src_active) = surface_wants_src_active(surface) {
+            self.dock_src_active = src_active;
+            crate::ui::dock_stance::save(src_active);
+        }
+        window.focus(self.focus_handle(surface));
+        cx.notify();
     }
 }
 
@@ -608,9 +644,8 @@ fn bench(
             let key = event.keystroke.key.as_str();
             if is_focus_cycle_key(key) {
                 let next = next_surface(Surface::Bench, event.keystroke.modifiers.shift);
-                window.focus(this.focus_handle(next));
+                this.focus_surface(next, window, cx);
                 cx.stop_propagation();
-                cx.notify();
             } else if is_focus_exit_key(key) {
                 // Leaves the ring rather than deleting it: the root handle
                 // gets focus back, and a second escape there is what does
