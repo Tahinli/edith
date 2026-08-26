@@ -1739,6 +1739,24 @@ impl Player {
             }
             return true;
         }
+        // The Clip tab's transition duration field (DEBT #111): the same
+        // keyboard door as the export card's bitrate field, checked first
+        // since it can be open while no card is (the Clip tab is always on
+        // screen, not modal).
+        if let Some(edit) = &mut self.transition_edit {
+            if key == ESCAPE {
+                self.transition_edit = None;
+            } else if key == "enter" {
+                self.commit_transition(cx);
+            } else if key == "backspace" {
+                edit.backspace();
+            } else if let Ok(digit) = key.parse::<u32>() {
+                edit.digit(digit);
+            } else {
+                return false;
+            }
+            return true;
+        }
         // The export card's custom bitrate field: the mouse door is the
         // steppers and the row's own click (`Player::edit_mbps`), but the
         // `0–9`/backspace/enter/esc chords `keymap::FIXED` already
