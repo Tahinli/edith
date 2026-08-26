@@ -969,8 +969,8 @@ pub struct Binding {
 }
 
 /// Every binding in force, in display order. No chord appears twice -- that is
-/// the invariant [`Keymap::rebind_action`] and [`parse`] both defend, and it is what
-/// lets [`Keymap::lookup`] answer with the first match.
+/// the invariant [`parse`] defends, and it is what lets [`Keymap::lookup`]
+/// answer with the first match.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Keymap {
     bindings: Vec<Binding>,
@@ -1284,9 +1284,9 @@ impl Keymap {
     /// The primary chord for `action`, compact ([`Chord::compact`]) -- a
     /// badge that has room for one token, not [`Keymap::display`]'s sentence.
     /// The first bound stroke wins (`defaults`' own insertion order, and
-    /// `rebind_action`'s "makes `chord` the whole of what reaches `action`"
-    /// leaves at most one anyway); an action with no stroke reads `--`
-    /// rather than the unbound sentence, since a badge is not a warning.
+    /// [`parse`]'s "no chord appears twice" leaves at most one anyway); an
+    /// action with no stroke reads `--` rather than the unbound sentence,
+    /// since a badge is not a warning.
     pub fn chord(&self, action: ActionId) -> String {
         self.bindings
             .iter()
@@ -1298,35 +1298,6 @@ impl Keymap {
     /// Every binding, in display order.
     pub fn entries(&self) -> &[Binding] {
         &self.bindings
-    }
-
-    /// Makes `chord` the whole of what reaches `action`: its other chords go, so
-    /// what the editor shows for an action is what a rebind replaced. Two
-    /// strokes for one action stay expressible, but only in the file -- the
-    /// parser takes as many lines per action as it is given.
-    ///
-    /// `Err` names the action that already holds the chord and nothing changes:
-    /// two actions on one stroke would make the second unreachable, and silently
-    /// stealing it is worse than refusing. A chord the action already holds is
-    /// not a conflict with itself -- it collapses the action onto that one.
-    pub fn rebind_action(&mut self, action: ActionId, chord: Chord) -> Result<(), ActionId> {
-        if let Some(held) = self
-            .bindings
-            .iter()
-            .find(|b| b.action != action && b.chord == chord)
-        {
-            return Err(held.action);
-        }
-        self.bindings.retain(|b| b.action != action);
-        // Back into its own place in the display order rather than onto the end,
-        // so the file and the editor keep reading in the order of `ALL`.
-        let at = self
-            .bindings
-            .iter()
-            .position(|b| rank(b.action) > rank(action))
-            .unwrap_or(self.bindings.len());
-        self.bindings.insert(at, Binding { action, chord });
-        Ok(())
     }
 
     /// The keymap in force, and what to tell the user if the file could not be
@@ -1412,15 +1383,6 @@ impl Keymap {
             std::env::var_os("HOME"),
         )
     }
-}
-
-/// Where an action sits in the display order, which is the order of
-/// [`ActionId::ALL`] and the order the file is written in.
-fn rank(action: ActionId) -> usize {
-    ActionId::ALL
-        .iter()
-        .position(|a| *a == action)
-        .unwrap_or(ActionId::ALL.len())
 }
 
 /// The path rule, with the environment handed in so it can be checked. An
@@ -1743,65 +1705,11 @@ mod tests {
         assert!(!chord("", false).bindable());
         assert!(!chord("X", false).bindable());
         assert!(!chord("page up", false).bindable());
-        // A bindable chord is one `rebind_action` may keep: what it writes is
-        // what the next load reads, for every stroke that passes here.
-        let mut k = Keymap::defaults();
-        // Any free chord will do here; ctrl+= is the zoom's.
-        k.rebind_action(ActionId::Play, chord("w", true)).unwrap();
+        // A bindable chord is one the file's own grammar can spell: what it
+        // writes is what the next load reads, for every stroke that passes
+        // here.
+        let k = whole("edith-keys 1\nplay ctrl+w\n");
         assert_eq!(whole(&emit(&k)), k);
-    }
-
-    #[test]
-    fn rebinding_refuses_to_steal_another_actions_stroke() {
-        let mut k = Keymap::defaults();
-        assert_eq!(
-            k.rebind_action(ActionId::Export, chord("space", false)),
-            Err(ActionId::Play)
-        );
-        // Refused means unchanged, on both sides of the conflict.
-        assert_eq!(k.lookup("e", false), Some(ActionId::Export));
-        assert_eq!(k.lookup("space", false), Some(ActionId::Play));
-        // And the refusal is a name, not a shrug: it is the holder's own label
-        // the card prints back at the waiting row (`Player::capture`, "ALREADY
-        // BOUND — space is Play / Pause").
-        assert_eq!(ActionId::Play.label(), "Play / Pause");
-        // A free stroke takes, and the old one stops meaning anything.
-        assert_eq!(k.rebind_action(ActionId::Export, chord("w", true)), Ok(()));
-        assert_eq!(k.lookup("w", true), Some(ActionId::Export));
-        assert_eq!(k.lookup("e", false), None);
-        assert_eq!(k.display(ActionId::Export), "ctrl+w");
-    }
-
-    #[test]
-    fn a_rebound_action_keeps_only_the_new_stroke() {
-        let mut k = Keymap::defaults();
-        assert_eq!(k.display(ActionId::Delete), "x or delete");
-        // One stroke replaces the whole set: what the row showed is what went.
-        assert_eq!(k.rebind_action(ActionId::Delete, chord("d", true)), Ok(()));
-        assert_eq!(k.display(ActionId::Delete), "ctrl+d");
-        assert_eq!(k.lookup("x", false), None);
-        assert_eq!(k.lookup("delete", false), None);
-        assert_eq!(k.lookup("d", true), Some(ActionId::Delete));
-        // One of its own chords is not a conflict with itself -- it collapses
-        // the action onto that one.
-        assert_eq!(k.rebind_action(ActionId::Undo, chord("z", true)), Ok(()));
-        assert_eq!(k.display(ActionId::Undo), "ctrl+z");
-        assert_eq!(k.lookup("z", false), None);
-        // The action keeps its place in the display order, and the file keeps
-        // reading in that order too. Deduped only for safety -- both actions
-        // this test rebinds (Delete and Undo) started with two default
-        // chords each, but both rebinds above collapse them to one, so no
-        // action here still appears twice.
-        let mut order: Vec<_> = k.entries().iter().map(|b| b.action).collect();
-        order.dedup();
-        assert_eq!(order, ActionId::ALL);
-        assert_eq!(emit(&k), emit(&whole(&emit(&k))));
-        // With Delete and Undo both collapsed to one chord, every action is
-        // single-bound: one line each. The stride-10 walk
-        // (WalkCutNext10/WalkCutPrev10) is its own action now, each bound to
-        // exactly one literal chord (`>`/`<`), not a second chord on
-        // WalkCutNext/WalkCutPrev.
-        assert_eq!(k.entries().len(), ActionId::ALL.len());
     }
 
     #[test]
@@ -1881,10 +1789,17 @@ mod tests {
         // Its own directory, never the real config one: this test writes.
         let dir = Scratch::dir("edith-keymap");
         let path = dir.join("edith").join("keybindings");
-        let mut written = Keymap::defaults();
-        written
-            .rebind_action(ActionId::Export, chord("w", true))
-            .unwrap();
+        // A defaults file with Export's own line swapped for a free stroke --
+        // parsed rather than rebound, since nothing left in the API mutates
+        // a `Keymap` in place.
+        let text: String = emit(&Keymap::defaults())
+            .lines()
+            .filter(|l| !l.starts_with("export "))
+            .chain(std::iter::once("export ctrl+w"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        let written = whole(&text);
         // The config directory does not exist yet -- the first save makes it.
         written.save_to(&path).unwrap();
         let (read, notice) = Keymap::load_from(&path);

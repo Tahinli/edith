@@ -251,55 +251,6 @@ impl Player {
         cx.notify();
     }
 
-    /// A press on the scrollbar's track: on the thumb, the drag begins from
-    /// wherever in it the hand landed; beside it, the view jumps so the
-    /// thumb's middle is at the press and the drag carries on from there --
-    /// a click is a jump, and holding it is a jump that keeps going.
-    pub(crate) fn scroll_press(&mut self, x: Pixels, cx: &mut Context<Self>) {
-        let view = self.view();
-        if view.bed <= 0. || view.duration <= 0. {
-            return;
-        }
-        let (thumb_x, thumb_w) = scroll_thumb(
-            view.bed,
-            view.duration,
-            view.scale.start.max(0.),
-            view.span(),
-        );
-        let at = px_along(x, self.scroll_track.get());
-        let grab = match (thumb_x..thumb_x + thumb_w).contains(&at) {
-            true => at - thumb_x,
-            // Beside the thumb: jump so its middle is under the pointer --
-            // by the track's own proportion, the very mapping a drag sample
-            // is read through below, so the first move of the drag that
-            // follows lands exactly where the jump left the view and the
-            // thumb never snaps under the hand (a jump worked out in pixels
-            // at the view's own pps landed at span-over-duration of the
-            // target and the snap was the drag correcting it). The thumb is
-            // clamped inside the track by [`scroll_thumb`], so the grab this
-            // leaves is always a real place inside it -- at the thumb's floor
-            // width as much as anywhere else.
-            false => {
-                let start = f64::from((at - thumb_w / 2.).max(0.)) / f64::from(view.bed.max(1.))
-                    * view.duration;
-                self.scale = View {
-                    scale: Scale {
-                        start,
-                        ..view.scale
-                    },
-                    ..view
-                }
-                .settled();
-                thumb_w / 2.
-            }
-        };
-        self.scroll_drag = Some(grab);
-        // The wheel's own claim on the follow: a hand on the scrollbar is
-        // looking away from the playhead on purpose.
-        self.panned = true;
-        cx.notify();
-    }
-
     /// A sample of a thumb drag: the window starts where the thumb's grabbed
     /// point sits under the pointer, clamped by the same `settled` every other
     /// scroll answers to. No reseek, no worker -- the view is the only thing
@@ -336,38 +287,6 @@ impl Player {
         to.clamp(0., max)
     }
 
-    /// A press on the lane stack's scrollbar: on the thumb, the drag begins
-    /// from wherever in it the hand landed; beside it, the stack jumps so the
-    /// thumb's middle is at the press and the drag carries on from there --
-    /// the time axis's own terms ([`Self::scroll_press`]), turned through a
-    /// right angle.
-    pub(crate) fn lanes_press(&mut self, y: Pixels, cx: &mut Context<Self>) {
-        let track = f32::from(self.lanes_scroll.bounds().size.height);
-        let max = f32::from(self.lanes_scroll.max_offset().height);
-        if track <= 0. || max <= 0. {
-            return;
-        }
-        let scrolled = -f32::from(self.lanes_scroll.offset().y);
-        let (thumb_y, thumb_h) = lanes_thumb(track, track + max, track, scrolled);
-        let at = px_down(y, self.lanes_scroll.bounds());
-        let grab = match (thumb_y..thumb_y + thumb_h).contains(&at) {
-            true => at - thumb_y,
-            // Beside the thumb: jump so its middle is under the pointer, at
-            // the press's own share of the stack. The thumb is clamped inside
-            // the track by [`lanes_thumb`], so the grab this leaves is always
-            // a real place inside it.
-            false => {
-                let to =
-                    self.lanes_taken((at - thumb_h / 2.).max(0.) / (track - thumb_h).max(1.) * max);
-                self.lanes_scroll
-                    .set_offset(point(self.lanes_scroll.offset().x, px(-to)));
-                thumb_h / 2.
-            }
-        };
-        self.lanes_drag = Some(grab);
-        cx.notify();
-    }
-
     /// A sample of the lane thumb's drag: the stack is taken to where the
     /// thumb's grabbed point sits under the pointer, clamped by the same
     /// `max_offset` the column's own wheel answers to. No reseek, no repaint
@@ -381,23 +300,6 @@ impl Player {
         let (_, thumb_h) = lanes_thumb(track, track + max, track, 0.);
         let at = px_down(y, self.lanes_scroll.bounds());
         let to = self.lanes_taken((at - grab).max(0.) / (track - thumb_h).max(1.) * max);
-        self.lanes_scroll
-            .set_offset(point(self.lanes_scroll.offset().x, px(-to)));
-        cx.notify();
-    }
-
-    /// The wheel over the lane stack's strip, in the pixels gpui's own scroll
-    /// of the column would move it (`pixel_delta` -- a line a notch, not a
-    /// share of anything): the strip stops the wheel before the column behind
-    /// it sees it, so this is the notch's one path and it moves the stack
-    /// exactly as far as the names' own surface does.
-    pub(crate) fn lanes_wheel(&mut self, dy: f32, cx: &mut Context<Self>) {
-        let max = f32::from(self.lanes_scroll.max_offset().height);
-        if max <= 0. {
-            return;
-        }
-        let scrolled = -f32::from(self.lanes_scroll.offset().y);
-        let to = self.lanes_taken(scrolled - dy);
         self.lanes_scroll
             .set_offset(point(self.lanes_scroll.offset().x, px(-to)));
         cx.notify();

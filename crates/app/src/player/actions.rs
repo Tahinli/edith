@@ -175,9 +175,13 @@ impl Player {
             ActionId::FocusPanels => {
                 self.focus_surface(crate::ui::stance::Surface::Dock, window, cx);
             }
-            // Nothing to cancel while nothing is exporting; the export guard in
-            // the key handler is what answers this one while there is.
-            ActionId::CancelExport => {}
+            // `^esc` (or whatever the keymap now binds it to) reaches here
+            // through the plain `act()` dispatch even while an export is
+            // running (`ui::stance`'s key handler deliberately leaves
+            // `exporting()` out of its modal guard so this keeps working):
+            // was a no-op until now, the real gap the progress card's own
+            // "the chord as well" doc promised.
+            ActionId::CancelExport => self.cancel_export(),
             ActionId::ShowActions => self.show_actions(cx),
             ActionId::Settings => self.open_settings(cx),
             ActionId::Screenshot => self.take_screenshot(cx),
@@ -256,13 +260,11 @@ impl Player {
     }
 
     /// The actions card, from its key, from the panel button, or from its own
-    /// row: open, with an empty search box -- a card that opens showing the
-    /// last search would hide most of the list for a reason nobody remembers.
+    /// row: open, scrolled to the top -- a card that opens where the last
+    /// look left it would hide most of the list for a reason nobody remembers.
     pub(crate) fn show_actions(&mut self, cx: &mut Context<Self>) {
         self.keys_open = true;
-        self.keys_search.clear();
         self.scroll_keys(None);
-        self.rebinding = None;
         // One card at a time, the rule the other cards follow.
         self.export_open = false;
         cx.notify();
@@ -433,11 +435,7 @@ impl Player {
         // below, which otherwise repeats nothing.
         if self.mbps_edit.is_some() {
             Repeat::Card
-        } else if self.rebinding.is_some()
-            || self.keys_open
-            || self.export_open
-            || self.exporting().is_some()
-        {
+        } else if self.keys_open || self.export_open || self.exporting().is_some() {
             Repeat::Nothing
         } else if self.eq_open.is_some()
             || self.color_open.is_some()
@@ -628,46 +626,6 @@ impl Player {
         }
         self.selected.clear();
         cx.notify();
-    }
-
-    /// The stroke a waiting row was after: it becomes the whole of what reaches
-    /// that action, which is what the row was showing. A chord another action
-    /// already holds is refused by the keymap and the row keeps waiting, so the
-    /// next stroke is another try rather than a lost one. A binding that took
-    /// holds either way:
-    /// what a failed write costs is only the next run, which is what the notice
-    /// is for.
-    pub(crate) fn capture(&mut self, action: ActionId, key: &str, ctrl: bool) {
-        let chord = keymap::Chord {
-            key: key.to_string(),
-            ctrl,
-        };
-        // Only a stroke the file can spell and read back as itself: gpui reports
-        // "+" for shift+=, which is the chord grammar's separator, so binding it
-        // would write a line the next load would have to drop. Refused here, in
-        // front of the user, rather than silently costing that binding later.
-        // The row keeps waiting, as it does for a stroke already taken.
-        if !chord.bindable() {
-            let text = format!("THAT KEY CANNOT BE BOUND — {}", chord.pretty());
-            eprintln!("{text}");
-            self.notify_user(text.into());
-            return;
-        }
-        let text = match self.keymap.rebind_action(action, chord.clone()) {
-            Ok(()) => {
-                self.rebinding = None;
-                match self.keymap.save() {
-                    Ok(()) => return,
-                    Err(e) => format!(
-                        "KEYBINDINGS NOT SAVED — {}: {e}",
-                        Keymap::config_path().display()
-                    ),
-                }
-            }
-            Err(holder) => format!("ALREADY BOUND — {} is {}", chord.pretty(), holder.label()),
-        };
-        eprintln!("{text}");
-        self.notify_user(text.into());
     }
 }
 

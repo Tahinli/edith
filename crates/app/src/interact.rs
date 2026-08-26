@@ -194,7 +194,7 @@ pub(crate) fn scrim() -> Div {
 /// is old too". A plate is `panel` with a seam around it and a 6px radius
 /// (DESIGN §2/§4); the legacy tree keeps its own raised sheet. One function,
 /// so the next change reaches all three or none.
-pub(crate) fn menu_plate(id: &'static str, x: f32, y: f32, darkroom: bool) -> Stateful<Div> {
+pub(crate) fn menu_plate(id: &'static str, x: f32, y: f32) -> Stateful<Div> {
     div()
         .id(id)
         .absolute()
@@ -205,15 +205,9 @@ pub(crate) fn menu_plate(id: &'static str, x: f32, y: f32, darkroom: bool) -> St
         .flex_col()
         .p(px(crate::layout::MENU_PAD))
         .rounded(px(6.))
-        .bg(rgb(if darkroom {
-            crate::ui::theme::DARK_PANEL()
-        } else {
-            crate::ui::theme::BG_RAISED()
-        }))
-        .when(darkroom, |d| {
-            d.border_1()
-                .border_color(rgba(crate::ui::theme::DARK_SEAM()))
-        })
+        .bg(rgb(crate::ui::theme::DARK_PANEL()))
+        .border_1()
+        .border_color(rgba(crate::ui::theme::DARK_SEAM()))
 }
 
 /// The sheet a card with a *slider* in it takes instead: the same scrim, with
@@ -334,13 +328,3 @@ pub(crate) fn repeats(scope: Repeat, key: &str, action: Option<ActionId>) -> boo
     }
 }
 
-/// The keys that are only ever half a chord. gpui delivers a lone modifier
-/// press as a keystroke of its own, and taking one as a binding would leave an
-/// action that fires the moment the user reaches for any chord that uses it --
-/// so a capture waits through them instead.
-pub(crate) fn is_bare_modifier(key: &str) -> bool {
-    matches!(
-        key,
-        "control" | "shift" | "alt" | "super" | "platform" | "function" | "fn" | "meta" | "command"
-    )
-}

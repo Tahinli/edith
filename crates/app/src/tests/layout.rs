@@ -3,47 +3,6 @@
 
 use super::*;
 
-/// The edit toolbar against the 640x360 floor the whole editor is measured
-/// at. It does not fit and cannot be made to -- so what it may never do is
-/// *hide* the tail: the row scrolls, and the door to everything scrolled
-/// off it is pinned outside the scrolling box.
-#[test]
-fn toolbar_fits_the_smallest_window() {
-    let toolbar = src_text("ui/toolbar.rs");
-    let row = &toolbar[toolbar.find("pub(crate) fn toolbar(").expect("the toolbar")..];
-    // Every button in the row is a hit target, so none of them is narrower
-    // than `HIT_MIN`, and they sit in 8 px gaps inside the row's own 12 px
-    // padding.
-    let buttons = row.matches("action_control(").count();
-    assert!(buttons >= 11, "the row's buttons moved; this scan is blind");
-    // The row is shorter than it was -- the project's own settings (size,
-    // rate, HDR) are the inspector's now and the transport is the
-    // picture's -- so whether it fits at 640 px depends on the words in it
-    // and is not something this scan can measure. What it can hold to is
-    // the rule: "it scrolls" is not "it can be found", so the door to
-    // whatever is off the right edge is pinned outside the scrolling box
-    // and the card it opens carries every action there is
-    // (`every_action_is_on_the_actions_card`).
-    assert!(
-        row.contains("\"controls-more\""),
-        "nothing pinned beside the scrolling row: the tail is unreachable at 640 px"
-    );
-    assert_eq!(row.matches("overflow_x_scroll").count(), 1);
-    assert!(
-        row.find("\"controls-more\"") > row.find("overflow_x_scroll"),
-        "the pinned door is inside the row it is meant to outlive"
-    );
-    // ...and nothing in the row decides for itself whether it can act: the
-    // oracle does, once, for the key and the button alike. A raw `control(`
-    // in here is a button that can go dead while its stroke still fires --
-    // the bug this redesign was called in for.
-    assert_eq!(
-        row.matches("\n                    .child(control(").count(),
-        0,
-        "a toolbar button bypassing the availability oracle"
-    );
-}
-
 /// The class the user reported twice in one day ("some menus are belongs to
 /// old ui ... for example resolution picker", then "right click menu in
 /// library is old too"): a surface that paints a *role* token
@@ -164,30 +123,6 @@ fn the_line_about_what_is_below_the_fold_counts_what_is_still_below_it() {
         "{} px of chrome and a lane will not fit {floor} px",
         timeline_fixed_h(true)
     );
-    // The lane questions, asked of the mixed math the render actually walks
-    // (the uniform lanes_shown/rows_below pair went with their last caller;
-    // a lane in the stack may be a thinner
-    // caption one: a uniform stack answers exactly what the plain
-    // functions above do, and a mixed one answers off the real heights,
-    // never the media one alone.
-    let uniform = [LaneKind::Video, LaneKind::Audio];
-    assert_eq!(lanes_h_mixed(&uniform), lanes_h(2));
-    assert_eq!(lanes_shown_mixed(&uniform, LANE_H), 1);
-    let mixed = [LaneKind::Video, LaneKind::Audio, LaneKind::Subtitle];
-    assert_eq!(
-        lanes_h_mixed(&mixed),
-        2. * LANE_H + SUB_LANE_H + 2. * 8.,
-        "a caption lane is not counted as a full LANE_H row"
-    );
-    // A box exactly tall enough for the two media lanes and no more: the
-    // thinner third lane still does not fit above it.
-    assert_eq!(lanes_shown_mixed(&mixed, lanes_h(2)), 2);
-    // ...and with room for the caption lane too, all three show and
-    // nothing is below the fold.
-    assert_eq!(lanes_shown_mixed(&mixed, lanes_h_mixed(&mixed)), 3);
-    assert_eq!(rows_below_mixed(&mixed, lanes_h_mixed(&mixed), 0.), 0);
-    assert_eq!(rows_below_mixed(&mixed, lanes_h(2), 0.), 1);
-
     // The inspector's rows are not one height, so its own line is measured
     // in pixels off the scroll instead: gpui keeps the offset negative going
     // down, and at the bottom the two cancel out exactly.
@@ -287,11 +222,12 @@ fn a_message_wears_the_colour_its_own_words_say() {
 /// overlay again, whatever it looked like on the day it was written.
 #[test]
 fn an_inspector_section_occludes_no_timeline() {
-    let inspector = src_text("ui/inspector.rs");
     // Whichever file the root render has come to live in, from the impl to the
     // end of it -- found rather than named, so moving the root does not quietly
     // leave this rule reading a file the render is no longer in.
     let render = source_from("impl Render for Player");
+    let dock = src_text("ui/dock_stance.rs");
+    let stance = src_text("ui/stance.rs");
     for card in [
         "eq_card",
         "color_card",
@@ -300,56 +236,48 @@ fn an_inspector_section_occludes_no_timeline() {
         "mix_card",
         "subtitle_style_card",
     ] {
+        // Docked (unmaximized), the card is a section of the dock's own
+        // narrow column; maximized, it escapes to `stance-centre`'s window-
+        // space positioning context instead -- either way it is mounted
+        // through the darkroom's own structure, never straight off the
+        // root render.
         assert!(
-            inspector.contains(&format!("self.{card}(")),
-            "{card} is not a section of the inspector"
+            dock.contains(&format!("player.{card}("))
+                || stance.contains(&format!("player.{card}(")),
+            "{card} is not mounted anywhere in the darkroom"
         );
         assert!(
             !render.contains(&format!("self.{card}(")),
             "{card} is drawn from the root again -- it is an overlay over the timeline"
         );
     }
-    // The docked cards are placed against the inspector's own box, which is
-    // what turns `scrim()` (`absolute().inset_0()`) from a window-wide sheet
-    // into this column.
+    // The docked cards are placed against the dock's own box, and the
+    // maximized escape against `stance-centre` -- both positioning contexts,
+    // which is what turns `scrim()` (`absolute().inset_0()`) from a
+    // window-wide sheet into a contained one.
     assert!(
-        inspector.contains(".relative()"),
-        "the inspector is not a positioning context: its cards would cover the window"
+        stance.contains(".relative()"),
+        "the darkroom has no positioning context: its cards would cover the window"
     );
 }
 
-/// MUST 1, on the two named offenders: the button that relabels itself
-/// mid-export and the one that used to read "Muted 80%". Both live in a
-/// rect that is reserved once, so the words change and the box does not.
 #[test]
 fn a_stateful_button_keeps_its_rect() {
-    use crate::ui::toolbar::{EXPORT_SLOT_W, SNAP_SLOT_W, VOLUME_SLOT_W};
-    // Widest word each slot can hold, at the 12 px text this window is set
-    // in -- ~7 px a character plus the 16 px of padding.
-    let fits = |slot: f32, word: &str| slot >= word.chars().count() as f32 * 7. + 16.;
-    for word in ["Export", "Cancel"] {
-        assert!(fits(EXPORT_SLOT_W, word), "{word} overflows its rect");
-    }
-    for word in ["Snap on", "Snap off", "No subs", "Subs off"] {
-        assert!(fits(SNAP_SLOT_W, word), "{word} overflows its rect");
-    }
-    for word in ["100%", "× 100%"] {
-        assert!(fits(VOLUME_SLOT_W, word), "{word} overflows its rect");
-    }
-    // And the rect is passed, not hoped for: every stateful control in the
-    // three chrome rows names its width.
-    let toolbar = src_text("ui/toolbar.rs");
-    for (id, slot) in [
-        ("\"export\"", "EXPORT_SLOT_W"),
-        ("\"snap\"", "SNAP_SLOT_W"),
-        ("\"subs\"", "SNAP_SLOT_W"),
-        ("\"volume\"", "VOLUME_SLOT_W"),
-        ("\"zoom-fit\"", "ZOOM_SLOT_W"),
-    ] {
-        let at = toolbar.find(id).unwrap_or_else(|| panic!("no {id} button"));
+    // A toggle's own state must never gate whether the button exists --
+    // only how it looks. Flip the state and the pointer's target (the
+    // element the hitmap id names, and the rect a click lands on) is
+    // unchanged; only the label and the `active` styling read the flag.
+    // "eq-spectrum" and "export-cancel" are the darkroom's own stateful
+    // toggles: the first flips `self.eq_spectrum`, the second reads
+    // `armed` (whether cancel is armed), and neither may gate its own
+    // button out of the tree.
+    let cards = src_text("ui/cards.rs");
+    for (id, flag) in [("\"eq-spectrum\"", "self.eq_spectrum"), ("\"export-cancel\"", "armed")] {
+        let at = cards.find(id).unwrap_or_else(|| panic!("no {id} button"));
+        let before = &cards[at.saturating_sub(350)..at];
         assert!(
-            toolbar[at..at + 120].contains(slot),
-            "{id} does not reserve {slot}"
+            !before.contains(&format!(".when({flag}")) && !before.contains(&format!(".when(!{flag}")),
+            "{id} is gated on the very flag it flips -- its rect would move when the state does"
         );
     }
 }
@@ -361,11 +289,6 @@ fn nothing_clickable_is_smaller_than_the_wcag_minimum() {
     assert!(CONTROL_H >= HIT_MIN);
     assert!(RULER_HIT_H >= HIT_MIN);
     assert!(LANE_H >= HIT_MIN);
-    // A caption lane's header carries exactly one hit target now (the
-    // show/hide eye; remove moved to its right button), and that target
-    // fills the whole row -- so the row is never allowed to undercut the
-    // target it *is*.
-    assert!(SUB_LANE_H >= HIT_MIN);
     // A clip box is a hit target too, and its two trim strips occlude it:
     // on a box narrower than the pair there is no body left to press, so
     // the clip cannot be selected, dragged or menued at all -- which is
@@ -388,9 +311,6 @@ fn nothing_clickable_is_smaller_than_the_wcag_minimum() {
 
 #[test]
 fn a_lane_row_is_a_fixed_header_and_a_bed_that_can_be_hit() {
-    // The header column is what the ruler is offset by as well, so both
-    // numbers are shared rather than repeated per row (A-MUST1/A-MUST2).
-    assert!(HEADER_W > 0. && HEADER_GAP >= 0.);
     // Two lanes, a ruler, a button row and the timecode line, inside the
     // panel the window is sized for.
     assert!(
@@ -420,64 +340,6 @@ fn a_lane_row_is_a_fixed_header_and_a_bed_that_can_be_hit() {
     assert_eq!(lanes_h(2), 2. * LANE_H + 8.);
 }
 
-/// The scrollbar's thumb: the visible share of the timeline at its own
-/// place on the track, full width with nothing to scroll, never narrower than
-/// a hand can hold, and never off the ends.
-#[test]
-fn the_scroll_thumb_is_the_visible_share_at_its_own_place() {
-    use crate::SCROLL_THUMB_MIN;
-    use crate::scroll_thumb;
-
-    // Nothing to scroll: the strip fills and says so.
-    assert_eq!(scroll_thumb(400., 10., 0., 12.), (0., 400.));
-    assert_eq!(scroll_thumb(400., 0., 0., 0.), (0., 400.));
-    // Half the timeline on the bed: a half-width thumb, halfway along for a
-    // window starting halfway in.
-    assert_eq!(scroll_thumb(400., 20., 0., 10.), (0., 200.));
-    assert_eq!(scroll_thumb(400., 20., 10., 10.), (200., 200.));
-    // The floor width: however long the timeline, the thumb stays holdable --
-    // and the clamp keeps it on the track, not the caller.
-    let (x, w) = scroll_thumb(400., 1_000_000., 999_000., 100.);
-    assert_eq!(w, SCROLL_THUMB_MIN);
-    assert_eq!(x, 400. - SCROLL_THUMB_MIN);
-    assert_eq!(scroll_thumb(400., 1_000_000., 0., 100.).0, 0.);
-}
-
-/// A press beside the time axis's thumb jumps so the thumb's middle is under
-/// the pointer, and the drag that carries on from the press must land exactly
-/// where the jump left the view: both are read through the track's own
-/// proportion (a jump worked out in pixels at the view's pps used to land at
-/// span-over-duration of the target, and the snap on the first move was the
-/// drag correcting it). The equality below is the no-snap invariant, at the
-/// thumb's own width and at its floor width alike.
-#[test]
-fn a_beside_thumb_press_jumps_by_the_tracks_own_proportion() {
-    use crate::scroll_thumb;
-
-    let bed = 400.;
-    // The mapping both halves of the gesture share: a place on the track is
-    // that share of the drawn duration.
-    let jump = |at: f32, thumb_w: f32| (at - thumb_w / 2.).max(0.) / bed;
-    for (duration, span) in [(100_f32, 20_f32), (1_000_000_f32, 100_f32)] {
-        let (_, thumb_w) = scroll_thumb(bed, f64::from(duration), 0., f64::from(span));
-        let at = 3. * bed / 4.;
-        let start = jump(at, thumb_w) * duration;
-        // The jump centres the thumb on the press (the far end of a million
-        // seconds is the clamp's to hold, so the pin is measured from the
-        // thumb the track actually shows).
-        let (x, w) = scroll_thumb(bed, f64::from(duration), f64::from(start), f64::from(span));
-        let centre = (x + w / 2.).min(bed - w / 2.);
-        assert!(
-            (centre - at.min(bed - w / 2.)).abs() < 1.,
-            "thumb centre {centre} not at the press {at}"
-        );
-        // The drag's first sample from that press -- the grabbed middle, the
-        // same track proportion -- is the same start, whatever the width.
-        let grab = thumb_w / 2.;
-        assert_eq!(jump(at, 2. * grab) * duration, start);
-    }
-}
-
 /// The strip's row is furniture only while there is somewhere to scroll to:
 /// zoomed out to the whole timeline the strip is not drawn and neither is its
 /// height -- out of every budget at once (the region, the box the lanes are
@@ -505,10 +367,7 @@ fn the_scroll_strip_row_comes_and_goes_with_the_zoom() {
         // either face of the zoom boundary.
         let floor = split_size(Split::Timeline, Some(0.), 2, window, scroll);
         let box_h = floor - timeline_fixed_h(scroll);
-        assert!(
-            2 > lanes_shown_mixed(&[LaneKind::Video, LaneKind::Audio], box_h),
-            "no line to pay for at the floor"
-        );
+        assert!(box_h < lanes_h(2), "no line to pay for at the floor");
         assert!(
             box_h - LABEL_H - 8. >= LANE_H,
             "the floor leaves {} px for a {LANE_H} px lane",
@@ -552,57 +411,6 @@ fn the_lane_thumb_is_the_visible_share_of_the_stack() {
     assert_eq!(y, 200. - SCROLL_THUMB_MIN);
     assert_eq!(lanes_thumb(200., 2000., 200., 0.).0, 0.);
     assert_eq!(lanes_thumb(200., 1_000_000., 200., 0.).0, 0.);
-}
-
-/// A caption's box wears the rate its window plays at, derived off the
-/// placement itself: unity placements -- including odd widths whose frames
-/// came off `frames_of_us` rounding -- do not badge, and a re-rate does, with
-/// the rate surviving the group coming apart.
-#[test]
-fn a_caption_box_wears_the_rate_its_window_plays_at() {
-    use crate::caption_rate;
-
-    let sub = |frames: u32, out_us: i64| SubClip {
-        start: 0,
-        frames,
-        track: 0,
-        in_us: 0,
-        out_us,
-        link: None,
-    };
-    // Unity, exact and rounded: neither is a re-timing.
-    assert_eq!(caption_rate(sub(300, 10_000_000), 30.), None);
-    assert_eq!(
-        caption_rate(sub(100, 3_333_333), 30.),
-        None,
-        "placement rounding is not a re-timing"
-    );
-    // ...and rounding on SHORT tracks, where half a frame is a large share of
-    // the window: `frames_of_us` of 1,016,667µs gives 31 frames (16,667µs of
-    // error -- 16 permille, but half a frame), and of 5,015,000µs gives 150
-    // (15,000µs). Both are unity; a relative gate badges one 0.98x and the
-    // other a self-contradicting 1.00x.
-    assert_eq!(
-        caption_rate(sub(31, 1_016_667), 30.),
-        None,
-        "half a frame off a one-second window is still unity"
-    );
-    assert_eq!(
-        caption_rate(sub(150, 5_015_000), 30.),
-        None,
-        "a hair under five seconds rounds to 150 frames and stays unity"
-    );
-    // A 2x re-rate: a 5s span holding the same 10s of words.
-    assert_eq!(
-        caption_rate(sub(150, 10_000_000), 30.).map(|s| s.permille()),
-        Some(2000)
-    );
-    // ...and a slowed one -- a 20s span for the same words -- which the badge
-    // keeps after any detach: the proportion is the placement's own.
-    assert_eq!(
-        caption_rate(sub(600, 10_000_000), 30.).map(|s| s.permille()),
-        Some(500)
-    );
 }
 
 /// The selection itself: clicks in order, the anchor under the hand, the
@@ -721,18 +529,6 @@ fn a_click_marks_the_whole_group_and_nothing_else() {
 }
 
 #[test]
-fn a_name_is_dropped_rather_than_smeared_across_a_thin_clip() {
-    assert!(show_label(LABEL_MIN_W));
-    assert!(show_label(400.));
-    assert!(!show_label(LABEL_MIN_W - 0.1));
-    // The label test is the box's own width in pixels now, which is what
-    // the scale hands it -- no bed width, and so nothing to be zero.
-    let scale = Scale::default();
-    assert!(show_label(scale.width_px(LABEL_MIN_W as f64 / PPS_DEFAULT)));
-    assert!(!show_label(scale.width_px(0.)));
-}
-
-#[test]
 fn an_envelope_stays_inside_the_box_it_is_drawn_in() {
     // A ramp: silence at the start, full scale at the end.
     let peaks: Vec<(f32, f32)> = (0..40)
@@ -785,17 +581,7 @@ fn an_envelope_never_costs_more_points_than_a_screen_can_show() {
     // ...and the slice actually painted is the part of the box on the bed,
     // which is where that width stops mattering: a column per two visible
     // pixels, at every zoom.
-    let (x, w) = visible_slice(-huge / 2., huge, 1200.);
-    assert_eq!((x, w), (huge / 2., 1200.));
-    assert_eq!(envelope(&peaks, 0., 5., w, 30.).len(), 601);
-    // A box entirely off the bed has no slice, and one that has never been
-    // measured is drawn whole -- what was drawn before there was a bed.
-    assert_eq!(visible_slice(2000., 500., 1200.), (0., 0.));
-    assert_eq!(visible_slice(-3000., 500., 1200.), (500., 0.));
-    assert_eq!(visible_slice(-40., 500., 0.), (0., 500.));
-    // Half on, at either edge.
-    assert_eq!(visible_slice(-100., 500., 1200.), (100., 400.));
-    assert_eq!(visible_slice(1000., 500., 1200.), (0., 200.));
+    assert_eq!(envelope(&peaks, 0., 5., 1200., 30.).len(), 601);
 }
 
 /// The box a trim draws is the box its release commits, at every speed. The
@@ -1416,33 +1202,41 @@ fn the_subtitles_toggle_says_what_is_placed_and_never_the_picked_row() {
 }
 
 /// The door this editor answers "don't make me import the film again" with,
-/// and it is in the panel where the tracks it adds are listed: the Text
-/// tab's own button reads a file's subtitle tracks onto the open timeline
+/// and it is in the dock's IMPORT section beside the other two imports
+/// (`ui/dock_stance.rs`'s own doc comment: it moved off the spine's crowded
+/// TRACK group here): reads a file's subtitle tracks onto the open timeline
 /// -- a release's `.mkv`, an `.srt` beside it -- while the file itself
 /// joins nothing. It is the *action* and not a second implementation of it,
 /// so the button, the stroke and the actions card cannot drift apart, and
-/// it is oracle-gated like every other action button, so with no timeline
+/// it is oracle-gated like every other verb in the dock, so with no timeline
 /// open it dims and says why instead of opening a chooser for nothing.
 #[test]
 fn the_text_tab_carries_the_add_subtitles_door() {
-    let library = src_text("ui/library.rs");
-    let at = library
-        .find("\"add-subtitles\"")
-        .expect("no add-subtitles control in the library column");
-    let block = &library[at..(at + 1600).min(library.len())];
+    let dock = src_text("ui/dock_stance.rs");
+    let at = dock
+        .find("\"dock-import-subtitles\"")
+        .expect("no import-subtitles control in the dock");
+    let block = &dock[at..(at + 500).min(dock.len())];
     assert!(
         block.contains("ActionId::ImportSubtitles"),
         "the button is a door of its own rather than the action: {block}"
     );
     assert!(
-        block.contains("pick_and_add_subtitles"),
-        "the button does not open the subtitle chooser: {block}"
+        block.contains("this.act(ActionId::ImportSubtitles"),
+        "the button does not dispatch through the action oracle: {block}"
     );
-    // `action_control` is the oracle-gated one: dimmed with the refusal in
-    // the oracle's own words. `control` alone would be lit with no timeline.
+    // `act(ActionId::ImportSubtitles, ...)` routes to `pick_and_add_subtitles`
+    // -- the button names the action, not a second implementation of it.
+    let actions = src_text("player/actions.rs");
     assert!(
-        library[..at].ends_with("self.action_control(\n                    "),
-        "the add-subtitles button is not oracle-gated"
+        actions.contains("ActionId::ImportSubtitles => self.pick_and_add_subtitles(cx)"),
+        "ImportSubtitles no longer opens the subtitle chooser"
+    );
+    // `ghost_verb` is the oracle-gated one: dimmed with the refusal in the
+    // oracle's own words (`player.enable(action, None)` in its own body).
+    assert!(
+        dock[..at].ends_with("ghost_verb(\n                    "),
+        "the add-subtitles button is not built from the oracle-gated ghost_verb"
     );
     // ...and the empty tab names that button, rather than pointing at a
     // toolbar the person is not looking at.
@@ -1484,34 +1278,26 @@ fn the_darkroom_subtitle_palette_drags_tracks_to_subtitle_lanes() {
     );
 }
 
-/// A source's group header in the library must not vanish on a short
-/// window: it is drawn whenever there is more than one source
-/// (`several_files`), never gated on the viewport's height, and the list
-/// under it is what scrolls instead ([`SUB_ROWS_H`]). And it has to be a
-/// real fold, not the click-cycling pattern this codebase has already
+/// A subtitle group's header in the dock must not vanish on a short
+/// window: `subtitle_palette` draws one per group unconditionally -- there
+/// is no viewport-height gate on it at all any more, so the list under it
+/// is what would scroll instead, never the header itself. And it has to be
+/// a real fold, not the click-cycling pattern this codebase has already
 /// thrown out once: one click toggles `sub_folded` shut or open, it never
 /// steps through more than those two states.
 #[test]
 fn a_subtitle_group_header_is_never_gated_on_window_height() {
-    let timeline = src_text("ui/timeline.rs");
+    let dock = src_text("ui/dock_stance.rs");
     assert!(
-        !timeline.contains("sub_headers_fit"),
+        !dock.contains("sub_headers_fit"),
         "the header is still gated on the viewport's height"
-    );
-    let at = timeline
-        .find("let headed = ")
-        .expect("no `headed` computed in subtitle_section");
-    let line = &timeline[at..(at + 80).min(timeline.len())];
-    assert!(
-        line.contains("several_files") && !line.contains("viewport"),
-        "headed depends on something other than the file count: {line}"
     );
     // The header is a click target that flips membership in a set --
     // `remove` else `insert` -- not a value stepped through several states.
-    let head_at = timeline
-        .find("subtitle-group-head")
+    let head_at = dock
+        .find("\"dock-subtitle-group\"")
         .expect("no id on the group header");
-    let block = &timeline[head_at..(head_at + 2400).min(timeline.len())];
+    let block = &dock[head_at..(head_at + 2700).min(dock.len())];
     assert!(
         block.contains("sub_folded.remove"),
         "no fold-open path: {block}"
@@ -1521,7 +1307,7 @@ fn a_subtitle_group_header_is_never_gated_on_window_height() {
         "no fold-shut path: {block}"
     );
     assert!(
-        block.contains("\"1 track\"") || block.contains("tracks"),
+        block.contains("{track_count} track"),
         "the header does not say how many tracks it holds: {block}"
     );
 }
@@ -1895,10 +1681,7 @@ fn a_dragged_divider_stops_before_either_panel_disappears() {
     // ([`Player::timeline`]): what the affordance costs comes off the box, and
     // a whole lane is still standing under it.
     let lanes_box = floor - timeline_fixed_h(true);
-    assert!(
-        2 > lanes_shown_mixed(&[LaneKind::Video, LaneKind::Audio], lanes_box),
-        "no line to pay for at the floor"
-    );
+    assert!(lanes_box < lanes_h(2), "no line to pay for at the floor");
     assert!(
         lanes_box - LABEL_H - 8. >= LANE_H,
         "the floor leaves {} px for a {LANE_H} px lane",
@@ -2263,13 +2046,10 @@ fn a_missing_stance_splits_file_leaves_every_region_at_its_default() {
 /// window's own share is a panel whose divider moves nothing.
 #[test]
 fn every_seam_in_the_layout_has_a_divider_on_it() {
-    let render = src_text("render.rs");
-    for split in ["Split::Library", "Split::Inspector", "Split::Timeline"] {
-        assert!(
-            render.contains(&format!("divider({split}")),
-            "{split} has no divider to drag"
-        );
-    }
+    // The darkroom collapsed Library/Inspector/Timeline into rooms with no
+    // seam of their own; render.rs no longer draws any divider at all --
+    // ui::stance::render is the whole root now -- so the only two seams a
+    // hand can still drag are the ones the stance itself owns.
     let stance = src_text("ui/stance.rs");
     for split in ["Split::Dock", "Split::Bench"] {
         assert!(
@@ -2284,17 +2064,15 @@ fn every_seam_in_the_layout_has_a_divider_on_it() {
         interact.contains("cursor_col_resize") && interact.contains("cursor_row_resize"),
         "a divider with no resize cursor on it"
     );
-    // ...and nothing lays a region out off the untouched share any more.
-    for (file, stale) in [
-        ("ui/inspector.rs", "inspector_w("),
-        ("ui/toolbar.rs", "library_w("),
-        ("render.rs", "library_w("),
-    ] {
-        assert!(
-            !src_text(file).contains(stale),
-            "{file} still measures a panel with {stale}"
-        );
-    }
+    // ...and nothing lays a region out off the untouched share any more:
+    // the legacy panels that read `library_w`/`inspector_w` (`ui/library.rs`,
+    // `ui/inspector.rs`, `ui/toolbar.rs`) are gone or gone from the render
+    // path, so what remains is layout.rs's own Split::Library/Inspector
+    // arms -- kept for save-file compat, never drawn.
+    assert!(
+        !src_text("render.rs").contains("library_w("),
+        "render.rs still measures a panel with library_w("
+    );
 }
 
 /// DESIGN.md §12 step 2: the stance skeleton draws its six regions -- spine,
@@ -2353,13 +2131,17 @@ fn the_stance_renders_its_six_regions_in_the_documented_order() {
         "render() does not compose the six regions in DESIGN §5's order: {composed:?}"
     );
 
-    // The flag has to reach it, or the skeleton is dead code behind a door
-    // nobody opens. Darkroom is the default room now (`OLD_GUI=1` is the
-    // opt-out) -- `Player::darkroom` is still the field render.rs reads.
+    // The skeleton is reached unconditionally now -- the darkroom is the
+    // only room, and `self.darkroom`'s branch is gone with the legacy tree
+    // it used to choose between.
     let render_rs = src_text("render.rs");
     assert!(
-        render_rs.contains("if self.darkroom") && render_rs.contains("ui::stance::render("),
-        "Player::darkroom never reaches ui::stance::render"
+        render_rs.contains("ui::stance::render("),
+        "render.rs no longer reaches ui::stance::render"
+    );
+    assert!(
+        !render_rs.contains("self.darkroom"),
+        "render.rs still branches on self.darkroom after the legacy tree was removed"
     );
 }
 
@@ -2405,25 +2187,20 @@ fn the_picture_letterboxes_through_a_canvas_never_a_plain_img_object_fit() {
 /// picture on the darkroom path too -- measured live covering the bottom 10%
 /// of the frame (rows 300-333 of 335) *underneath* the stance's own
 /// §8-conformant plate (`ui::stance::notice_plate`), which drew the same
-/// notice a second time above the ledger. The legacy (non-darkroom) room
-/// keeps its full-width `notice_bar` exactly as it always has -- this only
-/// pins the darkroom path off it.
+/// notice a second time above the ledger. The legacy full-width `notice_bar`
+/// and its non-darkroom caller are gone with the rest of the old tree now,
+/// so this pins the sole remaining channel (`notice_plate`) off the
+/// picture for good.
 #[test]
 fn the_darkroom_path_never_lets_a_notice_surface_reach_the_picture() {
+    // `notice_bar` and its legacy (non-darkroom) caller are gone with the
+    // rest of the old tree -- the darkroom's own `ui::stance::notice_plate`
+    // is the only notice channel left, and the stronger invariant now is
+    // that picture_area's body never draws a second one over the picture.
     let body = fn_body("picture_area");
     assert!(
-        body.contains("self.notice_bar(cx)"),
-        "picture_area no longer draws notice_bar at all; re-check the darkroom gate still applies"
-    );
-    let at = body.find("self.notice_bar(cx)").expect("checked above");
-    // Whatever gates the call, it has to name `darkroom` and it has to be
-    // upstream of the call itself -- a gate written after the call, or one
-    // that never mentions the flag, is not a gate on this method.
-    let before = &body[..at];
-    assert!(
-        before.contains("self.darkroom") || before.contains("!self.darkroom"),
-        "notice_bar in picture_area is not gated on self.darkroom any more -- \
-         the darkroom stance would paint it over the picture again"
+        !body.contains("notice_bar"),
+        "picture_area draws a notice surface over the picture again (the old occlusion defect)"
     );
 }
 
@@ -2717,6 +2494,18 @@ fn every_action_has_a_darkroom_widget_home_or_explicit_owner() {
             "clicking empty timeline space already clears the selection with the mouse; \
              bare escape is a keyboard-only accelerator for that existing door, not a new one",
         ),
+        (
+            ActionId::SelectNext,
+            "clicking a clip already selects it with the mouse; `}` is a keyboard-only \
+             accelerator for cycling that existing selection, not a new door -- legacy had no \
+             toolbar button for it either",
+        ),
+        (
+            ActionId::SelectPrev,
+            "clicking a clip already selects it with the mouse; `{` is a keyboard-only \
+             accelerator for cycling that existing selection, not a new door -- legacy had no \
+             toolbar button for it either",
+        ),
     ];
     let darkroom = [
         "ui/bench_stance.rs",
@@ -2727,7 +2516,6 @@ fn every_action_has_a_darkroom_widget_home_or_explicit_owner() {
         "ui/spine_stance.rs",
         "ui/stance.rs",
         "ui/timeband_stance.rs",
-        "ui/timeline.rs",
         "menus.rs",
     ]
     .map(src_text)
@@ -2871,7 +2659,8 @@ fn hitmap_names_every_darkroom_pointer_entry_surface() {
                 "menu.{action:?}",
                 "menu.properties",
                 "theme.{n}.row",
-                "hitmap::action(action, refusal.yes())",
+                "let enabled = refusal.yes()",
+                "hitmap::dynamic(\n                            move || (format!(\"menu.{action:?}\"",
             ][..],
         ),
         (

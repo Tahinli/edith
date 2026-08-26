@@ -40,7 +40,6 @@
 //! ([`BG_PANEL()`]): one relaxed load and one field read off a `'static`
 //! table, which is what "the palette can be swapped whole" costs at paint time.
 
-use engine::project::LaneKind;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
@@ -1443,20 +1442,6 @@ pub const GLYPH_SLOT: f32 = 14.;
 /// little enough that the clip under it is still legible. Not a colour, so both
 /// families share it.
 pub const GHOST_ALPHA: u32 = 0x66;
-
-/// What a clip on `kind` is painted: the timeline's whole colour language in
-/// one call, so a lane added later cannot invent a shade of its own.
-pub fn clip_kind(kind: LaneKind, image: bool) -> u32 {
-    match kind {
-        LaneKind::Audio => CLIP_AUDIO(),
-        LaneKind::Video if image => CLIP_IMAGE(),
-        LaneKind::Video => CLIP_VIDEO(),
-        // The purple every editor paints a title track, and the one clip colour
-        // this palette already carried and nothing drew: a caption's box is now
-        // that box.
-        LaneKind::Subtitle => CLIP_TEXT(),
-    }
-}
 
 /// Which of the feedback colours a message wears. Read off the words rather
 /// than carried alongside them: every message in this editor already opens with

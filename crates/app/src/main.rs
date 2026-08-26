@@ -31,9 +31,6 @@ pub(crate) use interact::*;
 pub(crate) use layout::*;
 pub(crate) use library_meta::*;
 pub(crate) use menus::*;
-// The tests' door to the escape rule; render.rs calls it by its own name.
-#[cfg(test)]
-pub(crate) use render::escape_leaves_player_fullscreen;
 // The Contain letterbox, shared with the subtitle picture overlay
 // (ui/preview.rs) so both draw the same fitted rect the same way.
 pub(crate) use notices::*;
@@ -79,12 +76,6 @@ use gpui::{
 };
 
 struct Player {
-    /// DESIGN.md §12 step 2: the stance skeleton behind `EDITH_DARKROOM`, read
-    /// once at startup ([`main`]) and never toggled at runtime -- a mid-session
-    /// flip would mean every region rebuilding under the pointer, which is not
-    /// this flag's job. [`crate::render`] branches its one `Render::render` on
-    /// it; nothing else reads it.
-    darkroom: bool,
     /// The timeline, once there is one. A run with no file opens without it and
     /// waits: the first media import or project load is what fills it, and
     /// until then every action that needs a timeline says so instead of acting.
@@ -225,7 +216,7 @@ struct Player {
     pub(crate) dock_src_active: bool,
     /// The Sources tab's own filter text (darkroom dock, MOCK-SPEC "Dock" §2)
     /// and whether it is the thing typed strokes go to right now -- the same
-    /// capture-flag shape `keys_search`/`keys_open` already use, so a letter
+    /// capture-flag shape `keys_open` already uses, so a letter
     /// filters the list instead of firing a spine action while the box is
     /// focused, and does nothing to the keymap once it is not.
     pub(crate) dock_filter: String,
@@ -512,15 +503,10 @@ struct Player {
     /// list). Cleared by [`Player::close_card`], the one reset list every
     /// opener routes through.
     settings_open: bool,
-    /// What has been typed into the card's search box, which is the card's own
-    /// input exactly as the export card's digits are (nothing in it takes
-    /// focus, so the root's key handler is the field). Emptied every time the
-    /// card opens: a search is a look at the list, not a setting.
-    keys_search: String,
-    /// Where that list is scrolled to. Held here rather than left to the
-    /// wheel alone: forty actions are four times what a 360 px window shows,
-    /// and the rows past the fold have to be reachable from the keyboard that
-    /// is already typing in the search box.
+    /// Where the actions list is scrolled to. Held here rather than left to
+    /// the wheel alone: forty actions are four times what a 360 px window
+    /// shows, and the rows past the fold have to be reachable from the
+    /// keyboard.
     keys_scroll: ScrollHandle,
     /// Where the lane column and the inspector's rows have been taken to. Read
     /// back at render, not only written by the wheel: the line each of them
@@ -528,7 +514,6 @@ struct Player {
     /// it, and a scroll that nothing reads is a scroll the affordance cannot
     /// follow.
     lanes_scroll: ScrollHandle,
-    inspector_scroll: ScrollHandle,
     /// And where the equalizer card's own body has been taken to. It is the
     /// tallest card in the column -- a graph with a row of numbers and a row of
     /// buttons under it -- and at the 360 px floor its title and its buttons
@@ -744,9 +729,6 @@ struct Player {
     /// which is what makes the colour card's graph move as a slider is dragged:
     /// each live write reseeks, and the reseek's frame is the next count.
     histogram: [[u32; HIST_BINS]; 3],
-    /// The action whose row is waiting for a stroke. The next key that is
-    /// neither escape nor a lone modifier becomes the whole of what reaches it.
-    rebinding: Option<ActionId>,
     /// What the file actions have had to say, oldest first. A *queue* and not a
     /// slot: two imports that fail back to back used to be one message, because
     /// the second overwrote the first before a frame had drawn it -- the failure
@@ -803,19 +785,7 @@ fn main() {
     // DESIGN.md §1: "the room is the film's" -- darkroom mode owns the
     // palette outright, so the saved pick above is overridden the moment the
     // flag is read, once, before the first paint.
-    //
-    // Darkroom is the default room now (user order: "make darkroom default
-    // no need to pass environment"). `OLD_GUI=1` (any case) is the one door
-    // back into the legacy four-region tree -- `EDITH_DARKROOM` opted IN to
-    // the new room; this opts OUT of it, which is why the sense of the read
-    // below is inverted rather than the flag renamed in place.
-    let old_gui = std::env::vars()
-        .find(|(k, _)| k.eq_ignore_ascii_case("OLD_GUI"))
-        .is_some_and(|(_, v)| v.eq_ignore_ascii_case("1"));
-    let darkroom = !old_gui;
-    if darkroom {
-        ui::theme::set(ui::theme::PaletteId::Darkroom);
-    }
+    ui::theme::set(ui::theme::PaletteId::Darkroom);
     // The subtitle style the last session picked, same silence on a missing
     // or unreadable file.
     let (sub_family, sub_text) = load_subtitle_style();
@@ -875,7 +845,6 @@ fn main() {
             |window, cx| {
                 let queue = queue.clone();
                 let player = cx.new(|cx| Player {
-                    darkroom,
                     // Nothing to wait for yet: the file named on the command
                     // line is still queued, and the repaint that carries its
                     // poster frame to the screen is asked for when it lands
@@ -977,10 +946,8 @@ fn main() {
                     keymap: keymap.clone(),
                     keys_open: false,
                     settings_open: false,
-                    keys_search: String::new(),
                     keys_scroll: ScrollHandle::new(),
                     lanes_scroll: ScrollHandle::new(),
-                    inspector_scroll: ScrollHandle::new(),
                     eq_scroll: ScrollHandle::new(),
                     export_open: false,
                     export_grouped: true,
@@ -1048,7 +1015,6 @@ fn main() {
                     // Picture and sound, which is what an export was before
                     // there was anything to pick.
                     format: Format::default(),
-                    rebinding: None,
                     notices: notice.clone().map(SharedString::from).into_iter().collect(),
                     exported: None,
                     // The whole of argv, waiting for the first repaint to start

@@ -2,21 +2,6 @@
 
 use crate::*;
 
-/// What the zoom button says it is showing: how much timeline fits on the bed,
-/// in the coarsest unit that still tells two zooms apart.
-pub(crate) fn span_label(span: f64) -> String {
-    match span {
-        s if !s.is_finite() || s <= 0. => "—".to_string(),
-        // Hours once a timeline is long enough to be measured in them: the far
-        // stop follows the content now, so "315m" is a span a user can be sat
-        // at, and no one reads a pill in minutes past sixty.
-        s if s >= 3600. => format!("{:.1}h", s / 3600.),
-        s if s >= 600. => format!("{:.0}m", s / 60.),
-        s if s >= 60. => format!("{:.1}m", s / 60.),
-        s if s >= 10. => format!("{s:.0}s"),
-        s => secs_label(s),
-    }
-}
 
 /// A span of seconds as a person reads it: one decimal above a second, two
 /// below -- [`scaled`]'s rule, for its reason. The tightest zoom is

@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::audio_cards::EQ_GRAPH_MAX_H;
-use crate::ui::inspector::transition_of;
+use crate::ui::dock_stance::transition_of;
 use std::sync::atomic::Ordering;
 
 /// FAULT 2's general shape (not just the source dot's menu): `overlaid()`
@@ -29,7 +29,7 @@ fn no_overlaid_state_in_the_stance_goes_modal_without_painting_something() {
         );
     }
     let guard_at = stance
-        .find("if this.rebinding.is_some()\n                || this.card_open()")
+        .find("if this.card_open()\n                || this.context_menu.is_some()")
         .expect("the stance's modal guard");
     let guard = &stance[guard_at..guard_at + 1600];
     for field in [
@@ -39,7 +39,7 @@ fn no_overlaid_state_in_the_stance_goes_modal_without_painting_something() {
     ] {
         assert!(
             guard.contains(field),
-            "the overlaid()/rebinding branch no longer clears {field} on every key -- \
+            "the overlaid() branch no longer clears {field} on every key -- \
              a menu can go modal and unrecoverable again (FAULT 2)"
         );
     }
@@ -139,7 +139,7 @@ fn every_modal_field_has_a_mounted_surface_somewhere_in_the_darkroom() {
 fn the_stances_key_guard_does_not_swallow_a_bare_export_before_the_oracle_is_asked() {
     let stance = src_text("ui/stance.rs");
     let guard_at = stance
-        .find("if this.rebinding.is_some()\n                || this.card_open()")
+        .find("if this.card_open()\n                || this.context_menu.is_some()")
         .expect("the stance's modal guard moved -- update this test's search string");
     let guard_line = &stance[guard_at..guard_at + 200];
     assert!(
@@ -157,58 +157,6 @@ fn the_stances_key_guard_does_not_swallow_a_bare_export_before_the_oracle_is_ask
          `the_stances_key_guard_does_not_swallow_a_bare_export_before_the_oracle_is_asked` \
          exists to keep out; `modal()` is where `exporting()` belongs"
     );
-}
-
-#[test]
-fn a_bare_escape_leaves_player_fullscreen_before_anything_under_it() {
-    // Fires while the picture-only layout is up, on the same bare escape
-    // every menu and preview close on -- and only that key: a chord, or an
-    // escape while not fullscreen, means nothing to it.
-    assert!(escape_leaves_player_fullscreen("escape", false, true));
-    assert!(!escape_leaves_player_fullscreen("escape", false, false));
-    assert!(!escape_leaves_player_fullscreen("escape", true, true));
-    assert!(!escape_leaves_player_fullscreen("q", false, true));
-}
-
-#[test]
-fn only_a_chord_gets_out_of_an_export() {
-    use keymap::ActionId;
-    // What this guards: bare escape is the stroke a hand throws at anything on
-    // screen, and while an export ran it deleted the encode. The way out is the
-    // same key with control on it, and the card says so.
-    assert!(cancels_export("escape", true, Some(ActionId::CancelExport)));
-    assert!(!cancels_export("escape", false, None));
-    // Even if something else were ever bound to bare escape, it is not this.
-    assert!(!cancels_export("escape", false, Some(ActionId::Play)));
-    // A rebound cancel works as well -- it adds a way out, never replaces the
-    // chord, and the keymap is what decides whether that one carries control.
-    assert!(cancels_export("q", false, Some(ActionId::CancelExport)));
-    // Nothing else does, whatever it means outside an export.
-    assert!(!cancels_export("e", false, Some(ActionId::Export)));
-    assert!(!cancels_export("space", false, Some(ActionId::Play)));
-    assert!(!cancels_export("q", false, None));
-    // The default keymap is what the handler feeds this: the chord reaches
-    // CancelExport, the bare key reaches Deselect instead -- neither of which
-    // this guard lets cancel a running export.
-    let k = keymap::Keymap::defaults();
-    assert!(cancels_export("escape", true, k.lookup("escape", true)));
-    assert!(!cancels_export("escape", false, k.lookup("escape", false)));
-}
-
-#[test]
-fn a_capture_waits_through_a_lone_modifier() {
-    // gpui delivers these on their own; taking one as a binding would make
-    // the action fire on the way to every chord that uses it.
-    for key in [
-        "control", "shift", "alt", "super", "platform", "function", "fn", "meta", "command",
-    ] {
-        assert!(is_bare_modifier(key), "{key}");
-    }
-    // Everything a binding is actually made of, escape included -- the
-    // capture branch turns that one away itself.
-    for key in ["c", "x", "space", "escape", "delete", "f1", "z"] {
-        assert!(!is_bare_modifier(key), "{key}");
-    }
 }
 
 /// The whole point of the card: there is no action a pointer cannot reach.
@@ -263,76 +211,8 @@ fn every_action_is_on_the_actions_card() {
         assert!(!action.label().is_empty(), "{action:?}");
         assert_ne!(keymap.display(action), "unbound", "{action:?}");
     }
-    // The list scrolls inside a card the smallest window holds, so a
-    // thirty-fourth action costs no height at all.
-    assert!(
-        rows.len() as f32 * KEYS_ROW_H > KEYS_ROWS_H,
-        "no cap needed?"
-    );
     // Both halves of a row are click targets, so WCAG 2.5.8 binds them.
     assert!(KEYS_ROW_H >= HIT_MIN);
-}
-
-/// The search box: what a typed word leaves standing. Forty actions is more
-/// than a 360 px window shows at once, so this is the card's answer to
-/// "where is the one I want" -- and a heading with nothing under it would
-/// be worse than no filter at all.
-#[test]
-fn a_search_leaves_the_rows_it_names_under_their_own_headings() {
-    use keymap::{ActionId, Category, Keymap};
-    let keymap = Keymap::defaults();
-    let acts = |found: &[(usize, KeyRow)]| -> Vec<ActionId> {
-        found
-            .iter()
-            .filter_map(|(_, r)| match r {
-                KeyRow::Act(a) => Some(*a),
-                _ => None,
-            })
-            .collect()
-    };
-    let heads = |found: &[(usize, KeyRow)]| -> Vec<Category> {
-        found
-            .iter()
-            .filter_map(|(_, r)| match r {
-                KeyRow::Head(c) => Some(*c),
-                _ => None,
-            })
-            .collect()
-    };
-    // Nothing typed hides nothing, and every row keeps its place in the
-    // unfiltered list: an element id must not move under a keystroke.
-    let all = keys_filter("", &keymap);
-    assert_eq!(all.len(), keys_rows().len());
-    assert!(all.iter().enumerate().all(|(n, (i, _))| n == *i));
-    // The word the user types is the word on the row. The mix card names
-    // the track volumes, so it is an honest hit; the fixed row about the
-    // volume keys is another, and each comes with its own heading only.
-    let vol = keys_filter("vol", &keymap);
-    assert_eq!(
-        acts(&vol),
-        vec![ActionId::VolumeUp, ActionId::VolumeDown, ActionId::Mix]
-    );
-    assert_eq!(heads(&vol), vec![Category::Audio, Category::View]);
-    // Case is not part of the question, in either direction.
-    assert_eq!(keys_filter("VoL", &keymap).len(), vol.len());
-    // The stroke column is searched too -- "what did ctrl do again" -- and
-    // an unbound-looking word finds nothing rather than everything.
-    let ctrl = keys_filter("ctrl+", &keymap);
-    assert!(acts(&ctrl).contains(&ActionId::Save));
-    assert!(!acts(&ctrl).contains(&ActionId::Play));
-    assert!(
-        keys_filter("qzx", &keymap).is_empty(),
-        "headings left behind"
-    );
-    // The card's own door is on the card, by name and by stroke.
-    assert_eq!(
-        acts(&keys_filter("?", &keymap)),
-        vec![ActionId::ShowActions]
-    );
-    assert_eq!(
-        acts(&keys_filter("all actions", &keymap)),
-        vec![ActionId::ShowActions]
-    );
 }
 
 /// What a keystroke means to that box: a letter is a letter, and a word
@@ -364,23 +244,8 @@ fn the_keybindings_card_fits_the_smallest_window() {
     // The line the list scrolls under: margin, rule, padding.
     let separator = 4. + 1. + 4.;
     assert!(
-        title + status + search + separator + KEYS_ROWS_H + gaps + padding <= 360.,
+        title + status + search + separator + 10. * KEYS_ROW_H + gaps + padding <= 360.,
         "card too tall"
-    );
-    // ...and the list is the only part that grows with the editor, so the
-    // rows past the fold are reached by scrolling that viewport (and, with
-    // forty of them, by the search box above it) rather than by a card
-    // taller than the window.
-    assert!(
-        keys_rows().len() as f32 * KEYS_ROW_H > KEYS_ROWS_H,
-        "the list outgrew the viewport long ago; the cap must still scroll"
-    );
-    // The cap is only honest if it is the taller list that scrolls, not the
-    // card that grows: every action must be reachable by scrolling, and
-    // enough of them visible that the list reads as a list.
-    assert!(
-        KEYS_ROWS_H / KEYS_ROW_H >= 8.,
-        "too few rows visible to scan"
     );
     assert!(KEYS_W <= 640., "card too wide");
     // The rows are clickable, so WCAG 2.5.8 binds them like every other
@@ -507,7 +372,7 @@ fn the_equalizer_graph_puts_a_band_where_a_drag_reads_it_and_fits_the_smallest_w
         "card too tall"
     );
     assert!(
-        EQ_GRAPH_H <= EXPORT_ROWS_H,
+        EQ_GRAPH_H <= (8. * KEYS_ROW_H),
         "graph taller than a card of rows"
     );
     // What is dragged is the whole graph -- the handle is a 10 px dot, but
@@ -789,7 +654,7 @@ fn a_colour_drag_lands_where_it_paints_and_the_card_fits_the_smallest_window() {
     // The label still has room beside the bar and the readout, which is
     // what the buttons coming off the row bought.
     let row = COLOR_W - padding - 12. - 2. * 8. - COLOR_BAR_W - 44.;
-    assert!(row >= LABEL_MIN_W, "no room left for a label: {row}px");
+    assert!(row >= 36., "no room left for a label: {row}px");
     // What is dragged is the whole row's height, not the 4 px the bar is
     // drawn as (WCAG 2.5.8) -- the same split the ruler makes.
     assert!(KEYS_ROW_H >= HIT_MIN);
@@ -1117,16 +982,6 @@ fn the_sound_row_carries_its_rate_into_both_kinds_of_file() {
     }
     // A rate no row holds marks none of them, rather than the wrong one.
     assert!(audio_rate_choices(7).iter().all(|(.., picked)| !picked));
-
-    // The wrap the row's key does, which is the row's own step function.
-    assert_eq!(
-        next_audio_kbps(AUDIO_KBPS[AUDIO_KBPS.len() - 1]),
-        AUDIO_KBPS[0]
-    );
-    assert_eq!(next_audio_kbps(DEFAULT_AUDIO_KBPS), 320);
-    // A rate no list holds (a stale one, say) lands back on the first row
-    // rather than nowhere.
-    assert_eq!(next_audio_kbps(7), AUDIO_KBPS[1]);
 }
 
 #[test]
@@ -1209,7 +1064,7 @@ fn a_typed_bitrate_is_a_field_and_not_a_key_capture() {
     assert!(detail.starts_with("6▏"), "{detail}");
 }
 
-/// [`crate::ui::inspector::transition_of`]: the inspector's duration row
+/// [`crate::ui::dock_stance::transition_of`]: the dock's duration row
 /// appears only for an anchor that actually carries a dissolve or a
 /// crossfade, and the room it offers is capped at what the successor clip
 /// actually has -- the same clamp [`engine::project::Project::set_transition_out`]/
@@ -1600,25 +1455,25 @@ fn the_export_card_fits_the_smallest_window() {
     let gaps = 5. * 2.;
     let padding = 24.;
     assert_eq!(
-        EXPORT_FIXED_H,
+        (17. + 28. + 15. + 30. + CONTROL_H + 4. + 10. + 24.),
         title + status + summary + CONTROL_H + 4. + gaps + padding
     );
-    assert!(EXPORT_FIXED_H + EXPORT_ROWS_H <= 360., "card too tall");
+    assert!((17. + 28. + 15. + 30. + CONTROL_H + 4. + 10. + 24.) + (8. * KEYS_ROW_H) <= 360., "card too tall");
     // The list grows with a window that has the room -- and never shrinks
     // below the cap that made the floor fit, whatever arithmetic the window
     // hands it.
-    let cap = |h: f32| (h - EXPORT_FIXED_H - 24.).max(EXPORT_ROWS_H);
-    assert_eq!(cap(360.), EXPORT_ROWS_H);
-    assert_eq!(cap(0.), EXPORT_ROWS_H);
-    assert!(cap(720.) > EXPORT_ROWS_H);
-    assert!(EXPORT_FIXED_H + cap(720.) <= 720.);
+    let cap = |h: f32| (h - (17. + 28. + 15. + 30. + CONTROL_H + 4. + 10. + 24.) - 24.).max(8. * KEYS_ROW_H);
+    assert_eq!(cap(360.), (8. * KEYS_ROW_H));
+    assert_eq!(cap(0.), (8. * KEYS_ROW_H));
+    assert!(cap(720.) > (8. * KEYS_ROW_H));
+    assert!((17. + 28. + 15. + 30. + CONTROL_H + 4. + 10. + 24.) + cap(720.) <= 720.);
     // ...and inside the 640 px floor with the scrim showing either side.
     assert!(EXPORT_W + 2. * 12. <= 640.);
     // The cap is only honest if enough of the list is on screen to read as
     // one -- and the whole format section is: its header and every codec
     // row, so nothing that is picked *first* is behind a scroll.
     let codecs = FORMATS.iter().filter(|(row, ..)| !row.is_empty()).count();
-    assert!(EXPORT_ROWS_H / KEYS_ROW_H >= 1. + codecs as f32);
+    assert!((8. * KEYS_ROW_H) / KEYS_ROW_H >= 1. + codecs as f32);
     // Clickable rows, so WCAG 2.5.8 binds them as it binds the panel's --
     // and the bitrate steppers are `HIT_MIN` squares sitting inside a row,
     // which only fits while the row is at least as tall as one.

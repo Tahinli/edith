@@ -166,59 +166,10 @@ impl Selection {
     }
 }
 
-/// The rate a caption's box plays its window at, read off the placement
-/// itself: how long the words are, against how much timeline they cross. A
-/// clip's badge comes from its own `speed`; a caption has none, so its box
-/// derives one -- and keeps it even after the group that re-timed it comes
-/// apart, because the proportion is the placement's own. `None` at unity:
-/// placement rounding leaves an odd-width window a frame or so off real time,
-/// and a badge is for a box that was *re-timed*, not one that rounds.
-pub(crate) fn caption_rate(sub: SubClip, fps: f64) -> Option<Speed> {
-    if !(fps.is_finite() && fps > 0.0) || sub.window_us() <= 0 {
-        return None;
-    }
-    let (span_us, window_us) = (f64::from(sub.frames) / fps * 1e6, sub.window_us() as f64);
-    // The unity gate is absolute, in frames of the timeline: placement
-    // rounding (`frames_of_us`) leaves a short track up to half a frame off
-    // real time, which against a one-second window is fifteen permille -- a
-    // relative gate would badge most palette drops under two and a half
-    // seconds. Unity is "the window lands within a frame and a half of the
-    // span"; the permille is only ever the rate the badge shows.
-    if (span_us - window_us).abs() <= 1.5 / fps * 1e6 {
-        return None;
-    }
-    // The rate is the window over the span -- content per timeline, a clip's
-    // own `speed` in the same spelling: 10s of words crossing 5s of timeline
-    // is 2.00x.
-    let permille = (window_us / span_us * 1000.).round();
-    Some(Speed::from_permille(permille.clamp(
-        f64::from(Speed::MIN.permille()),
-        f64::from(Speed::MAX.permille()),
-    ) as u16))
-}
-
-/// The scrollbar's thumb over a track `w` px wide: `(x, width)` of the box
-/// standing for the visible share of a timeline `duration` long whose window
-/// starts at `start` and spans `span`. Full width when nothing is off-screen
-/// (there is nothing to scroll and the strip says so by filling), never
-/// narrower than [`SCROLL_THUMB_MIN`] when there is (a thumb a pixel wide is a
-/// thumb no hand can hold), and never off the track either way -- the clamp,
-/// not the caller, owns that, because a drag's samples arrive raw.
-pub(crate) fn scroll_thumb(w: f32, duration: f64, start: f64, span: f64) -> (f32, f32) {
-    if w <= 0. || duration <= 0. || span >= duration {
-        return (0., w.max(0.));
-    }
-    let share = f64::from(w);
-    let width = ((span / duration) * share).clamp(f64::from(SCROLL_THUMB_MIN), f64::from(w));
-    let x = (start / duration * share).clamp(0., f64::from(w) - width);
-    (x as f32, width as f32)
-}
-
 /// The lane stack's thumb over a track `h` px tall: `(y, height)` of the box
 /// standing for the visible share of a stack `content` px tall in a box
-/// `box_h` px tall, taken down by `scrolled` px -- the time axis's
-/// [`scroll_thumb`] turned through a right angle, and on the same terms:
-/// full track when the whole stack is on screen, never shorter than
+/// `box_h` px tall, taken down by `scrolled` px. Full track when the whole
+/// stack is on screen, never shorter than
 /// [`SCROLL_THUMB_MIN`] when it is not, and never off the track either way.
 pub(crate) fn lanes_thumb(track: f32, content: f32, box_h: f32, scrolled: f32) -> (f32, f32) {
     if track <= 0. || content <= 0. || box_h >= content {
@@ -255,11 +206,6 @@ pub(crate) fn marked(
     pick_links: &[Option<u32>],
 ) -> bool {
     picks.contains(&here) || (link.is_some() && pick_links.contains(&link))
-}
-
-/// Whether a clip is wide enough to be worth naming.
-pub(crate) fn show_label(w: f32) -> bool {
-    w >= LABEL_MIN_W
 }
 
 /// The clip a trim is *showing*, worked out the way `Project::trim` will write
@@ -481,22 +427,6 @@ pub(crate) fn sub_mark(subs: &[SubClip], start: u32) -> Option<usize> {
     subs.iter().position(|s| s.start == start)
 }
 
-/// The part of a clip's box that is on the bed, in the box's own pixels:
-/// `(left, width)` of its intersection with the visible strip. Everything drawn
-/// *inside* a box -- its waveform, its name, its speed badge -- is placed in
-/// here rather than at the box's own edges, which at a deep zoom sit thousands
-/// of pixels off either side of the screen: a label out there is a label nobody
-/// can read, and a waveform out there is a path with a point per two pixels of a
-/// width nobody can see. A bed that has not been measured yet answers with the
-/// whole box, which is what was drawn before there was a bed to clip to.
-pub(crate) fn visible_slice(left: f32, width: f32, bed: f32) -> (f32, f32) {
-    if bed <= 0. {
-        return (0., width);
-    }
-    let from = (-left).clamp(0., width);
-    let to = (bed - left).clamp(from, width);
-    (from, to - from)
-}
 
 /// Scales an envelope to its own loudest sample, so a quietly mastered source
 /// still draws as a shape. The fixtures peak around an eighth of full scale, and
