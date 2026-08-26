@@ -9,19 +9,26 @@ use crate::*;
 /// **a different file** -- the next one along -- over the range it was copied
 /// from.
 ///
-/// The clip's own file gone means there is nothing to paste: `None`, and the
-/// next paste says the clipboard is empty rather than putting some other take
-/// down. Every index past it moves down by one, exactly as the lanes' clips do.
-pub(crate) fn clipboard_after_remove(clip: Option<Clip>, removed: usize) -> Option<Clip> {
-    let mut clip = clip?;
-    match clip.source.cmp(&removed) {
-        std::cmp::Ordering::Equal => None,
-        std::cmp::Ordering::Greater => {
-            clip.source -= 1;
-            Some(clip)
-        }
-        std::cmp::Ordering::Less => Some(clip),
-    }
+/// An entry whose own file is gone drops out of the clipboard rather than
+/// pasting some other take down in its place; a set with even one such
+/// member is trimmed, not emptied whole, the way a lane keeps every clip a
+/// removal did not touch. Every index past `removed` moves down by one,
+/// exactly as the lanes' clips do.
+pub(crate) fn clipboard_after_remove(
+    clipboard: Vec<(Lane, Clip)>,
+    removed: usize,
+) -> Vec<(Lane, Clip)> {
+    clipboard
+        .into_iter()
+        .filter_map(|(lane, mut clip)| match clip.source.cmp(&removed) {
+            std::cmp::Ordering::Equal => None,
+            std::cmp::Ordering::Greater => {
+                clip.source -= 1;
+                Some((lane, clip))
+            }
+            std::cmp::Ordering::Less => Some((lane, clip)),
+        })
+        .collect()
 }
 
 /// One library row: a file and one of its audio streams. Plain data, planned

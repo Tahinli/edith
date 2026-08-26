@@ -1688,19 +1688,35 @@ fn a_copied_clip_is_renumbered_or_dropped_when_a_row_leaves_the_library() {
     };
     // Copied from source 2, source 0 removed: the same file is source 1 now.
     assert_eq!(
-        clipboard_after_remove(Some(clip(2)), 0).map(|c| c.source),
-        Some(1),
+        clipboard_after_remove(vec![(Lane::V1, clip(2))], 0)
+            .into_iter()
+            .map(|(_, c)| c.source)
+            .collect::<Vec<_>>(),
+        vec![1],
         "the clipboard follows its file down the list"
     );
     // Copied from a source *before* the one that went: untouched.
     assert_eq!(
-        clipboard_after_remove(Some(clip(0)), 2).map(|c| c.source),
-        Some(0)
+        clipboard_after_remove(vec![(Lane::V1, clip(0))], 2)
+            .into_iter()
+            .map(|(_, c)| c.source)
+            .collect::<Vec<_>>(),
+        vec![0]
     );
     // Copied from the row that was just removed: there is nothing left to
     // paste, and pasting the next file along would be a lie.
-    assert!(clipboard_after_remove(Some(clip(1)), 1).is_none());
-    assert!(clipboard_after_remove(None, 0).is_none());
+    assert!(clipboard_after_remove(vec![(Lane::V1, clip(1))], 1).is_empty());
+    assert!(clipboard_after_remove(Vec::new(), 0).is_empty());
+    // A set with one member's file gone loses only that member -- the rest
+    // of the set survives to be pasted, gaps and lanes intact.
+    let trimmed = clipboard_after_remove(
+        vec![(Lane::V1, clip(1)), (Lane::A1, clip(2))],
+        1,
+    );
+    assert_eq!(
+        trimmed.into_iter().map(|(_, c)| c.source).collect::<Vec<_>>(),
+        vec![1]
+    );
 }
 
 /// The trim-a-clip path through the doors the edge drag uses:
@@ -1898,6 +1914,259 @@ fn a_track_can_be_added_dropped_on_edited_and_taken_back() {
     assert_eq!(session.lanes(), vec![Lane::V1, Lane::A1]);
     assert_eq!(session.lane_clips(Lane::V1).len(), 1);
     assert_eq!(format_refusal(&session, Format::Mp4), None);
+}
+
+/// [`PlaybackSession::move_selection_to`], the door a selection drag uses
+/// ([`Player::move_clip`]'s set path): three picks across two lanes, one of
+/// them the dragged clip, all travel the *same* frame delta in one call --
+/// the same all-or-nothing clamp [`Project::move_room`] already gave a
+/// linked group, generalised to an arbitrary selection.
+#[test]
+fn a_selection_drag_moves_every_pick_by_the_same_delta() {
+    use engine::project::LaneKind;
+
+    let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+    session.set_gain(0.0);
+    let path = session.sources()[0].path.clone();
+    session.import(&asset("test_av2.mp4")).expect("av2 matches");
+    let second = session.sources()[1].path.clone();
+
+    // clip0 on V1 at the fixture's own start; clip1 on V1 ten seconds in,
+    // appended to the open bed and rippling nothing.
+    assert!(session
+        .place_stream_at(10.0, &second, 0, None)
+        .expect("av2 is on this timeline"));
+    let clip0 = session.lane_clips(Lane::V1)[0];
+    let clip1 = session.lane_clips(Lane::V1)[1];
+    assert_eq!((clip0.start, clip1.start), (0, 300));
+
+    // clipC on a second video row, well past both of the above.
+    let v2 = session.add_lane(LaneKind::Video);
+    assert!(session
+        .place_stream_at(20.0, &path, 0, Some(v2))
+        .expect("test_av.mp4 is on this timeline"));
+    let clip_c = session.lane_clips(v2)[0];
+    assert_eq!(clip_c.start, 600);
+
+    let picks = [(Lane::V1, 0), (Lane::V1, 1), (v2, 0)];
+    // Drag clip1 fifty frames along its own lane -- the other two picks own
+    // no neighbours of their own here, so nothing narrows the room and the
+    // full fifty-frame ask goes through for all three.
+    assert!(session.move_selection_to(&picks, Lane::V1, 1, Lane::V1, clip1.start + 50));
+    assert_eq!(session.lane_clips(Lane::V1)[0].start, clip0.start + 50);
+    assert_eq!(session.lane_clips(Lane::V1)[1].start, clip1.start + 50);
+    assert_eq!(session.lane_clips(v2)[0].start, clip_c.start + 50);
+    // Every pick still names the clip it named: found again by the frame it
+    // now starts at -- exactly the lookup `Player::remap_selection` makes
+    // once the move lands, which is what keeps a set-move's selection alive
+    // rather than clearing it.
+    assert_eq!(
+        session.lane_clips(Lane::V1)[0],
+        Clip { start: clip0.start + 50, ..clip0 }
+    );
+    assert_eq!(
+        session.lane_clips(v2)[0],
+        Clip { start: clip_c.start + 50, ..clip_c }
+    );
+
+    assert!(session.undo(), "one step for the whole set-move");
+    assert_eq!(session.lane_clips(Lane::V1)[0].start, clip0.start);
+    assert_eq!(session.lane_clips(Lane::V1)[1].start, clip1.start);
+    assert_eq!(session.lane_clips(v2)[0].start, clip_c.start);
+}
+
+/// One pick with nowhere to go refuses the whole set: the walk onto another
+/// clip's own span that already refuses a lone drag
+/// (`move_clip_keeps_the_frames_and_refuses_the_rest`, in this crate's own
+/// engine tests) refuses a selection drag exactly the same way, and every
+/// *other* pick -- which had all the room in the world -- stays exactly
+/// where it was rather than moving on its own.
+#[test]
+fn a_selection_drag_refuses_as_one_set_when_any_pick_cannot_land() {
+    use engine::project::LaneKind;
+
+    let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+    session.set_gain(0.0);
+    let path = session.sources()[0].path.clone();
+    session.import(&asset("test_av2.mp4")).expect("av2 matches");
+    let second = session.sources()[1].path.clone();
+
+    assert!(session
+        .place_stream_at(10.0, &second, 0, None)
+        .expect("av2 is on this timeline"));
+    let clip0 = session.lane_clips(Lane::V1)[0];
+    let clip1 = session.lane_clips(Lane::V1)[1];
+
+    let v2 = session.add_lane(LaneKind::Video);
+    assert!(session
+        .place_stream_at(0.0, &path, 0, Some(v2))
+        .expect("test_av.mp4 is on this timeline"));
+    let clip_c = session.lane_clips(v2)[0];
+    // A clip clip1 is not picked, blocking the road on V2 the drag is about
+    // to try: clip1 dragged onto V2 lands its head inside this one.
+    assert!(session
+        .place_stream_at(10.0, &second, 0, Some(v2))
+        .expect("av2 is on this timeline"));
+    let blocker = session.lane_clips(v2)[1];
+    assert_eq!(blocker.start, 300);
+
+    let picks = [(Lane::V1, 0), (Lane::V1, 1), (v2, 0)];
+    // Dragged onto V2 at a frame inside the blocker: refused outright, the
+    // way a lone drag onto another clip already is.
+    assert!(!session.move_selection_to(
+        &picks,
+        Lane::V1,
+        1,
+        v2,
+        blocker.start + 10
+    ));
+    // Nothing moved -- not clip1 clamped short of the blocker, and not the
+    // two picks that had all the room to spare.
+    assert_eq!(session.lane_clips(Lane::V1)[0], clip0);
+    assert_eq!(session.lane_clips(Lane::V1)[1], clip1);
+    assert_eq!(session.lane_clips(v2)[0], clip_c);
+    assert_eq!(session.lane_clips(v2)[1], blocker);
+}
+
+/// A plain click's copy is one clipboard entry, and one entry still takes
+/// [`PlaybackSession::paste_at`] -- the door it always has, unchanged by a
+/// set ever being able to ride [`PlaybackSession::paste_set_at`] instead.
+#[test]
+fn a_single_pick_copy_paste_round_trips_unchanged() {
+    let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+    session.set_gain(0.0);
+    // `open` seeds V1 with the whole fixture as its own clip -- what a plain
+    // click would copy.
+    let copied = session.lane_clips(Lane::V1)[0];
+
+    let at = session.timeline_duration();
+    assert!(session.paste_at(at, copied), "a free spot always takes it");
+    let pasted = session.lane_clips(Lane::V1)[1];
+    assert_eq!(
+        (pasted.source, pasted.in_frame, pasted.out_frame),
+        (copied.source, copied.in_frame, copied.out_frame),
+        "the pasted clip plays the same source frames the copy did"
+    );
+
+    assert!(session.undo(), "one step for the paste");
+    assert_eq!(session.lane_clips(Lane::V1).len(), 1);
+}
+
+/// [`PlaybackSession::paste_set_at`], the set-copy's own door
+/// ([`Player::paste`]'s multi-entry path): three picks across two lanes, some
+/// distance apart, keep that same distance and the same lane each landed on
+/// -- the offset [`Project::paste_set`] moves every item by is the one from
+/// the earliest pick to `at`, not a collapse onto `V1`/`A1`.
+#[test]
+fn a_three_pick_copy_paste_preserves_gaps_and_lane_assignment() {
+    use engine::project::LaneKind;
+
+    let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+    session.set_gain(0.0);
+    let path = session.sources()[0].path.clone();
+    session.import(&asset("test_av2.mp4")).expect("av2 matches");
+    let second = session.sources()[1].path.clone();
+
+    assert!(session
+        .place_stream_at(10.0, &second, 0, None)
+        .expect("av2 is on this timeline"));
+    let clip0 = session.lane_clips(Lane::V1)[0];
+    let clip1 = session.lane_clips(Lane::V1)[1];
+
+    let v2 = session.add_lane(LaneKind::Video);
+    assert!(session
+        .place_stream_at(20.0, &path, 0, Some(v2))
+        .expect("test_av.mp4 is on this timeline"));
+    let clip_c = session.lane_clips(v2)[0];
+
+    // Copied in click order, out of the lanes each was clicked in -- exactly
+    // what `Player::copy_selected` builds.
+    let items = [(Lane::V1, clip0), (Lane::V1, clip1), (v2, clip_c)];
+    let at = session.timeline_duration();
+    assert!(session.paste_set_at(at, &items), "a free spot takes the set");
+
+    let new0 = session.lane_clips(Lane::V1)[2];
+    let new1 = session.lane_clips(Lane::V1)[3];
+    let new_c = session.lane_clips(v2)[1];
+    // The gaps between picks survive the trip untouched.
+    assert_eq!(new1.start - new0.start, clip1.start - clip0.start);
+    assert_eq!(new_c.start - new0.start, clip_c.start - clip0.start);
+    // And each still plays the source frames it was copied with, off the
+    // lane it was copied off of.
+    assert_eq!(
+        (new0.source, new0.in_frame, new0.out_frame),
+        (clip0.source, clip0.in_frame, clip0.out_frame)
+    );
+    assert_eq!(
+        (new_c.source, new_c.in_frame, new_c.out_frame),
+        (clip_c.source, clip_c.in_frame, clip_c.out_frame)
+    );
+
+    assert!(session.undo(), "one step for the whole set-paste");
+    assert_eq!(session.lane_clips(Lane::V1).len(), 2);
+    assert_eq!(session.lane_clips(v2).len(), 1);
+}
+
+/// A set-paste never ripples the bed: a landing that would overlap so much
+/// as one existing clip on its own lane refuses the *whole* set, exactly as
+/// [`Project::paste_set`] documents, leaving the project as it was rather
+/// than placing the picks that had room to spare.
+#[test]
+fn a_colliding_set_paste_refuses_whole() {
+    use engine::project::LaneKind;
+
+    let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+    session.set_gain(0.0);
+    let path = session.sources()[0].path.clone();
+    session.import(&asset("test_av2.mp4")).expect("av2 matches");
+    let second = session.sources()[1].path.clone();
+
+    assert!(session
+        .place_stream_at(10.0, &second, 0, None)
+        .expect("av2 is on this timeline"));
+    let clip0 = session.lane_clips(Lane::V1)[0];
+    let clip1 = session.lane_clips(Lane::V1)[1];
+
+    let v2 = session.add_lane(LaneKind::Video);
+    assert!(session
+        .place_stream_at(20.0, &path, 0, Some(v2))
+        .expect("test_av.mp4 is on this timeline"));
+    let clip_c = session.lane_clips(v2)[0];
+
+    let items = [(Lane::V1, clip0), (Lane::V1, clip1), (v2, clip_c)];
+    // A blocker sat right where the V1 half of the set would land: pasting
+    // at the timeline's own start walks every item straight back onto the
+    // lanes it was copied off of, colliding with everything already there.
+    assert!(!session.paste_set_at(0.0, &items));
+
+    assert_eq!(session.lane_clips(Lane::V1)[0], clip0);
+    assert_eq!(session.lane_clips(Lane::V1)[1], clip1);
+    assert_eq!(session.lane_clips(v2)[0], clip_c);
+    assert_eq!(session.lane_clips(Lane::V1).len(), 2);
+    assert_eq!(session.lane_clips(v2).len(), 1);
+}
+
+/// The refactor `move_clip` -> `move_selection` owes: a clip dragged from
+/// outside the selection (or with nothing else selected) moves exactly as it
+/// always has -- `move_clip_to`'s own door and `move_selection_to`'s
+/// selection-of-one both walk the same code, so they cannot drift apart.
+#[test]
+fn a_lone_clip_drag_is_unchanged_by_the_selection_path() {
+    use engine::project::LaneKind;
+
+    let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+    session.set_gain(0.0);
+    let v2 = session.add_lane(LaneKind::Video);
+
+    assert!(session.move_clip_to(Lane::V1, 0, v2, 0), "V1 -> V2");
+    assert!(session.lane_clips(Lane::V1).is_empty());
+    assert_eq!(session.lane_clips(v2).len(), 1);
+
+    // The other kind of lane is refused exactly as before.
+    assert!(!session.move_clip_to(v2, 0, Lane::A1, 0));
+    // A drop back where it was picked up is a click, still refused.
+    let clip = session.lane_clips(v2)[0];
+    assert!(!session.move_clip_to(v2, 0, v2, clip.start));
 }
 
 /// A caption grouped with a clip on an *added* lane closes its lane's hole
@@ -2180,5 +2449,65 @@ fn should_loop_restart_is_play_state_blind_the_pump_gates_it() {
         should_loop_restart(60, Some((30, 60))),
         "the predicate alone can't tell paused-at-the-edge from playing-\
          into-it -- that distinction is pump's is_playing() guard, not this"
+    );
+}
+
+/// This binary has no `TestAppContext` to press a live escape through, so the
+/// guard reads the ordering `render.rs`'s key listener actually runs: every
+/// card/menu/list close returns before the fallthrough that dispatches
+/// `ActionId::Deselect` ever runs, so escape with one of them open closes it
+/// and never touches `self.selected` -- the picks made before the card opened
+/// are still there once it is gone.
+#[test]
+fn escape_closes_a_card_before_it_can_ever_reach_deselect() {
+    let render_rs = src_text("render.rs");
+    let dispatch = render_rs
+        .find("if let Some(action) = action {")
+        .expect("the keymap fallthrough that fires Deselect");
+    for (guard, label) in [
+        ("if this.keys_open {", "the keys overlay"),
+        ("if this.dock_filter_edit {", "the dock filter"),
+        (
+            "if this.param_card_key(key, event.keystroke.modifiers.shift, cx) {",
+            "a param card",
+        ),
+        (
+            "if escape_leaves_player_fullscreen(key, ctrl, this.player_fullscreen) {",
+            "player fullscreen",
+        ),
+        ("let clip_menu = this.context_menu.take().is_some();", "the clip/row menu or a list"),
+        (
+            "if key == ESCAPE && !ctrl && this.preview_session.is_some() {",
+            "an open preview",
+        ),
+    ] {
+        let at = render_rs
+            .find(guard)
+            .unwrap_or_else(|| panic!("{label}'s own escape guard moved or was renamed"));
+        assert!(
+            at < dispatch,
+            "{label}'s guard reads after the Deselect dispatch -- escape would \
+             clear the selection before this card ever got a look at the key"
+        );
+    }
+}
+
+/// The other half: with nothing on screen to claim the key, bare escape falls
+/// all the way through to `Player::act`, whose `ActionId::Deselect` arm is
+/// the one place `self.selected` is emptied by a bare stroke rather than by
+/// picking something else.
+#[test]
+fn escape_with_nothing_open_empties_the_selection() {
+    let actions_rs = src_text("player/actions.rs");
+    assert!(
+        actions_rs.contains("ActionId::Deselect => {")
+            && actions_rs.contains("self.selected = Selection::new();"),
+        "the Deselect arm no longer clears self.selected"
+    );
+    let k = keymap::Keymap::defaults();
+    assert_eq!(
+        k.lookup("escape", false),
+        Some(ActionId::Deselect),
+        "bare escape must still route to Deselect for that arm to ever run"
     );
 }
