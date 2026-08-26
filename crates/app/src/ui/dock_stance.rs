@@ -1316,9 +1316,8 @@ fn cycle_on_key_down(
         let key = event.keystroke.key.as_str();
         if is_focus_cycle_key(key) {
             let next = next_surface(surface, event.keystroke.modifiers.shift);
-            window.focus(this.focus_handle(next));
+            this.focus_surface(next, window, cx);
             cx.stop_propagation();
-            cx.notify();
         } else if is_focus_exit_key(key) {
             // Same exit as `stance.rs`'s bench handler: leaves the ring for
             // the root handle rather than letting escape bubble to whatever
