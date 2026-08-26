@@ -110,6 +110,10 @@ pub(crate) fn enable(action: ActionId, ctx: Ctx) -> Enable {
     if action == ActionId::Theme
         || action == ActionId::Fullscreen
         || action == ActionId::SubtitleStyle
+        // Moving the keyboard ring is the same kind of always-there,
+        // touches-no-timeline action as the three above: there is always a
+        // dock/bench/inspector to land the ring on, export or no.
+        || action == ActionId::FocusPanels
     {
         return Enable::Yes;
     }

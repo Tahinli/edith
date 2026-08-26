@@ -165,6 +165,16 @@ impl Player {
                     window.toggle_fullscreen();
                 }
             }
+            // The ring's own door: nothing else in the app ever calls
+            // `window.focus` on one of the three surface handles
+            // (`ui::stance::Surface`), so without this the Tab handlers those
+            // surfaces carry (`stance.rs`'s `bench`, `dock_stance.rs`'s
+            // `cycle_on_key_down`) are unreachable dead code -- the ring never
+            // starts. Lands on the cycle's first stop (`stance::SURFACE_CYCLE`
+            // -- the dock); a second Tab from there walks it same as ever.
+            ActionId::FocusPanels => {
+                self.focus_surface(crate::ui::stance::Surface::Dock, window, cx);
+            }
             // Nothing to cancel while nothing is exporting; the export guard in
             // the key handler is what answers this one while there is.
             ActionId::CancelExport => {}
