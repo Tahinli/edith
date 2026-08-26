@@ -370,6 +370,18 @@ impl Player {
                     .get(clip.source)
                     .is_some_and(|s| engine::is_image(&s.path))
             }),
+            // The probed stream table again, this time asking the other
+            // question of it: an empty list is a silent file
+            // ([`Player::streams`]), and a clip cut from one has no sound to
+            // scan whatever lane it sits on -- said before the row is drawn
+            // rather than after the scan comes back empty
+            // ([`Player::start_silence_scan`]'s `Ok(None)` arm).
+            no_sound: clip.is_some_and(|(clip, _)| {
+                session
+                    .sources()
+                    .get(clip.source)
+                    .is_some_and(|s| self.streams.get(&s.path).is_some_and(Vec::is_empty))
+            }),
             playhead: frame_at(session.now(), self.fps),
             timeline: true,
             clipboard: !self.clipboard.is_empty(),

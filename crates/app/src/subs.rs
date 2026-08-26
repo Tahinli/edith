@@ -243,6 +243,28 @@ pub(crate) fn read_ahead(
     Landed::Read(walk_subtitles(path), probe)
 }
 
+/// The toast's own words for a standalone audio import -- rate, channel
+/// count and rounded length -- appended after every other tail, so an
+/// audio-only file's IMPORTED line reads the numbers a properties card would
+/// otherwise take a click to open. `has_video` is the caller's probed answer
+/// ([`Player::has_video`], or the import's own `NoVideoTrack` refusal): a
+/// film's toast is unchanged, an audio-only container gets the numbers the
+/// same as a song, and a song whose own small header read comes back empty
+/// stays plain.
+pub(crate) fn audio_import_tail(path: &std::path::Path, has_video: bool) -> String {
+    if has_video {
+        return String::new();
+    }
+    let probe = engine::AudioSession::probe(path, 0).ok().flatten();
+    let secs = engine::AudioSession::duration_secs(path).ok().flatten();
+    match (probe, secs) {
+        (Some(p), Some(secs)) => {
+            format!(" — {} Hz, {} ch, {}s", p.sample_rate, p.channels, secs.round() as u64)
+        }
+        _ => String::new(),
+    }
+}
+
 /// Every subtitle track a file carries, cues and all -- the walk that costs, in
 /// the one place every door that pays it goes through. `Ok` and empty for a file
 /// with none to read, which is what a file that is neither a container we can

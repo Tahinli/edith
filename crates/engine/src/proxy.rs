@@ -217,6 +217,41 @@ fn sweep(dir: &Path, cap: u64) -> u64 {
     total
 }
 
+/// Deletes every `.part` in `dir`: the leftover of an encoder that never got
+/// to unlink its own half-written file, because the process holding it was
+/// killed rather than let finish or cancel cleanly.
+///
+/// Unlike the one removal in [`started`], which clears only *this film's* own
+/// `.part` right before a new encode of it starts, this clears everyone
+/// else's too -- which is safe to do only because nothing in this process has
+/// claimed a `.part` yet at the point it runs ([`sweep_stale_parts`]).
+fn sweep_parts(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == "part") && std::fs::remove_file(&path).is_ok() {
+            eprintln!("proxy cache: swept stale {}", path.display());
+        }
+    }
+}
+
+/// Run once, at launch, ahead of anything that could claim a stand-in for
+/// itself: clears every orphan `.part` a killed editor left in the proxy
+/// cache. "Stale" needs no age check here -- at launch [`IN_FLIGHT`] is empty
+/// by construction, so *every* `.part` on disk belongs to nobody still
+/// running. A no-op where the machine has no cache directory at all.
+pub fn sweep_stale_parts() {
+    if let Some(dir) = crate::demux::cache_dir(
+        std::env::var_os("XDG_CACHE_HOME"),
+        std::env::var_os("HOME"),
+        "proxies",
+    ) {
+        sweep_parts(&dir);
+    }
+}
+
 /// The proxy of `source` if one has already been made, `None` otherwise. The
 /// answer a session asks at open: a hit costs one `stat`.
 pub fn cached(source: &Path) -> Option<PathBuf> {
@@ -659,6 +694,29 @@ mod tests {
         // Under the cap, nothing is touched at all.
         assert_eq!(sweep(&dir, 900), 800);
         assert!(fresh.exists());
+    }
+
+    /// What a killed editor leaves behind piles up as `.part` files nothing
+    /// ever revisits (nothing but the one film's own next start clears its
+    /// own, [`started`]) -- the launch-time sweep takes every one of them,
+    /// and leaves the finished stand-ins beside them alone.
+    #[test]
+    fn the_launch_sweep_takes_every_orphan_part() {
+        let dir = crate::scratch::Scratch::dir("proxy-part-sweep");
+        let write = |name: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, b"orphaned mid-encode").expect("write");
+            path
+        };
+        let orphan_a = write("aaaa.mp4.part");
+        let orphan_b = write("bbbb.mp4.part");
+        let finished = write("cccc.mp4");
+
+        sweep_parts(&dir);
+
+        assert!(!orphan_a.exists(), "one orphan part survived the sweep");
+        assert!(!orphan_b.exists(), "the other orphan part survived it");
+        assert!(finished.exists(), "a finished stand-in was swept too");
     }
 
     /// A song and a still are not films: they are answered `None` -- the same

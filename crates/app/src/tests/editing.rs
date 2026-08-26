@@ -839,6 +839,22 @@ fn the_clip_menu_dims_what_the_playhead_is_not_on_and_stays_in_the_window() {
         ),
         Enable::Hidden(_)
     ));
+    // A video clip the probed stream table says has no audio track at all --
+    // the row is hidden rather than offered and refused after a scan comes
+    // back with nothing to report (`Player::start_silence_scan`'s `Ok(None)`).
+    assert!(matches!(
+        enable(
+            ActionId::Silence,
+            Ctx {
+                clip: Some((clip, v1)),
+                no_sound: true,
+                playhead: 60,
+                timeline: true,
+                ..Ctx::default()
+            }
+        ),
+        Enable::Hidden(_)
+    ));
     // The editor as a whole, which is how the actions card asks: with no
     // timeline nothing is offered, an export leaves only its own cancel,
     // and the three that act on the marked clip say so when none is.

@@ -61,6 +61,12 @@ pub(crate) struct Ctx {
     /// reach at all -- not the lane's business, because a still sits on a video
     /// lane exactly like a take whose sound is one lane down.
     pub(crate) image: bool,
+    /// The clip's source is known, from the probed stream table
+    /// ([`Player::streams`]), to carry no audio track at all -- a video shot
+    /// mute, not merely a video whose sound is quiet. `false` (the default)
+    /// covers both "has sound" and "not probed yet": a row nobody has asked
+    /// about is not one this hides a working action from.
+    pub(crate) no_sound: bool,
     pub(crate) playhead: u32,
     /// A timeline is open.
     pub(crate) timeline: bool,
@@ -221,6 +227,7 @@ pub(crate) fn enable(action: ActionId, ctx: Ctx) -> Enable {
         // `unscannable` says after the fact, said before the row is drawn so
         // there is no row left to click.
         ActionId::Silence if ctx.image => Enable::Hidden("this clip is a still"),
+        ActionId::Silence if ctx.no_sound => Enable::Hidden("this clip has no sound"),
         // -- state: true of this clip now, and the next playhead click or the
         // next selection changes the answer. Splits this clip only from inside
         // it: at either edge there is nothing to split off -- and, on a speeded
