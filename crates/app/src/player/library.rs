@@ -624,7 +624,15 @@ impl Player {
         self.proxies.insert(path.clone(), Proxy::Asked);
         let started = cx.background_executor().spawn({
             let path = path.clone();
-            async move { engine::proxy::generate_if_wanted(&path) }
+            // deferred: DEBT #91 wires only the engine's header-read cancel
+            // (crates/engine/src/proxy.rs); the app has no cancel to hand it
+            // yet -- a stop asked during Asked still lands the way it always
+            // has, by the `stopped` check below once the ask returns. Wiring
+            // this flag to `toggle_proxy` is the next slice.
+            async move {
+                let uncancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                engine::proxy::generate_if_wanted(&path, &uncancelled)
+            }
         });
         cx.spawn(async move |this, cx| {
             let started = started.await;

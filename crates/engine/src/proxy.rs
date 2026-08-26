@@ -32,6 +32,8 @@
 //! cancel a file export has ([`Job`]).
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::UNIX_EPOCH;
 
 use crate::demux::{Codec, Demuxer, NoVideoTrack, VideoMeta};
@@ -439,7 +441,10 @@ impl Job {
 /// back through [`Job::outcome`], so a caller has two places to look and not
 /// twenty.
 pub fn generate(source: &Path) -> crate::Result<Job> {
-    Ok(started(source, |_| true)?.expect("nothing was filtered out"))
+    // Nothing here has anything to cancel a header read with -- a flag that is
+    // never set is the same as the read never checking one at all.
+    let uncancelled = Arc::new(AtomicBool::new(false));
+    Ok(started(source, |_| true, &uncancelled)?.expect("nothing was filtered out"))
 }
 
 /// The same, for a file that is worth standing in for and nobody else
@@ -461,7 +466,17 @@ pub fn generate(source: &Path) -> crate::Result<Job> {
 /// header says so -- so the demuxer's own [`NoVideoTrack`] answer is taken here
 /// as the same quiet `None`. A film that *has* a picture and will not open is a
 /// different thing and stays loud.
-pub fn generate_if_wanted(source: &Path) -> crate::Result<Option<Job>> {
+///
+/// `cancel` is polled through the whole Asked phase, the same flag the caller
+/// hands the [`Job`] once one exists: a click to stop this file's stand-in
+/// while the header is still being read (a Matroska's is a cluster walk, not
+/// a stat) used to have nothing to set, since there was no [`Job`] yet to
+/// [`cancel`](Job::cancel) -- so the read ran to completion regardless, and a
+/// stop landed only once an encoder was already open. Set before this is
+/// called or at any point while it runs, it is read at the door and again
+/// wrapped around the header read itself ([`crate::demux::with_cancel`]), so a
+/// cancelled read unwinds at its next element instead of finishing.
+pub fn generate_if_wanted(source: &Path, cancel: &Arc<AtomicBool>) -> crate::Result<Option<Job>> {
     if crate::is_audio(source) || crate::is_image(source) {
         return Ok(None);
     }
@@ -472,7 +487,7 @@ pub fn generate_if_wanted(source: &Path) -> crate::Result<Option<Job>> {
     if is_off(source) {
         return Ok(None);
     }
-    match started(source, wanted) {
+    match started(source, wanted, cancel) {
         Err(e) if NoVideoTrack::is_it(&e) => Ok(None),
         other => other,
     }
@@ -480,7 +495,18 @@ pub fn generate_if_wanted(source: &Path) -> crate::Result<Option<Job>> {
 
 /// Both doors: the cache is looked at, the header is read once, and `only_if`
 /// decides off that header whether there is anything to do.
-fn started(source: &Path, only_if: fn(&VideoMeta) -> bool) -> crate::Result<Option<Job>> {
+///
+/// `cancel` is checked the moment the seat is claimed and again around the
+/// header read: a cancel that lands before either point is answered without
+/// spending a read nobody wants the result of, with [`crate::demux::is_cancelled`]
+/// true of the error -- and the seat this claimed is given back the same way
+/// a cancelled encode's is, [`Claim`]'s own `Drop`, run on the early return
+/// exactly as it is on the ordinary one.
+fn started(
+    source: &Path,
+    only_if: fn(&VideoMeta) -> bool,
+    cancel: &Arc<AtomicBool>,
+) -> crate::Result<Option<Job>> {
     let out = path_for(source).ok_or("no cache directory to keep a proxy in")?;
     if out.is_file() {
         return Ok(Some(Job {
@@ -493,10 +519,18 @@ fn started(source: &Path, only_if: fn(&VideoMeta) -> bool) -> crate::Result<Opti
     // the job is dropped ([`IN_FLIGHT`]): the second start would unlink the
     // first's `.part` below and orphan an encode nothing can stop.
     let claim = claim(&out).ok_or("a stand-in for this film is already being made")?;
+    // A cancel that landed before this ran at all, or while it queued behind
+    // another film's seat: answered here, before a byte of the header is read,
+    // rather than starting a read that would only be thrown away.
+    if cancel.load(std::sync::atomic::Ordering::Acquire) {
+        return Err(crate::demux::cancelled_read_error());
+    }
     // The source's own header: its rate and length are the proxy's (a stand-in
     // that ran at another rate or stopped early would put every cut on another
-    // frame), and only its picture size changes.
-    let (meta, _) = Demuxer::open(source)?;
+    // frame), and only its picture size changes. Wrapped in the same cancel an
+    // encode itself is polled with, so a stop asked for mid-walk unwinds the
+    // walk instead of waiting it out.
+    let (meta, _) = crate::demux::with_cancel(cancel, || Demuxer::open(source))?;
     if !only_if(&meta) {
         return Ok(None);
     }
@@ -579,6 +613,12 @@ fn started(source: &Path, only_if: fn(&VideoMeta) -> bool) -> crate::Result<Opti
 mod tests {
     use super::*;
     use crate::colorspace::ColorDescription;
+
+    /// A cancel flag no test in this file is exercising, for the calls that
+    /// have nothing to cancel.
+    fn uncancelled() -> Arc<AtomicBool> {
+        Arc::new(AtomicBool::new(false))
+    }
 
     fn meta(width: u32, height: u32, codec: Codec) -> VideoMeta {
         VideoMeta {
@@ -738,7 +778,7 @@ mod tests {
         for name in ["tone.wav", "song.mp3", "track.mka", "still.png", "shot.jpg"] {
             let file = dir.join(name);
             std::fs::write(&file, b"not a film, and never read").expect("write");
-            let answer = generate_if_wanted(&file);
+            let answer = generate_if_wanted(&file, &uncancelled());
             assert!(
                 matches!(answer, Ok(None)),
                 "{name} is not a film to stand in for: {:?}",
@@ -758,7 +798,7 @@ mod tests {
             crate::demux::NoVideoTrack::is_it(&refusal),
             "not the no-picture answer: {refusal}"
         );
-        let answer = generate_if_wanted(&silent_film);
+        let answer = generate_if_wanted(&silent_film, &uncancelled());
         assert!(
             matches!(answer, Ok(None)),
             "an audio-only mp4 is not a film to stand in for: {:?}",
@@ -873,7 +913,7 @@ mod tests {
         assert!(is_off(&file), "the mark is beside the cache entry");
         // Which is what the sweep asks -- and it does not even read the header.
         assert!(
-            matches!(generate_if_wanted(&file), Ok(None)),
+            matches!(generate_if_wanted(&file, &uncancelled()), Ok(None)),
             "a switched-off film was started again"
         );
         set_off(&file, false);
@@ -889,6 +929,37 @@ mod tests {
         filetime_bump(&file);
         assert!(!is_off(&file), "a changed source kept the old answer");
         std::fs::remove_file(stale).expect("the old mark");
+    }
+
+    /// DEBT #91: a cancel already up when the Asked phase starts must answer
+    /// promptly and never touch the header at all -- before this, the flag
+    /// [`generate_if_wanted`] takes did not exist, so nothing here could be
+    /// cancelled before a [`Job`] existed to call [`Job::cancel`] on, and the
+    /// only way to see this pass on old code was to change the signature.
+    ///
+    /// The file is never a real film: the cancel is answered at the door,
+    /// before [`Demuxer::open`] is ever reached, which is what "promptly"
+    /// means here and what proves the header was never read.
+    #[test]
+    fn a_cancel_set_before_the_ask_stops_it_at_the_door() {
+        let dir = crate::scratch::Scratch::dir("proxy-cancel-at-door");
+        let file = dir.join("a.mp4");
+        std::fs::write(&file, b"not a real film, and never read").expect("write");
+        let cancel = Arc::new(AtomicBool::new(true));
+
+        let answer = generate_if_wanted(&file, &cancel);
+        let err = answer.err().expect("a pre-cancelled ask must not hand back a job");
+        assert!(
+            crate::demux::is_cancelled(&err),
+            "not the cancelled answer: {err}"
+        );
+        assert_eq!(cached(&file), None, "no proxy was produced");
+
+        // Settled the same way a cancelled `Making` is: the seat this claimed
+        // is given back, so the very next ask -- uncancelled -- is free to take
+        // it rather than being told one is "already being made".
+        let out = path_for(&file).expect("a key");
+        assert!(claim(&out).is_some(), "the door-cancel left the seat held");
     }
 
     /// One encoder per film, in the engine and not only in the window that

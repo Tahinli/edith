@@ -77,6 +77,14 @@ pub fn is_cancelled(error: &crate::Error) -> bool {
     error.to_string() == CANCELLED
 }
 
+/// The same answer a walk gives up with on its own, for a caller that finds
+/// its cancel already set before there is any walk to abandon -- a proxy's
+/// header read finding its flag up the moment its seat is claimed, say. Kept
+/// to one string so [`is_cancelled`] answers both the same way.
+pub fn cancelled_read_error() -> crate::Error {
+    CANCELLED.into()
+}
+
 /// What the video track is coded with. Not a decoder choice by itself: only
 /// H.264 has a software decoder here, which is what [`Codec::needs_plugin`]
 /// says for the others.
