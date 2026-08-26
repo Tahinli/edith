@@ -77,6 +77,31 @@ pub fn is_cancelled(error: &crate::Error) -> bool {
     error.to_string() == CANCELLED
 }
 
+/// The mp4 arm's half of [`cancelled`]: the Matroska walk polls the flag itself
+/// between elements, but `Mp4Reader::read_header` is the `mp4` crate's own loop
+/// over the `moov`, called once and not returned to until the whole header is
+/// parsed. This is the same poll wearing a `Read`/`Seek` face instead, so a
+/// cancel mid-`moov` surfaces exactly where the crate next asks this file for
+/// bytes -- as an [`io::Error`](std::io::Error) that `Mp4Reader::read_header`
+/// has no choice but to propagate, in [`CANCELLED`]'s own words so
+/// [`is_cancelled`] tells it apart from the file the same way either arm does.
+struct CancelableReader<R>(R);
+
+impl<R: Read> Read for CancelableReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if cancelled() {
+            return Err(std::io::Error::other(CANCELLED));
+        }
+        self.0.read(buf)
+    }
+}
+
+impl<R: Seek> Seek for CancelableReader<R> {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        self.0.seek(pos)
+    }
+}
+
 /// What the video track is coded with. Not a decoder choice by itself: only
 /// H.264 has a software decoder here, which is what [`Codec::needs_plugin`]
 /// says for the others.
@@ -602,7 +627,7 @@ pub fn is_matroska(path: &Path) -> bool {
 }
 
 pub struct Mp4Demuxer {
-    reader: Mp4Reader<BufReader<File>>,
+    reader: Mp4Reader<CancelableReader<BufReader<File>>>,
     track_id: u32,
     sample_count: u32,
     /// 1-based sample id of *frame 0*: the edit list can start the presentation
@@ -639,7 +664,7 @@ impl Mp4Demuxer {
     fn open(path: &Path) -> crate::Result<(VideoMeta, Self)> {
         let file = File::open(path)?;
         let size = file.metadata()?.len();
-        let reader = Mp4Reader::read_header(BufReader::new(file), size)?;
+        let reader = Mp4Reader::read_header(CancelableReader(BufReader::new(file)), size)?;
 
         // In *file* order, out of `moov.traks` rather than `Mp4Reader::tracks`,
         // which is a `HashMap`: iterating that would make "the video track" a
@@ -4200,6 +4225,25 @@ mod tests {
         assert!(
             walked.is_ok_and(|(blocks, ..)| !blocks.is_empty()),
             "{name}: the uncancelled walk found nothing"
+        );
+    }
+
+    /// **A cancelled mp4 open stops reading the header too.** The `mp4` crate
+    /// has no cancel of its own -- [`CancelableReader`] is what stands in --
+    /// so this pre-sets the flag before [`Mp4Demuxer::open`] ever calls
+    /// `Mp4Reader::read_header` and asserts the open comes back [`is_cancelled`]
+    /// rather than a parsed header. On the reader that only wraps `BufReader`
+    /// (pre-[`CancelableReader`]) the flag is never polled and this test fails
+    /// with `Ok(_)`.
+    #[test]
+    fn a_cancelled_mp4_open_gives_up_and_says_so() {
+        let path = asset("test_av.mp4");
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let opened = with_cancel(&flag, || Mp4Demuxer::open(&path));
+        let error = opened.err().expect("a cancelled open must not parse a header");
+        assert!(
+            is_cancelled(&error),
+            "a cancelled mp4 open reported {error} -- a verdict about the file"
         );
     }
 
