@@ -231,7 +231,7 @@ impl Player {
     pub(crate) fn toggle_snap(&mut self, cx: &mut Context<Self>) {
         self.snap = !self.snap;
         self.snap_cue = None;
-        self.ghost = None;
+        self.ghost.clear();
         self.notify_user(match self.snap {
             true => "SNAP ON — drags land on clip edges, the playhead and the start".into(),
             false => "SNAP OFF — drags land exactly where the hand leaves them".into(),

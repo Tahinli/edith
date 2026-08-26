@@ -246,7 +246,7 @@ impl Player {
         // ...and the shadow a drag is drawn under promises a landing on a lane
         // this edit has just reshaped. The next move of the drag draws it
         // again; until then it says nothing.
-        self.ghost = None;
+        self.ghost.clear();
     }
 
     /// Jumps the timeline.
