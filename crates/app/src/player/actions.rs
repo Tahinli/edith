@@ -98,6 +98,12 @@ impl Player {
             ActionId::SelectNext => self.select_step(true, cx),
             ActionId::SelectPrev => self.select_step(false, cx),
             ActionId::SelectAll => self.select_all(cx),
+            // Last in escape's precedence chain (render.rs): nothing else
+            // claimed the key, so it just empties the selection.
+            ActionId::Deselect => {
+                self.selected = Selection::new();
+                cx.notify();
+            }
             ActionId::Delete => self.delete_selected(cx),
             ActionId::Lift => self.lift_selected(cx),
             ActionId::Color => self.open_color(cx),
