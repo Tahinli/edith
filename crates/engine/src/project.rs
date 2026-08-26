@@ -3591,23 +3591,71 @@ impl Project {
     /// is on, and a drop that changes neither lane nor frame, which is a clip
     /// picked up and put back down, i.e. a click.
     pub fn move_clip(&mut self, from: Lane, idx: usize, to: Lane, start: u32) -> bool {
+        self.move_selection(&[(from, idx)], from, idx, to, start)
+    }
+
+    /// [`move_clip`](Self::move_clip)'s general form: every pick in `picks`
+    /// (each with its own link group, exactly as [`group_of`](Self::group_of)
+    /// reads it) travels the same distance as the clip at `idx` of `from`,
+    /// which alone changes lane, onto `to`. One clamp across the whole set
+    /// ([`move_room`](Self::move_room)) is what makes this all-or-nothing: a
+    /// neighbour that boxes in *any* member narrows the delta every member
+    /// moves by, and a member with no room at all (`lo > hi`) refuses the
+    /// whole set rather than moving the rest and leaving that one behind.
+    /// `move_clip` is this with a selection of one -- the dragged clip's own
+    /// group and nothing else -- so a drag on a clip outside the selection is
+    /// byte-identical to before this existed.
+    pub fn move_selection(
+        &mut self,
+        picks: &[(Lane, usize)],
+        from: Lane,
+        idx: usize,
+        to: Lane,
+        start: u32,
+    ) -> bool {
         let (Some(dest), Some(clip)) = (self.index(to), self.lane(from).get(idx).copied()) else {
             return false;
         };
         if from.kind != to.kind {
             return false;
         }
-        let members = self.group_of(from, idx).expect("the clip was found");
         let held = self.index(from).expect("the clip was found on it");
-        // The two halves of one group would land on one span of one lane, which
-        // is the one thing a link may never mean. Refused rather than clamped:
-        // the partner moves the same distance, so there is no room for it
-        // anywhere on that lane.
+        // Every pick's own group, unioned: the whole selection moves as one,
+        // and a pick's link partners (not themselves picked) come along with
+        // it exactly as a lone drag's do.
+        let mut members = Members::default();
+        for &(lane, i) in picks {
+            let Some(group) = self.group_of(lane, i) else {
+                continue;
+            };
+            for m in group.clips {
+                if !members.clips.contains(&m) {
+                    members.clips.push(m);
+                }
+            }
+            for m in group.subs {
+                if !members.subs.contains(&m) {
+                    members.subs.push(m);
+                }
+            }
+        }
+        if !members.clips.contains(&(held, idx)) {
+            members.clips.push((held, idx));
+        }
+        // The two halves of *the dragged clip's own* group would land on one
+        // span of one lane, which is the one thing a link may never mean --
+        // checked against that group alone, not the whole moving set: an
+        // unlinked fellow pick already sitting on `dest` is no conflict at
+        // all, since it travels by the same delta and `move_room` below
+        // leaves it the room to. Refused rather than clamped: the partner
+        // moves the same distance, so there is no room for it anywhere on
+        // that lane.
+        let own_group = self.group_of(from, idx).expect("the clip was found");
         if dest != held
-            && members
+            && own_group
                 .clips
                 .iter()
-                .chain(&members.subs)
+                .chain(&own_group.subs)
                 .any(|&(l, _)| l == dest)
         {
             return false;

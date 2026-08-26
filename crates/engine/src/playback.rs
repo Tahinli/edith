@@ -2374,6 +2374,22 @@ impl PlaybackSession {
         self.edit(Dirty::Both, |p| p.move_clip(from, idx, to, start))
     }
 
+    /// [`move_clip_to`](Self::move_clip_to)'s general form: every one of
+    /// `picks` travels the same frame delta as the dragged clip at `idx` of
+    /// `from`, all-or-nothing, one undo step for the lot -- what a hand drags
+    /// on a selection rather than a lone clip. See
+    /// [`Project::move_selection`] for the clamp that makes it all-or-nothing.
+    pub fn move_selection_to(
+        &mut self,
+        picks: &[(Lane, usize)],
+        from: Lane,
+        idx: usize,
+        to: Lane,
+        start: u32,
+    ) -> bool {
+        self.edit(Dirty::Both, |p| p.move_selection(picks, from, idx, to, start))
+    }
+
     /// Drags one end of that clip to timeline frame `to`, changing how much of
     /// its source it plays and nothing else on the lane -- see [`Project::trim`]
     /// for the walls it is clamped by, which this fills the source lengths in
