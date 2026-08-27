@@ -453,8 +453,8 @@ fn keys_overlay(player: &Player, bench_h: f32, cx: &mut Context<Player>) -> impl
         .bottom_0()
         .left_0()
         .right_0()
-        // The live `bench_h` the caller already measures for `bench`/
-        // `notice_plate`, not the fixed `BENCH_H` default: a hand-dragged
+        // The live `bench_h` the caller already measures for `bench`,
+        // not the fixed `BENCH_H` default: a hand-dragged
         // bench taller than the default left this scrim short of the real
         // footprint, so the overlay stopped mid-bench instead of covering it.
         .h(px(bench_h + LEDGER_H))
@@ -724,126 +724,6 @@ fn bench(
         .child(bench_stance::render(player, bench_h - BENCH_CHROME_H, cx))
 }
 
-/// Which of the three §8 severities a notice's own words carry. Reuses
-/// [`notice_tone`] (the legacy bar's own classification, by word) rather than
-/// a second heuristic, and folds its four-way answer onto the darkroom's
-/// three tokens: `STATUS_ERROR`/`STATUS_WARNING` are the same constants as
-/// `NOTICE_DECIDE`/`NOTICE_LOOK` already (`ui/theme.rs`'s `darkroom` module
-/// aliases them both ways), so the two failure/refusal tones fold straight
-/// across and everything else -- success included -- reads as *told you*.
-fn notice_severity(message: &str) -> u32 {
-    let tone = notice_tone(message);
-    if tone == STATUS_ERROR() {
-        NOTICE_DECIDE()
-    } else if tone == STATUS_WARNING() {
-        NOTICE_LOOK()
-    } else {
-        NOTICE_TELL()
-    }
-}
-
-/// [`notice_plate`]'s own `bottom` offset, pulled out as a pure function so
-/// a `TestAppContext`-less test binary (this crate's own, no live `Context`
-/// to mount a real `notice_plate` in) can still check the anchor without
-/// duplicating the arithmetic by hand and risking the two drifting apart.
-///
-/// Anchored a fixed `LEDGER_H + 6.` above the ledger, not floated by
-/// `bench_h` (F3, user report): floating it `bench_h` further up put the
-/// plate up beside the time band's transport timecode row for any tall
-/// bench, reading as if it belonged to that row instead of the ledger it
-/// answers. The old float existed only to dodge the bench's V1/A1 lane
-/// chips (F2) -- [`notice_plate`] now dodges those horizontally instead
-/// (right-aligned, DESIGN §11.6: the lane chips there are left-aligned),
-/// so the vertical float is no longer needed to keep the plate clear.
-pub(crate) fn notice_bottom_offset() -> f32 {
-    LEDGER_H + 6.
-}
-
-/// A notice plate (DESIGN §8): one at a time, rising above the *bench*, its
-/// severity a 3px left spine rather than a colour flood. Fed by the same
-/// [`Player::notify_user`]/`notices` queue the legacy bar reads
-/// ([`Player::notice_bar`]) -- no second notice channel.
-///
-/// Reads the *back* of the queue, not the front: dismissal only ever fires
-/// on a keystroke ([`render`]'s `on_key_down` calling `dismiss_notice()`),
-/// and most of what fills this queue -- a click on a gap, a menu row, a
-/// drag -- is not one. A `front()` plate left showing a `ctrl+s` "SAVED"
-/// notice sat frozen through an unrelated mouse-driven refusal that queued
-/// in behind it: the ledger strip's own "last action" already reads
-/// `back()` for exactly this reason, and the plate disagreeing with it is
-/// what made the refusal look like it never reached the notice surface at
-/// all. `back()` keeps the two in step and guarantees the newest, most
-/// actionable message is always the one on screen.
-///
-/// Anchored a fixed [`notice_bottom_offset`] above the ledger, bottom-right
-/// (DESIGN §5's timecode/transport row lives bottom-left of the time band,
-/// well above this): a `bench_h`-floated offset used to put the plate right
-/// beside that transport row for a tall bench, reading as if it belonged to
-/// the wrong strip (user report). Right-aligned rather than left keeps it
-/// off the bench's own V1/A1 lane chips, which are left-aligned there
-/// (DESIGN §11.6 occlusion check) -- horizontal separation now does the job
-/// the old vertical float existed for.
-///
-/// corner-cut: amber's "carries a jump action" is not wired -- the queue
-/// only ever held plain text, no structured jump target, in either the
-/// legacy bar or here. Ceiling: give `notify_user` an optional jump payload
-/// once a call site actually has one to carry.
-fn notice_plate(message: SharedString, cx: &mut Context<Player>) -> impl IntoElement {
-    div()
-        .id("stance-notice")
-        .absolute()
-        .bottom(px(notice_bottom_offset()))
-        .right(px(12.))
-        .cursor_pointer()
-        // A click answers the notice the same way any other key does
-        // (`stance-room`'s `on_key_down` -> `Player::dismiss_notice`):
-        // the darkroom's own click-to-dismiss for a plate with no other
-        // affordance on it (DESIGN §8).
-        .on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                if this.dismiss_notice() {
-                    cx.notify();
-                }
-            }),
-        )
-        // `max_w` only caps a box after GPUI has measured its text at
-        // max-content width. `w_full` supplies a definite width to that
-        // measurement (then `max_w` bounds it at 480 px), and normal
-        // whitespace gives the text system permission to shape every word
-        // into the resulting lines. Keep this a block: as a flex child the
-        // text's automatic min-content width can overflow its own plate.
-        //
-        // No fixed height: GPUI's shaped lines contribute their actual
-        // default `phi()` line boxes, so two or three lines grow upward from
-        // this bottom anchor without reaching down over the bench lanes.
-        .w_full()
-        .max_w(px(480.))
-        .whitespace_normal()
-        .px(px(10.))
-        .py(px(6.))
-        .rounded(px(2.))
-        .bg(rgb(DARK_PANEL()))
-        // The severity spine (DESIGN §8): a 3px left border, coloured, same
-        // shape as the legacy notice bar's own tone stripe (`notice_bar`).
-        .border_l(px(3.))
-        .border_color(rgb(notice_severity(&message)))
-        .type_style(type_scale::label(
-            type_scale::LABEL_ROW_PX,
-            gpui::FontWeight::MEDIUM,
-        ))
-        .text_color(rgb(INK1()))
-        // `div()` is a flex row by default, and a bare text child measures
-        // its min-content as the *whole line* (`TextLayout::layout` only
-        // wraps against a `Definite` available width, which a flex item's
-        // content-sizing pass never supplies). `w_full`/`max_w` on the
-        // plate itself only bounds the *container* -- the text still never
-        // sees a definite width to wrap against unless it is a `flex_1`
-        // child, which is handed the container's resolved width. Same fix
-        // as `overlays.rs`'s notice bar (`div().flex_1().min_w(...)`).
-        .child(div().flex_1().child(message))
-}
-
 /// Thin strip at the bottom of the centre column: project identity, last
 /// action, export progress, position. Notices rise from here (DESIGN §5, §8).
 fn ledger(player: &Player, position: f64) -> impl IntoElement {
@@ -860,6 +740,17 @@ fn ledger(player: &Player, position: f64) -> impl IntoElement {
         }
     );
     let last_action = player.notices.back().cloned().unwrap_or_else(|| "—".into());
+    // With the floating plate gone (user 2026-08-27, "we also have notifier
+    // at the ledger section"), this strip is the one notice surface left --
+    // a refusal or a failure keeps the tone the plate's severity spine
+    // carried ([`notice_tone`], the same word-read the legacy bar used),
+    // while everything routine stays at the strip's own quiet ink.
+    let tone = notice_tone(&last_action);
+    let action_ink = if tone == STATUS_ERROR() || tone == STATUS_WARNING() {
+        tone
+    } else {
+        INK3()
+    };
     let export = player
         .exporting()
         .map(|h| format!("EXPORTING {:.0}%", h.progress() * 100.));
@@ -897,7 +788,7 @@ fn ledger(player: &Player, position: f64) -> impl IntoElement {
                     type_scale::CHORD_METADATA_MIN_PX,
                     gpui::FontWeight::MEDIUM,
                 ))
-                .text_color(rgb(INK3()))
+                .text_color(rgb(action_ink))
                 .child(last_action),
         )
         .children(export.map(|e| {
@@ -1011,9 +902,6 @@ pub(crate) fn render(
                 } else if let Some(sidecar) = this.recovery_sidecar.take() {
                     Player::discard_sidecar(&sidecar);
                 }
-            }
-            if this.dismiss_notice() {
-                cx.notify();
             }
             // DESIGN §9: "`?` held ... surfaces chords ... release restores.
             // No modal cheat-sheet." Opened here, ahead of the modal guard
@@ -1245,13 +1133,6 @@ pub(crate) fn render(
                         .children(player.silence_card(window_size, cx))
                         .children(player.mix_card(window_size, cx))
                         .children(player.subtitle_style_card(window_size, cx))
-                })
-                // Mounted after `card_maximized` (not beside `ledger` above
-                // any more): a maximized Mix/EQ card painted over a notice
-                // sitting below it in this same child list, and a notice is
-                // transient -- it should win over a card, not lose to one.
-                .when_some(player.notices.back().cloned(), |el, n| {
-                    el.child(notice_plate(n, cx))
                 }),
         )
         .child(divider(Split::Dock, cx))

@@ -243,13 +243,6 @@ impl Player {
         push_notice(&mut self.notices, message);
     }
 
-    /// Answers the message on the bar and brings up the next one. Whether there
-    /// was one to answer, because a key that dismissed a notice owes a repaint
-    /// and a key that dismissed nothing does not.
-    pub(crate) fn dismiss_notice(&mut self) -> bool {
-        self.notices.pop_front().is_some()
-    }
-
     /// The magnet off and on again, in words: a snap that stops working
     /// silently reads as a bug, and one that starts working silently reads as
     /// one too. The line goes with it -- nothing is being promised any more.
