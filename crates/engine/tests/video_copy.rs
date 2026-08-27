@@ -169,6 +169,76 @@ fn an_untouched_av1_timeline_leaves_as_its_source_packets() {
     }
 }
 
+/// The Exact quality row asked of a timeline nobody has touched: it must copy
+/// exactly as the plain [`Format::Hevc`] row above already does, since the
+/// only thing `exact` adds over an untouched timeline is the flag itself --
+/// what it changes is the *fallback*, and there is none to reach here.
+#[test]
+fn exact_on_an_untouched_matroska_timeline_is_stream_identical() {
+    let source = asset("test_hevc.mkv");
+    let session = PlaybackSession::open(&source).expect("open the fixture");
+    let out = Scratch::file("ve_copy_exact", "mkv");
+    let settings = ExportSettings {
+        format: Format::Hevc,
+        exact: true,
+        ..Default::default()
+    };
+    let handle = session.export_to_with(&out, &settings);
+    let started = Instant::now();
+    while !handle.is_finished() {
+        assert!(
+            started.elapsed() < Duration::from_secs(600),
+            "the export did not finish in 600 s"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let line = handle.encoders().unwrap_or_default();
+    handle
+        .result()
+        .expect("an outcome")
+        .unwrap_or_else(|e| panic!("export failed: {e}"));
+    assert!(line.starts_with("copy · "), "exact did not copy: {line}");
+    let (before, after) = (blocks(&source), blocks(&out));
+    assert_eq!(before.len(), after.len(), "block count");
+    for (i, (a, b)) in before.iter().zip(&after).enumerate() {
+        assert_eq!(a.bytes, b.bytes, "block {i} is not the source's bytes");
+        assert_eq!(a.key, b.key, "block {i} sync flag");
+    }
+}
+
+/// Exact asked of an mp4: [`CopyPlan`]'s own corner-cut is that mp4 copies
+/// nothing yet, so the container cannot carry the source's codec byte for
+/// byte -- a state report, named before a frame is touched, and not a silent
+/// re-encode wearing the Exact label.
+#[test]
+fn exact_refuses_a_container_that_cannot_carry_the_codec() {
+    let source = asset("test_hevc.mkv");
+    let session = PlaybackSession::open(&source).expect("open the fixture");
+    let out = Scratch::file("ve_copy_exact_refused", "mp4");
+    let settings = ExportSettings {
+        format: Format::Mp4,
+        exact: true,
+        ..Default::default()
+    };
+    let handle = session.export_to_with(&out, &settings);
+    let started = Instant::now();
+    while !handle.is_finished() {
+        assert!(
+            started.elapsed() < Duration::from_secs(600),
+            "the export did not finish in 600 s"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let err = handle
+        .result()
+        .expect("an outcome")
+        .expect_err("an mp4 cannot honour exact");
+    assert!(
+        err.to_string().contains("cannot carry"),
+        "unexpected refusal: {err}"
+    );
+}
+
 /// A cut placed on a sync point: the middle of the film is deleted and both
 /// sides leave as copies. What is checked is the join -- the blocks either side
 /// of it are the source's own, the timestamps rise a frame at a time across it
