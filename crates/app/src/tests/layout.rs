@@ -1195,10 +1195,15 @@ fn the_subtitles_toggle_says_what_is_placed_and_never_the_picked_row() {
     }
     // Off leaves them on the lanes; that is the half a person needs told.
     assert!(subtitle_toggle_notice(false, 2).contains("still placed"));
-    // An empty timeline says the move instead of a count that reads as broken.
+    // An empty timeline says the state, not a count that reads as broken --
+    // and DESIGN §8 (2026-08-27) keeps this a state report, not a "drag it"
+    // instruction.
     let none = subtitle_toggle_notice(true, 0);
     assert!(!none.contains('0'), "{none} counts nothing at nothing");
-    assert!(none.contains("drag"), "{none} says the next move");
+    assert!(
+        none.contains("nothing placed"),
+        "{none} says the state, not the move"
+    );
 }
 
 /// The door this editor answers "don't make me import the film again" with,
@@ -1238,13 +1243,9 @@ fn the_text_tab_carries_the_add_subtitles_door() {
         dock[..at].ends_with("ghost_verb(\n                    "),
         "the add-subtitles button is not built from the oracle-gated ghost_verb"
     );
-    // ...and the empty tab names that button, rather than pointing at a
-    // toolbar the person is not looking at.
-    assert!(
-        crate::LibraryTab::Text.empty().contains("Add subtitles"),
-        "{}",
-        crate::LibraryTab::Text.empty()
-    );
+    // ...and the empty tab stays a noun, not a sentence pointing at the
+    // button (DESIGN §8, 2026-08-27: no instructional copy).
+    assert_eq!(crate::LibraryTab::Text.empty(), "No subtitles");
 }
 
 /// The Darkroom keeps imported subtitle tracks in the Sources dock, where a

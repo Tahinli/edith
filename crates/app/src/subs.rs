@@ -347,9 +347,7 @@ pub(crate) fn subtitle_tail(session: &mut PlaybackSession, subs: Subs) -> Option
 /// put words there instead.
 pub(crate) fn subtitle_toggle_notice(on: bool, placed: usize) -> String {
     match (on, placed) {
-        (true, 0) => {
-            "SUBTITLES SHOWN — nothing placed yet: drag a track onto a subtitle track".to_string()
-        }
+        (true, 0) => "SUBTITLES SHOWN — nothing placed yet".to_string(),
         (true, n) => format!("SUBTITLES SHOWN — {n} caption(s) on the timeline"),
         (false, n) => format!("SUBTITLES HIDDEN — {n} caption(s) still placed"),
     }

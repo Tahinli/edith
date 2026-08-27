@@ -630,7 +630,7 @@ fn subtitle_palette(player: &Player, cx: &mut Context<Player>) -> Option<AnyElem
                     .into();
                     let detail: SharedString = row
                         .refused
-                        .unwrap_or_else(|| "drag onto an S lane to place".to_string())
+                        .unwrap_or_else(|| "not placed".to_string())
                         .into();
                     let ghost = title.clone();
                     let hitmap_title = title.clone();
@@ -903,7 +903,7 @@ fn sources_tab(
                 }))
                 .children(hitmap::control("dock.filter", "Filter sources", true))
                 .child(match player.dock_filter.is_empty() {
-                    true => "⌕ type to filter — name, codec, unused…".to_string(),
+                    true => "⌕ filter".to_string(),
                     false => format!("⌕ {filter_text}"),
                 })
         })
@@ -996,9 +996,6 @@ fn sources_tab(
                             .text_size(style.size)
                             .text_color(rgb(INK3()))
                             .child(match player.dock_filter.is_empty() {
-                                true if player.library_tab == LibraryTab::Text => {
-                                    "No subtitle sources yet — Import subtitles".to_string()
-                                }
                                 true => player.library_tab.empty().to_string(),
                                 false => "nothing matches the filter".to_string(),
                             }),
@@ -1193,13 +1190,6 @@ fn clip_tab(
     // and a maximized card is mounted at `ui::stance::render` instead, never
     // through this `room`).
     let room = Size::new(px(width), window_size.height);
-    let none_open = player.eq_open.is_none()
-        && player.color_open.is_none()
-        && player.transform_open.is_none()
-        && player.speed_open.is_none()
-        && player.silence_open.is_none()
-        && !player.mix_open
-        && !player.subtitle_style_open;
     div()
         .id("dock-clip")
         .track_focus(&player.focus_inspector)
@@ -1332,21 +1322,6 @@ fn clip_tab(
                         // like the six cards beside it until the subtitle
                         // lane grows the header that is its real home.
                         .children(player.subtitle_style_card(room, cx))
-                })
-                // A plate, not bare space: DESIGN §11's "states" checklist --
-                // nothing picked reads as a hint, not as a hole in the panel.
-                .when(none_open, |d| {
-                    let style = label(type_scale::LABEL_ROW_PX, FontWeight::MEDIUM);
-                    d.child(
-                        div()
-                            .rounded(px(2.))
-                            .bg(rgb(DARK_CANVAS()))
-                            .p(px(8.))
-                            .font(style.font)
-                            .text_size(style.size)
-                            .text_color(rgb(INK3()))
-                            .child("pick a verb above"),
-                    )
                 }),
         )
 }
