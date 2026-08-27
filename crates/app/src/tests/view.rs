@@ -136,8 +136,7 @@ fn a_lane_refuses_the_files_it_cannot_hold_before_the_release_says_so() {
     // ...and a subtitle lane holds none of the three: a caption comes off the
     // Subtitles list, which is where the refusal points.
     for (file, has_video) in [(sound, false), (still, true), (movie, true)] {
-        let why =
-            lane_refuses(file, Lane::S1, has_video).expect("a subtitle lane takes no media");
+        let why = lane_refuses(file, Lane::S1, has_video).expect("a subtitle lane takes no media");
         assert!(why.starts_with("NOT ON S1 — "), "{why}");
         assert!(why.contains("Subtitles list"), "{why}");
     }
@@ -937,7 +936,9 @@ fn only_tab_is_intercepted_by_a_focused_surface_everything_else_reaches_root() {
     use crate::ui::stance::is_focus_cycle_key;
 
     assert!(is_focus_cycle_key("tab"));
-    for key in ["space", "escape", "s", "c", "left", "right", "enter", "delete", "?"] {
+    for key in [
+        "space", "escape", "s", "c", "left", "right", "enter", "delete", "?",
+    ] {
         assert!(!is_focus_cycle_key(key), "{key} must bubble to the root");
     }
 }
@@ -952,7 +953,9 @@ fn escape_is_the_only_key_a_focused_surface_uses_to_leave_the_ring() {
     use crate::ui::stance::is_focus_exit_key;
 
     assert!(is_focus_exit_key("escape"));
-    for key in ["tab", "space", "s", "c", "left", "right", "enter", "delete", "?"] {
+    for key in [
+        "tab", "space", "s", "c", "left", "right", "enter", "delete", "?",
+    ] {
         assert!(!is_focus_exit_key(key), "{key} must not exit the ring");
     }
 }

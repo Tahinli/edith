@@ -1048,7 +1048,10 @@ fn lane_row(
                 )
                 .drag_over::<AssetDrag>(|d, _, _, _| d.bg(rgb(DARK_RAISED())))
                 .on_drop(cx.listener(move |this, drag: &AssetDrag, window, cx| {
-                    let x = this.drag_x.take().unwrap_or_else(|| window.mouse_position().x);
+                    let x = this
+                        .drag_x
+                        .take()
+                        .unwrap_or_else(|| window.mouse_position().x);
                     let at = this.place_frame(x).0;
                     this.insert_source(&drag.0.clone(), drag.1, Some(lane), Some(at), cx)
                 }))
@@ -1090,7 +1093,10 @@ fn lane_row(
                     let Some(idx) = this.dragged(drag) else {
                         return;
                     };
-                    let x = this.drag_x.take().unwrap_or_else(|| window.mouse_position().x);
+                    let x = this
+                        .drag_x
+                        .take()
+                        .unwrap_or_else(|| window.mouse_position().x);
                     this.move_clip(drag.lane, idx, lane, x, cx)
                 }))
                 .on_drag_move(
@@ -1108,7 +1114,10 @@ fn lane_row(
                 // the same call `ui/timeline.rs`'s own bed makes).
                 .drag_over::<SubDrag>(|d, _, _, _| d.bg(rgb(DARK_RAISED())))
                 .on_drop(cx.listener(move |this, drag: &SubDrag, window, cx| {
-                    let x = this.drag_x.take().unwrap_or_else(|| window.mouse_position().x);
+                    let x = this
+                        .drag_x
+                        .take()
+                        .unwrap_or_else(|| window.mouse_position().x);
                     this.move_sub(drag, lane, x, cx);
                 }))
                 .on_drag_move(
@@ -1123,7 +1132,10 @@ fn lane_row(
                 )
                 .drag_over::<SubPick>(|d, _, _, _| d.bg(rgb(DARK_RAISED())))
                 .on_drop(cx.listener(move |this, drag: &SubPick, window, cx| {
-                    let x = this.drag_x.take().unwrap_or_else(|| window.mouse_position().x);
+                    let x = this
+                        .drag_x
+                        .take()
+                        .unwrap_or_else(|| window.mouse_position().x);
                     this.place_sub(drag.0, lane, x, cx);
                 }))
                 .on_drag_move(

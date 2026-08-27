@@ -54,8 +54,7 @@ impl Player {
         // a frame counter this pump keeps -- the same `now()`
         // [`Player::step`] reads.
         let loop_window = active_loop_window(self.loop_on, self.range, self.loop_trim);
-        if session.is_playing() && should_loop_restart(frame_at(session.now(), fps), loop_window)
-        {
+        if session.is_playing() && should_loop_restart(frame_at(session.now(), fps), loop_window) {
             let start = loop_window.map_or(0, |(lo, _)| lo);
             session.seek(f64::from(start) / fps);
         }

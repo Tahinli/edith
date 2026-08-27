@@ -259,7 +259,12 @@ pub(crate) fn audio_import_tail(path: &std::path::Path, has_video: bool) -> Stri
     let secs = engine::AudioSession::duration_secs(path).ok().flatten();
     match (probe, secs) {
         (Some(p), Some(secs)) => {
-            format!(" — {} Hz, {} ch, {}s", p.sample_rate, p.channels, secs.round() as u64)
+            format!(
+                " — {} Hz, {} ch, {}s",
+                p.sample_rate,
+                p.channels,
+                secs.round() as u64
+            )
         }
         _ => String::new(),
     }

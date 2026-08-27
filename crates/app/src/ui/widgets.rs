@@ -315,7 +315,10 @@ impl NumberEdit {
     /// past.
     pub(crate) fn digit(&mut self, digit: u32) {
         if self.text.chars().count() >= self.digits {
-            self.refusal = Some(format!("{} digits is already past the ceiling", self.digits));
+            self.refusal = Some(format!(
+                "{} digits is already past the ceiling",
+                self.digits
+            ));
             return;
         }
         match char::from_digit(digit, 10) {
@@ -370,7 +373,10 @@ impl NumberEdit {
                 None
             }
             Ok(v) => {
-                self.refusal = Some(format!("{v} is past the {} {} ceiling", self.max, self.unit));
+                self.refusal = Some(format!(
+                    "{v} is past the {} {} ceiling",
+                    self.max, self.unit
+                ));
                 None
             }
             Err(_) => {
