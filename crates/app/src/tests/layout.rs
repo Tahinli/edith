@@ -272,11 +272,15 @@ fn a_stateful_button_keeps_its_rect() {
     // `armed` (whether cancel is armed), and neither may gate its own
     // button out of the tree.
     let cards = src_text("ui/cards.rs");
-    for (id, flag) in [("\"eq-spectrum\"", "self.eq_spectrum"), ("\"export-cancel\"", "armed")] {
+    for (id, flag) in [
+        ("\"eq-spectrum\"", "self.eq_spectrum"),
+        ("\"export-cancel\"", "armed"),
+    ] {
         let at = cards.find(id).unwrap_or_else(|| panic!("no {id} button"));
         let before = &cards[at.saturating_sub(350)..at];
         assert!(
-            !before.contains(&format!(".when({flag}")) && !before.contains(&format!(".when(!{flag}")),
+            !before.contains(&format!(".when({flag}"))
+                && !before.contains(&format!(".when(!{flag}")),
             "{id} is gated on the very flag it flips -- its rect would move when the state does"
         );
     }

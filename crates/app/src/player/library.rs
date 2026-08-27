@@ -626,7 +626,8 @@ impl Player {
         // still being walked ([`Player::toggle_proxy`]'s `Asked` arm) sets it,
         // so the walk unwinds mid-read instead of running to completion.
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        self.proxies.insert(path.clone(), Proxy::Asked(cancel.clone()));
+        self.proxies
+            .insert(path.clone(), Proxy::Asked(cancel.clone()));
         let started = cx.background_executor().spawn({
             let path = path.clone();
             async move { engine::proxy::generate_if_wanted(&path, &cancel) }
