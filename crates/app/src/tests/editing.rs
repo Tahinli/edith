@@ -771,6 +771,30 @@ fn the_clip_menu_dims_what_the_playhead_is_not_on_and_stays_in_the_window() {
     assert!(still.contains(&ActionId::Color));
     assert!(still.contains(&ActionId::Fit));
     assert!(still.contains(&ActionId::Speed));
+    // Mix is not in the clip menu, but it wears the same class refusal the
+    // dock's verb row hides it by (`ui::dock_stance::ghost_verb`): nothing to
+    // mix for a picture with no sound at all, live everywhere else.
+    let mix_ctx = |lane, image| Ctx {
+        clip: Some((clip, lane)),
+        image,
+        playhead: 60,
+        timeline: true,
+        ..Ctx::default()
+    };
+    assert!(!enable(ActionId::Mix, mix_ctx(v1, true)).listed());
+    assert!(enable(ActionId::Mix, mix_ctx(v1, false)).listed());
+    assert!(enable(ActionId::Mix, mix_ctx(a1, false)).listed());
+    // A silent video (no still, but its source's stream table is empty)
+    // refuses Mix and Silence the same way, by `no_sound` rather than `image`.
+    let mute_video = Ctx {
+        clip: Some((clip, v1)),
+        no_sound: true,
+        playhead: 60,
+        timeline: true,
+        ..Ctx::default()
+    };
+    assert!(!enable(ActionId::Mix, mute_video).listed());
+    assert!(!enable(ActionId::Silence, mute_video).listed());
     // ...and the state refusals are on all three, dimmed rather than gone:
     // at 30 the playhead is on this clip's head, where a cut has nothing to
     // split off -- a row the next click of the playhead lights.
@@ -1730,12 +1754,12 @@ fn a_copied_clip_is_renumbered_or_dropped_when_a_row_leaves_the_library() {
     assert!(clipboard_after_remove(Vec::new(), 0).is_empty());
     // A set with one member's file gone loses only that member -- the rest
     // of the set survives to be pasted, gaps and lanes intact.
-    let trimmed = clipboard_after_remove(
-        vec![(Lane::V1, clip(1)), (Lane::A1, clip(2))],
-        1,
-    );
+    let trimmed = clipboard_after_remove(vec![(Lane::V1, clip(1)), (Lane::A1, clip(2))], 1);
     assert_eq!(
-        trimmed.into_iter().map(|(_, c)| c.source).collect::<Vec<_>>(),
+        trimmed
+            .into_iter()
+            .map(|(_, c)| c.source)
+            .collect::<Vec<_>>(),
         vec![1]
     );
 }
@@ -2042,18 +2066,22 @@ fn a_selection_drag_moves_every_pick_by_the_same_delta() {
 
     // clip0 on V1 at the fixture's own start; clip1 on V1 ten seconds in,
     // appended to the open bed and rippling nothing.
-    assert!(session
-        .place_stream_at(10.0, &second, 0, None)
-        .expect("av2 is on this timeline"));
+    assert!(
+        session
+            .place_stream_at(10.0, &second, 0, None)
+            .expect("av2 is on this timeline")
+    );
     let clip0 = session.lane_clips(Lane::V1)[0];
     let clip1 = session.lane_clips(Lane::V1)[1];
     assert_eq!((clip0.start, clip1.start), (0, 300));
 
     // clipC on a second video row, well past both of the above.
     let v2 = session.add_lane(LaneKind::Video);
-    assert!(session
-        .place_stream_at(20.0, &path, 0, Some(v2))
-        .expect("test_av.mp4 is on this timeline"));
+    assert!(
+        session
+            .place_stream_at(20.0, &path, 0, Some(v2))
+            .expect("test_av.mp4 is on this timeline")
+    );
     let clip_c = session.lane_clips(v2)[0];
     assert_eq!(clip_c.start, 600);
 
@@ -2071,11 +2099,17 @@ fn a_selection_drag_moves_every_pick_by_the_same_delta() {
     // rather than clearing it.
     assert_eq!(
         session.lane_clips(Lane::V1)[0],
-        Clip { start: clip0.start + 50, ..clip0 }
+        Clip {
+            start: clip0.start + 50,
+            ..clip0
+        }
     );
     assert_eq!(
         session.lane_clips(v2)[0],
-        Clip { start: clip_c.start + 50, ..clip_c }
+        Clip {
+            start: clip_c.start + 50,
+            ..clip_c
+        }
     );
 
     assert!(session.undo(), "one step for the whole set-move");
@@ -2100,35 +2134,35 @@ fn a_selection_drag_refuses_as_one_set_when_any_pick_cannot_land() {
     session.import(&asset("test_av2.mp4")).expect("av2 matches");
     let second = session.sources()[1].path.clone();
 
-    assert!(session
-        .place_stream_at(10.0, &second, 0, None)
-        .expect("av2 is on this timeline"));
+    assert!(
+        session
+            .place_stream_at(10.0, &second, 0, None)
+            .expect("av2 is on this timeline")
+    );
     let clip0 = session.lane_clips(Lane::V1)[0];
     let clip1 = session.lane_clips(Lane::V1)[1];
 
     let v2 = session.add_lane(LaneKind::Video);
-    assert!(session
-        .place_stream_at(0.0, &path, 0, Some(v2))
-        .expect("test_av.mp4 is on this timeline"));
+    assert!(
+        session
+            .place_stream_at(0.0, &path, 0, Some(v2))
+            .expect("test_av.mp4 is on this timeline")
+    );
     let clip_c = session.lane_clips(v2)[0];
     // A clip clip1 is not picked, blocking the road on V2 the drag is about
     // to try: clip1 dragged onto V2 lands its head inside this one.
-    assert!(session
-        .place_stream_at(10.0, &second, 0, Some(v2))
-        .expect("av2 is on this timeline"));
+    assert!(
+        session
+            .place_stream_at(10.0, &second, 0, Some(v2))
+            .expect("av2 is on this timeline")
+    );
     let blocker = session.lane_clips(v2)[1];
     assert_eq!(blocker.start, 300);
 
     let picks = [(Lane::V1, 0), (Lane::V1, 1), (v2, 0)];
     // Dragged onto V2 at a frame inside the blocker: refused outright, the
     // way a lone drag onto another clip already is.
-    assert!(!session.move_selection_to(
-        &picks,
-        Lane::V1,
-        1,
-        v2,
-        blocker.start + 10
-    ));
+    assert!(!session.move_selection_to(&picks, Lane::V1, 1, v2, blocker.start + 10));
     // Nothing moved -- not clip1 clamped short of the blocker, and not the
     // two picks that had all the room to spare.
     assert_eq!(session.lane_clips(Lane::V1)[0], clip0);
@@ -2176,23 +2210,30 @@ fn a_three_pick_copy_paste_preserves_gaps_and_lane_assignment() {
     session.import(&asset("test_av2.mp4")).expect("av2 matches");
     let second = session.sources()[1].path.clone();
 
-    assert!(session
-        .place_stream_at(10.0, &second, 0, None)
-        .expect("av2 is on this timeline"));
+    assert!(
+        session
+            .place_stream_at(10.0, &second, 0, None)
+            .expect("av2 is on this timeline")
+    );
     let clip0 = session.lane_clips(Lane::V1)[0];
     let clip1 = session.lane_clips(Lane::V1)[1];
 
     let v2 = session.add_lane(LaneKind::Video);
-    assert!(session
-        .place_stream_at(20.0, &path, 0, Some(v2))
-        .expect("test_av.mp4 is on this timeline"));
+    assert!(
+        session
+            .place_stream_at(20.0, &path, 0, Some(v2))
+            .expect("test_av.mp4 is on this timeline")
+    );
     let clip_c = session.lane_clips(v2)[0];
 
     // Copied in click order, out of the lanes each was clicked in -- exactly
     // what `Player::copy_selected` builds.
     let items = [(Lane::V1, clip0), (Lane::V1, clip1), (v2, clip_c)];
     let at = session.timeline_duration();
-    assert!(session.paste_set_at(at, &items), "a free spot takes the set");
+    assert!(
+        session.paste_set_at(at, &items),
+        "a free spot takes the set"
+    );
 
     let new0 = session.lane_clips(Lane::V1)[2];
     let new1 = session.lane_clips(Lane::V1)[3];
@@ -2230,16 +2271,20 @@ fn a_colliding_set_paste_refuses_whole() {
     session.import(&asset("test_av2.mp4")).expect("av2 matches");
     let second = session.sources()[1].path.clone();
 
-    assert!(session
-        .place_stream_at(10.0, &second, 0, None)
-        .expect("av2 is on this timeline"));
+    assert!(
+        session
+            .place_stream_at(10.0, &second, 0, None)
+            .expect("av2 is on this timeline")
+    );
     let clip0 = session.lane_clips(Lane::V1)[0];
     let clip1 = session.lane_clips(Lane::V1)[1];
 
     let v2 = session.add_lane(LaneKind::Video);
-    assert!(session
-        .place_stream_at(20.0, &path, 0, Some(v2))
-        .expect("test_av.mp4 is on this timeline"));
+    assert!(
+        session
+            .place_stream_at(20.0, &path, 0, Some(v2))
+            .expect("test_av.mp4 is on this timeline")
+    );
     let clip_c = session.lane_clips(v2)[0];
 
     let items = [(Lane::V1, clip0), (Lane::V1, clip1), (v2, clip_c)];
@@ -2570,8 +2615,14 @@ fn escape_closes_a_card_before_it_can_ever_reach_deselect() {
             "if this.param_card_key(key, event.keystroke.modifiers.shift, cx) {",
             "a param card",
         ),
-        ("if this.card_open()", "a card (keys overlay/export/eq/color/...)"),
-        ("|| this.context_menu.is_some()", "the clip/row menu or a list"),
+        (
+            "if this.card_open()",
+            "a card (keys overlay/export/eq/color/...)",
+        ),
+        (
+            "|| this.context_menu.is_some()",
+            "the clip/row menu or a list",
+        ),
         (
             "if key == ESCAPE && !ctrl && this.preview_session.is_some() {",
             "an open preview",

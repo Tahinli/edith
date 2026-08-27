@@ -109,8 +109,10 @@ impl DockSort {
 /// A ghost verb (DESIGN §4): borderless glyph/label in `ink2`, its chord in
 /// `ink3` beside it, read live off the keymap so it can never drift from the
 /// key that does the same thing. Hover is one fill step and an ink brighten;
-/// held open (`active`) keeps both. A refused verb dims and says why on
-/// hover instead of disappearing (§8).
+/// held open (`active`) keeps both. A verb the current *state* refuses dims
+/// and says why on hover; a verb the clip's *media kind* can never use
+/// ([`Enable::Hidden`]) is left out of the row entirely instead (§8) -- the
+/// same `listed()`/`Hidden` split the clip menu already reads.
 fn ghost_verb(
     id: &'static str,
     verb_label: &'static str,
@@ -119,8 +121,11 @@ fn ghost_verb(
     hint: &str,
     player: &Player,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> impl IntoElement {
+) -> Option<impl IntoElement> {
     let enabled = player.enable(action, None);
+    if !enabled.listed() {
+        return None;
+    }
     let key = player.keymap.chord(action);
     let say: SharedString = match enabled.why() {
         Some(why) => format!("{key} — {why}"),
@@ -130,39 +135,41 @@ fn ghost_verb(
     let on = enabled.yes();
     let label_style = label(type_scale::LABEL_ROW_PX, FontWeight::MEDIUM);
     let chord_style = mono(type_scale::CHORD_METADATA_MIN_PX, FontWeight::MEDIUM);
-    div()
-        .id(id)
-        .flex_none()
-        .flex()
-        .items_center()
-        .justify_between()
-        .h(px(CONTROL_H))
-        .px(px(8.))
-        .rounded(px(3.))
-        .when(active, |d| d.bg(rgb(DARK_RAISED())))
-        .tooltip(move |_, cx| cx.new(|_| Tip(say.clone())).into())
-        .when(!on, |d| d.opacity(0.4).cursor_not_allowed())
-        .when(on, |d| {
-            d.cursor_pointer()
-                .hover(|s| s.bg(rgb(DARK_RAISED())).text_color(rgb(INK1())))
-                .on_click(on_click)
-        })
-        .children(hitmap::action(action, on))
-        .child(
-            div()
-                .font(label_style.font)
-                .text_size(label_style.size)
-                .text_color(rgb(if active { INK1() } else { INK2() }))
-                .child(verb_label),
-        )
-        .child(
-            div()
-                .flex_none()
-                .font(chord_style.font)
-                .text_size(chord_style.size)
-                .text_color(rgb(if active { INK1() } else { INK3() }))
-                .child(key),
-        )
+    Some(
+        div()
+            .id(id)
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_between()
+            .h(px(CONTROL_H))
+            .px(px(8.))
+            .rounded(px(3.))
+            .when(active, |d| d.bg(rgb(DARK_RAISED())))
+            .tooltip(move |_, cx| cx.new(|_| Tip(say.clone())).into())
+            .when(!on, |d| d.opacity(0.4).cursor_not_allowed())
+            .when(on, |d| {
+                d.cursor_pointer()
+                    .hover(|s| s.bg(rgb(DARK_RAISED())).text_color(rgb(INK1())))
+                    .on_click(on_click)
+            })
+            .children(hitmap::action(action, on))
+            .child(
+                div()
+                    .font(label_style.font)
+                    .text_size(label_style.size)
+                    .text_color(rgb(if active { INK1() } else { INK2() }))
+                    .child(verb_label),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .font(chord_style.font)
+                    .text_size(chord_style.size)
+                    .text_color(rgb(if active { INK1() } else { INK3() }))
+                    .child(key),
+            ),
+    )
 }
 
 /// One tab of the Src/Clip pair (MOCK-SPEC "Dock": no pill, no fill, no
@@ -827,11 +834,7 @@ fn subtitle_palette(player: &Player, cx: &mut Context<Player>) -> Option<AnyElem
 /// filter, sort chips, rows, IMPORT, hint -- none of it the legacy
 /// Media/Audio/Text panel `library.rs` draws. That panel's row facts
 /// ([`library_rows`]) are still what every row here is built from.
-fn sources_tab(
-    player: &Player,
-    window: &mut Window,
-    cx: &mut Context<Player>,
-) -> impl IntoElement {
+fn sources_tab(player: &Player, window: &mut Window, cx: &mut Context<Player>) -> impl IntoElement {
     let focused = player.focus_dock.is_focused(window);
     let sources = player
         .session
@@ -1033,7 +1036,7 @@ fn sources_tab(
                 .flex_none()
                 .flex()
                 .flex_col()
-                .child(ghost_verb(
+                .children(ghost_verb(
                     "dock-import-files",
                     "Add files",
                     ActionId::AddFiles,
@@ -1042,7 +1045,7 @@ fn sources_tab(
                     player,
                     cx.listener(|this, _: &ClickEvent, _, cx| this.pick_and_import(cx)),
                 ))
-                .child(ghost_verb(
+                .children(ghost_verb(
                     "dock-paste-path",
                     "Paste path",
                     ActionId::PasteFilePath,
@@ -1057,7 +1060,7 @@ fn sources_tab(
                 // that no longer had the height for it (user 2026-08-21:
                 // "the spine menu is too crowded"), and an import belongs
                 // beside the other two imports, not beside the lane verbs.
-                .child(ghost_verb(
+                .children(ghost_verb(
                     "dock-import-subtitles",
                     "Import subtitles",
                     ActionId::ImportSubtitles,
@@ -1117,11 +1120,14 @@ fn transition_row(player: &Player, cx: &mut Context<Player>) -> Option<impl Into
     let (lane, idx) = player.selected.anchor()?;
     let session = player.session.as_ref()?;
     let clips = session.lane_clips(lane);
-    let (label_text, frames, cap) =
-        transition_of(lane.kind, clips.get(idx)?, clips.get(idx + 1))?;
+    let (label_text, frames, cap) = transition_of(lane.kind, clips.get(idx)?, clips.get(idx + 1))?;
     let label_style = label(type_scale::LABEL_ROW_PX, FontWeight::MEDIUM);
     let field = player.transition_edit.as_ref();
-    let step = |id: &'static str, label: &'static str, glyph: &'static str, by: i32, cx: &mut Context<Player>| {
+    let step = |id: &'static str,
+                label: &'static str,
+                glyph: &'static str,
+                by: i32,
+                cx: &mut Context<Player>| {
         div()
             .id(id)
             .flex()
@@ -1220,7 +1226,7 @@ fn clip_tab(
                 .flex_col()
                 .gap(px(2.))
                 .p(px(8.))
-                .child(ghost_verb(
+                .children(ghost_verb(
                     "dock-verb-speed",
                     "Speed",
                     ActionId::Speed,
@@ -1229,7 +1235,7 @@ fn clip_tab(
                     player,
                     cx.listener(|this, _: &ClickEvent, _, cx| this.open_speed(cx)),
                 ))
-                .child(ghost_verb(
+                .children(ghost_verb(
                     "dock-verb-color",
                     "Colour",
                     ActionId::Color,
@@ -1238,7 +1244,7 @@ fn clip_tab(
                     player,
                     cx.listener(|this, _: &ClickEvent, _, cx| this.open_color(cx)),
                 ))
-                .child(ghost_verb(
+                .children(ghost_verb(
                     "dock-verb-transform",
                     "Transform",
                     ActionId::Transform,
@@ -1247,7 +1253,7 @@ fn clip_tab(
                     player,
                     cx.listener(|this, _: &ClickEvent, _, cx| this.open_transform(cx)),
                 ))
-                .child(ghost_verb(
+                .children(ghost_verb(
                     "dock-verb-eq",
                     "EQ",
                     ActionId::Equalizer,
@@ -1264,7 +1270,7 @@ fn clip_tab(
                 // (`bench_stance.rs`, another builder's file this session);
                 // it stays reachable by its chord until that lane grows a
                 // header to hang a verb on.
-                .child(ghost_verb(
+                .children(ghost_verb(
                     "dock-verb-silence",
                     "Silence",
                     ActionId::Silence,
@@ -1273,7 +1279,7 @@ fn clip_tab(
                     player,
                     cx.listener(|this, _: &ClickEvent, _, cx| this.open_silence(cx)),
                 ))
-                .child(ghost_verb(
+                .children(ghost_verb(
                     "dock-verb-mix",
                     "Mix",
                     ActionId::Mix,
@@ -1290,7 +1296,7 @@ fn clip_tab(
                 // right-click menu (`overlays.rs`'s `Pick::Fit`); this is its
                 // direct button, beside the other per-clip verbs it keeps
                 // company with.
-                .child(ghost_verb(
+                .children(ghost_verb(
                     "dock-verb-fit",
                     "Fit",
                     ActionId::Fit,
