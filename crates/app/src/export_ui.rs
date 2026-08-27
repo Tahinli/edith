@@ -938,7 +938,11 @@ pub(crate) const MBPS_DIGITS: usize = 3;
 /// checks again, so a caller here and the worker can never disagree about
 /// whether Exact is honoured. `None` for every quality but `Exact` itself,
 /// since nothing else has anything to refuse.
-pub(crate) fn exact_refusal(session: &PlaybackSession, format: Format, quality: Quality) -> Option<String> {
+pub(crate) fn exact_refusal(
+    session: &PlaybackSession,
+    format: Format,
+    quality: Quality,
+) -> Option<String> {
     if quality != Quality::Exact {
         return None;
     }
