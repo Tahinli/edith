@@ -24,14 +24,20 @@ impl LibraryTab {
         }
     }
 
-    /// Whether a source belongs on this tab. Subtitles are not sources at all
-    /// -- they are the [`Player::subtitle_section`] under the list -- so the
-    /// Text tab holds no rows of its own and says so.
+    /// Whether a source belongs on this tab. Text mirrors Media/Audio's own
+    /// rule -- an extension-only kind check, [`is_subtitle`] -- rather than
+    /// the `false` it used to hardcode: a standalone `.srt`/`.vtt`/`.ass` is
+    /// a Text source in the same sense an `.mp3` is an Audio one. A track
+    /// *inside* a container (a Matroska's embedded track) never reaches this
+    /// check at all -- the Text tab's rows are built from
+    /// [`crate::subs::subtitle_rows`] grouped by source, not filtered off
+    /// [`crate::library_meta::library_rows`] the way Media/Audio's are -- so
+    /// this only ever gates a standalone subtitle file.
     pub(crate) fn holds(self, path: &Path) -> bool {
         match self {
             LibraryTab::Media => !engine::is_audio(path),
             LibraryTab::Audio => engine::is_audio(path),
-            LibraryTab::Text => false,
+            LibraryTab::Text => is_subtitle(path),
         }
     }
 
@@ -40,7 +46,7 @@ impl LibraryTab {
         match self {
             LibraryTab::Media => "No video",
             LibraryTab::Audio => "No sound",
-            LibraryTab::Text => "No subtitles",
+            LibraryTab::Text => "empty",
         }
     }
 }

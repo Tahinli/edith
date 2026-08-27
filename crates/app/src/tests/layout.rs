@@ -1249,18 +1249,19 @@ fn the_text_tab_carries_the_add_subtitles_door() {
     );
     // ...and the empty tab stays a noun, not a sentence pointing at the
     // button (DESIGN §8, 2026-08-27: no instructional copy).
-    assert_eq!(crate::LibraryTab::Text.empty(), "No subtitles");
+    assert_eq!(crate::LibraryTab::Text.empty(), "empty");
 }
 
-/// The Darkroom keeps imported subtitle tracks in the Sources dock, where a
-/// row can be selected, folded with its source, removed, and dragged to the
+/// The Darkroom keeps imported subtitle tracks in the Text tab itself (moved
+/// off the unconditional spot under the Sources list, user 2026-08-27), where
+/// a row can be selected, folded with its source, removed, and dragged to the
 /// bench's existing subtitle-lane target.
 #[test]
 fn the_darkroom_subtitle_palette_drags_tracks_to_subtitle_lanes() {
     let dock = src_text("ui/dock_stance.rs");
     let palette = &dock[dock
-        .find("fn subtitle_palette")
-        .expect("no Darkroom subtitle palette")..];
+        .find("fn subtitle_tab_rows")
+        .expect("no Darkroom subtitle rows")..];
     for required in [
         "subtitle_rows",
         "dock-subtitle-group",
@@ -1283,8 +1284,8 @@ fn the_darkroom_subtitle_palette_drags_tracks_to_subtitle_lanes() {
     );
 }
 
-/// A subtitle group's header in the dock must not vanish on a short
-/// window: `subtitle_palette` draws one per group unconditionally -- there
+/// A subtitle group's header in the Text tab must not vanish on a short
+/// window: `subtitle_tab_rows` draws one per group unconditionally -- there
 /// is no viewport-height gate on it at all any more, so the list under it
 /// is what would scroll instead, never the header itself. And it has to be
 /// a real fold, not the click-cycling pattern this codebase has already
