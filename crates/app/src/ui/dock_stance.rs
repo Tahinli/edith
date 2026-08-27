@@ -95,6 +95,15 @@ impl DockSort {
             DockSort::Unused => "Unused",
         }
     }
+
+    /// The next chip in the cycle, wrapping back to `Recent` -- the whole
+    /// row collapsed to one ghost control that cycles on click instead of
+    /// four chips fighting for the same line (user 2026-08-27: "too much
+    /// chrome").
+    fn next(self) -> DockSort {
+        let idx = Self::ALL.iter().position(|s| *s == self).unwrap_or(0);
+        Self::ALL[(idx + 1) % Self::ALL.len()]
+    }
 }
 
 /// A ghost verb (DESIGN §4): borderless glyph/label in `ink2`, its chord in
@@ -880,10 +889,18 @@ fn sources_tab(
         .gap(px(6.))
         .p(px(8.))
         .overflow_y_scroll()
-        .child(section_head(format!(
-            "{} · {total} · {unused_count} UNUSED",
-            player.library_tab.label().to_uppercase()
-        )))
+        .child({
+            let style = head();
+            let hint: SharedString = format!("{total} total · {unused_count} unused").into();
+            div()
+                .id("dock-header")
+                .flex_none()
+                .font(style.font)
+                .text_size(style.size)
+                .text_color(rgb(INK3()))
+                .tooltip(move |_, cx| cx.new(|_| Tip(hint.clone())).into())
+                .child(player.library_tab.label().to_uppercase())
+        })
         .child({
             let style = mono(type_scale::CHORD_METADATA_MAX_PX, FontWeight::MEDIUM);
             div()
@@ -943,42 +960,35 @@ fn sources_tab(
                         .child(tab.label())
                 })),
         )
-        .child(
+        .child({
+            let current = player.dock_sort;
+            let style = label(type_scale::FLOOR_PX, FontWeight::MEDIUM);
             div()
+                .id("dock-sort-cycle")
                 .flex_none()
-                .flex()
-                .gap(px(4.))
-                .children(DockSort::ALL.map(|sort| {
-                    let on = sort == player.dock_sort;
-                    let style = label(type_scale::FLOOR_PX, FontWeight::MEDIUM);
-                    div()
-                        .id(("dock-sort", sort as usize))
-                        .flex_none()
-                        .px(px(6.))
-                        .py(px(2.))
-                        .rounded(px(3.))
-                        .font(style.font)
-                        .text_size(style.size)
-                        .when(on, |d| d.bg(rgb(DARK_RAISED())).text_color(rgb(INK1())))
-                        .when(!on, |d| d.text_color(rgb(INK3())))
-                        .cursor_pointer()
-                        .hover(|s| s.bg(rgb(DARK_RAISED())))
-                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                            this.dock_sort = sort;
-                            cx.notify();
-                        }))
-                        .children(hitmap::dynamic(
-                            move || {
-                                (
-                                    format!("dock.sort.{}", sort.label()),
-                                    format!("Sort {}", sort.label()),
-                                )
-                            },
-                            true,
-                        ))
-                        .child(sort.label())
-                })),
-        )
+                .px(px(6.))
+                .py(px(2.))
+                .rounded(px(3.))
+                .font(style.font)
+                .text_size(style.size)
+                .text_color(rgb(INK2()))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(DARK_RAISED())).text_color(rgb(INK1())))
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.dock_sort = this.dock_sort.next();
+                    cx.notify();
+                }))
+                .children(hitmap::dynamic(
+                    move || {
+                        (
+                            "dock.sort.cycle".to_string(),
+                            format!("Sort: {} — click to cycle", current.label()),
+                        )
+                    },
+                    true,
+                ))
+                .child(format!("↕ {}", current.label()))
+        })
         .child(
             div()
                 .id("dock-source-rows")
