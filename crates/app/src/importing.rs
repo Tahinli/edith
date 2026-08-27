@@ -38,11 +38,9 @@ impl LibraryTab {
     /// What an empty tab says instead of being a blank column.
     pub(crate) fn empty(self) -> &'static str {
         match self {
-            LibraryTab::Media => "No video or stills yet — Import, or drop a file on the window",
-            LibraryTab::Audio => "No sound yet — Import, or drop a file on the window",
-            LibraryTab::Text => {
-                "No subtitles yet — Add subtitles from a file, or drop an .srt on the window"
-            }
+            LibraryTab::Media => "No video",
+            LibraryTab::Audio => "No sound",
+            LibraryTab::Text => "No subtitles",
         }
     }
 }
