@@ -1126,6 +1126,26 @@ pub(crate) fn render(
                 .min_w(px(0.))
                 .flex()
                 .flex_col()
+                // A file dropped from outside the window (gpui's
+                // `ExternalPaths`, Wayland's `text/uri-list`) lands here: the
+                // one room-wide surface under everything else drawn below,
+                // so a drop anywhere in the darkroom is heard. No prior
+                // press starts this -- the drop itself arrives as a
+                // `MouseUp` (`window.rs`) -- and the tint is the same
+                // raised fill every other drop target in the darkroom
+                // answers a drag with, DESIGN §8's affordance without a
+                // word of copy on it.
+                .drag_over::<gpui::ExternalPaths>(|d, _, _, _| d.bg(rgb(DARK_RAISED())))
+                .on_drop(cx.listener(|this, paths: &gpui::ExternalPaths, _, cx| {
+                    // `Player::import` is the one door a project or media
+                    // path already goes through (argv, the Import button,
+                    // Paste path) -- it forks on `.edith` vs everything else
+                    // itself (`arrival`) and already refuses during an
+                    // export, so a drop names nothing this loop has to.
+                    for path in paths.paths() {
+                        this.import(path, cx);
+                    }
+                }))
                 .child(screen(player, position, window, cx))
                 .child(time_band(player, position, cx))
                 .child(divider(Split::Bench, cx))
