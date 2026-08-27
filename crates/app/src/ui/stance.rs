@@ -359,9 +359,9 @@ fn scale_plate(player: &Player) -> impl IntoElement {
         .flex_none()
         .flex()
         .items_center()
-        .gap(px(4.))
-        .px(px(6.))
-        .py(px(2.))
+        .gap(px(6.))
+        .px(px(10.))
+        .py(px(6.))
         .rounded(px(2.))
         .bg(rgb(DARK_CANVAS()))
         .font(style.font)
@@ -778,12 +778,25 @@ pub(crate) fn notice_bottom_offset() -> f32 {
 /// only ever held plain text, no structured jump target, in either the
 /// legacy bar or here. Ceiling: give `notify_user` an optional jump payload
 /// once a call site actually has one to carry.
-fn notice_plate(message: SharedString) -> impl IntoElement {
+fn notice_plate(message: SharedString, cx: &mut Context<Player>) -> impl IntoElement {
     div()
         .id("stance-notice")
         .absolute()
         .bottom(px(notice_bottom_offset()))
         .right(px(12.))
+        .cursor_pointer()
+        // A click answers the notice the same way any other key does
+        // (`stance-room`'s `on_key_down` -> `Player::dismiss_notice`):
+        // the darkroom's own click-to-dismiss for a plate with no other
+        // affordance on it (DESIGN §8).
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                if this.dismiss_notice() {
+                    cx.notify();
+                }
+            }),
+        )
         // `max_w` only caps a box after GPUI has measured its text at
         // max-content width. `w_full` supplies a definite width to that
         // measurement (then `max_w` bounds it at 480 px), and normal
@@ -1173,9 +1186,6 @@ pub(crate) fn render(
                 .child(divider(Split::Bench, cx))
                 .child(bench(player, bench_h, window, cx))
                 .child(ledger(player, position))
-                .when_some(player.notices.back().cloned(), |el, n| {
-                    el.child(notice_plate(n))
-                })
                 .when(player.keys_open, |el| {
                     el.child(keys_overlay(player, bench_h, cx))
                 })
@@ -1221,6 +1231,13 @@ pub(crate) fn render(
                         .children(player.silence_card(window_size, cx))
                         .children(player.mix_card(window_size, cx))
                         .children(player.subtitle_style_card(window_size, cx))
+                })
+                // Mounted after `card_maximized` (not beside `ledger` above
+                // any more): a maximized Mix/EQ card painted over a notice
+                // sitting below it in this same child list, and a notice is
+                // transient -- it should win over a card, not lose to one.
+                .when_some(player.notices.back().cloned(), |el, n| {
+                    el.child(notice_plate(n, cx))
                 }),
         )
         .child(divider(Split::Dock, cx))
