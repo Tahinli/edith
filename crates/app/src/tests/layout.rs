@@ -2213,18 +2213,25 @@ fn the_darkroom_path_never_lets_a_notice_surface_reach_the_picture() {
 
 /// DESIGN §5/§11 check 6, the fourth occlusion defect (notice bar, export
 /// card, preview badge, now menus): every floating menu that can open above
-/// the picture -- the clip context menu, the picker, the library menu -- must
-/// size its scrolling list against `stance::menu_floor`'s room, not the raw
-/// window. Sizing against the whole viewport is exactly the bug that shipped:
-/// a menu taller than the bench/ledger/dock footprint got clamped by
-/// `menu_at`'s own bottom-edge fit back up over the picture, because nothing
-/// had told the list it only had the footprint to grow into. This pins the
-/// general rule so the next surface someone floats -- a fourth menu, a fifth
+/// the picture -- the clip context menu, the picker -- must size its
+/// scrolling list against `stance::menu_floor`'s room, not the raw window.
+/// Sizing against the whole viewport is exactly the bug that shipped: a menu
+/// taller than the bench/ledger/dock footprint got clamped by `menu_at`'s
+/// own bottom-edge fit back up over the picture, because nothing had told
+/// the list it only had the footprint to grow into. This pins the general
+/// rule so the next surface someone floats -- a fourth menu, a fifth
 /// occlusion -- cannot silently reintroduce `menu_rows_h(rows.len(),
 /// viewport)` in its place.
+///
+/// The library menu is the deliberate exception (user 2026-08-27, "right
+/// clicking a library media opens a menu in somewhere nonsense"): it anchors
+/// to a pointer that is always inside the dock, where no picture exists to
+/// protect, and `menu_floor`'s clamp teleported it down to the picture floor
+/// -- so `ui/library.rs` must open at the pointer through `menu_at` alone,
+/// and this guard pins that it never routes back through `menu_floor`.
 #[test]
 fn every_darkroom_menu_sizes_its_list_against_the_floor_room_not_the_raw_viewport() {
-    for file in ["ui/overlays.rs", "ui/library.rs"] {
+    for file in ["ui/overlays.rs"] {
         let text = src_text(file);
         assert!(
             !text.contains("menu_rows_h(rows.len(), viewport)"),
@@ -2245,6 +2252,18 @@ fn every_darkroom_menu_sizes_its_list_against_the_floor_room_not_the_raw_viewpor
             "{file} no longer opens any menu -- update this guard"
         );
     }
+    let library = src_text("ui/library.rs");
+    assert!(
+        !library.contains("menu_floor("),
+        "ui/library.rs routes its menu through menu_floor's picture-floor \
+         clamp again -- a right-click high in the dock teleports back down \
+         to the picture floor (the 'menu in somewhere nonsense' defect)"
+    );
+    assert!(
+        library.contains("menu_at(menu.at, viewport"),
+        "ui/library.rs no longer anchors its menu to the pointer through \
+         menu_at -- update this guard"
+    );
 }
 
 /// The settings page's own organising rule: PROJECT rows open only the

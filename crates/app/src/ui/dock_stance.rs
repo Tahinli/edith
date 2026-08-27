@@ -626,10 +626,26 @@ fn source_row(
 /// dialect from Media/Audio. Hands back the track count for the tab header's
 /// own count line, same as `rows.len()` does for the other two tabs.
 fn subtitle_tab_rows(player: &Player, cx: &mut Context<Player>) -> (usize, Vec<AnyElement>) {
-    let groups = match player.session.as_ref() {
+    let mut groups = match player.session.as_ref() {
         Some(session) => subtitle_rows(session.subtitles()),
         None => Vec::new(),
     };
+    // The same search box the other two tabs answer to -- a visible filter
+    // that a whole tab ignored would be a dead control. It matches a track's
+    // label or its file's name; a group with no surviving track leaves with
+    // its rows.
+    let filter = player.dock_filter.to_lowercase();
+    if !filter.is_empty() {
+        for group in &mut groups {
+            if group.name.to_lowercase().contains(&filter) {
+                continue;
+            }
+            group
+                .rows
+                .retain(|row| row.label.to_lowercase().contains(&filter));
+        }
+        groups.retain(|group| !group.rows.is_empty());
+    }
     // Which lane(s) actually hold each track's captions right now -- the
     // row's second line answers "is it showing?", so it has to read the
     // timeline, not stay the literal "not placed" it was born saying (the
