@@ -686,3 +686,42 @@ pub(crate) fn frac_down(y: Pixels, bounds: Bounds<Pixels>) -> f32 {
     }
     ((y - bounds.top()) / bounds.size.height).clamp(0., 1.)
 }
+
+#[cfg(test)]
+mod drop_landing_tests {
+    use super::*;
+
+    /// A release a few pixels' worth of frames right of an empty timeline's
+    /// head still lands on frame 0: [`snap_marks`] always offers 0
+    /// (`marks.push(0)`, above) even with no clips on the timeline yet, so
+    /// the "you must be exactly at 0.0" complaint is the tolerance, not a
+    /// missing mark.
+    #[test]
+    fn a_pull_near_the_head_of_an_empty_timeline_snaps_to_frame_0() {
+        let marks = snap_marks(&[&[]], None, None, 0);
+        assert!(marks.contains(&0), "an empty timeline still offers frame 0");
+        assert_eq!(snapped(4, 0, 10, &marks), 0);
+        // Outside the tolerance, the raw ask stands: this is a magnet, not a
+        // clamp to 0.
+        assert_eq!(snapped(11, 0, 10, &marks), 11);
+    }
+
+    /// A clip already on the lane offers both of its own edges as marks
+    /// ([`snap_marks`]'s `flat_map(|clip| [clip.start, clip.end()])`), and a
+    /// release close to either -- within the drop tolerance -- lands on it
+    /// rather than the raw pixel.
+    #[test]
+    fn a_pull_near_a_clip_edge_snaps_onto_it() {
+        let marks = [0, 100, 200];
+        assert_eq!(snapped(205, 0, 10, &marks), 200);
+    }
+
+    /// The playhead is a mark too, so a clip let go near it lines up with
+    /// where the timeline is parked.
+    #[test]
+    fn a_pull_near_the_playhead_snaps_onto_it() {
+        let marks = snap_marks(&[&[]], None, None, 500);
+        assert!(marks.contains(&500));
+        assert_eq!(snapped(493, 0, 10, &marks), 500);
+    }
+}
