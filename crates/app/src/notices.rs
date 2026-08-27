@@ -55,14 +55,13 @@ pub(crate) fn audio_notice(session: &PlaybackSession) -> Option<String> {
 mod tests {
     use super::*;
 
-    /// The class this guards: a notice queued behind an earlier, undismissed
-    /// one is never *lost* -- `push_notice` still appends it to the back --
-    /// but a reader of `front()` alone (what `stance::notice_plate` read
-    /// before this fix) would never see it, because nothing but a keystroke
-    /// ever calls `dismiss_notice`, and most of what fills this queue (a
-    /// click on a gap, a menu row, a drag) is not one. `back()` is the read
-    /// that survives that: it always names the newest message, which is why
-    /// the plate and the ledger's "last action" both read it now.
+    /// The class this guards: a notice queued behind an earlier one is never
+    /// *lost* -- `push_notice` still appends it to the back -- but a reader
+    /// of `front()` alone would never see it, since nothing dismisses the
+    /// queue any more (the floating plate and its keystroke-dismiss went
+    /// with it, user 2026-08-27). `back()` is the read that survives that:
+    /// it always names the newest message, which is why the ledger's "last
+    /// action" -- the one notice channel left -- reads it.
     ///
     /// This is a value-level check on the queue only -- this binary has no
     /// `TestAppContext`, so it cannot measure what actually painted, and this

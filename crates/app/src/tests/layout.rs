@@ -1914,61 +1914,6 @@ fn a_lane_row_fits_what_its_own_head_draws() {
     );
 }
 
-/// The notice plate's own anchor ([`crate::ui::stance::notice_bottom_offset`])
-/// sits a fixed step above the ledger, not floated by `bench_h` -- a float
-/// used to put the plate up beside the time band's transport timecode row
-/// for a tall bench, reading as if it belonged to that row instead of the
-/// ledger it answers (user report). `Player`'s live tree has no
-/// `TestAppContext` in this binary to mount a real `notice_plate` in and
-/// read its painted bounds back, so this checks the pure geometry the
-/// anchor is built from, and the source-level anchor that now keeps the
-/// plate off the bench's left-aligned V1/A1 lane chips horizontally instead
-/// (right-aligned, DESIGN §11.6) rather than by floating with `bench_h`.
-#[test]
-fn the_notice_plate_sits_a_fixed_step_above_the_ledger_right_aligned() {
-    use crate::ui::stance::{LEDGER_H, notice_bottom_offset};
-
-    assert_eq!(
-        notice_bottom_offset(),
-        LEDGER_H + 6.,
-        "the notice plate's bottom offset drifted off the ledger -- it must \
-         stay a fixed step above it, not float with bench_h again"
-    );
-
-    let body = fn_body("notice_plate");
-    assert!(
-        body.contains(".right(px(12.))") && !body.contains(".left(px(12.))"),
-        "notice_plate must anchor right, clear of the bench's left-aligned \
-         V1/A1 lane chips (DESIGN §11.6)"
-    );
-}
-/// The renderer only wraps text when the text measurement receives a definite
-/// width and normal whitespace. This source-level guard keeps both declarations
-/// on the notice plate: `max_w` alone limits max-content after that measurement
-/// and silently permits one-line overflow. It cannot inspect GPUI's painted
-/// lines; only live driving can confirm the full notice actually wrapped.
-#[test]
-fn the_notice_plate_declares_a_bounded_wrapping_text_layout() {
-    let stance = src_text("ui/stance.rs");
-    let notice_start = stance
-        .find("fn notice_plate(")
-        .expect("notice plate moved or renamed");
-    let notice_end = stance[notice_start..]
-        .find("\n/// Thin strip")
-        .map(|end| notice_start + end)
-        .expect("notice plate no longer precedes the ledger");
-    let plate = &stance[notice_start..notice_end];
-
-    assert!(
-        plate.contains(".w_full()") && plate.contains(".max_w(px(480.))"),
-        "notice plate lacks a definite width bounded to 480 px; max_w alone does not wrap text"
-    );
-    assert!(
-        plate.contains(".whitespace_normal()"),
-        "notice plate no longer explicitly requests GPUI's wrapping whitespace mode"
-    );
-}
-
 /// A round trip through the file: what is saved is what the next load reads
 /// back, all five seams touched -- a scratch path, not the real config, the
 /// same isolation `keymap::tests`' own `load_from`/`save_to` already takes.
@@ -2195,18 +2140,16 @@ fn the_picture_letterboxes_through_a_canvas_never_a_plain_img_object_fit() {
 /// [`Player::picture_area`](crate::Player::picture_area) directly, so a
 /// notice surface that reaches into that method unconditionally reaches the
 /// picture on the darkroom path too -- measured live covering the bottom 10%
-/// of the frame (rows 300-333 of 335) *underneath* the stance's own
-/// §8-conformant plate (`ui::stance::notice_plate`), which drew the same
-/// notice a second time above the ledger. The legacy full-width `notice_bar`
-/// and its non-darkroom caller are gone with the rest of the old tree now,
-/// so this pins the sole remaining channel (`notice_plate`) off the
-/// picture for good.
+/// of the frame (rows 300-333 of 335). The legacy full-width `notice_bar`
+/// and its non-darkroom caller are gone with the rest of the old tree, and
+/// the floating notice plate went after them (user 2026-08-27: the ledger's
+/// own "last action" strip is the one notice channel now), so this pins
+/// `picture_area` itself never growing a notice surface back.
 #[test]
 fn the_darkroom_path_never_lets_a_notice_surface_reach_the_picture() {
-    // `notice_bar` and its legacy (non-darkroom) caller are gone with the
-    // rest of the old tree -- the darkroom's own `ui::stance::notice_plate`
-    // is the only notice channel left, and the stronger invariant now is
-    // that picture_area's body never draws a second one over the picture.
+    // The ledger strip (`ui::stance::ledger` reading `notices.back()`) is
+    // the only notice channel left, and the invariant is that
+    // picture_area's body never draws one over the picture.
     let body = fn_body("picture_area");
     assert!(
         !body.contains("notice_bar"),
