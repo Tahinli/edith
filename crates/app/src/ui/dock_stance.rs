@@ -1401,6 +1401,18 @@ fn cycle_on_key_down(
             this.focus_surface(next, window, cx);
             cx.stop_propagation();
         } else if is_focus_exit_key(key) {
+            // A dismissible overlay (context menu, library menu, picker, any
+            // card, a live preview) opened by a click into the dock/inspector
+            // takes this escape first -- the same door the root handler
+            // itself closes it through (`Player::escape_closes_overlay`) --
+            // so it does not go on sitting open just because focus happened
+            // to be inside this ring when escape was pressed (the "esc is
+            // not closing menus opened by clicking in the clip section"
+            // report).
+            if this.escape_closes_overlay(cx) {
+                cx.stop_propagation();
+                return;
+            }
             // Same exit as `stance.rs`'s bench handler: leaves the ring for
             // the root handle rather than letting escape bubble to whatever
             // the root does with it.
