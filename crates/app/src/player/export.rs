@@ -726,6 +726,14 @@ impl Player {
             cx.notify();
             return;
         }
+        // Exact asks the same question format_refusal just did, for the same
+        // reason: the row can be picked, then the cut or the format changed
+        // under it, and this is the fence with a keystroke to blame.
+        if let Some(why) = exact_refusal(session, self.format, self.quality) {
+            self.notify_user(format!("NOT EXPORTED — {why}").into());
+            cx.notify();
+            return;
+        }
         session.pause();
         self.export = Some(session.export_to_with(&self.export_path, &settings));
         // The clock starts with the worker, not with the first repaint that

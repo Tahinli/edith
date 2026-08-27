@@ -72,6 +72,7 @@ pub(crate) fn sample_rate_choices(current: Option<u32>) -> Vec<ChoiceRow> {
 /// them.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) enum Quality {
+    Exact,
     Auto,
     Low,
     Medium,
@@ -80,7 +81,8 @@ pub(crate) enum Quality {
 }
 
 impl Quality {
-    pub(crate) const ALL: [Quality; 5] = [
+    pub(crate) const ALL: [Quality; 6] = [
+        Quality::Exact,
         Quality::Auto,
         Quality::Low,
         Quality::Medium,
@@ -90,6 +92,7 @@ impl Quality {
 
     pub(crate) fn label(self) -> &'static str {
         match self {
+            Quality::Exact => "Exact",
             Quality::Auto => "Auto",
             Quality::Low => "Low",
             Quality::Medium => "Medium",
@@ -101,6 +104,12 @@ impl Quality {
     /// The figure the row stands for, said in the units the row is chosen by.
     pub(crate) fn detail(self, custom_mbps: u32) -> String {
         match self {
+            // corner-cut: worded without naming the mechanism (which codec,
+            // which container) -- DESIGN.md §8 keeps a card's detail line a
+            // fact about the *output*, not an instruction about how to get
+            // there; [`exact_refusal`] is where the mechanism's own limits
+            // are said, once the row has actually been picked.
+            Quality::Exact => "input quality — copy where cuts allow".to_string(),
             Quality::Auto => "from the picture size and frame rate".to_string(),
             Quality::Custom => {
                 format!("{custom_mbps} Mbps — wheel or ± steps, n types one, {MBPS_MIN}–{MBPS_MAX}")
@@ -858,12 +867,17 @@ pub(crate) fn export_settings(
         // has dimmed cannot have been changed.
         audio_kbps: Some(audio_kbps),
         bitrate: match quality {
-            Quality::Auto => None,
+            // A copied span carries its source's own bits, and a fallback
+            // re-encode -- the only case `bitrate` reaches an encoder under
+            // Exact -- is the automatic figure ([`engine::export::run`]),
+            // not a preset's, so this asks for neither.
+            Quality::Exact | Quality::Auto => None,
             Quality::Low => Some(2_000_000),
             Quality::Medium => Some(6_000_000),
             Quality::High => Some(12_000_000),
             Quality::Custom => Some(u64::from(custom_mbps) * 1_000_000),
         },
+        exact: quality == Quality::Exact,
         // The card's own row now ([`encoder_choices`]), kept with the project:
         // it was a `VE_SW_ENC` env pin and nothing else, which is a switch
         // nobody exporting a film would ever find.
@@ -918,6 +932,21 @@ pub(crate) const MBPS_DIGITS: usize = 3;
 /// cannot say what the timeline says (`export::copy_audio`), so none of them is
 /// a refusal any more -- and every video format carries the sound, so there is
 /// nothing here that is one format's alone.
+/// Why the Exact row would refuse this project's own picked format right
+/// now, asked before the button is pressed rather than minutes into a
+/// worker -- [`engine::export::exact_refusal`] is the same gate `start`
+/// checks again, so a caller here and the worker can never disagree about
+/// whether Exact is honoured. `None` for every quality but `Exact` itself,
+/// since nothing else has anything to refuse.
+pub(crate) fn exact_refusal(session: &PlaybackSession, format: Format, quality: Quality) -> Option<String> {
+    if quality != Quality::Exact {
+        return None;
+    }
+    let (project, meta) = session.export_snapshot();
+    let settings = export_settings(quality, 0, format, DEFAULT_AUDIO_KBPS, EncoderSeat::Auto);
+    engine::export::exact_refusal(&project, &meta, &settings)
+}
+
 pub(crate) fn format_refusal(session: &PlaybackSession, format: Format) -> Option<String> {
     if !format.has_video() {
         return None;
