@@ -1029,11 +1029,27 @@ fn lane_row(
                 .min_w(px(0.))
                 .h_full()
                 .bg(rgb(DARK_CANVAS()))
-                .border_l_1()
-                .border_color(rgba(DARK_SEAM()))
+                // The seam is drawn as an absolute overlay rather than a
+                // layout `border_l_1`: a border eats a pixel out of the
+                // content box it decorates, so frame 0 -- drawn by every
+                // ghost and clip at `left(px(0.))` relative to *this* box --
+                // would sit one pixel right of what `Player::frame_under`
+                // computes through the ruler's own (unbordered) bounds
+                // (bench-ruler, below). One shared origin, so a drop lands
+                // exactly on the frame its ghost showed.
+                .child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .top_0()
+                        .w(px(1.))
+                        .h_full()
+                        .bg(rgba(DARK_SEAM())),
+                )
                 .drag_over::<AssetDrag>(|d, _, _, _| d.bg(rgb(DARK_RAISED())))
                 .on_drop(cx.listener(move |this, drag: &AssetDrag, window, cx| {
-                    let at = this.place_frame(window.mouse_position().x).0;
+                    let x = this.drag_x.take().unwrap_or_else(|| window.mouse_position().x);
+                    let at = this.place_frame(x).0;
                     this.insert_source(&drag.0.clone(), drag.1, Some(lane), Some(at), cx)
                 }))
                 // Right-click on empty bed space: the "Close Gap" door. A
@@ -1065,6 +1081,7 @@ fn lane_row(
                             return;
                         }
                         let path = event.drag(cx).0.clone();
+                        this.drag_x = Some(event.event.position.x);
                         this.preview_ghost_asset(&path, lane, event.event.position.x, cx);
                     }),
                 )
@@ -1073,7 +1090,8 @@ fn lane_row(
                     let Some(idx) = this.dragged(drag) else {
                         return;
                     };
-                    this.move_clip(drag.lane, idx, lane, window.mouse_position().x, cx)
+                    let x = this.drag_x.take().unwrap_or_else(|| window.mouse_position().x);
+                    this.move_clip(drag.lane, idx, lane, x, cx)
                 }))
                 .on_drag_move(
                     cx.listener(move |this, event: &DragMoveEvent<ClipDrag>, _, cx| {
@@ -1081,6 +1099,7 @@ fn lane_row(
                             return;
                         }
                         let drag = *event.drag(cx);
+                        this.drag_x = Some(event.event.position.x);
                         this.preview_ghost(&drag, lane, event.event.position.x, cx);
                     }),
                 )
@@ -1089,7 +1108,8 @@ fn lane_row(
                 // the same call `ui/timeline.rs`'s own bed makes).
                 .drag_over::<SubDrag>(|d, _, _, _| d.bg(rgb(DARK_RAISED())))
                 .on_drop(cx.listener(move |this, drag: &SubDrag, window, cx| {
-                    this.move_sub(drag, lane, window.mouse_position().x, cx);
+                    let x = this.drag_x.take().unwrap_or_else(|| window.mouse_position().x);
+                    this.move_sub(drag, lane, x, cx);
                 }))
                 .on_drag_move(
                     cx.listener(move |this, event: &DragMoveEvent<SubDrag>, _, cx| {
@@ -1097,12 +1117,14 @@ fn lane_row(
                             return;
                         }
                         let drag = *event.drag(cx);
+                        this.drag_x = Some(event.event.position.x);
                         this.preview_ghost_sub(&drag, lane, event.event.position.x, cx);
                     }),
                 )
                 .drag_over::<SubPick>(|d, _, _, _| d.bg(rgb(DARK_RAISED())))
                 .on_drop(cx.listener(move |this, drag: &SubPick, window, cx| {
-                    this.place_sub(drag.0, lane, window.mouse_position().x, cx);
+                    let x = this.drag_x.take().unwrap_or_else(|| window.mouse_position().x);
+                    this.place_sub(drag.0, lane, x, cx);
                 }))
                 .on_drag_move(
                     cx.listener(move |this, event: &DragMoveEvent<SubPick>, _, cx| {
@@ -1110,6 +1132,7 @@ fn lane_row(
                             return;
                         }
                         let track = event.drag(cx).0;
+                        this.drag_x = Some(event.event.position.x);
                         this.preview_ghost_pick(track, lane, event.event.position.x, cx);
                     }),
                 )
