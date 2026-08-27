@@ -46,7 +46,7 @@ impl LibraryTab {
         match self {
             LibraryTab::Media => "No video",
             LibraryTab::Audio => "No sound",
-            LibraryTab::Text => "empty",
+            LibraryTab::Text => "No subtitles",
         }
     }
 }
