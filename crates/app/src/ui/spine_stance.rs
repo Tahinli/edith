@@ -185,51 +185,13 @@ fn trim_control(active: bool, player: &Player, cx: &mut Context<Player>) -> impl
         )
 }
 
-/// Which spine section is expanded under the pointer (density reduction,
-/// user feedback 2026-08-27: "feels complex" against the always-visible
-/// ~40-glyph rail). `CutMore` is the low-frequency tail of the CUT group
-/// (stride-10 walks, ±1 trim, trim-to-playhead, loop-trim) sitting under
-/// the burst-use walk-cut pair, which stays visible on its own; VIEW,
-/// TRACK and ROOM collapse whole since every row in them is once-per-scene
-/// or rarer next to EDIT/CUT's every-cut cadence (DESIGN §6).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SpineZone {
-    CutMore,
-    View,
-    Track,
-    Room,
-}
-
-/// A collapsed section: one hairline, no prose, no repeated group word
-/// (DESIGN §8's rejected-instructional-copy rule applies to labels too --
-/// a collapsed group reads as a seam in the rail, not a sentence).
-fn hairline() -> impl IntoElement {
-    div()
-        .flex_none()
-        .w(px(20.))
-        .h(px(1.))
-        .my(px(5.))
-        .bg(rgba(DARK_SEAM()))
-}
-
-/// A section that is a hairline at rest and its full row set on hover
-/// (task: "hover the collapsed group's zone -> its glyphs expand in
-/// place; leave -> collapse"). The wrapping div is the hover target and
-/// carries the hover state onto [`Player::spine_hover`] rather than any
-/// local widget state, since gpui re-renders the whole spine on
-/// `cx.notify()` and this is the one flag the whole rail reads. Every
-/// glyph inside `rows` keeps its own `cx.listener` click handler, so a
-/// verb revealed by hover is exactly as clickable as an always-visible one
-/// once it is on screen -- collapsing only removes it from the layout, it
-/// never disables the handler.
-fn collapsible<T: IntoElement>(
-    id: &'static str,
-    zone: SpineZone,
-    player: &Player,
-    rows: T,
-    cx: &mut Context<Player>,
-) -> impl IntoElement + use<T> {
-    let hovered = player.spine_hover == Some(zone);
+/// A compact section: always visible (hide-until-hover for controls is a
+/// rejected pattern -- user 2026-08-27, "simplify it not hide the things";
+/// see DESIGN.md §8). Rare-cadence groups (CUT's tail, VIEW, TRACK, ROOM)
+/// stay on the rail permanently, just tighter (smaller row gap, no extra
+/// group head where they're the tail of one already named above them) so
+/// they read quieter than EDIT/CUT's every-cut rows without disappearing.
+fn compact_group<T: IntoElement>(id: &'static str, rows: T) -> impl IntoElement + use<T> {
     div()
         .id(id)
         .flex_none()
@@ -237,21 +199,8 @@ fn collapsible<T: IntoElement>(
         .flex()
         .flex_col()
         .items_center()
-        .on_hover(cx.listener(move |this, now_hovered: &bool, _window, cx| {
-            this.spine_hover = if *now_hovered {
-                Some(zone)
-            } else if this.spine_hover == Some(zone) {
-                None
-            } else {
-                this.spine_hover
-            };
-            cx.notify();
-        }))
-        .child(if hovered {
-            rows.into_any_element()
-        } else {
-            hairline().into_any_element()
-        })
+        .gap(px(1.))
+        .child(rows)
 }
 
 /// Two commands side by side in one row -- the opposite-direction pairs
@@ -352,11 +301,11 @@ pub(crate) fn render(player: &Player, cx: &mut Context<Player>) -> impl IntoElem
         ))
         // Everything past the walk-cut pair above is CUT's low-frequency
         // tail (stride-10 walks, ±1 trim, trim-to-playhead, loop-trim) --
-        // collapsed to a hairline, revealed on hover of this zone.
-        .child(collapsible(
+        // always visible (no hover-gating, DESIGN §8/user 2026-08-27), just
+        // `quiet`-demoted a step so it reads under the burst-use pair above
+        // it rather than competing with it for weight.
+        .child(compact_group(
             "spine-zone-cut-more",
-            SpineZone::CutMore,
-            player,
             div()
                 .flex()
                 .flex_col()
@@ -368,7 +317,7 @@ pub(crate) fn render(player: &Player, cx: &mut Context<Player>) -> impl IntoElem
                         "‹10",
                         ActionId::WalkCutPrev10,
                         false,
-                        false,
+                        true,
                         player,
                         cx,
                     ),
@@ -377,7 +326,7 @@ pub(crate) fn render(player: &Player, cx: &mut Context<Player>) -> impl IntoElem
                         "10›",
                         ActionId::WalkCutNext10,
                         false,
-                        false,
+                        true,
                         player,
                         cx,
                     ),
@@ -392,7 +341,7 @@ pub(crate) fn render(player: &Player, cx: &mut Context<Player>) -> impl IntoElem
                         "[▮",
                         ActionId::TrimInToPlayhead,
                         false,
-                        false,
+                        true,
                         player,
                         cx,
                     ),
@@ -401,7 +350,7 @@ pub(crate) fn render(player: &Player, cx: &mut Context<Player>) -> impl IntoElem
                         "▮]",
                         ActionId::TrimOutToPlayhead,
                         false,
-                        false,
+                        true,
                         player,
                         cx,
                     ),
@@ -411,21 +360,19 @@ pub(crate) fn render(player: &Player, cx: &mut Context<Player>) -> impl IntoElem
                     "↻",
                     ActionId::LoopTrim,
                     player.loop_trim.is_some(),
-                    false,
+                    true,
                     player,
                     cx,
                 )),
-            cx,
         ))
         // VIEW group: ZoomIn/ZoomOut/ZoomFit/ToggleSnap all read the
         // timeline at a scale rather than cutting it -- real handlers with
         // a darkroom home, but well under EDIT/CUT's every-cut cadence
-        // (DESIGN §6), so the whole group collapses under one hairline
-        // rather than carrying its own always-visible "view" word.
-        .child(collapsible(
+        // (DESIGN §6), so it gets its own plain head and `quiet` rows
+        // rather than a heavier full-size group.
+        .child(group_head("view"))
+        .child(compact_group(
             "spine-zone-view",
-            SpineZone::View,
-            player,
             div()
                 .flex()
                 .flex_col()
@@ -437,7 +384,7 @@ pub(crate) fn render(player: &Player, cx: &mut Context<Player>) -> impl IntoElem
                         "−",
                         ActionId::ZoomOut,
                         false,
-                        false,
+                        true,
                         player,
                         cx,
                     ),
@@ -446,7 +393,7 @@ pub(crate) fn render(player: &Player, cx: &mut Context<Player>) -> impl IntoElem
                         "+",
                         ActionId::ZoomIn,
                         false,
-                        false,
+                        true,
                         player,
                         cx,
                     ),
@@ -456,7 +403,7 @@ pub(crate) fn render(player: &Player, cx: &mut Context<Player>) -> impl IntoElem
                     "⊡",
                     ActionId::ZoomFit,
                     false,
-                    false,
+                    true,
                     player,
                     cx,
                 ))
@@ -469,17 +416,15 @@ pub(crate) fn render(player: &Player, cx: &mut Context<Player>) -> impl IntoElem
                     "Sn",
                     ActionId::ToggleSnap,
                     player.snap,
-                    false,
+                    true,
                     player,
                     cx,
                 )),
-            cx,
         ))
-        // TRACK: once-per-project lane adds, collapsed whole.
-        .child(collapsible(
+        // TRACK: once-per-project lane adds -- own head, `quiet` rows.
+        .child(group_head("track"))
+        .child(compact_group(
             "spine-zone-track",
-            SpineZone::Track,
-            player,
             div()
                 .flex()
                 .flex_col()
@@ -491,7 +436,7 @@ pub(crate) fn render(player: &Player, cx: &mut Context<Player>) -> impl IntoElem
                         "+V",
                         ActionId::AddVideoLane,
                         false,
-                        false,
+                        true,
                         player,
                         cx,
                     ),
@@ -500,7 +445,7 @@ pub(crate) fn render(player: &Player, cx: &mut Context<Player>) -> impl IntoElem
                         "+A",
                         ActionId::AddAudioLane,
                         false,
-                        false,
+                        true,
                         player,
                         cx,
                     ),
@@ -517,7 +462,7 @@ pub(crate) fn render(player: &Player, cx: &mut Context<Player>) -> impl IntoElem
                         "+S",
                         ActionId::AddSubtitleLane,
                         false,
-                        false,
+                        true,
                         player,
                         cx,
                     ),
@@ -526,7 +471,7 @@ pub(crate) fn render(player: &Player, cx: &mut Context<Player>) -> impl IntoElem
                         "−S",
                         ActionId::RemoveSubtitleLane,
                         false,
-                        false,
+                        true,
                         player,
                         cx,
                     ),
@@ -536,21 +481,19 @@ pub(crate) fn render(player: &Player, cx: &mut Context<Player>) -> impl IntoElem
                     "CC",
                     ActionId::ToggleSubtitles,
                     player.subs_on,
-                    false,
+                    true,
                     player,
                     cx,
                 )),
-            cx,
         ))
         // ROOM: the three acts that are *acts* rather than settings (user
         // 2026-08-21: "the spine menu is too crowded"). Theme, proxies and
         // auto-proxies stayed off this rail entirely (settings_stance).
-        // Once-a-session/once-a-project cadence -- collapsed whole, same as
-        // VIEW/TRACK above it.
-        .child(collapsible(
+        // Once-a-session/once-a-project cadence -- own head, `quiet` rows,
+        // same as VIEW/TRACK above it, always visible.
+        .child(group_head("room"))
+        .child(compact_group(
             "spine-zone-room",
-            SpineZone::Room,
-            player,
             div()
                 .flex()
                 .flex_col()
@@ -585,7 +528,6 @@ pub(crate) fn render(player: &Player, cx: &mut Context<Player>) -> impl IntoElem
                     player,
                     cx,
                 )),
-            cx,
         ))
         .child(div().flex_1())
 }
