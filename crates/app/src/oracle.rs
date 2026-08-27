@@ -225,9 +225,13 @@ pub(crate) fn enable(action: ActionId, ctx: Ctx) -> Enable {
         // The scan reads samples, and a still has none -- ever, unlike a video
         // clip whose sound may be one lane down or simply silent. Exactly what
         // `unscannable` says after the fact, said before the row is drawn so
-        // there is no row left to click.
-        ActionId::Silence if ctx.image => Enable::Hidden("this clip is a still"),
-        ActionId::Silence if ctx.no_sound => Enable::Hidden("this clip has no sound"),
+        // there is no row left to click. The mixer's track volumes are the
+        // same class refusal over the same clip: nothing to mix for a picture
+        // with no sound at all.
+        ActionId::Silence | ActionId::Mix if ctx.image => Enable::Hidden("this clip is a still"),
+        ActionId::Silence | ActionId::Mix if ctx.no_sound => {
+            Enable::Hidden("this clip has no sound")
+        }
         // -- state: true of this clip now, and the next playhead click or the
         // next selection changes the answer. Splits this clip only from inside
         // it: at either edge there is nothing to split off -- and, on a speeded
@@ -464,4 +468,3 @@ pub(crate) fn menu_at(at: Point<Pixels>, viewport: Size<Pixels>, height: f32) ->
         fit(f32::from(at.y), height, f32::from(viewport.height)),
     )
 }
-
