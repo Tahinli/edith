@@ -2076,7 +2076,7 @@ fn darkroom_source_rows_keep_proxy_add_and_media_audio_text_paths() {
         "LIBRARY_TABS.map",
         "dock-source-filter",
         "player.library_tab.holds(&row.path)",
-        "No subtitle sources yet — Import subtitles",
+        "true => player.library_tab.empty().to_string(),",
     ] {
         assert!(
             dock.contains(needle),

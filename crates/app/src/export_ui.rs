@@ -175,7 +175,7 @@ impl ExportPreset {
             ExportPreset::Small => "AV1 · MP4 · low quality — smallest file",
             ExportPreset::Master => "HEVC · MP4 · high quality — intra-only, for re-editing later",
             ExportPreset::AudioOnly => "FLAC — lossless sound, no picture",
-            ExportPreset::Custom => "pick a codec, quality and the rest below",
+            ExportPreset::Custom => "no fixed codec or quality",
         }
     }
 

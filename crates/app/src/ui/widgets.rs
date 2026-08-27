@@ -409,9 +409,9 @@ impl NumberEdit {
     }
 }
 
-/// What a window with no file open is waiting for. Both ways in are already
-/// built -- the whole window is the drop target and the Import chooser takes a
-/// project as readily as media -- so this only has to say so.
+/// What a window with no file open shows: DESIGN §8 wants a noun, not a
+/// sentence -- both ways in (window drop target, Import in the media list)
+/// are taught by their own geography, not by this label.
 pub(crate) fn empty_hint() -> impl IntoElement {
     div()
         .flex()
@@ -419,10 +419,5 @@ pub(crate) fn empty_hint() -> impl IntoElement {
         .items_center()
         .gap(px(6.))
         .text_color(rgb(FG_SECONDARY()))
-        .child("Drop a video or an .edith project here")
-        .child(
-            div()
-                .text_size(px(11.))
-                .child("or click Import in the media list"),
-        )
+        .child("No project")
 }
