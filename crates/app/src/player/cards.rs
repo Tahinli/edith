@@ -1332,6 +1332,37 @@ impl Player {
         self.subtitle_style_open = false;
     }
 
+    /// Escape's one door to every dismissible overlay the room can have up
+    /// (`ui::stance::render`'s root `on_key_down`'s own escape branches,
+    /// mirrored here exactly): a focus surface with its own escape branch
+    /// (dock/inspector's `cycle_on_key_down`, the bench's handler) calls
+    /// this FIRST, before its own ring-exit behavior, so an overlay opened
+    /// by a click into that surface still closes on the first escape
+    /// instead of the ring's `stop_propagation` swallowing the key before
+    /// the root ever sees it (the "esc does not close menus opened by
+    /// clicking in the clip section" report). Returns whether it closed
+    /// something, so a caller only falls through to its own ring-exit
+    /// behavior when nothing was open to close.
+    pub(crate) fn escape_closes_overlay(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.card_open()
+            || self.context_menu.is_some()
+            || self.library_menu.is_some()
+            || self.picker.is_some()
+        {
+            self.close_card();
+            self.context_menu = None;
+            self.library_menu = None;
+            self.picker = None;
+            cx.notify();
+            return true;
+        }
+        if self.preview_session.is_some() {
+            self.close_preview(cx);
+            return true;
+        }
+        false
+    }
+
     /// The one switch every param card's expand affordance and its `m`
     /// chord both flip (`dark_card_head`, [`Player::param_card_key`]):
     /// whichever card is open trades its usual capped, floating size for the

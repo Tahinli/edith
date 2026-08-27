@@ -683,6 +683,16 @@ fn bench(
                 this.focus_surface(next, window, cx);
                 cx.stop_propagation();
             } else if is_focus_exit_key(key) {
+                // A dismissible overlay (context menu, library menu, picker,
+                // any card, a live preview) opened by a click into the bench
+                // takes this escape first -- the same door the root handler
+                // itself closes it through (`Player::escape_closes_overlay`)
+                // -- so it does not go on sitting open just because focus
+                // happened to be inside this ring when escape was pressed.
+                if this.escape_closes_overlay(cx) {
+                    cx.stop_propagation();
+                    return;
+                }
                 // Leaves the ring rather than deleting it: the root handle
                 // gets focus back, and a second escape there is what does
                 // whatever escape means at the root (nothing, today) --
@@ -1092,8 +1102,12 @@ pub(crate) fn render(
                 // Escape is every card's own way out (`Player::close_card`,
                 // the same list `overlaid`/`modal` read) -- blocking every
                 // key while a card is open must not also lock the card open.
+                // `escape_closes_overlay` (`player/cards.rs`) is the same
+                // call a focus surface's own escape branch makes first, so
+                // this and that never disagree on what escape closes.
                 if key == ESCAPE {
-                    this.close_card();
+                    this.escape_closes_overlay(cx);
+                    return;
                 }
                 // FAULT 2, general shape: `context_menu`/`library_menu`/
                 // `picker` are three of the four reasons `overlaid()` refuses
