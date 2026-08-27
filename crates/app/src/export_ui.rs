@@ -947,6 +947,22 @@ pub(crate) fn exact_refusal(session: &PlaybackSession, format: Format, quality: 
     engine::export::exact_refusal(&project, &meta, &settings)
 }
 
+/// Which format picking Exact should set, from the source's own codec --
+/// "the input's own quality" means the input's own codec, so this is what
+/// `Player::pick_quality` derives the format from rather than leaving
+/// whatever format a previous pick left behind. `None` for a codec Exact has
+/// no copy path for at all (h264); the row itself still refuses through
+/// [`exact_refusal`] in that case, since a mixed-source project can fail the
+/// same way after the format is set.
+pub(crate) fn exact_format(session: &PlaybackSession) -> Option<Format> {
+    let (_, meta) = session.export_snapshot();
+    match meta.codec {
+        engine::demux::Codec::Hevc => Some(Format::Hevc),
+        engine::demux::Codec::Av1 => Some(Format::Av1),
+        _ => None,
+    }
+}
+
 pub(crate) fn format_refusal(session: &PlaybackSession, format: Format) -> Option<String> {
     if !format.has_video() {
         return None;

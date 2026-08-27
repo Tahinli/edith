@@ -1714,6 +1714,30 @@ fn a_preset_over_a_picture_this_timeline_has_none_of_carries_the_codec_refusal()
     assert_eq!(format_refusal(&session, audio_format), None);
 }
 
+/// Picking Exact must derive the container from the source's own codec
+/// rather than leave whatever format was already picked -- an HEVC or AV1
+/// source lands on its own copy-capable Matroska format, and a source Exact
+/// has no copy path for at all (h264) leaves `exact_format` with nothing to
+/// set, so the row's own [`exact_refusal`] is what a click on it would see.
+#[test]
+fn exact_derives_its_format_from_the_source_codec() {
+    let hevc = PlaybackSession::open(asset("test_hevc.mkv")).expect("an hevc fixture");
+    assert_eq!(crate::exact_format(&hevc), Some(Format::Hevc));
+
+    let av1 = PlaybackSession::open(asset("test_av1.mkv")).expect("an av1 fixture");
+    assert_eq!(crate::exact_format(&av1), Some(Format::Av1));
+
+    let h264 = PlaybackSession::open(asset("test_h264.mkv")).expect("an h264 fixture");
+    assert_eq!(h264.export_snapshot().1.codec, engine::demux::Codec::H264);
+    assert_eq!(crate::exact_format(&h264), None);
+    // No copy path for h264 at any format -- the row's own refusal is what a
+    // click on Exact would still show, since `exact_format` sets nothing and
+    // the format is left at whatever it already was (Mp4's own refusal, or
+    // Hevc's if the pane was left there from an earlier pick).
+    assert!(crate::exact_refusal(&h264, Format::Mp4, Quality::Exact).is_some());
+    assert!(crate::exact_refusal(&h264, Format::Hevc, Quality::Exact).is_some());
+}
+
 /// The stacking-scrims bug: opening the speed card while the colour card was
 /// up left both up at once, because each `open_*` cleared a different
 /// hand-picked subset of the other flags rather than all of them. The fix is
