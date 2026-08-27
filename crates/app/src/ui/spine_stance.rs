@@ -185,6 +185,75 @@ fn trim_control(active: bool, player: &Player, cx: &mut Context<Player>) -> impl
         )
 }
 
+/// Which spine section is expanded under the pointer (density reduction,
+/// user feedback 2026-08-27: "feels complex" against the always-visible
+/// ~40-glyph rail). `CutMore` is the low-frequency tail of the CUT group
+/// (stride-10 walks, ±1 trim, trim-to-playhead, loop-trim) sitting under
+/// the burst-use walk-cut pair, which stays visible on its own; VIEW,
+/// TRACK and ROOM collapse whole since every row in them is once-per-scene
+/// or rarer next to EDIT/CUT's every-cut cadence (DESIGN §6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SpineZone {
+    CutMore,
+    View,
+    Track,
+    Room,
+}
+
+/// A collapsed section: one hairline, no prose, no repeated group word
+/// (DESIGN §8's rejected-instructional-copy rule applies to labels too --
+/// a collapsed group reads as a seam in the rail, not a sentence).
+fn hairline() -> impl IntoElement {
+    div()
+        .flex_none()
+        .w(px(20.))
+        .h(px(1.))
+        .my(px(5.))
+        .bg(rgba(DARK_SEAM()))
+}
+
+/// A section that is a hairline at rest and its full row set on hover
+/// (task: "hover the collapsed group's zone -> its glyphs expand in
+/// place; leave -> collapse"). The wrapping div is the hover target and
+/// carries the hover state onto [`Player::spine_hover`] rather than any
+/// local widget state, since gpui re-renders the whole spine on
+/// `cx.notify()` and this is the one flag the whole rail reads. Every
+/// glyph inside `rows` keeps its own `cx.listener` click handler, so a
+/// verb revealed by hover is exactly as clickable as an always-visible one
+/// once it is on screen -- collapsing only removes it from the layout, it
+/// never disables the handler.
+fn collapsible<T: IntoElement>(
+    id: &'static str,
+    zone: SpineZone,
+    player: &Player,
+    rows: T,
+    cx: &mut Context<Player>,
+) -> impl IntoElement + use<T> {
+    let hovered = player.spine_hover == Some(zone);
+    div()
+        .id(id)
+        .flex_none()
+        .w_full()
+        .flex()
+        .flex_col()
+        .items_center()
+        .on_hover(cx.listener(move |this, now_hovered: &bool, _window, cx| {
+            this.spine_hover = if *now_hovered {
+                Some(zone)
+            } else if this.spine_hover == Some(zone) {
+                None
+            } else {
+                this.spine_hover
+            };
+            cx.notify();
+        }))
+        .child(if hovered {
+            rows.into_any_element()
+        } else {
+            hairline().into_any_element()
+        })
+}
+
 /// Two commands side by side in one row -- the opposite-direction pairs
 /// (walk cuts, no-aim trim) that share a row in the mock rather than each
 /// eating a full row of the spine's own height.
@@ -281,205 +350,241 @@ pub(crate) fn render(player: &Player, cx: &mut Context<Player>) -> impl IntoElem
                 cx,
             ),
         ))
-        .child(pair(
-            glyph(
-                "spine-cut-prev-ten",
-                "‹10",
-                ActionId::WalkCutPrev10,
-                false,
-                false,
-                player,
-                cx,
-            ),
-            glyph(
-                "spine-cut-next-ten",
-                "10›",
-                ActionId::WalkCutNext10,
-                false,
-                false,
-                player,
-                cx,
-            ),
-        ))
-        .child(trim_control(player.loop_trim.is_some(), player, cx))
-        .child(pair(
-            // Trim-to-playhead (debt #42): the keyboard's own version of the
-            // pointer's drag-to-a-spot trim, beside the nudge pair it shares
-            // its primitive with.
-            glyph(
-                "spine-trim-in-playhead",
-                "[▮",
-                ActionId::TrimInToPlayhead,
-                false,
-                false,
-                player,
-                cx,
-            ),
-            glyph(
-                "spine-trim-out-playhead",
-                "▮]",
-                ActionId::TrimOutToPlayhead,
-                false,
-                false,
-                player,
-                cx,
-            ),
-        ))
-        .child(glyph(
-            "spine-loop-trim",
-            "↻",
-            ActionId::LoopTrim,
-            player.loop_trim.is_some(),
-            false,
+        // Everything past the walk-cut pair above is CUT's low-frequency
+        // tail (stride-10 walks, ±1 trim, trim-to-playhead, loop-trim) --
+        // collapsed to a hairline, revealed on hover of this zone.
+        .child(collapsible(
+            "spine-zone-cut-more",
+            SpineZone::CutMore,
             player,
+            div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(px(1.))
+                .child(pair(
+                    glyph(
+                        "spine-cut-prev-ten",
+                        "‹10",
+                        ActionId::WalkCutPrev10,
+                        false,
+                        false,
+                        player,
+                        cx,
+                    ),
+                    glyph(
+                        "spine-cut-next-ten",
+                        "10›",
+                        ActionId::WalkCutNext10,
+                        false,
+                        false,
+                        player,
+                        cx,
+                    ),
+                ))
+                .child(trim_control(player.loop_trim.is_some(), player, cx))
+                .child(pair(
+                    // Trim-to-playhead (debt #42): the keyboard's own version
+                    // of the pointer's drag-to-a-spot trim, beside the nudge
+                    // pair it shares its primitive with.
+                    glyph(
+                        "spine-trim-in-playhead",
+                        "[▮",
+                        ActionId::TrimInToPlayhead,
+                        false,
+                        false,
+                        player,
+                        cx,
+                    ),
+                    glyph(
+                        "spine-trim-out-playhead",
+                        "▮]",
+                        ActionId::TrimOutToPlayhead,
+                        false,
+                        false,
+                        player,
+                        cx,
+                    ),
+                ))
+                .child(glyph(
+                    "spine-loop-trim",
+                    "↻",
+                    ActionId::LoopTrim,
+                    player.loop_trim.is_some(),
+                    false,
+                    player,
+                    cx,
+                )),
             cx,
         ))
-        // VIEW group, added this task: ZoomIn/ZoomOut/ZoomFit (keymap.rs) had
-        // real, already-working handlers (`Player::zoom`/`zoom_fit`, wired
-        // into the legacy `ui/toolbar.rs`) but no home anywhere in the
-        // darkroom -- a DESIGN §9 "nothing lives only on a key" violation.
-        // Placed between CUT and TRACK per §11 check 1 (task frequency):
-        // reading the timeline at a different scale happens many times a
-        // session (more than the once-per-project lane add below it), but
-        // less than walking/trimming cuts above it.
-        .child(group_head("view"))
-        .child(pair(
-            glyph(
-                "spine-zoom-out",
-                "−",
-                ActionId::ZoomOut,
-                false,
-                false,
-                player,
-                cx,
-            ),
-            glyph(
-                "spine-zoom-in",
-                "+",
-                ActionId::ZoomIn,
-                false,
-                false,
-                player,
-                cx,
-            ),
-        ))
-        .child(glyph(
-            "spine-zoom-fit",
-            "⊡",
-            ActionId::ZoomFit,
-            false,
-            false,
+        // VIEW group: ZoomIn/ZoomOut/ZoomFit/ToggleSnap all read the
+        // timeline at a scale rather than cutting it -- real handlers with
+        // a darkroom home, but well under EDIT/CUT's every-cut cadence
+        // (DESIGN §6), so the whole group collapses under one hairline
+        // rather than carrying its own always-visible "view" word.
+        .child(collapsible(
+            "spine-zone-view",
+            SpineZone::View,
             player,
+            div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(px(1.))
+                .child(pair(
+                    glyph(
+                        "spine-zoom-out",
+                        "−",
+                        ActionId::ZoomOut,
+                        false,
+                        false,
+                        player,
+                        cx,
+                    ),
+                    glyph(
+                        "spine-zoom-in",
+                        "+",
+                        ActionId::ZoomIn,
+                        false,
+                        false,
+                        player,
+                        cx,
+                    ),
+                ))
+                .child(glyph(
+                    "spine-zoom-fit",
+                    "⊡",
+                    ActionId::ZoomFit,
+                    false,
+                    false,
+                    player,
+                    cx,
+                ))
+                // ToggleSnap: decides where a drag lands, which is what the
+                // eye reads the zoom scale against -- kept beside the zoom
+                // controls it shares this zone with. Active fill mirrors
+                // loop-trim's own on/off convention.
+                .child(glyph(
+                    "snap",
+                    "Sn",
+                    ActionId::ToggleSnap,
+                    player.snap,
+                    false,
+                    player,
+                    cx,
+                )),
             cx,
         ))
-        // ToggleSnap: decides where a drag lands, which is what the eye
-        // reads the zoom scale against -- placed as the VIEW group's last
-        // row, beside the zoom controls above it, rather than off in CUT
-        // where nothing else answers "what scale/behaviour am I looking
-        // at". Active fill mirrors loop-trim's own on/off convention.
-        .child(glyph(
-            "snap",
-            "Sn",
-            ActionId::ToggleSnap,
-            player.snap,
-            false,
+        // TRACK: once-per-project lane adds, collapsed whole.
+        .child(collapsible(
+            "spine-zone-track",
+            SpineZone::Track,
             player,
+            div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(px(1.))
+                .child(pair(
+                    glyph(
+                        "spine-add-video",
+                        "+V",
+                        ActionId::AddVideoLane,
+                        false,
+                        false,
+                        player,
+                        cx,
+                    ),
+                    glyph(
+                        "spine-add-audio",
+                        "+A",
+                        ActionId::AddAudioLane,
+                        false,
+                        false,
+                        player,
+                        cx,
+                    ),
+                ))
+                // The subtitle lane pair: add beside remove, one row, the
+                // same "+letter"/"−letter" grammar +V/+A above it already
+                // reads in. Import (`↓S`) left this rail entirely -- it is
+                // an import, so it lives in the dock's own IMPORT list
+                // beside "Add files" (`dock_stance`), where an editor
+                // already goes to bring a file into the room.
+                .child(pair(
+                    glyph(
+                        "spine-add-subtitle",
+                        "+S",
+                        ActionId::AddSubtitleLane,
+                        false,
+                        false,
+                        player,
+                        cx,
+                    ),
+                    glyph(
+                        "spine-remove-subtitle",
+                        "−S",
+                        ActionId::RemoveSubtitleLane,
+                        false,
+                        false,
+                        player,
+                        cx,
+                    ),
+                ))
+                .child(glyph(
+                    "spine-toggle-subtitles",
+                    "CC",
+                    ActionId::ToggleSubtitles,
+                    player.subs_on,
+                    false,
+                    player,
+                    cx,
+                )),
             cx,
         ))
-        .child(group_head("track"))
-        .child(pair(
-            glyph(
-                "spine-add-video",
-                "+V",
-                ActionId::AddVideoLane,
-                false,
-                false,
-                player,
-                cx,
-            ),
-            glyph(
-                "spine-add-audio",
-                "+A",
-                ActionId::AddAudioLane,
-                false,
-                false,
-                player,
-                cx,
-            ),
-        ))
-        // The subtitle lane pair: add beside remove, one row, the same
-        // "+letter"/"−letter" grammar +V/+A above it already reads in. Import
-        // (`↓S`) left this rail entirely -- it is an import, so it lives in
-        // the dock's own IMPORT list beside "Add files" (`dock_stance`),
-        // where an editor already goes to bring a file into the room. That
-        // move is what takes this group from three crowded rows to two.
-        .child(pair(
-            glyph(
-                "spine-add-subtitle",
-                "+S",
-                ActionId::AddSubtitleLane,
-                false,
-                false,
-                player,
-                cx,
-            ),
-            glyph(
-                "spine-remove-subtitle",
-                "−S",
-                ActionId::RemoveSubtitleLane,
-                false,
-                false,
-                player,
-                cx,
-            ),
-        ))
-        .child(glyph(
-            "spine-toggle-subtitles",
-            "CC",
-            ActionId::ToggleSubtitles,
-            player.subs_on,
-            false,
+        // ROOM: the three acts that are *acts* rather than settings (user
+        // 2026-08-21: "the spine menu is too crowded"). Theme, proxies and
+        // auto-proxies stayed off this rail entirely (settings_stance).
+        // Once-a-session/once-a-project cadence -- collapsed whole, same as
+        // VIEW/TRACK above it.
+        .child(collapsible(
+            "spine-zone-room",
+            SpineZone::Room,
             player,
-            cx,
-        ))
-        // ROOM, cut to the three acts that are *acts* rather than settings
-        // (user 2026-08-21: "the spine menu is too crowded and looks weird
-        // also not fitting" -- measured at 1280x720 the rail overflowed its
-        // own height and the settings glyph, the last row, could only be
-        // reached by scrolling the spine). Theme, proxies and auto-proxies
-        // were the three that are *preferences*, not verbs: they are rows on
-        // the settings page now (`settings_stance`), which is where an
-        // editor already goes to change what the room is rather than what
-        // the film is -- so nothing lost a visible home (DESIGN §9) and the
-        // rail lost three rows.
-        .child(group_head("room"))
-        .child(pair(
-            glyph(
-                "spine-settings",
-                "St",
-                ActionId::Settings,
-                player.settings_open,
-                true,
-                player,
-                cx,
-            ),
-            glyph(
-                "spine-screenshot",
-                "Sh",
-                ActionId::Screenshot,
-                false,
-                true,
-                player,
-                cx,
-            ),
-        ))
-        .child(glyph(
-            "spine-fullscreen",
-            "FS",
-            ActionId::Fullscreen,
-            false,
-            true,
-            player,
+            div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(px(1.))
+                .child(pair(
+                    glyph(
+                        "spine-settings",
+                        "St",
+                        ActionId::Settings,
+                        player.settings_open,
+                        true,
+                        player,
+                        cx,
+                    ),
+                    glyph(
+                        "spine-screenshot",
+                        "Sh",
+                        ActionId::Screenshot,
+                        false,
+                        true,
+                        player,
+                        cx,
+                    ),
+                ))
+                .child(glyph(
+                    "spine-fullscreen",
+                    "FS",
+                    ActionId::Fullscreen,
+                    false,
+                    true,
+                    player,
+                    cx,
+                )),
             cx,
         ))
         .child(div().flex_1())
