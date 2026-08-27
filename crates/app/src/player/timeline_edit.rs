@@ -753,7 +753,7 @@ impl Player {
             self.grab,
             sub.frames,
             self.snap,
-            self.snap_frames(),
+            self.drop_snap_frames(),
             &marks,
         )
     }
@@ -826,7 +826,7 @@ impl Player {
             self.grab,
             clip.frames(),
             self.snap,
-            self.snap_frames(),
+            self.drop_snap_frames(),
             &marks,
         ))
     }
@@ -843,7 +843,7 @@ impl Player {
             0,
             0,
             self.snap,
-            self.snap_frames(),
+            self.drop_snap_frames(),
             &marks,
         )
     }
@@ -1151,6 +1151,14 @@ impl Player {
     /// timeline wherever the view sits.
     pub(crate) fn snap_frames(&self) -> u32 {
         self.scale.snap_frames(self.fps)
+    }
+
+    /// [`Player::snap_frames`]'s twin for a drag's own release
+    /// ([`DROP_SNAP_PX`]): every `place_frame`/`drop_frame`/`sub_drop_frame`
+    /// asks this instead, so a dropped clip is aimed with the wider magnet
+    /// while an edge trim keeps the finer one.
+    pub(crate) fn drop_snap_frames(&self) -> u32 {
+        self.scale.drop_snap_frames(self.fps)
     }
 
     /// Opens the clip menu on the box under the pointer, from the right button
