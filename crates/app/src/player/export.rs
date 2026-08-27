@@ -502,6 +502,25 @@ impl Player {
         }
     }
 
+    /// A quality row, by click or by its own key (`Custom` goes through
+    /// [`Self::edit_mbps`] instead). Exact is the one row that is also a
+    /// format decision -- "the input's own quality" means the input's own
+    /// codec, so picking it derives the container from the source rather
+    /// than leaving whatever format a previous pick left behind for
+    /// [`exact_refusal`] to refuse minutes later. A source this cannot copy
+    /// (h264, mixed sources) leaves the format alone; the row itself
+    /// ([`crate::ui::cards`]'s quality list) already says why.
+    pub(crate) fn pick_quality(&mut self, quality: Quality) {
+        self.quality = quality;
+        if quality != Quality::Exact {
+            return;
+        }
+        let Some(format) = self.session.as_ref().and_then(exact_format) else {
+            return;
+        };
+        self.set_format(format);
+    }
+
     /// The container row: the same codec in the other box, which retargets the
     /// destination exactly as picking a codec does -- and does nothing at all
     /// for a codec with only one box, so the stroke cannot invent a choice the
@@ -722,6 +741,14 @@ impl Player {
         // edit away -- so the button asks again rather than starting a worker
         // that will only settle with the same refusal minutes later.
         if let Some(why) = format_refusal(session, self.format) {
+            self.notify_user(format!("NOT EXPORTED — {why}").into());
+            cx.notify();
+            return;
+        }
+        // Exact asks the same question format_refusal just did, for the same
+        // reason: the row can be picked, then the cut or the format changed
+        // under it, and this is the fence with a keystroke to blame.
+        if let Some(why) = exact_refusal(session, self.format, self.quality) {
             self.notify_user(format!("NOT EXPORTED — {why}").into());
             cx.notify();
             return;
