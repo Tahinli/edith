@@ -1,6 +1,5 @@
 //! The media library: the left panel's rows and the menu over them.
 
-use crate::ui::stance::menu_floor;
 use crate::ui::type_scale::Typeset;
 use crate::ui::widgets::*;
 use crate::*;
@@ -162,14 +161,14 @@ impl Player {
                 );
             }
         }
-        // Placed by the height it is drawn to, and drawn to what the window has
-        // room for -- the clip menu's rule, one function for all three. The
-        // floor clamp and the room the list sizes against are `menu_floor`'s,
-        // so a menu taller than the footprint scrolls instead of climbing
-        // back over the picture.
-        let (at, room) = menu_floor(menu.at, viewport, self.split_px(Split::Bench, viewport));
-        let list_h = menu_rows_h(rows.len(), room);
-        let (x, y) = menu_at(at, viewport, MENU_PAD * 2. + list_h);
+        // Placed at the pointer, clamped only to the window's own bounds --
+        // standard context-menu behavior. Unlike the clip menu, this menu
+        // mounts on the root over the dock (no picture behind it to protect),
+        // so it does not go through `menu_floor`'s picture-floor clamp; doing
+        // so pulled a right-click high in the dock down to the picture floor,
+        // teleporting the menu away from the pointer that opened it.
+        let list_h = menu_rows_h(rows.len(), viewport);
+        let (x, y) = menu_at(menu.at, viewport, MENU_PAD * 2. + list_h);
         let full: SharedString = path.display().to_string().into();
         Some(
             scrim()
