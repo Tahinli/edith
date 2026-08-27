@@ -699,7 +699,12 @@ fn subtitle_tab_rows(player: &Player, cx: &mut Context<Player>) -> (usize, Vec<A
                         .flex()
                         .items_center()
                         .gap(px(6.))
-                        .px(px(8.))
+                        // A track is the header's subset, and the row says
+                        // so the way an outline does: stepped in under the
+                        // header's own name (user 2026-08-27, "indentation
+                        // is needed for subset").
+                        .pl(px(30.))
+                        .pr(px(8.))
                         .py(px(4.))
                         .rounded(px(3.))
                         .when(picked, |d| d.border_1().border_color(rgb(INK1())))
@@ -749,7 +754,14 @@ fn subtitle_tab_rows(player: &Player, cx: &mut Context<Player>) -> (usize, Vec<A
                                 .flex_1()
                                 .min_w(px(0.))
                                 .truncate()
-                                .type_style(mono(type_scale::LABEL_ROW_PX, FontWeight::MEDIUM))
+                                // A step below the header's LABEL_ROW_PX --
+                                // subset smaller than superset (user
+                                // 2026-08-27), same ink so it stays a name,
+                                // not a footnote.
+                                .type_style(mono(
+                                    type_scale::CHORD_METADATA_MIN_PX,
+                                    FontWeight::MEDIUM,
+                                ))
                                 .text_color(rgb(INK1()))
                                 .child(title),
                         )
@@ -822,7 +834,17 @@ fn subtitle_tab_rows(player: &Player, cx: &mut Context<Player>) -> (usize, Vec<A
                             },
                             true,
                         ))
-                        .child(if folded { "▸" } else { "▾" })
+                        // Bare, the glyph inherited the panel's dim ink and
+                        // vanished ("the little arrow on left side is hard
+                        // to see", user 2026-08-27) -- it reads at the same
+                        // ink as the name it folds.
+                        .child(
+                            div()
+                                .flex_none()
+                                .w(px(10.))
+                                .text_color(rgb(INK1()))
+                                .child(if folded { "▸" } else { "▾" }),
+                        )
                         .when_some(tint, |d, tint| {
                             d.child(
                                 div()

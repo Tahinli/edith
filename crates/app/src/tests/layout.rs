@@ -1303,7 +1303,10 @@ fn a_subtitle_group_header_is_never_gated_on_window_height() {
     let head_at = dock
         .find("\"dock-subtitle-group\"")
         .expect("no id on the group header");
-    let block = &dock[head_at..(head_at + 2700).min(dock.len())];
+    // Wide enough to reach the count line past the header's styling and its
+    // commentary -- a window that stops short reads as the line deleted
+    // (the same fixed-window misfire the modal-guard scan had, 2026-08-27).
+    let block = &dock[head_at..(head_at + 3600).min(dock.len())];
     assert!(
         block.contains("sub_folded.remove"),
         "no fold-open path: {block}"
