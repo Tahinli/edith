@@ -604,6 +604,14 @@ impl Player {
                             .mbps_edit
                             .as_ref()
                             .filter(|_| quality == Quality::Custom);
+                        // Exact's own row carries whatever [`exact_refusal`] says of
+                        // the format currently picked, whether or not Exact is the
+                        // row in force -- the same reason `start_export` would give,
+                        // said here instead of only after the button is pressed.
+                        let exact_why = (quality == Quality::Exact)
+                            .then(|| self.session.as_ref())
+                            .flatten()
+                            .and_then(|s| exact_refusal(s, self.format, quality));
                         let mut r = entry(
                             ("quality", i),
                             match quality {
@@ -611,9 +619,10 @@ impl Player {
                                 _ => "q",
                             },
                             quality.label().into(),
-                            match field {
-                                Some(edit) => edit.detail().into(),
-                                None => quality.detail(self.custom_mbps).into(),
+                            match (&exact_why, field) {
+                                (Some(why), _) => why.clone().into(),
+                                (None, Some(edit)) => edit.detail().into(),
+                                (None, None) => quality.detail(self.custom_mbps).into(),
                             },
                             self.quality == quality,
                             true,
@@ -622,7 +631,7 @@ impl Player {
                             move |this, _: &ClickEvent, _, cx| {
                                 match quality {
                                     Quality::Custom => this.edit_mbps(),
-                                    _ => this.quality = quality,
+                                    _ => this.pick_quality(quality),
                                 }
                                 cx.notify();
                             },
