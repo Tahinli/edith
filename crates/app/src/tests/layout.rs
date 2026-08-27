@@ -1249,7 +1249,7 @@ fn the_text_tab_carries_the_add_subtitles_door() {
     );
     // ...and the empty tab stays a noun, not a sentence pointing at the
     // button (DESIGN §8, 2026-08-27: no instructional copy).
-    assert_eq!(crate::LibraryTab::Text.empty(), "empty");
+    assert_eq!(crate::LibraryTab::Text.empty(), "No subtitles");
 }
 
 /// The Darkroom keeps imported subtitle tracks in the Text tab itself (moved
