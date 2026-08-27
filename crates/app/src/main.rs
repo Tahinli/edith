@@ -511,6 +511,13 @@ struct Player {
     /// list). Cleared by [`Player::close_card`], the one reset list every
     /// opener routes through.
     settings_open: bool,
+    /// Which spine section, if any, currently sits under the pointer
+    /// (density reduction, user feedback 2026-08-27): the low-frequency
+    /// glyphs of that section render expanded while this is `Some`, and
+    /// collapse to a hairline the instant the pointer leaves
+    /// ([`crate::ui::spine_stance`]). Never gates a chord -- every action
+    /// still fires from the keyboard whether its section is expanded or not.
+    spine_hover: Option<crate::ui::spine_stance::SpineZone>,
     /// Where the actions list is scrolled to. Held here rather than left to
     /// the wheel alone: forty actions are four times what a 360 px window
     /// shows, and the rows past the fold have to be reachable from the
@@ -966,6 +973,7 @@ fn main() {
                     keymap: keymap.clone(),
                     keys_open: false,
                     settings_open: false,
+                    spine_hover: None,
                     keys_scroll: ScrollHandle::new(),
                     lanes_scroll: ScrollHandle::new(),
                     eq_scroll: ScrollHandle::new(),
