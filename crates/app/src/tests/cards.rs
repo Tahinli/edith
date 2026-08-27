@@ -31,7 +31,17 @@ fn no_overlaid_state_in_the_stance_goes_modal_without_painting_something() {
     let guard_at = stance
         .find("if this.card_open()\n                || this.context_menu.is_some()")
         .expect("the stance's modal guard");
-    let guard = &stance[guard_at..guard_at + 1600];
+    // Wide enough to span the whole guard block -- escape's
+    // `escape_closes_overlay` branch and its commentary sit above the
+    // any-key clears, and a scan window that ends before them read as the
+    // clears having been deleted (2026-08-27).
+    let guard = &stance[guard_at..guard_at + 3000];
+    assert!(
+        guard.contains("escape_closes_overlay"),
+        "the modal guard's escape branch no longer routes through \
+         Player::escape_closes_overlay -- the focus rings' own escape \
+         branches call that same door, and the two must not diverge"
+    );
     for field in [
         "this.context_menu = None",
         "this.library_menu = None",
