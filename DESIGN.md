@@ -173,8 +173,10 @@ one at a time; severity is a **3px left spine**, not a color flood:
 
 Every failure names its remedy, and the wound stays visible where it lives (dark clips in the
 lane). **A refusal string is a claim:** shipping "cannot be decoded" requires a test proving the
-capability is genuinely absent — otherwise it is a bug, not a message. A verb the state refuses
-(in menus) greys out with its reason on hover; it never disappears.
+capability is genuinely absent — otherwise it is a bug, not a message. A verb the current *state*
+refuses (in menus) greys out with its reason on hover; it never disappears. A verb the selected
+clip's *media kind* can never use (a grade on sound, an equalizer on a picture) is hidden outright
+instead — a class refusal, not a moment's answer the next click could change (user 2026-08-27).
 
 **No instructional copy (rejected pattern, user 2026-08-27).** The room never explains itself in
 prose: no "pick a verb above", no "type to filter — name, codec, unused…", no "Import, or drop a
