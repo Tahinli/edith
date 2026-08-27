@@ -79,6 +79,18 @@ impl Scale {
             0
         }
     }
+
+    /// [`DROP_SNAP_PX`] in timeline frames, [`Scale::snap_frames`]'s twin for a
+    /// drag's *release* rather than a trim: a dropped clip is aimed with a
+    /// coarser hand than an edge nudged one frame at a time, and a pixel-exact
+    /// release is what the user asked never to need.
+    pub(crate) fn drop_snap_frames(self, fps: f64) -> u32 {
+        if self.pps > 0. {
+            (DROP_SNAP_PX / self.pps * fps) as u32
+        } else {
+            0
+        }
+    }
 }
 
 /// A [`Scale`] against the bed it is drawn on and the timeline it is drawn

@@ -272,6 +272,14 @@ pub(crate) fn swallow(_: &MouseDownEvent, _: &mut Window, cx: &mut App) {
 /// takes must still be able to leave a gap of a few frames there.
 pub(crate) const SNAP_PX: f64 = 5.;
 
+/// The same magnet, wider, for a drag's own *release* -- a library row or a
+/// clip let go of, rather than an edge nudged one frame at a time. The user's
+/// own complaint ("to drop at 0.0 you must be exactly at 0.0") is a 5px
+/// window read at zoom: past a couple of minutes on screen a pixel is worth
+/// several frames, and 5px of aim is not forgiving enough to feel like a
+/// magnet at all. Twice [`SNAP_PX`], [`Scale::drop_snap_frames`].
+pub(crate) const DROP_SNAP_PX: f64 = 10.;
+
 /// The scrollbar's thumb never narrows past this, however long the timeline:
 /// a thumb a pixel wide is a thumb no hand can hold. A quarter of the ruler's
 /// own seek strip, which is the idiom it sits under.
