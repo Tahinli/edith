@@ -373,6 +373,18 @@ pub struct ExportSettings {
     /// export nobody has marked in or out on writes the same bytes it always
     /// did. Session state, like the mark itself: never saved to a `.edith`.
     pub range: Option<(u32, u32)>,
+    /// The Exact quality row: this file must be the source's own coded
+    /// picture, copied wherever [`CopyPlan`] already says a copy is exactly
+    /// what the timeline says. `bitrate` and `seat` mean nothing to a copied
+    /// track, but a fallback re-encode (a cut off a sync point, a grade, a
+    /// speed, a transform) still honours them, so a copy-minded caller sends
+    /// `bitrate: None` beside this and gets the automatic figure rather than
+    /// a preset's.
+    ///
+    /// [`exact_refusal`] is the gate a front-end asks before the button is
+    /// pressed; [`run`] asks it again, which is what makes this a setting a
+    /// worker can trust rather than one only the card checked.
+    pub exact: bool,
 }
 
 /// The lowest H.264 level (Table A-1) whose frame size and macroblock rate
@@ -1673,6 +1685,52 @@ struct CopyRegion {
     start: u32,
 }
 
+/// Why [`ExportSettings::exact`] cannot be honoured for this project right
+/// now, or `None` where [`CopyPlan`] already carries the whole file. A state
+/// report, not an instruction: it says what the file *is* rather than what to
+/// pick instead.
+///
+/// Two shapes of reason, told apart because only one of them is permanent.
+/// **The container cannot carry the source's own codec at all** -- Exact was
+/// asked of an mp4, or of a Matroska file whose codec is not the source's own
+/// -- which is [`CopyPlan`]'s own corner-cut (mp4 copies nothing yet) and
+/// [`CopyPlan::of`]'s codec check, so it is checked here the same way rather
+/// than duplicated with different words. **The edit is what stops it** -- a
+/// cut off a sync point, a grade, a speed, a dissolve, a moved or scaled
+/// clip -- which the same format would carry exactly if the edit let it, so
+/// those six [`CopyPlan::of`] gates are named together rather than picked
+/// apart into six different sentences.
+pub fn exact_refusal(project: &Project, meta: &VideoMeta, settings: &ExportSettings) -> Option<String> {
+    if !settings.exact || CopyPlan::of(project, meta, settings).is_some() {
+        return None;
+    }
+    let codec = match settings.format {
+        Format::Hevc => Codec::Hevc,
+        Format::Av1 => Codec::Av1,
+        _ => {
+            return Some(format!(
+                "{} cannot carry a source's own coded picture byte for byte — pick an HEVC or AV1 Matroska to copy it exactly",
+                settings.format.name()
+            ));
+        }
+    };
+    let carries = project.sources().iter().all(|source| {
+        crate::demux::is_matroska(&source.path)
+            && Demuxer::open(&source.path)
+                .ok()
+                .is_some_and(|(source_meta, _)| source_meta.codec == codec)
+    });
+    Some(match carries {
+        false => format!(
+            "{} cannot carry the source's own codec byte for byte",
+            settings.format.name()
+        ),
+        true => "the edit does not let this file copy the source exactly — a cut off a sync \
+                 point, a grade, a speed or a transform forces a re-encode"
+            .to_string(),
+    })
+}
+
 impl CopyPlan {
     /// The plan for this timeline, or `None` where anything at all makes a copy
     /// say something other than what the timeline says -- in which case the
@@ -2428,6 +2486,9 @@ fn run(
     }
     if settings.intra_only && settings.format != Format::Mp4 {
         return Err(format!("{} cannot be written intra-only", settings.format.name()).into());
+    }
+    if let Some(why) = exact_refusal(project, meta, settings) {
+        return Err(why.into());
     }
     let sources = project.sources();
     // The picture's decision first, before a sample of sound is touched: it is
