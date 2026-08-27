@@ -444,16 +444,27 @@ fn ghost(
 /// Ceiling: DESIGN §12 step 7's full geographic pass (each region draws its
 /// own rows while held) -- §9's amendment names the 56 actions still
 /// without a home.
-fn keys_overlay(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
+fn keys_overlay(player: &Player, bench_h: f32, cx: &mut Context<Player>) -> impl IntoElement {
     div()
         .id("stance-keys-overlay")
         .absolute()
         .bottom_0()
         .left_0()
         .right_0()
-        .h(px(BENCH_H + LEDGER_H))
+        // The live `bench_h` the caller already measures for `bench`/
+        // `notice_plate`, not the fixed `BENCH_H` default: a hand-dragged
+        // bench taller than the default left this scrim short of the real
+        // footprint, so the overlay stopped mid-bench instead of covering it.
+        .h(px(bench_h + LEDGER_H))
         .bg(rgba(SCRIM()))
         .flex()
+        // Bottom-left, not centred: the `?` control that opens this lives at
+        // the foot of the spine ([`spine`]'s last child), and this overlay
+        // mounts inside the *centre* column next to it -- anchoring the list
+        // to this column's own bottom-left edge puts it flush against the
+        // spine side, beside the control that opened it, instead of adrift
+        // in the middle of the bench/ledger footprint (user report).
+        .items_end()
         // Click also dismisses (DESIGN §9): the hold-`?`-release above is
         // the fast door, this is the same scrim-press-closes contract every
         // other card's scrim answers, so a hand that let go of `?` before
@@ -469,8 +480,9 @@ fn keys_overlay(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
         .child(
             div()
                 .id("stance-keys-list")
-                .m_auto()
-                .h(px(BENCH_H + LEDGER_H - 16.))
+                .ml(px(12.))
+                .mb(px(12.))
+                .h(px((bench_h + LEDGER_H - 24.).max(0.)))
                 .w(px(460.))
                 .overflow_y_scroll()
                 .p(px(10.))
@@ -720,11 +732,19 @@ fn notice_severity(message: &str) -> u32 {
 
 /// [`notice_plate`]'s own `bottom` offset, pulled out as a pure function so
 /// a `TestAppContext`-less test binary (this crate's own, no live `Context`
-/// to mount a real `notice_plate` in) can still check the plate never lands
-/// over the bench, for any `bench_h` -- without duplicating the arithmetic
-/// by hand and risking the two drifting apart.
-pub(crate) fn notice_bottom_offset(bench_h: f32) -> f32 {
-    LEDGER_H + bench_h + 6.
+/// to mount a real `notice_plate` in) can still check the anchor without
+/// duplicating the arithmetic by hand and risking the two drifting apart.
+///
+/// Anchored a fixed `LEDGER_H + 6.` above the ledger, not floated by
+/// `bench_h` (F3, user report): floating it `bench_h` further up put the
+/// plate up beside the time band's transport timecode row for any tall
+/// bench, reading as if it belonged to that row instead of the ledger it
+/// answers. The old float existed only to dodge the bench's V1/A1 lane
+/// chips (F2) -- [`notice_plate`] now dodges those horizontally instead
+/// (right-aligned, DESIGN §11.6: the lane chips there are left-aligned),
+/// so the vertical float is no longer needed to keep the plate clear.
+pub(crate) fn notice_bottom_offset() -> f32 {
+    LEDGER_H + 6.
 }
 
 /// A notice plate (DESIGN §8): one at a time, rising above the *bench*, its
@@ -743,25 +763,25 @@ pub(crate) fn notice_bottom_offset(bench_h: f32) -> f32 {
 /// all. `back()` keeps the two in step and guarantees the newest, most
 /// actionable message is always the one on screen.
 ///
-/// Anchored off `bench_h` rather than a fixed offset off the ledger: at the
-/// bench's floor a fixed `LEDGER_H + 6.` bottom offset put the plate right
-/// over the V1/A1 lane chips -- a transient message hiding the lanes for as
-/// long as it sat there. Floating it `bench_h` further up puts its bottom
-/// edge at the bench's own *top* edge for any bench height, so it always
-/// sits in the divider/time-band's slack above the bench rather than over
-/// the lanes, and never has to reserve room in the bench itself for a
-/// message that is not always there.
+/// Anchored a fixed [`notice_bottom_offset`] above the ledger, bottom-right
+/// (DESIGN §5's timecode/transport row lives bottom-left of the time band,
+/// well above this): a `bench_h`-floated offset used to put the plate right
+/// beside that transport row for a tall bench, reading as if it belonged to
+/// the wrong strip (user report). Right-aligned rather than left keeps it
+/// off the bench's own V1/A1 lane chips, which are left-aligned there
+/// (DESIGN §11.6 occlusion check) -- horizontal separation now does the job
+/// the old vertical float existed for.
 ///
 /// corner-cut: amber's "carries a jump action" is not wired -- the queue
 /// only ever held plain text, no structured jump target, in either the
 /// legacy bar or here. Ceiling: give `notify_user` an optional jump payload
 /// once a call site actually has one to carry.
-fn notice_plate(message: SharedString, bench_h: f32) -> impl IntoElement {
+fn notice_plate(message: SharedString) -> impl IntoElement {
     div()
         .id("stance-notice")
         .absolute()
-        .bottom(px(notice_bottom_offset(bench_h)))
-        .left(px(12.))
+        .bottom(px(notice_bottom_offset()))
+        .right(px(12.))
         // `max_w` only caps a box after GPUI has measured its text at
         // max-content width. `w_full` supplies a definite width to that
         // measurement (then `max_w` bounds it at 480 px), and normal
@@ -1152,9 +1172,11 @@ pub(crate) fn render(
                 .child(bench(player, bench_h, window, cx))
                 .child(ledger(player, position))
                 .when_some(player.notices.back().cloned(), |el, n| {
-                    el.child(notice_plate(n, bench_h))
+                    el.child(notice_plate(n))
                 })
-                .when(player.keys_open, |el| el.child(keys_overlay(player, cx)))
+                .when(player.keys_open, |el| {
+                    el.child(keys_overlay(player, bench_h, cx))
+                })
                 .when(player.settings_open, |el| {
                     el.child(settings_stance::render(player, window_size, cx))
                 })

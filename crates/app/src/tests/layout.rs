@@ -1907,31 +1907,32 @@ fn a_lane_row_fits_what_its_own_head_draws() {
 }
 
 /// The notice plate's own anchor ([`crate::ui::stance::notice_bottom_offset`])
-/// keeps it off the bench, at *any* bench height -- not merely the floor --
-/// because its bottom offset always lands at or above the bench's own top
-/// edge. `Player`'s live tree has no `TestAppContext` in this binary to mount
-/// a real `notice_plate` in and read its painted bounds back, so this checks
-/// the pure geometry the anchor is built from instead (F2: previously the
-/// plate sat at a fixed `LEDGER_H + 6.` off the ledger and covered the
-/// V1/A1 lane chips whenever the bench was short enough for the plate's own
-/// height to reach past it).
+/// sits a fixed step above the ledger, not floated by `bench_h` -- a float
+/// used to put the plate up beside the time band's transport timecode row
+/// for a tall bench, reading as if it belonged to that row instead of the
+/// ledger it answers (user report). `Player`'s live tree has no
+/// `TestAppContext` in this binary to mount a real `notice_plate` in and
+/// read its painted bounds back, so this checks the pure geometry the
+/// anchor is built from, and the source-level anchor that now keeps the
+/// plate off the bench's left-aligned V1/A1 lane chips horizontally instead
+/// (right-aligned, DESIGN §11.6) rather than by floating with `bench_h`.
 #[test]
-fn the_notice_plate_cannot_reach_the_bench_at_any_height() {
-    use crate::BENCH_MIN_H;
-    use crate::ui::stance::{BENCH_H, LEDGER_H, notice_bottom_offset};
+fn the_notice_plate_sits_a_fixed_step_above_the_ledger_right_aligned() {
+    use crate::ui::stance::{LEDGER_H, notice_bottom_offset};
 
-    for bench_h in [BENCH_MIN_H, BENCH_H, 400.] {
-        let notice_bottom = notice_bottom_offset(bench_h);
-        // The bench sits directly above the ledger in the centre column, so
-        // its own top edge (measured the same way, from the column's foot)
-        // is exactly `LEDGER_H + bench_h`.
-        let bench_top = LEDGER_H + bench_h;
-        assert!(
-            notice_bottom >= bench_top,
-            "notice bottom {notice_bottom} sits below the bench's top {bench_top} \
-             at bench_h={bench_h} -- the plate can cover a lane row"
-        );
-    }
+    assert_eq!(
+        notice_bottom_offset(),
+        LEDGER_H + 6.,
+        "the notice plate's bottom offset drifted off the ledger -- it must \
+         stay a fixed step above it, not float with bench_h again"
+    );
+
+    let body = fn_body("notice_plate");
+    assert!(
+        body.contains(".right(px(12.))") && !body.contains(".left(px(12.))"),
+        "notice_plate must anchor right, clear of the bench's left-aligned \
+         V1/A1 lane chips (DESIGN §11.6)"
+    );
 }
 /// The renderer only wraps text when the text measurement receives a definite
 /// width and normal whitespace. This source-level guard keeps both declarations
