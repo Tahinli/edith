@@ -178,6 +178,12 @@ refuses (in menus) greys out with its reason on hover; it never disappears. A ve
 clip's *media kind* can never use (a grade on sound, an equalizer on a picture) is hidden outright
 instead — a class refusal, not a moment's answer the next click could change (user 2026-08-27).
 
+**Hide-until-hover for controls/verbs is rejected (user 2026-08-27: "simplify it not hide the
+things").** A control's visibility never gates on pointer position — hover may brighten or fill a
+control already on screen, but a verb group that needs thinning gets thinned by subtraction
+(compact rows, plain always-visible group labels, smaller type) or dropped outright, never hidden
+behind a hover/expand/collapse.
+
 **No instructional copy (rejected pattern, user 2026-08-27).** The room never explains itself in
 prose: no "pick a verb above", no "type to filter — name, codec, unused…", no "Import, or drop a
 file on the window". Empty states are empty (or a single noun); placeholders are one word or
