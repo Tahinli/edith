@@ -176,6 +176,13 @@ lane). **A refusal string is a claim:** shipping "cannot be decoded" requires a 
 capability is genuinely absent — otherwise it is a bug, not a message. A verb the state refuses
 (in menus) greys out with its reason on hover; it never disappears.
 
+**No instructional copy (rejected pattern, user 2026-08-27).** The room never explains itself in
+prose: no "pick a verb above", no "type to filter — name, codec, unused…", no "Import, or drop a
+file on the window". Empty states are empty (or a single noun); placeholders are one word or
+absent; a control's use is taught by its chord and its geography (§4, §9), never by a sentence.
+Telling the editor what to do is the keys overlay's job on request — not ambient text. Any new
+string over ~4 words that instructs rather than reports state is a defect.
+
 ## 9. Menus and the keys overlay
 
 - **Right-click = verbs of the thing under the cursor** (clip menu: clip verbs; lane head: lane
