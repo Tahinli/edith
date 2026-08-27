@@ -616,13 +616,20 @@ fn source_row(
         })
 }
 
-/// Imported subtitle tracks, grouped by their source. A row selects and drags
-/// its track; its header folds that source's rows without becoming a cycle.
-fn subtitle_palette(player: &Player, cx: &mut Context<Player>) -> Option<AnyElement> {
-    let groups = subtitle_rows(player.session.as_ref()?.subtitles());
-    if groups.is_empty() {
-        return None;
-    }
+/// Imported subtitle tracks, grouped by their source -- the Text tab's own
+/// rows (DESIGN.md's "text section ... not serving to anything", user
+/// 2026-08-27: relocated off the unconditional spot under the source list
+/// and into the tab that names them). A row selects and drags its track; its
+/// header folds that source's rows without becoming a cycle. Styled off
+/// [`source_row`] -- same dot, same name/detail ink and type scale, same
+/// hover fill and selection ring -- so Text stops reading as a second
+/// dialect from Media/Audio. Hands back the track count for the tab header's
+/// own count line, same as `rows.len()` does for the other two tabs.
+fn subtitle_tab_rows(player: &Player, cx: &mut Context<Player>) -> (usize, Vec<AnyElement>) {
+    let groups = match player.session.as_ref() {
+        Some(session) => subtitle_rows(session.subtitles()),
+        None => Vec::new(),
+    };
     let count: usize = groups.iter().map(|group| group.rows.len()).sum();
     let rows: Vec<_> = groups
         .into_iter()
@@ -654,11 +661,11 @@ fn subtitle_palette(player: &Player, cx: &mut Context<Player>) -> Option<AnyElem
                     div()
                         .id(("dock-subtitle-track", track))
                         .flex_none()
-                        .h(px(CONTROL_H))
                         .flex()
                         .items_center()
                         .gap(px(6.))
                         .px(px(8.))
+                        .py(px(4.))
                         .rounded(px(3.))
                         .when(picked, |d| d.border_1().border_color(rgb(INK1())))
                         .when(!usable, |d| d.opacity(0.5))
@@ -692,11 +699,14 @@ fn subtitle_palette(player: &Player, cx: &mut Context<Player>) -> Option<AnyElem
                             usable,
                         ))
                         .child(
+                            // The same round dot `source_row`'s own name line
+                            // opens with, not the old vertical bar -- one dot
+                            // shape for every row this dock draws.
                             div()
                                 .flex_none()
-                                .w(px(4.))
-                                .h(px(16.))
-                                .rounded(px(2.))
+                                .w(px(8.))
+                                .h(px(8.))
+                                .rounded(px(4.))
                                 .when_some(tint, |d, tint| d.bg(rgb(tint))),
                         )
                         .child(
@@ -704,11 +714,8 @@ fn subtitle_palette(player: &Player, cx: &mut Context<Player>) -> Option<AnyElem
                                 .flex_1()
                                 .min_w(px(0.))
                                 .truncate()
-                                .type_style(mono(
-                                    type_scale::CHORD_METADATA_MIN_PX,
-                                    FontWeight::MEDIUM,
-                                ))
-                                .text_color(rgb(INK2()))
+                                .type_style(mono(type_scale::LABEL_ROW_PX, FontWeight::MEDIUM))
+                                .text_color(rgb(INK1()))
                                 .child(title),
                         )
                         .child(
@@ -724,7 +731,7 @@ fn subtitle_palette(player: &Player, cx: &mut Context<Player>) -> Option<AnyElem
                                 .id(("dock-subtitle-remove", track))
                                 .flex_none()
                                 .w(px(HIT_MIN))
-                                .h_full()
+                                .h(px(HIT_MIN))
                                 .flex()
                                 .items_center()
                                 .justify_center()
@@ -757,11 +764,11 @@ fn subtitle_palette(player: &Player, cx: &mut Context<Player>) -> Option<AnyElem
                     div()
                         .id(("dock-subtitle-group", group_ord))
                         .flex_none()
-                        .h(px(CONTROL_H))
                         .flex()
                         .items_center()
                         .gap(px(6.))
                         .px(px(8.))
+                        .py(px(4.))
                         .rounded(px(3.))
                         .cursor_pointer()
                         .hover(|s| s.bg(rgb(DARK_RAISED())))
@@ -785,9 +792,9 @@ fn subtitle_palette(player: &Player, cx: &mut Context<Player>) -> Option<AnyElem
                             d.child(
                                 div()
                                     .flex_none()
-                                    .w(px(4.))
-                                    .h(px(16.))
-                                    .rounded(px(2.))
+                                    .w(px(8.))
+                                    .h(px(8.))
+                                    .rounded(px(4.))
                                     .bg(rgb(tint)),
                             )
                         })
@@ -796,8 +803,8 @@ fn subtitle_palette(player: &Player, cx: &mut Context<Player>) -> Option<AnyElem
                                 .flex_1()
                                 .min_w(px(0.))
                                 .truncate()
-                                .type_style(label(type_scale::LABEL_ROW_PX, FontWeight::MEDIUM))
-                                .text_color(rgb(INK2()))
+                                .type_style(mono(type_scale::LABEL_ROW_PX, FontWeight::MEDIUM))
+                                .text_color(rgb(INK1()))
                                 .child(group.name),
                         )
                         .child(
@@ -815,19 +822,10 @@ fn subtitle_palette(player: &Player, cx: &mut Context<Player>) -> Option<AnyElem
                         ),
                 )
                 .when(!folded, |d| d.children(tracks))
+                .into_any_element()
         })
         .collect();
-    Some(
-        div()
-            .id("dock-subtitle-palette")
-            .flex_none()
-            .flex()
-            .flex_col()
-            .gap(px(2.))
-            .child(section_head(format!("SUBTITLES · {count}")))
-            .children(rows)
-            .into_any_element(),
-    )
+    (count, rows)
 }
 
 /// The Sources tab, built off MOCK-SPEC.md's "Dock" section: count line,
@@ -836,47 +834,71 @@ fn subtitle_palette(player: &Player, cx: &mut Context<Player>) -> Option<AnyElem
 /// ([`library_rows`]) are still what every row here is built from.
 fn sources_tab(player: &Player, window: &mut Window, cx: &mut Context<Player>) -> impl IntoElement {
     let focused = player.focus_dock.is_focused(window);
-    let sources = player
-        .session
-        .as_ref()
-        .map_or(&[][..], PlaybackSession::sources);
-    let all_rows: Vec<Row> = library_rows(
-        sources,
-        &player.streams,
-        &player.decoders,
-        player.timeline_audio(),
-        |path| {
-            player
-                .session
-                .as_ref()
-                .map_or(0, |session| session.file_frames(path))
-        },
-    );
-    let filter = player.dock_filter.to_lowercase();
-    let mut rows: Vec<(Row, usize)> = all_rows
-        .into_iter()
-        .filter(|row| player.library_tab.holds(&row.path))
-        .map(|row| {
-            let placed = player.row_ctx(&row.path, row.stream).placed;
-            (row, placed)
-        })
-        .filter(|(row, placed)| {
-            filter.is_empty()
-                || row.name.to_lowercase().contains(&filter)
-                || row.detail.to_lowercase().contains(&filter)
-                || ("unused".contains(&filter) && *placed == 0)
-        })
-        .collect();
-    let unused_count = rows.iter().filter(|(_, placed)| *placed == 0).count();
-    match player.dock_sort {
-        DockSort::Recent => {}
-        DockSort::Name => {
-            rows.sort_by(|(a, _), (b, _)| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    let text_tab = player.library_tab == LibraryTab::Text;
+    // Text has no per-stream `Row` to fill -- its rows are subtitle tracks
+    // grouped by source ([`subtitle_tab_rows`]), not `library_rows`' files --
+    // so it takes its own branch instead of a `Row` shape that would not fit
+    // it. `dock_filter`/`dock_sort` stay Media/Audio's own: a subtitle track
+    // has no "unused" count and its own row order is the file's own order,
+    // the same reason the old palette never carried either control.
+    let (total, unused_count, row_elements): (usize, usize, Vec<AnyElement>) = if text_tab {
+        let (count, elements) = subtitle_tab_rows(player, cx);
+        (count, 0, elements)
+    } else {
+        let sources = player
+            .session
+            .as_ref()
+            .map_or(&[][..], PlaybackSession::sources);
+        let all_rows: Vec<Row> = library_rows(
+            sources,
+            &player.streams,
+            &player.decoders,
+            player.timeline_audio(),
+            |path| {
+                player
+                    .session
+                    .as_ref()
+                    .map_or(0, |session| session.file_frames(path))
+            },
+        );
+        let filter = player.dock_filter.to_lowercase();
+        let mut rows: Vec<(Row, usize)> = all_rows
+            .into_iter()
+            .filter(|row| player.library_tab.holds(&row.path))
+            .map(|row| {
+                let placed = player.row_ctx(&row.path, row.stream).placed;
+                (row, placed)
+            })
+            .filter(|(row, placed)| {
+                filter.is_empty()
+                    || row.name.to_lowercase().contains(&filter)
+                    || row.detail.to_lowercase().contains(&filter)
+                    || ("unused".contains(&filter) && *placed == 0)
+            })
+            .collect();
+        let unused_count = rows.iter().filter(|(_, placed)| *placed == 0).count();
+        match player.dock_sort {
+            DockSort::Recent => {}
+            DockSort::Name => {
+                rows.sort_by(|(a, _), (b, _)| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            }
+            DockSort::Usage => rows.sort_by(|(_, a), (_, b)| b.cmp(a)),
+            DockSort::Unused => rows.sort_by_key(|(_, placed)| *placed > 0),
         }
-        DockSort::Usage => rows.sort_by(|(_, a), (_, b)| b.cmp(a)),
-        DockSort::Unused => rows.sort_by_key(|(_, placed)| *placed > 0),
-    }
-    let total = rows.len();
+        let total = rows.len();
+        let elements: Vec<AnyElement> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, (row, placed))| {
+                let picked = player
+                    .selected_asset
+                    .as_ref()
+                    .is_some_and(|p| *p == (row.path.clone(), row.stream));
+                source_row(player, i, row, *placed, picked, cx).into_any_element()
+            })
+            .collect();
+        (total, unused_count, elements)
+    };
     let filter_text: SharedString = player.dock_filter.clone().into();
     div()
         .id("dock-sources")
@@ -894,7 +916,11 @@ fn sources_tab(player: &Player, window: &mut Window, cx: &mut Context<Player>) -
         .overflow_y_scroll()
         .child({
             let style = head();
-            let hint: SharedString = format!("{total} total · {unused_count} unused").into();
+            let hint: SharedString = match text_tab {
+                true => format!("{total} total"),
+                false => format!("{total} total · {unused_count} unused"),
+            }
+            .into();
             div()
                 .id("dock-header")
                 .flex_none()
@@ -963,34 +989,38 @@ fn sources_tab(player: &Player, window: &mut Window, cx: &mut Context<Player>) -
                         .child(tab.label())
                 })),
         )
-        .child({
-            let current = player.dock_sort;
-            let style = label(type_scale::FLOOR_PX, FontWeight::MEDIUM);
-            div()
-                .id("dock-sort-cycle")
-                .flex_none()
-                .px(px(6.))
-                .py(px(2.))
-                .rounded(px(3.))
-                .font(style.font)
-                .text_size(style.size)
-                .text_color(rgb(INK2()))
-                .cursor_pointer()
-                .hover(|s| s.bg(rgb(DARK_RAISED())).text_color(rgb(INK1())))
-                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                    this.dock_sort = this.dock_sort.next();
-                    cx.notify();
-                }))
-                .children(hitmap::dynamic(
-                    move || {
-                        (
-                            "dock.sort.cycle".to_string(),
-                            format!("Sort: {} — click to cycle", current.label()),
-                        )
-                    },
-                    true,
-                ))
-                .child(format!("↕ {}", current.label()))
+        // The sort cycle is Media/Audio's own: a subtitle track's order is
+        // its file's own order, not a pick among Recent/Name/Usage/Unused.
+        .when(!text_tab, |d| {
+            d.child({
+                let current = player.dock_sort;
+                let style = label(type_scale::FLOOR_PX, FontWeight::MEDIUM);
+                div()
+                    .id("dock-sort-cycle")
+                    .flex_none()
+                    .px(px(6.))
+                    .py(px(2.))
+                    .rounded(px(3.))
+                    .font(style.font)
+                    .text_size(style.size)
+                    .text_color(rgb(INK2()))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(DARK_RAISED())).text_color(rgb(INK1())))
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.dock_sort = this.dock_sort.next();
+                        cx.notify();
+                    }))
+                    .children(hitmap::dynamic(
+                        move || {
+                            (
+                                "dock.sort.cycle".to_string(),
+                                format!("Sort: {} — click to cycle", current.label()),
+                            )
+                        },
+                        true,
+                    ))
+                    .child(format!("↕ {}", current.label()))
+            })
         })
         .child(
             div()
@@ -1001,35 +1031,21 @@ fn sources_tab(player: &Player, window: &mut Window, cx: &mut Context<Player>) -
                 .flex_col()
                 .gap(px(2.))
                 .overflow_y_scroll()
-                .when(rows.is_empty(), |d| {
+                .when(row_elements.is_empty(), |d| {
                     let style = label(type_scale::LABEL_ROW_PX, FontWeight::MEDIUM);
                     d.child(
                         div()
                             .font(style.font)
                             .text_size(style.size)
                             .text_color(rgb(INK3()))
-                            .child(match player.dock_filter.is_empty() {
+                            .child(match text_tab || player.dock_filter.is_empty() {
                                 true => player.library_tab.empty().to_string(),
                                 false => "nothing matches the filter".to_string(),
                             }),
                     )
                 })
-                .children({
-                    let elements: Vec<_> = rows
-                        .iter()
-                        .enumerate()
-                        .map(|(i, (row, placed))| {
-                            let picked = player
-                                .selected_asset
-                                .as_ref()
-                                .is_some_and(|p| *p == (row.path.clone(), row.stream));
-                            source_row(player, i, row, *placed, picked, cx).into_any_element()
-                        })
-                        .collect();
-                    elements
-                }),
+                .children(row_elements),
         )
-        .children(subtitle_palette(player, cx))
         .child(section_head("IMPORT"))
         .child(
             div()
