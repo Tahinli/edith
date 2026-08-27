@@ -630,6 +630,24 @@ fn subtitle_tab_rows(player: &Player, cx: &mut Context<Player>) -> (usize, Vec<A
         Some(session) => subtitle_rows(session.subtitles()),
         None => Vec::new(),
     };
+    // Which lane(s) actually hold each track's captions right now -- the
+    // row's second line answers "is it showing?", so it has to read the
+    // timeline, not stay the literal "not placed" it was born saying (the
+    // old palette's badge never updated after a drop).
+    let placed_on = |track: usize| -> Option<String> {
+        let session = player.session.as_ref()?;
+        let lanes: Vec<String> = session
+            .lanes()
+            .into_iter()
+            .filter(|lane| session.sub_lane(*lane).iter().any(|sub| sub.track == track))
+            .map(|lane| lane.label())
+            .collect();
+        if lanes.is_empty() {
+            None
+        } else {
+            Some(lanes.join(" "))
+        }
+    };
     let count: usize = groups.iter().map(|group| group.rows.len()).sum();
     let rows: Vec<_> = groups
         .into_iter()
@@ -653,6 +671,7 @@ fn subtitle_tab_rows(player: &Player, cx: &mut Context<Player>) -> (usize, Vec<A
                     .into();
                     let detail: SharedString = row
                         .refused
+                        .or_else(|| placed_on(track))
                         .unwrap_or_else(|| "not placed".to_string())
                         .into();
                     let ghost = title.clone();
