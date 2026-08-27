@@ -1028,7 +1028,12 @@ fn a_typed_bitrate_is_a_field_and_not_a_key_capture() {
     let mut edit = mbps_edit(0);
     edit.digit(0);
     assert_eq!(edit.commit(), None);
-    assert!(edit.refusal.clone().expect("zero says why").contains("0 is not a value"));
+    assert!(
+        edit.refusal
+            .clone()
+            .expect("zero says why")
+            .contains("0 is not a value")
+    );
     assert_eq!(mbps_edit(MBPS_MIN).commit(), Some(MBPS_MIN));
     assert_eq!(mbps_edit(MBPS_MAX).commit(), Some(MBPS_MAX));
     let mut edit = mbps_edit(0);
@@ -1143,7 +1148,10 @@ fn a_duration_row_shows_only_for_a_transition_and_its_room_is_the_successors() {
     // A plain cut carries neither field, so the row has nothing to show.
     let plain = clip(0, 10, 0, 0, 0);
     let plain_next = clip(10, 15, 0, 0, 0);
-    assert_eq!(transition_of(LaneKind::Video, &plain, Some(&plain_next)), None);
+    assert_eq!(
+        transition_of(LaneKind::Video, &plain, Some(&plain_next)),
+        None
+    );
 
     // A dissolve: video lane, `transition_out` set, an adjacent successor.
     // The room offered is the shorter of the two -- here the successor's own
@@ -1506,11 +1514,16 @@ fn the_export_card_fits_the_smallest_window() {
         (17. + 28. + 15. + 30. + CONTROL_H + 4. + 10. + 24.),
         title + status + summary + CONTROL_H + 4. + gaps + padding
     );
-    assert!((17. + 28. + 15. + 30. + CONTROL_H + 4. + 10. + 24.) + (8. * KEYS_ROW_H) <= 360., "card too tall");
+    assert!(
+        (17. + 28. + 15. + 30. + CONTROL_H + 4. + 10. + 24.) + (8. * KEYS_ROW_H) <= 360.,
+        "card too tall"
+    );
     // The list grows with a window that has the room -- and never shrinks
     // below the cap that made the floor fit, whatever arithmetic the window
     // hands it.
-    let cap = |h: f32| (h - (17. + 28. + 15. + 30. + CONTROL_H + 4. + 10. + 24.) - 24.).max(8. * KEYS_ROW_H);
+    let cap = |h: f32| {
+        (h - (17. + 28. + 15. + 30. + CONTROL_H + 4. + 10. + 24.) - 24.).max(8. * KEYS_ROW_H)
+    };
     assert_eq!(cap(360.), (8. * KEYS_ROW_H));
     assert_eq!(cap(0.), (8. * KEYS_ROW_H));
     assert!(cap(720.) > (8. * KEYS_ROW_H));
@@ -2096,14 +2109,17 @@ fn darkroom_source_rows_keep_proxy_add_and_media_audio_text_paths() {
 #[test]
 fn toggle_proxy_wakes_the_asked_phase_it_stops() {
     let library = src_text("player/library.rs");
-    let start = &library[library.find("fn start_proxy_for(").expect("start_proxy_for")..];
+    let start = &library[library
+        .find("fn start_proxy_for(")
+        .expect("start_proxy_for")..];
     assert!(
         start.contains("generate_if_wanted(&path, &cancel)"),
         "start_proxy_for no longer hands the header read a cancel flag anyone can reach"
     );
     let toggle = &library[library.find("fn toggle_proxy(").expect("toggle_proxy")..];
-    let asked_arm =
-        &toggle[toggle.find("Proxy::Asked(cancel)").expect("the Asked arm's own flag")..];
+    let asked_arm = &toggle[toggle
+        .find("Proxy::Asked(cancel)")
+        .expect("the Asked arm's own flag")..];
     assert!(
         asked_arm.contains("cancel.store(true"),
         "a stop asked during Asked no longer sets the flag the header read polls"

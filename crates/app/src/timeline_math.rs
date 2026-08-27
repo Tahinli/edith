@@ -427,7 +427,6 @@ pub(crate) fn sub_mark(subs: &[SubClip], start: u32) -> Option<usize> {
     subs.iter().position(|s| s.start == start)
 }
 
-
 /// Scales an envelope to its own loudest sample, so a quietly mastered source
 /// still draws as a shape. The fixtures peak around an eighth of full scale, and
 /// an eighth of a 30 px lane is a flat line -- which says "silent" about a file

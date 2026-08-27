@@ -2,7 +2,6 @@
 
 use crate::*;
 
-
 /// A span of seconds as a person reads it: one decimal above a second, two
 /// below -- [`scaled`]'s rule, for its reason. The tightest zoom is
 /// [`ZOOM_MIN_FRAMES`] across the bed, which on the 240 fps slow-motion a phone

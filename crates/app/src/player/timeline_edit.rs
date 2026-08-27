@@ -1658,7 +1658,13 @@ impl Player {
     /// [`Project::crossfade`]), so a step past the successor's own length
     /// lands at the successor's length instead of asking for more than
     /// there is.
-    pub(crate) fn nudge_transition(&mut self, lane: Lane, idx: usize, step: i32, cx: &mut Context<Self>) {
+    pub(crate) fn nudge_transition(
+        &mut self,
+        lane: Lane,
+        idx: usize,
+        step: i32,
+        cx: &mut Context<Self>,
+    ) {
         let Some(session) = &mut self.session else {
             return;
         };

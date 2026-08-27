@@ -335,4 +335,3 @@ pub(crate) fn repeats(scope: Repeat, key: &str, action: Option<ActionId>) -> boo
         Repeat::Nothing => false,
     }
 }
-

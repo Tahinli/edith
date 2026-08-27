@@ -42,7 +42,11 @@ const SURFACE_CYCLE: [Surface; 3] = [Surface::Dock, Surface::Bench, Surface::Ins
 pub(crate) fn next_surface(current: Surface, backward: bool) -> Surface {
     let i = SURFACE_CYCLE.iter().position(|&s| s == current).unwrap();
     let n = SURFACE_CYCLE.len();
-    SURFACE_CYCLE[if backward { (i + n - 1) % n } else { (i + 1) % n }]
+    SURFACE_CYCLE[if backward {
+        (i + n - 1) % n
+    } else {
+        (i + 1) % n
+    }]
 }
 
 /// The one key a surface's own `on_key_down` answers. Everything else is
@@ -396,9 +400,7 @@ fn ghost(
         .rounded(px(3.))
         .cursor_pointer()
         .hover(|s| s.bg(rgb(DARK_RAISED())).text_color(rgb(INK1())))
-        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-            this.act(action, window, cx)
-        }))
+        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.act(action, window, cx)))
         .type_style(type_scale::label(
             type_scale::LABEL_ROW_PX,
             gpui::FontWeight::MEDIUM,
