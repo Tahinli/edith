@@ -393,6 +393,13 @@ struct Player {
     /// the clip under the hand: every other pick draws its own shadow too, at
     /// the same delta the anchor's is landing at ([`Player::preview_ghost`]).
     ghost: Vec<Ghost>,
+    /// The window `x` the last live `on_drag_move` sample over a bed used to
+    /// draw [`Player::ghost`] -- read back by that drag's `on_drop` instead of
+    /// a fresh `window.mouse_position()`. gpui's drop callback carries no
+    /// event of its own to read a position off, and a second, later poll of
+    /// the pointer is not guaranteed to answer what the ghost just showed
+    /// (DESIGN: "drop == shadow, by construction"). `None` between drags.
+    drag_x: Option<Pixels>,
     /// The slot a track header being dragged is about to drop into, or `None`
     /// while the pointer is over no lane: the line drawn between two headers,
     /// for the reason [`Player::ghost`] draws a shadow -- where a gesture lands
@@ -945,6 +952,7 @@ fn main() {
                     sub_lane: None,
                     snap_cue: None,
                     ghost: Vec::new(),
+                    drag_x: None,
                     lane_drop: None,
                     last_scrub: Instant::now(),
                     last_target: 0,
