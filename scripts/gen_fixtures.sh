@@ -539,4 +539,18 @@ ffmpeg -y -f lavfi -i "testsrc2=size=320x240:rate=30:duration=2" \
 ffmpeg -y -f lavfi -i "sine=frequency=440:duration=3" \
     -c:a aac -b:a 128k assets/test_audio_only.mp4
 
+# A QuickTime-brand `.mov` (what Resolve, Final Cut and `ffmpeg -f mov` write):
+# its AAC sample entry is a version-1 SoundDescription -- 16 bytes of
+# compression fields after the sample rate, then the `esds` inside a `wave`
+# wrapper -- rather than the bare ISO `mp4a`+`esds` an `.mp4` carries. Stock
+# mp4 0.14 walked past both and called the track esds-less, so a `.mov` opened
+# with no sound at all (`tests/audio_decode.rs`). 440 Hz left / 880 Hz right
+# at 44.1k, 2 s, so the same channel-identity check applies.
+ffmpeg -y -f lavfi -i testsrc2=size=320x240:rate=24:duration=2 \
+    -f lavfi -i "sine=frequency=440:duration=2" \
+    -f lavfi -i "sine=frequency=880:duration=2" \
+    -filter_complex "[1:a][2:a]join=inputs=2:channel_layout=stereo[a]" \
+    -map 0:v -map "[a]" -c:v libx264 -profile:v baseline -pix_fmt yuv420p \
+    -c:a aac -b:a 96k -f mov assets/test_qt.mov
+
 echo "fixtures written to assets/"

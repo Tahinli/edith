@@ -8,6 +8,7 @@ exclude = [
     "vendor/rusty_aac",
     "vendor/oxideav-h265",
     "vendor/rusty_h264-common",
+    "vendor/mp4",
 ]
 
 [workspace.package]
@@ -76,7 +77,15 @@ edition = "2024"
 #                 default and the six-line declaration in `src/lib.rs`; every
 #                 line of codec code is byte-identical to 0.9.1, so decode stays
 #                 bit-exact and the process gets glibc's malloc back.
-# Drop `vendor/` entirely once released versions handle all five.
+#   mp4         - reads the `mp4a` sample entry as ISO only: the 8 bytes
+#                 QuickTime uses for version/revision/vendor are skipped as
+#                 reserved, so a version-1 SoundDescription's 16-byte tail
+#                 (version 2's 36-byte one) is taken for the first child box
+#                 and the `wave`-wrapped `esds` behind it is never seen -- an
+#                 AAC track "with no esds", every Resolve / Final Cut / `ffmpeg
+#                 -f mov` file silent. The patch is `Mp4aBox::read_box` and a
+#                 `WaveBox` fourcc; writing is untouched.
+# Drop `vendor/` entirely once released versions handle all six.
 [patch.crates-io]
 cros-libva = { path = "vendor/cros-libva" }
 cros-codecs = { path = "vendor/cros-codecs" }
@@ -85,3 +94,8 @@ rusty_h264-common = { path = "vendor/rusty_h264-common" }
 # Drops the `pub use proc_macro;` re-export (E0365 future-incompat, rustc
 # warns on every workspace build); nothing in the crate or its users names it.
 proc-macro-error2 = { path = "vendor/proc-macro-error2" }
+# Reads QuickTime version-1/2 sound sample descriptions (Resolve, Final Cut,
+# `ffmpeg -f mov`): the 16/36-byte block after samplerate and the `esds`
+# inside the `wave` wrapper. Stock 0.14 walks past both and calls the AAC
+# track esds-less, so a `.mov` opens without sound.
+mp4 = { path = "vendor/mp4" }

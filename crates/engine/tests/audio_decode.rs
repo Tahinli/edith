@@ -103,6 +103,44 @@ fn decodes_av_mp4_audio() {
     );
 }
 
+/// A QuickTime-brand `.mov` -- Resolve's, Final Cut's, `ffmpeg -f mov`'s --
+/// keeps its AAC `esds` behind a version-1 SoundDescription and inside a
+/// `wave` wrapper. Stock mp4 0.14 read neither and refused the track as
+/// "esds not found", so a `.mov` opened as a silent film (his `late.mov`,
+/// 2026-09-06); the vendored crate reads both. The tone is the fixture's
+/// 440 Hz left / 880 Hz right, so this also proves the config it found is the
+/// right one and not a guess: a wrong rate or layout moves the crossings.
+#[test]
+fn a_quicktime_mov_keeps_its_aac_behind_a_wave_wrapper() {
+    let (meta, rx) = AudioSession::open(asset("test_qt.mov"))
+        .expect("open")
+        .expect("test_qt.mov has an audio track");
+    assert_eq!((meta.sample_rate, meta.channels), (RATE, 2));
+
+    let mut left = Vec::new();
+    let mut right = Vec::new();
+    for chunk in rx {
+        left.extend(chunk.samples.iter().step_by(2));
+        right.extend(chunk.samples[1..].iter().step_by(2));
+    }
+    let frames = left.len();
+    let want = (RATE * 2) as i64;
+    let slack = frames as i64 - want;
+    assert!(
+        (0..=FRAME).contains(&slack),
+        "{frames} frames per channel, want {want} (+0..={FRAME})"
+    );
+    let secs = frames as f64 / RATE as f64;
+    for (name, samples, hz) in [("left", &left, 440.0), ("right", &right, 880.0)] {
+        let want = 2.0 * hz * secs;
+        let got = zero_crossings(samples) as f64;
+        assert!(
+            (got - want).abs() <= 0.05 * want,
+            "{name}: {got} zero crossings, want {want} +/-5%"
+        );
+    }
+}
+
 #[test]
 fn video_only_file_has_no_audio() {
     assert!(
