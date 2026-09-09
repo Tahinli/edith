@@ -242,8 +242,8 @@ pub(crate) fn drag_scrim(cx: &mut Context<Player>) -> Div {
 /// Drawn to the ghost grammar (DESIGN §11.2): nothing at rest -- a room whose
 /// every seam is inked is the "crowded" the user named -- then one hairline of
 /// dim ink under the pointer, and the same line one step brighter while the
-/// hand is actually holding it. The 6 px strip is the *hit* area throughout;
-/// only its 1 px edge is ever painted. `held` is the seam this window is
+/// hand is actually holding it. The band below is the *hit* area throughout;
+/// only one 1 px line inside it is ever painted. `held` is the seam this window is
 /// dragging right now ([`Player::split_drag`]), which the pointer leaves on the
 /// first move -- so the lit line has to come from the model, not from `hover`.
 ///
@@ -256,46 +256,50 @@ pub(crate) fn drag_scrim(cx: &mut Context<Player>) -> Div {
 /// answering in strip coordinates). A 6 px target missed by 5 px is a resize
 /// the hand cannot find, which is the same as no resize at all (user
 /// 2026-09-09: "panes should be enlargable and shrinkable" -- they already
-/// were).
+/// were). The hairline is painted *by the band*, not by the strip, so the
+/// whole band lights it: a line raised only by the pixels that already grab
+/// the seam tells a hand nothing. The bench's band is deeper still
+/// ([`BENCH_GRAB_H`]) -- the row under its seam is the bench's own section
+/// head, and that is where a hand aiming at "the top of the timeline" lands.
 ///
 /// A double press resets the seam to the window's own share
 /// ([`Splits::clear`]): the cheap way back from a layout dragged somewhere
 /// unusable, and the one every editor's dividers answer to.
 pub(crate) fn divider(split: Split, held: bool, cx: &mut Context<Player>) -> Div {
     let across = matches!(split, Split::Timeline | Split::Bench);
+    // A row seam parts the picture from a panel whose own first row is its
+    // section head -- empty land -- so the bench's band reaches down through
+    // it ([`BENCH_GRAB_H`]). Every other seam keeps [`GRAB_W`]: the dock's
+    // neighbour is a list whose rows start at its very edge, and the legacy
+    // timeline's is the edit toolbar's buttons.
+    let grab = match split {
+        Split::Bench => BENCH_GRAB_H,
+        _ => GRAB_W,
+    };
+    // Named per seam: `group_hover` resolves by name through one global map,
+    // so two dividers sharing a name would light each other.
+    let group = format!("seam-{split:?}");
     div()
         .flex_none()
-        .when(across, |d| {
-            d.h(px(SPLIT_W)).w_full().cursor_row_resize().border_t_1()
-        })
-        .when(!across, |d| {
-            d.w(px(SPLIT_W)).h_full().cursor_col_resize().border_l_1()
-        })
-        .border_color(match held {
-            true => gpui::Hsla::from(rgb(INK3())),
-            false => gpui::transparent_black(),
-        })
-        // Lit under the pointer: the second half of "this can be dragged", said
-        // before the button goes down rather than after.
-        .when(!held, |d| {
-            d.hover(|s| s.border_color(rgb(STROKE_DIVIDER())))
-        })
+        .when(across, |d| d.h(px(SPLIT_W)).w_full())
+        .when(!across, |d| d.w(px(SPLIT_W)).h_full())
         .relative()
         .child(
             div()
                 .absolute()
+                .group(group.clone())
                 .when(across, |d| {
                     d.left_0()
                         .right_0()
                         .top(px(-1.))
-                        .h(px(GRAB_W))
+                        .h(px(grab))
                         .cursor_row_resize()
                 })
                 .when(!across, |d| {
                     d.top_0()
                         .bottom_0()
                         .left(px(-1.))
-                        .w(px(GRAB_W))
+                        .w(px(grab))
                         .cursor_col_resize()
                 })
                 .on_mouse_down(
@@ -315,6 +319,31 @@ pub(crate) fn divider(split: Split, held: bool, cx: &mut Context<Player>) -> Div
                         cx.notify();
                         cx.stop_propagation();
                     }),
+                )
+                // The hairline the eye is given, painted *inside* the band and
+                // one pixel thick, so the whole band -- not the 6 px strip it
+                // hangs on -- is what lights it. A line only the pixels that
+                // already hit the seam can raise tells the hand nothing it did
+                // not already know.
+                .child(
+                    div()
+                        .absolute()
+                        .when(across, |d| {
+                            d.left_0().right_0().top(px(1.)).h(px(1.)).border_t_1()
+                        })
+                        .when(!across, |d| {
+                            d.top_0().bottom_0().left(px(1.)).w(px(1.)).border_l_1()
+                        })
+                        .border_color(match held {
+                            true => gpui::Hsla::from(rgb(INK3())),
+                            false => gpui::transparent_black(),
+                        })
+                        // Lit under the pointer: the second half of "this can be
+                        // dragged", said before the button goes down rather than
+                        // after.
+                        .when(!held, |d| {
+                            d.group_hover(group, |s| s.border_color(rgb(STROKE_DIVIDER())))
+                        }),
                 ),
         )
 }
