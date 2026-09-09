@@ -388,11 +388,37 @@ impl Player {
         // nobody is choosing wears no chord, the Settings row's own rule for
         // a codec with no rate to pick.
         let (codec, rated) = crate::ui::settings_stance::sound_codec(self.format);
-        let sound_label = match audio.is_empty() {
-            true => codec.to_string(),
-            false => audio.to_string(),
+        // The codec and the rate it is spent at, always -- the user asked to
+        // *see* the sound rate here even where nothing on this surface picks
+        // it ("resolution and audio bitrate should be seen in export menu
+        // too even if they won't be changeable"). A copied stream carries
+        // the source's own rate, which this surface cannot ask for, so it
+        // says `copy` and nothing it would have to invent.
+        let copied = audio.contains("copy");
+        let mute = audio.is_empty() || audio == "no sound to write";
+        // The engine's own first word where it has one ("Opus · SW encode" on
+        // a Matroska mix it will take), the Settings row's word where it does
+        // not -- the moment must not say AAC about a file that gets Opus.
+        let word = match mute {
+            true => codec,
+            false => audio.split_whitespace().next().unwrap_or(codec),
         };
-        let sound_keyed = rated && !audio.contains("copy");
+        let sound_label = match (mute, copied, rated) {
+            (true, ..) => codec.to_string(),
+            (_, true, _) => format!("{word} copy"),
+            (_, _, true) => format!("{word} {}", self.audio_kbps),
+            _ => word.to_string(),
+        };
+        let sound_keyed = rated && !copied && !mute;
+        // The picture the file will hold, in the numbers Settings \u{b7} PROJECT
+        // already shows: a readout here, since the canvas is the project's
+        // and is set there. Greyed one step for a sound-only format -- the
+        // export writes no picture, but the project still has one and he
+        // asked to see it rather than to have it disappear.
+        let picture_readout = self.session.as_ref().map(|s| {
+            let (w, h) = s.resolution();
+            format!("{w}\u{d7}{h} \u{b7} {}", fps_label(self.fps))
+        });
         // `auto` is a promise until the probe answers; once it has, the seat
         // says what it resolved to rather than the word nobody picked.
         let seat = self.encoder_seat();
@@ -614,19 +640,43 @@ impl Player {
                     .flex_1()
                     .min_w(px(0.))
                     .flex()
+                    // Two lines rather than a truncated one: the readouts made
+                    // this line longer, and a number cut in half is worse than
+                    // a moment one line taller. Measured at 1280 wide it still
+                    // fits on one line -- this is the floor's guard, not the
+                    // usual case.
+                    .flex_wrap()
                     .items_baseline()
                     .gap(px(6.))
-                    .children(self.format.has_video().then(|| {
-                        moment_segment(
-                            "moment-picture",
-                            crate::ui::settings_stance::picture_label(self.format),
-                            "c",
-                            cx.listener(|this, _: &ClickEvent, _, cx| {
-                                this.cycle_export_picture();
-                                cx.notify();
-                            }),
-                        )
+                    // The project's own picture, read here and set in
+                    // Settings. INK4 is the faintest step this palette has, so
+                    // a sound-only format greys it no further -- it stays
+                    // said, which is what was asked for.
+                    .children(picture_readout.map(|read| {
+                        div()
+                            .flex_none()
+                            .type_style(type_scale::mono(
+                                type_scale::CHORD_METADATA_MIN_PX,
+                                gpui::FontWeight::MEDIUM,
+                            ))
+                            .text_color(rgb(INK4()))
+                            .child(read)
                     }))
+                    // Always a button, never hidden: the format cycle runs
+                    // through the sound-only files too, and this segment
+                    // disappearing on them left `c` with nothing to press and
+                    // no way back (user 2026-09-09: "when selection reaches
+                    // the audio clicking is disabled and can't turn it back to
+                    // video").
+                    .child(moment_segment(
+                        "moment-picture",
+                        crate::ui::settings_stance::picture_label(self.format),
+                        "c",
+                        cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.cycle_export_picture();
+                            cx.notify();
+                        }),
+                    ))
                     .children(sound_keyed.then(|| {
                         moment_segment(
                             "moment-sound",

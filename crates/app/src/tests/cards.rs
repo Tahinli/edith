@@ -1089,6 +1089,46 @@ fn row_three_wears_the_encode_options_and_the_door_to_the_rest() {
         .expect("the segment atom");
     assert!(seg.contains("INK3()") && seg.contains("INK4()"));
     assert!(seg.contains("DARK_RAISED()"), "a segment does not answer hover");
+    // The readouts he asked to see: the project's picture size and rate, and
+    // a sound rate that is on the line whether or not it is pressable.
+    assert!(
+        body.contains("s.resolution()") && body.contains("fps_label(self.fps)"),
+        "row 3 says nothing about the picture the file will hold"
+    );
+    assert!(
+        body.contains("format!(\"{word} {}\", self.audio_kbps)"),
+        "the sound segment no longer says the rate it is spent at"
+    );
+    // The picture segment is a child, not a `has_video` maybe: hidden on the
+    // sound-only formats it left `c` pressing nothing and no way back.
+    let at = body.find("\"moment-picture\"").expect("the picture segment");
+    assert!(
+        !body[at - 240..at].contains("has_video"),
+        "the picture segment is gated on has_video again -- the dead end"
+    );
+    // Wrapped, never cut: the readouts made row 3 longer than 1280 wide.
+    assert!(body.contains(".flex_wrap()"), "row 3 truncates instead of wrapping");
+}
+
+/// The dead end the user hit: the cycle walked into the sound-only formats
+/// and stopped there ("when selection reaches the audio clicking is disabled
+/// and can't turn it back to video"). One cycle, and it wraps.
+#[test]
+fn the_picture_cycle_wraps_out_of_the_sound_only_formats() {
+    use crate::ui::settings_stance::{PICTURE_CYCLE, next_picture};
+    // Nothing refused: every stop is the next one, and the last wraps to the
+    // first -- OGG, the tail of the list, back to MP4.
+    let mut at = PICTURE_CYCLE[0];
+    for &want in PICTURE_CYCLE.iter().skip(1).chain(std::iter::once(&PICTURE_CYCLE[0])) {
+        at = next_picture(at, |_| false);
+        assert_eq!(at, want, "the cycle stopped walking");
+    }
+    assert_eq!(at, PICTURE_CYCLE[0], "a full walk is a wrap, not a dead end");
+    assert_eq!(next_picture(Format::Ogg, |_| false), Format::Mp4);
+    // A timeline with no picture refuses every video format, and the cycle
+    // still moves: the sound-only stops are what is left of it.
+    let sound_only = next_picture(Format::Ogg, |f| f.has_video());
+    assert!(!sound_only.has_video() && sound_only != Format::Ogg);
 }
 
 /// One chord per thing, said the same on both surfaces: the moment's segments
