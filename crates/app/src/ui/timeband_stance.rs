@@ -23,6 +23,92 @@ thread_local! {
     // fold both into `Player` once `main.rs` is free again.
     static STRIP_BOUNDS: Rc<Cell<Bounds<Pixels>>> = Rc::new(Cell::new(Bounds::default()));
     static PAN_ANCHOR: Cell<Option<f32>> = Cell::new(None);
+    /// The band row's own measured width, read by the frame after the one
+    /// that took it (`width_probe` asks for that frame whenever it changes).
+    /// This is what the degradation ladder below keys off: the band cannot
+    /// know its column's width any other way without a `Window` this
+    /// module's `render` is not handed.
+    static BAND_W: Rc<Cell<Pixels>> = Rc::new(Cell::new(px(0.)));
+    /// Set once per `render` from the ladder, read by `ghost` (which the
+    /// band's own helpers call three levels down) -- a render-scoped
+    /// constant rather than a parameter threaded through every call site.
+    static SHOW_CHORDS: Cell<bool> = const { Cell::new(true) };
+}
+
+/// The contact strip's floor: the flex_1 element absorbs the band's slack,
+/// but a minimap narrower than this is not a map.
+pub(crate) const STRIP_MIN_W: f32 = 120.;
+
+/// The band's own width probe, `timeline_math::height_probe`'s shape on the
+/// other axis: a measurement is read by the frame after the one that took it,
+/// so a change has to ask for that frame or a resize would leave the ladder
+/// one layer behind until something else happened to draw.
+fn width_probe(into: Rc<Cell<Pixels>>) -> impl IntoElement {
+    canvas(
+        move |bounds, window, _| {
+            // Only on a change: an unconditional request is a repaint loop.
+            if into.replace(bounds.size.width) != bounds.size.width {
+                window.request_animation_frame();
+            }
+        },
+        |_, _, _, _| (),
+    )
+    .absolute()
+    .size_full()
+}
+
+/// Which layers of the band are still drawn at a given column width
+/// (DESIGN §7's ladder, one layer per threshold, never all at once).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct BandLayers {
+    /// Chord badges under the transport glyphs.
+    pub(crate) chords: bool,
+    /// The audio-monitoring cluster (mute, -/+, slider, level readout).
+    pub(crate) volume: bool,
+    /// The sync-point pair and the loop toggle.
+    pub(crate) sync: bool,
+    /// The export-range marks (I / O / x).
+    pub(crate) marks: bool,
+}
+
+/// The ladder itself. Every threshold is a MEASURED number: the band drawn
+/// whole at 2560x1440 (`$EDITH_HITMAP`) reads 1246px of fixed groups beside a
+/// 974px strip, and the same band at 1280x720 (chords off) reads each glyph's
+/// door at its `HIT_MIN` floor. Fixed width + `STRIP_MIN_W`, rounded up to the
+/// next 10px, is what each rung costs:
+///
+/// | drawn                                        | fixed | needs  |
+/// |----------------------------------------------|-------|--------|
+/// | everything, chords under every glyph         | 1246  | 1370px |
+/// | chords dropped (-97px, doors keep `HIT_MIN`) | 1149  | 1270px |
+/// | + monitoring cluster dropped (-256px)        |  893  | 1020px |
+/// | + sync pair and loop dropped (-102px)        |  791  |  920px |
+/// | + range marks dropped (-92px): the floor     |  699  |  820px |
+///
+/// The four things the band is *for* -- timecode, cut readout, contact strip
+/// (>=`STRIP_MIN_W`, the flex_1 that absorbs the slack) and the Export chip --
+/// are on every rung; below the floor's own 820px there is nothing left to
+/// shed and `overflow_hidden` is what keeps the rest inside the column.
+/// There is no zoom group in this band (the charter's rung 2): the monitoring
+/// cluster is the band's equivalent extra and takes its place.
+pub(crate) fn band_layers(band_w: f32) -> BandLayers {
+    BandLayers {
+        chords: band_w >= 1370.,
+        volume: band_w >= 1270.,
+        sync: band_w >= 1020.,
+        marks: band_w >= 920.,
+    }
+}
+
+/// The odometer's cut (DESIGN §6, "the cut readout is the odometer"): the cut
+/// the playhead rests on, or -- when it rests in a gap -- the next one ahead
+/// of it. `None` only when there is no cut at or after the playhead, which is
+/// when the caller falls back to the selection.
+pub(crate) fn odometer_cut(clips: &[Clip], frame: u32) -> Option<usize> {
+    clips
+        .iter()
+        .position(|c| frame >= c.start && frame < c.end())
+        .or_else(|| clips.iter().position(|c| c.start > frame))
 }
 
 /// A stacked ghost command (DESIGN §4, MOCK-SPEC "Ghost transport"/"spine"):
@@ -66,6 +152,13 @@ fn ghost(
         .flex()
         .flex_col()
         .items_center()
+        .justify_center()
+        // WCAG 2.5.8, the same `HIT_MIN` floor `interact.rs` holds clip edges
+        // to: a glyph may be 8px wide, its door may not. Padding only --
+        // glyph sizes and the groups' own gaps are untouched.
+        .min_w(px(HIT_MIN))
+        .min_h(px(HIT_MIN))
+        .px(px(2.))
         .gap(px(1.))
         .cursor_pointer()
         .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
@@ -76,13 +169,16 @@ fn ghost(
         .text_size(glyph_style.size)
         .text_color(rgb(if active { INK1() } else { INK2() }))
         .child(glyph.into())
-        .child(
-            div()
-                .font(chord_style.font)
-                .text_size(chord_style.size)
-                .text_color(rgb(INK3()))
-                .child(player.keymap.chord(action)),
-        )
+        .when(SHOW_CHORDS.with(Cell::get), |el| {
+            el.child(
+                div()
+                    .flex_none()
+                    .font(chord_style.font)
+                    .text_size(chord_style.size)
+                    .text_color(rgb(INK3()))
+                    .child(player.keymap.chord(action)),
+            )
+        })
 }
 
 /// The hero timecode, digits `ink1` and colons `ink3` (DESIGN §3, MOCK-SPEC
@@ -114,11 +210,24 @@ fn signed_delta(frames: i64, fps: f64) -> String {
 /// the subject cut's own trim deltas against where roll armed it (only real
 /// once [`Player::loop_trim`] has a baseline to measure against), and the
 /// roll word itself, on or dim. `·` separators in `ink3`, values in `ink2`.
-fn cut_readout(player: &Player) -> impl IntoElement {
+fn cut_readout(player: &Player, position: f64) -> impl IntoElement {
     let sep = || div().text_color(rgb(INK3())).child(" · ");
     let val = |s: String| div().text_color(rgb(INK2())).child(s);
     let anchor = player.selected.anchor();
-    let odometer = anchor
+    // The odometer reads the PLAYHEAD, not the selection (DESIGN 6): right
+    // after a split the two halves are on the bench and nothing is picked,
+    // and a readout saying `cut -/-` while the playhead sits on the new cut
+    // is an odometer that stopped turning. The selection only answers when
+    // the playhead is off every cut on its lane.
+    let frame = (position * player.active_fps()).max(0.).round() as u32;
+    let at_playhead = player.session.as_ref().and_then(|s| {
+        let lane = anchor
+            .map(|(lane, _)| lane)
+            .or_else(|| s.lanes().into_iter().find(|l| l.kind == LaneKind::Video))?;
+        Some((lane, odometer_cut(s.lane_clips(lane), frame)?))
+    });
+    let odometer = at_playhead
+        .or(anchor)
         .and_then(|(lane, idx)| {
             player
                 .session
@@ -285,7 +394,10 @@ fn contact_strip(player: &Player, position: f64, cx: &mut Context<Player>) -> im
         .id("stance-contact-strip")
         .relative()
         .flex_1()
-        .min_w(px(0.))
+        // The strip is what absorbs the band's slack, and it measured w=0 at
+        // 1280 before this: it holds a floor now and the ladder sheds groups
+        // above it instead of squeezing the map to nothing.
+        .min_w(px(STRIP_MIN_W))
         .h(px(28.))
         .cursor_pointer()
         .tooltip(|_, cx| {
@@ -570,6 +682,20 @@ fn volume_slider(player: &Player, cx: &mut Context<Player>) -> impl IntoElement 
         )
 }
 
+/// The level, written once (DESIGN 3: a number about a level is mono). It
+/// sits beside the slider that sets it -- the slider's fill and this readout
+/// are one truth in two forms, where the mute button used to wear a third.
+fn volume_readout(player: &Player) -> impl IntoElement {
+    let style = mono(type_scale::CHORD_METADATA_MAX_PX, FontWeight::MEDIUM);
+    div()
+        .flex_none()
+        .w(px(34.))
+        .font(style.font)
+        .text_size(style.size)
+        .text_color(rgb(if player.volume.muted { INK3() } else { INK2() }))
+        .child(format!("{}%", player.volume.percent()))
+}
+
 /// The whole band, left to right per MOCK-SPEC: hero timecode, ghost
 /// transport, cut readout, the contact strip filling the rest, the Export
 /// chip at the end.
@@ -579,6 +705,12 @@ pub(crate) fn render(
     cx: &mut Context<Player>,
 ) -> impl IntoElement {
     let tc = timecode(position, player.active_fps());
+    let band_w = BAND_W.with(Rc::clone);
+    // Layer decision for THIS frame, off the width the last frame measured
+    // (`width_probe` asks for a frame whenever that width changes, so a
+    // resize settles in one).
+    let layers = band_layers(f32::from(band_w.get()));
+    SHOW_CHORDS.with(|c| c.set(layers.chords));
     div()
         .id("stance-time-band-row")
         // FAULT 1 fix: this div used to be `flex_none`, which sized it to its
@@ -591,8 +723,13 @@ pub(crate) fn render(
         .h_full()
         .flex()
         .items_center()
-        .gap(px(16.))
+        // Nothing in this band may ever paint (or be clicked) outside its own
+        // column again: the Export chip used to land at x=1113 under the
+        // dock, where a click on blank dock space opened the export card.
+        .overflow_hidden()
+        .gap(px(12.))
         .px(px(12.))
+        .child(width_probe(band_w))
         // The most-read element anchors its region (DESIGN §5): the
         // timecode leads.
         .child(hero_timecode(&tc))
@@ -647,7 +784,7 @@ pub(crate) fn render(
                 .child(ghost(
                     "stance-tb-step-back",
                     player,
-                    "◀",
+                    "|◂",
                     ActionId::StepBack,
                     false,
                     cx,
@@ -655,7 +792,7 @@ pub(crate) fn render(
                 .child(ghost(
                     "stance-tb-step-forward",
                     player,
-                    "▶",
+                    "▸|",
                     ActionId::StepForward,
                     false,
                     cx,
@@ -676,36 +813,40 @@ pub(crate) fn render(
                     false,
                     cx,
                 ))
-                .child(ghost(
-                    "stance-tb-sync-prev",
-                    player,
-                    "‹|",
-                    ActionId::PrevSyncPoint,
-                    false,
-                    cx,
-                ))
-                .child(ghost(
-                    "stance-tb-sync-next",
-                    player,
-                    "|›",
-                    ActionId::NextSyncPoint,
-                    false,
-                    cx,
-                ))
+                .when(layers.sync, |el| {
+                    el.child(ghost(
+                        "stance-tb-sync-prev",
+                        player,
+                        "‹|",
+                        ActionId::PrevSyncPoint,
+                        false,
+                        cx,
+                    ))
+                    .child(ghost(
+                        "stance-tb-sync-next",
+                        player,
+                        "|›",
+                        ActionId::NextSyncPoint,
+                        false,
+                        cx,
+                    ))
+                })
                 // Loop (homeless per this task's audit): the playback-loop
                 // toggle -- burst-use during editing per the charter's own
                 // classification -- earns the transport cluster it plays
                 // alongside, not the CUT group's `LoopTrim` two files over
                 // (a different verb already drawn on the spine, "↻" taken).
                 // "∞" reads as "keeps going" without borrowing that glyph.
-                .child(ghost(
-                    "stance-tb-loop",
-                    player,
-                    "∞",
-                    ActionId::Loop,
-                    player.loop_on,
-                    cx,
-                )),
+                .when(layers.sync, |el| {
+                    el.child(ghost(
+                        "stance-tb-loop",
+                        player,
+                        "∞",
+                        ActionId::Loop,
+                        player.loop_on,
+                        cx,
+                    ))
+                }),
         )
         // The audio-monitoring cluster (homeless per this task's audit):
         // ToggleMute/VolumeUp/VolumeDown, burst-use per the charter, placed
@@ -717,7 +858,7 @@ pub(crate) fn render(
         // mute and the two ghosts flanking it nudge the level -- three
         // homeless actions sharing one cluster rather than three unrelated
         // rows.
-        .child(
+        .when(layers.volume, |el| el.child(
             div()
                 .flex_none()
                 .flex()
@@ -731,19 +872,22 @@ pub(crate) fn render(
                     false,
                     cx,
                 ))
+                // The level is NOT this button's label any more: the slider
+                // beside it already draws the same number as a fill and
+                // `volume_readout` writes it once, so wearing it here made
+                // mute a ghost with no glyph of its own (a percentage is not
+                // a verb). Speaker, struck when muted -- typographic, the
+                // same hand-drawn grammar as the glyphs around it.
                 .child(ghost(
                     "stance-tb-mute",
                     player,
-                    if player.volume.muted {
-                        format!("× {}%", player.volume.percent())
-                    } else {
-                        format!("{}%", player.volume.percent())
-                    },
+                    if player.volume.muted { "◁×" } else { "◁))" },
                     ActionId::ToggleMute,
                     player.volume.muted,
                     cx,
                 ))
                 .child(volume_slider(player, cx))
+                .child(volume_readout(player))
                 .child(ghost(
                     "stance-tb-vol-up",
                     player,
@@ -752,9 +896,9 @@ pub(crate) fn render(
                     false,
                     cx,
                 )),
-        )
-        .child(range_marks(player, cx))
-        .child(cut_readout(player))
+        ))
+        .when(layers.marks, |el| el.child(range_marks(player, cx)))
+        .child(cut_readout(player, position))
         .child(contact_strip(player, position, cx))
         .child(save_verb(player, cx))
         .child(export_chip(player, cx))
