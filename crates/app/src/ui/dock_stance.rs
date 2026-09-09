@@ -376,8 +376,20 @@ fn source_row(
                 // drag media in timeline") was the dock showing the *legacy*
                 // panel, which the darkroom bench was never wired against;
                 // this row is the darkroom's own half of that pairing.
-                .on_drag(AssetDrag(dragged.0, dragged.1), move |_, _, _, cx| {
-                    cx.new(|_| Tip(ghost.clone()))
+                .on_drag(AssetDrag(dragged.0, dragged.1), {
+                    let me = cx.entity();
+                    move |_, _, _, cx| {
+                    // A fresh gesture inherits nothing: `Player::drag_lane`
+                    // and `Player::drag_x` are the *last live sample* of the
+                    // drag being made, and a drag whose first sample lands
+                    // outside every row would otherwise be let go onto the
+                    // lane the previous one ended over.
+                    me.update(cx, |this, _| {
+                        this.drag_lane = None;
+                        this.drag_x = None;
+                    });
+                        cx.new(|_| Tip(ghost.clone()))
+                    }
                 })
         })
         .tooltip(crate::ui::widgets::tip_hover("Source", "drag to a lane", None))
@@ -675,8 +687,20 @@ fn subtitle_tab_rows(
                         .when(usable, |d| {
                             d.cursor_pointer()
                                 .hover(|s| s.bg(rgb(DARK_RAISED())))
-                                .on_drag(SubPick(track), move |_, _, _, cx| {
-                                    cx.new(|_| Tip(ghost.clone()))
+                                .on_drag(SubPick(track), {
+                                    let me = cx.entity();
+                                    move |_, _, _, cx| {
+                    // A fresh gesture inherits nothing: `Player::drag_lane`
+                    // and `Player::drag_x` are the *last live sample* of the
+                    // drag being made, and a drag whose first sample lands
+                    // outside every row would otherwise be let go onto the
+                    // lane the previous one ended over.
+                    me.update(cx, |this, _| {
+                        this.drag_lane = None;
+                        this.drag_x = None;
+                    });
+                                        cx.new(|_| Tip(ghost.clone()))
+                                    }
                                 })
                                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                                     this.sub_track = track;

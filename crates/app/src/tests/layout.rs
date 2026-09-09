@@ -3072,7 +3072,7 @@ fn the_bench_seam_stops_at_its_floor_and_its_ceiling() {
 /// DESIGN §7: "lanes scroll behind the pinned ruler and track heads" -- pinned
 /// means pinned. A clip that starts left of the view sits at a negative `left`
 /// inside its bed, and with no clip mask gpui paints it (and its hitbox) over
-/// the 72 px head column, so V1/A1 and their verbs disappear under the first
+/// the `HEAD_W` px head column, so V1/A1 and their verbs disappear under the first
 /// take as soon as the bench is wheeled past frame 0. The mask belongs on the
 /// bed itself so a half-scrolled clip still drags on the half that shows.
 #[test]

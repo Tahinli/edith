@@ -615,7 +615,14 @@ fn bench(
         // the bench is the selection one a picked clip draws (DESIGN §2/§4).
         .flex()
         .flex_col()
-        .px(px(12.))
+        // The 12px side gutter is spent INSIDE `bench_stance`'s own content
+        // box, not here: gpui fires `on_drop` only on an element whose own
+        // hitbox holds the pointer (`div.rs:2089`), and padding on this
+        // parent left the gutter outside every registered target -- a clip
+        // let go at x < 12, hard against the left edge where a hand aiming
+        // at frame 0 puts it, reached nothing at all and moved nothing,
+        // silently (DESIGN §8: a release that has aimed has made an edit).
+        // Same box, same pixels; only the catch-all's bounds grow.
         .py(px(4.))
         .child(bench_stance::render(player, bench_h - BENCH_CHROME_H, cx))
 }
