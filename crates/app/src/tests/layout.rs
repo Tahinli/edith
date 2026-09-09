@@ -3376,7 +3376,7 @@ fn the_export_section_is_four_rows_and_no_fifth() {
     );
     // Every row wears its chord (DESIGN §4): three keyed rows plus the
     // range's own marks, which are keymap actions.
-    for chord in ["\"c\"", "\"b\"", "\"e\"", "ActionId::SetIn"] {
+    for chord in ["\"c\"", "\"b\"", "\"g\"", "ActionId::SetIn"] {
         assert!(body.contains(chord), "an EXPORT row lost its chord {chord}");
     }
 }
