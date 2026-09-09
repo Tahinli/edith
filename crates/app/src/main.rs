@@ -333,6 +333,14 @@ struct Player {
     /// by one stroke ([`ActionId::ToggleSnap`]) for the frame-by-frame placement
     /// no magnet may take away.
     snap: bool,
+    /// Whether `alt` was down on the last sample of the gesture in flight:
+    /// snapping off for *this* drag only, the override every NLE has for the
+    /// one clip that has to sit a frame off an edge, leaving [`Player::snap`]
+    /// -- the switch -- exactly as the hand left it. Read by
+    /// [`Player::snap_live`], written by the bench's own drag samples and by
+    /// the trim's, and stale between gestures, which costs nothing: every
+    /// gesture writes it before it asks.
+    drag_alt: bool,
     /// Whether the subtitle lanes draw at all -- the mute over the shown lane
     /// ([`Player::sub_lane`]), not a lane of its own. On by default and off by
     /// one stroke
@@ -398,6 +406,12 @@ struct Player {
     /// the pointer is not guaranteed to answer what the ghost just showed
     /// (DESIGN: "drop == shadow, by construction"). `None` between drags.
     drag_x: Option<Pixels>,
+    /// The lane the last live sample of the drag in flight was over -- the one
+    /// a release off the rows themselves (left of the heads, between two rows,
+    /// below the last track) lands on, so a gesture that has already promised a
+    /// landing in the shadow cannot end in nothing. `None` before the pointer
+    /// has been over any lane, where there is no landing to promise.
+    drag_lane: Option<Lane>,
     /// The slot a track header being dragged is about to drop into, or `None`
     /// while the pointer is over no lane: the line drawn between two headers,
     /// for the reason [`Player::ghost`] draws a shadow -- where a gesture lands
@@ -935,6 +949,7 @@ fn main() {
                     fade_drag: None,
                     grab: 0,
                     snap: true,
+                    drag_alt: false,
                     subs_on: true,
                     sub_track: 0,
                     sub_folded: HashSet::new(),
@@ -942,6 +957,7 @@ fn main() {
                     snap_cue: None,
                     ghost: Vec::new(),
                     drag_x: None,
+                    drag_lane: None,
                     lane_drop: None,
                     last_scrub: Instant::now(),
                     last_target: 0,

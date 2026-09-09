@@ -399,6 +399,10 @@ impl Player {
                     self.selected.clear();
                 }
                 self.reset_after_reseek();
+                // The strip names the edit that just happened: a move that
+                // lands silently leaves the last word (`SPLIT`) standing, and
+                // an editor reads that as the drag having done nothing.
+                self.notify_user("MOVED".into());
             }
             // The three ways a drag is refused, told apart by what the
             // front-end already knows: a lane's kind, and where the clip was.
@@ -431,6 +435,9 @@ impl Player {
                 .into(),
             ),
         }
+        // The gesture is over: the lane it ended over is nobody's answer any
+        // more (`Player::drag_lane`, read by `bench-content`'s catch-all).
+        self.drag_lane = None;
         cx.notify();
     }
 
@@ -751,7 +758,7 @@ impl Player {
             self.frame_under(x),
             self.grab,
             sub.frames,
-            self.snap,
+            self.snap_live(),
             self.drop_snap_frames(),
             &marks,
         )
@@ -802,7 +809,7 @@ impl Player {
     /// Where a clip let go at window `x` over lane `to` wants its head: the
     /// frame under the pointer, less however far into the box the hand grabbed
     /// it (so the clip does not jump under the pointer), pulled onto a
-    /// neighbouring edge when it lands within [`SNAP_PX`] of one. `None` when
+    /// neighbouring edge when it lands within [`Player::drop_snap_frames`] of one. `None` when
     /// there is no such clip to move. The engine has the last word on where it
     /// may actually go -- this is the ask, not the answer.
     ///
@@ -824,7 +831,7 @@ impl Player {
             self.frame_under(x),
             self.grab,
             clip.frames(),
-            self.snap,
+            self.snap_live(),
             self.drop_snap_frames(),
             &marks,
         ))
@@ -841,7 +848,7 @@ impl Player {
             self.frame_under(x),
             0,
             0,
-            self.snap,
+            self.snap_live(),
             self.drop_snap_frames(),
             &marks,
         )
@@ -887,12 +894,49 @@ impl Player {
             self.set_ghost(Vec::new(), cx);
             return;
         };
+        // What the release would refuse: a lane of the other kind, and a head
+        // let go on top of a take already there ([`Project::move_selection`]
+        // changes nothing rather than overwrite one). Drawn as refused so a
+        // drop that will not happen is seen before the hand lets go, never as a
+        // silent no-op. The neighbours are the destination lane's clips less
+        // whatever travels with this one -- itself and its link group.
+        let neighbours: Vec<(u32, u32)> = self
+            .session
+            .as_ref()
+            .map(|session| {
+                session
+                    .lane_clips(to)
+                    .iter()
+                    .enumerate()
+                    .filter(|&(i, clip)| {
+                        (to, i) != (drag.lane, idx)
+                            && !(clip.link.is_some() && clip.link == drag.clip.link)
+                    })
+                    .map(|(_, clip)| (clip.start, clip.end()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        // Staying on its own lane, the engine clamps the travel into the gap
+        // the clip sits in rather than refusing it, so the shadow rests where
+        // the release will: flush against the take it was dragged into. Landing
+        // on *another* lane it clamps too ([`cross_room`], the engine's own
+        // `move_room` rule) and refuses only a head let go *inside* a take or a
+        // gap too narrow to hold the clip -- the shadow says so before the hand
+        // lets go, and never claims a refusal the release would not make.
+        let len = drag.clip.frames();
+        let (start, refused) = match to == drag.lane {
+            true => (gap_clamp(drag.clip.start, len, start, &neighbours), false),
+            false => match cross_room(start, len, &neighbours) {
+                Some(landed) => (landed, false),
+                None => (start, true),
+            },
+        };
         let anchor = Ghost {
             lane: to,
             start,
-            frames: drag.clip.frames(),
+            frames: len,
             tint: self.clip_tint(drag.clip.source),
-            refused: drag.lane.kind != to.kind,
+            refused: drag.lane.kind != to.kind || refused,
         };
         let mut ghosts = vec![anchor];
         if self.selected.contains((drag.lane, idx)) && self.selected.len() > 1 {
@@ -1046,13 +1090,13 @@ impl Player {
             .flatten()
         });
         let skip = skip.and_then(|(lane, idx)| Some((lanes.iter().position(|&l| l == lane)?, idx)));
-        snap_marks(&clips, skip, skip_link, frame_at(session.now(), self.fps))
-    }
-
-    /// Where a gesture at `raw` lands and the mark that pulled it there, with
-    /// the switch honoured: snapping off, nothing moves and no line is drawn.
-    pub(crate) fn snap_to(&self, raw: u32, len: u32, marks: &[u32]) -> (u32, Option<u32>) {
-        snap_cue(self.snap, raw, len, self.snap_frames(), marks)
+        snap_marks(
+            &clips,
+            skip,
+            skip_link,
+            frame_at(session.now(), self.fps),
+            self.range,
+        )
     }
 
     /// Every timeline frame that is a *source* sync point: each clip's own
@@ -1145,9 +1189,21 @@ impl Player {
         }
     }
 
-    /// [`SNAP_PX`] in timeline frames at the scale the bed is drawn at: the bed's
-    /// own width drops out of it, since a pixel is now worth the same stretch of
-    /// timeline wherever the view sits.
+    /// Whether the magnet is on for the gesture happening *now*: the switch
+    /// ([`Player::snap`]) unless `alt` is held ([`Player::drag_alt`]), which
+    /// turns it off for this drag or trim alone -- the temporary override
+    /// Resolve, Premiere and Final Cut all put on the same key. The switch is
+    /// not touched, so the stroke that follows the drag finds it where it was.
+    /// Every landing on this timeline asks it, so the shadow, the line and the
+    /// drop can never disagree about whether a magnet was on.
+    pub(crate) fn snap_live(&self) -> bool {
+        snap_live(self.snap, self.drag_alt)
+    }
+
+    /// [`SNAP_PX`] in timeline frames at the scale the bed is drawn at: the
+    /// bed's own width drops out of it, since a pixel is now worth the same
+    /// stretch of timeline wherever the view sits. The edge trims' magnet --
+    /// a drop asks [`Player::drop_snap_frames`].
     pub(crate) fn snap_frames(&self) -> u32 {
         self.scale.snap_frames(self.fps)
     }
@@ -1448,7 +1504,16 @@ impl Player {
         // The edge is pulled onto the same marks a whole clip is, by itself:
         // there is no other end travelling with it, so it snaps at length zero.
         let marks = self.snap_targets(Some((trim.lane, trim.idx)));
-        let (at, cue) = self.snap_to(self.frame_under(x), 0, &marks);
+        // The same 10 px of aim a drop is given ([`DROP_SNAP_PX`]): one
+        // threshold for every gesture on this bed, so an edge and a whole clip
+        // grip a cut at the same distance from it.
+        let (at, cue) = snap_cue(
+            self.snap_live(),
+            self.frame_under(x),
+            0,
+            self.drop_snap_frames(),
+            &marks,
+        );
         let Some((lo, hi)) = self.session.as_ref().and_then(|session| {
             match trim.lane.kind == LaneKind::Subtitle {
                 // The walls a caption's edge has -- its neighbour, its own
@@ -2005,7 +2070,10 @@ impl Player {
         // outside the window, still owing its one edit.
         if self.trim.is_some() {
             match event.pressed_button {
-                Some(MouseButton::Left) => self.trim_to(event.position.x, cx),
+                Some(MouseButton::Left) => {
+                    self.drag_alt = event.modifiers.alt;
+                    self.trim_to(event.position.x, cx);
+                }
                 _ => self.commit_trim(cx),
             }
             return;
@@ -2131,6 +2199,7 @@ impl Player {
         if self.trim.is_some() {
             // The release lands exactly, then the gesture is
             // written once -- one edit, one undo step.
+            self.drag_alt = event.modifiers.alt;
             self.trim_to(event.position.x, cx);
             self.commit_trim(cx);
             return;

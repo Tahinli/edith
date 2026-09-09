@@ -583,6 +583,7 @@ pub(crate) fn snap_marks(
     skip: Option<(usize, usize)>,
     skip_link: Option<u32>,
     playhead: u32,
+    range: Option<(u32, u32)>,
 ) -> Vec<u32> {
     let mut marks: Vec<u32> = lanes
         .iter()
@@ -599,6 +600,13 @@ pub(crate) fn snap_marks(
         .collect();
     marks.push(playhead);
     marks.push(0);
+    // The in and out points ([`Player::range`]): a hand that has marked a
+    // stretch is working to it, and a clip meets its brackets as readily as it
+    // meets a cut.
+    if let Some((in_, out)) = range {
+        marks.push(in_);
+        marks.push(out);
+    }
     marks
 }
 
@@ -626,6 +634,15 @@ pub(crate) fn snap_cue(
     (start, mark)
 }
 
+/// Whether the magnet is on for the gesture in flight: the switch, unless
+/// `alt` is held -- the temporary override Resolve, Premiere and Final Cut all
+/// put on that key, off for this one drag and leaving the switch where the hand
+/// left it. [`Player::snap_live`]'s whole rule, here so it can be read without
+/// a window.
+pub(crate) fn snap_live(on: bool, alt: bool) -> bool {
+    on && !alt
+}
+
 /// Where a drag lands and the mark that pulled it there: the frame under the
 /// pointer, less however far into the box the hand grabbed it (so a clip travels
 /// with the pointer rather than jumping its head under it), snapped by
@@ -642,6 +659,70 @@ pub(crate) fn landing(
     marks: &[u32],
 ) -> (u32, Option<u32>) {
     snap_cue(on, under.saturating_sub(grab), len, tol, marks)
+}
+
+/// Where a clip `len` frames long, let go over *another* lane with its head
+/// asked at `at`, really comes to rest -- `None` when the engine refuses the
+/// drop outright. A mirror of [`Project::move_room`]: the release is refused
+/// only when the asked head sits *inside* a take already there (a clamp has no
+/// answer for that), or when the gap it names is narrower than the clip;
+/// otherwise the head is clamped into that gap exactly as a same-lane move is
+/// ([`gap_clamp`]). `others` is `(start, end)` of every clip already on the
+/// destination lane, less the ones travelling with this one.
+///
+/// The shadow reads this, so a landing the release *will* make is never drawn
+/// as refused -- a whole-span overlap test refuses far more than the engine
+/// does, and a shadow that lies about a refusal reads as a broken timeline.
+pub(crate) fn cross_room(at: u32, len: u32, others: &[(u32, u32)]) -> Option<u32> {
+    let (mut lo, mut hi) = (0, u32::MAX);
+    for &(other_start, other_end) in others {
+        if other_start <= at && at < other_end {
+            return None;
+        }
+        match other_end <= at {
+            true => lo = lo.max(other_end),
+            false => hi = hi.min(other_start),
+        }
+    }
+    match hi - lo < len {
+        true => None,
+        false => Some(at.clamp(lo, hi - len)),
+    }
+}
+
+/// Where a clip staying on its own lane really comes to rest: `want`, clamped
+/// into the gap it is sitting in -- the take behind it and the take in front of
+/// it are walls ([`Project::move_selection`] clamps the delta by exactly these,
+/// it does not refuse), so a clip dragged hard left past its neighbour lands
+/// flush against that neighbour's tail rather than nowhere. `now` is its head
+/// today, which is what names the gap. The shadow reads this, so the box drawn
+/// in flight is the box the release leaves behind.
+pub(crate) fn gap_clamp(now: u32, len: u32, want: u32, others: &[(u32, u32)]) -> u32 {
+    let lo = others
+        .iter()
+        .filter(|&&(_, end)| end <= now)
+        .map(|&(_, end)| end)
+        .max()
+        .unwrap_or(0);
+    let hi = others
+        .iter()
+        .filter(|&&(start, _)| start >= now.saturating_add(len))
+        .map(|&(start, _)| start)
+        .min()
+        .unwrap_or(u32::MAX);
+    want.clamp(lo, hi.saturating_sub(len).max(lo))
+}
+
+/// The lane a release lands on when the pointer is off the rows themselves:
+/// the row under it while its kind can hold what is in the hand, and otherwise
+/// the last one that could -- a picture clip carried down across A1 on its way
+/// to the empty bench below is still aiming at V1. [`Player::drag_lane`]'s
+/// whole rule.
+pub(crate) fn held_lane(prev: Option<Lane>, over: Lane, from: Lane) -> Option<Lane> {
+    match over.kind == from.kind {
+        true => Some(over),
+        false => prev,
+    }
 }
 
 /// Why this file may not go on that lane, in the words the refusal is told in --
@@ -697,7 +778,7 @@ mod drop_landing_tests {
     /// missing mark.
     #[test]
     fn a_pull_near_the_head_of_an_empty_timeline_snaps_to_frame_0() {
-        let marks = snap_marks(&[&[]], None, None, 0);
+        let marks = snap_marks(&[&[]], None, None, 0, None);
         assert!(marks.contains(&0), "an empty timeline still offers frame 0");
         assert_eq!(snapped(4, 0, 10, &marks), 0);
         // Outside the tolerance, the raw ask stands: this is a magnet, not a
@@ -719,8 +800,162 @@ mod drop_landing_tests {
     /// where the timeline is parked.
     #[test]
     fn a_pull_near_the_playhead_snaps_onto_it() {
-        let marks = snap_marks(&[&[]], None, None, 500);
+        let marks = snap_marks(&[&[]], None, None, 500, None);
         assert!(marks.contains(&500));
         assert_eq!(snapped(493, 0, 10, &marks), 500);
+    }
+
+    /// The user's own repro: a clip dragged left through the lane-head column
+    /// -- window x *left of the bed* -- lands on frame 0 rather than nowhere.
+    /// Two clamps do it, and both are on the path the bench now takes for a
+    /// drop over the head ([`Player::frame_under`]): [`px_along`] pins an x
+    /// before the bed's left edge to 0 px, [`Scale::time_at`] pins the moment
+    /// to 0 s, and the grab offset comes off with a saturating subtraction, so
+    /// even a clip held by its tail cannot ask for a negative frame.
+    #[test]
+    fn a_drag_out_over_the_lane_head_lands_on_frame_0() {
+        let bed = Bounds {
+            origin: point(px(100.), px(0.)),
+            size: size(px(900.), px(60.)),
+        };
+        let scale = Scale::default();
+        // 40 px into the head column, and off the window entirely.
+        for x in [px(60.), px(-400.)] {
+            assert_eq!(px_along(x, bed), 0.);
+            let under = frame_at(scale.time_at(px_along(x, bed)), 25.);
+            assert_eq!(under, 0);
+            // Grabbed 30 frames into the box: still frame 0, never a refusal.
+            assert_eq!(landing(under, 30, 50, true, 10, &[0, 300]), (0, Some(0)));
+        }
+    }
+
+    /// Both edges of the clip in the hand are candidates and the nearest one
+    /// wins: a tail 2 frames short of a neighbour's head beats a head 8 frames
+    /// from the timeline's start.
+    #[test]
+    fn the_nearer_of_the_two_edges_wins() {
+        let marks = [0, 300, 500];
+        // len 292: the tail wants 300 (2 away), the head 0 (8 away).
+        // The tail already sits exactly on 300, so the head is left alone.
+        assert_eq!(snapped(8, 292, 10, &marks), 8);
+        assert_eq!(snapped(6, 292, 10, &marks), 8, "tail meets 300, head stays");
+    }
+
+    /// The threshold is a distance on *screen*: the same 10 px of aim at two
+    /// zooms is a different number of frames, which is what makes the magnet
+    /// feel identical zoomed in and zoomed out ([`Scale::drop_snap_frames`]).
+    /// Outside it the drag follows the pointer exactly.
+    #[test]
+    fn the_threshold_is_ten_pixels_at_any_zoom() {
+        let fps = 25.;
+        for pps in [50., 400.] {
+            let scale = Scale { pps, start: 0. };
+            let tol = scale.drop_snap_frames(fps);
+            // 10 px worth of frames, and one frame more than that is not near.
+            let near = (DROP_SNAP_PX / pps * fps) as u32;
+            assert_eq!(tol, near);
+            assert_eq!(snapped(500 + tol, 0, tol, &[500]), 500);
+            assert_eq!(
+                snapped(500 + tol + 1, 0, tol, &[500]),
+                500 + tol + 1,
+                "past the window the pointer is obeyed exactly"
+            );
+        }
+    }
+
+    /// `alt` held turns the magnet off for the gesture and nothing else: the
+    /// same raw ask, no line, and [`Player::snap`] itself untouched.
+    #[test]
+    fn alt_turns_the_magnet_off_for_this_drag_only() {
+        let on = true;
+        assert!(snap_live(on, false));
+        assert!(!snap_live(on, true));
+        let marks = [0, 300];
+        assert_eq!(
+            snap_cue(snap_live(on, true), 297, 0, 10, &marks),
+            (297, None)
+        );
+        assert_eq!(snap_cue(snap_live(on, false), 297, 0, 10, &marks), (300, Some(300)));
+        // The switch off stays off however the modifier is held.
+        assert!(!snap_live(false, false));
+    }
+
+    /// Every target an NLE offers is on the list: frame 0, the playhead, both
+    /// edges of every clip on *every* lane, and the in/out brackets.
+    #[test]
+    fn the_targets_are_zero_the_playhead_the_edges_and_the_marks() {
+        let clip = |start: u32, frames: u32| Clip {
+            fade_in: 0,
+            fade_out: 0,
+            transition_out: 0,
+            start,
+            in_frame: 0,
+            out_frame: frames,
+            source: 0,
+            link: None,
+            eq: None,
+            color: None,
+            transform: None,
+            fit: Default::default(),
+            speed: Default::default(),
+        };
+        let v1 = [clip(100, 50), clip(400, 50)];
+        let a1 = [clip(700, 20)];
+        let marks = snap_marks(&[&v1, &a1], None, None, 900, Some((250, 600)));
+        for want in [0, 900, 100, 150, 400, 450, 700, 720, 250, 600] {
+            assert!(marks.contains(&want), "{want} is not a snap target");
+        }
+        // And each of them actually pulls a drag onto itself.
+        for target in [0, 250, 600, 900] {
+            assert_eq!(snapped(target + 4, 0, 10, &marks), target);
+        }
+    }
+
+    /// A release on the empty bench below the last row, or left of the heads,
+    /// lands on the lane the last live sample was over -- and a lane of the
+    /// wrong kind crossed on the way down never steals it.
+    #[test]
+    fn the_last_lane_that_could_hold_it_keeps_the_drag() {
+        let v1 = Lane::V1;
+        let v2 = Lane::new(LaneKind::Video, 1);
+        let a1 = Lane::A1;
+        // The head column is part of the row, so the row over it is the answer.
+        assert_eq!(held_lane(None, v1, v1), Some(v1));
+        assert_eq!(held_lane(Some(v1), v2, v1), Some(v2));
+        assert_eq!(held_lane(Some(v2), a1, v1), Some(v2), "audio cannot hold it");
+        // Nothing promised yet and nothing that can hold it: no landing.
+        assert_eq!(held_lane(None, a1, v1), None);
+    }
+
+    /// A clip dragged hard left past the take in front of it comes to rest
+    /// flush against that take -- the walls of its own gap, which is what the
+    /// engine clamps the drag by -- and one dragged off the head of the
+    /// timeline rests on frame 0.
+    #[test]
+    fn a_drag_past_a_neighbour_rests_flush_against_it() {
+        let others = [(0, 375), (900, 1000)];
+        assert_eq!(gap_clamp(375, 500, 0, &others), 375, "flush with its tail");
+        assert_eq!(gap_clamp(375, 500, 380, &others), 380, "room to spare");
+        assert_eq!(gap_clamp(375, 500, 800, &others), 400, "flush with the next");
+        // An empty lane clamps at the head of the timeline and nowhere else.
+        assert_eq!(gap_clamp(500, 100, 0, &[]), 0);
+        assert_eq!(gap_clamp(500, 100, 9_000, &[]), 9_000);
+    }
+
+    /// The cross-lane shadow's rule, mirroring the engine: refused only when
+    /// the asked head is inside a take or the gap is too narrow, and otherwise
+    /// clamped into the gap rather than refused. The middle case is the
+    /// verifier's repro -- an obstacle at (360, 420), a 90-frame clip asked at
+    /// 315, which the engine lands at 270.
+    #[test]
+    fn a_cross_lane_landing_clamps_into_the_gap_the_engine_leaves() {
+        let others = [(360, 420)];
+        assert_eq!(cross_room(315, 90, &others), Some(270), "clamped, not refused");
+        assert_eq!(cross_room(380, 90, &others), None, "head inside the take");
+        assert_eq!(cross_room(100, 90, &others), Some(100), "room to spare");
+        let tight = [(0, 100), (150, 300)];
+        assert_eq!(cross_room(120, 90, &tight), None, "the gap is 50 frames wide");
+        assert_eq!(cross_room(120, 50, &tight), Some(100), "and holds a 50-frame clip");
+        assert_eq!(cross_room(500, 90, &[]), Some(500), "an empty lane takes it as asked");
     }
 }

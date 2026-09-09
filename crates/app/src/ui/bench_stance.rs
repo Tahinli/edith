@@ -328,7 +328,19 @@ fn clip_box(
             },
             {
                 let ghost = ghost.clone();
-                move |_, _, _, cx| cx.new(|_| Tip(ghost.clone()))
+                let me = cx.entity();
+                move |_, _, _, cx| {
+                    // A fresh gesture inherits nothing: `Player::drag_lane`
+                    // and `Player::drag_x` are the *last live sample* of the
+                    // drag being made, and a drag whose first sample lands
+                    // outside every row would otherwise be let go onto the
+                    // lane the previous one ended over.
+                    me.update(cx, |this, _| {
+                        this.drag_lane = None;
+                        this.drag_x = None;
+                    });
+                    cx.new(|_| Tip(ghost.clone()))
+                }
             },
         )
         .tooltip(crate::ui::widgets::tip_hover("Clip", "drag to move", None))
@@ -717,7 +729,19 @@ fn sub_box(
             },
             {
                 let ghost = ghost.clone();
-                move |_, _, _, cx| cx.new(|_| Tip(ghost.clone()))
+                let me = cx.entity();
+                move |_, _, _, cx| {
+                    // A fresh gesture inherits nothing: `Player::drag_lane`
+                    // and `Player::drag_x` are the *last live sample* of the
+                    // drag being made, and a drag whose first sample lands
+                    // outside every row would otherwise be let go onto the
+                    // lane the previous one ended over.
+                    me.update(cx, |this, _| {
+                        this.drag_lane = None;
+                        this.drag_x = None;
+                    });
+                    cx.new(|_| Tip(ghost.clone()))
+                }
             },
         )
         .tooltip(crate::ui::widgets::tip_hover("Subtitle", "drag to move", None))
@@ -877,6 +901,116 @@ fn lane_row(
                 this.preview_lane_drop(event.drag(cx).0, lane, cx);
             }),
         )
+        .drag_over::<AssetDrag>(|d, _, _, _| d.bg(rgb(DARK_RAISED())))
+        .on_drop(cx.listener(move |this, drag: &AssetDrag, window, cx| {
+            this.drag_alt = window.modifiers().alt;
+            let x = this
+                .drag_x
+                .take()
+                .unwrap_or_else(|| window.mouse_position().x);
+            let at = this.place_frame(x).0;
+            this.insert_source(&drag.0.clone(), drag.1, Some(lane), Some(at), cx)
+        }))
+        // The landing shadow (`Player::preview_ghost_asset`, the same
+        // setter `ui/timeline.rs`'s own bed calls) -- guarded on the
+        // pointer actually being inside this *row's* bounds, since
+        // `on_drag_move` fires on every painted element of the drag's
+        // type, not just the one under the pointer. The row and not the
+        // bed: the head column is `HEAD_W` px of this lane too, and a clip
+        // dragged out over it is aiming at frame 0 -- the drop it used to
+        // fall through (nothing under the pointer answered `ClipDrag`) is
+        // the "I have to be pixel perfect to snap to 0" complaint.
+        // `Player::frame_under` clamps an x left of the bed to the head of
+        // the view (`px_along`), so the head column reads as frame 0.
+        .on_drag_move(
+            cx.listener(move |this, event: &DragMoveEvent<AssetDrag>, _, cx| {
+                if !event.bounds.contains(&event.event.position) {
+                    return;
+                }
+                let path = event.drag(cx).0.clone();
+                this.drag_x = Some(event.event.position.x);
+                // The row the catch-all release below aims at. A file's own
+                // kind is not known until the engine has placed it, so the
+                // last row hovered is the answer and `Player::insert_source`
+                // words the refusal if it cannot hold this file.
+                this.drag_lane = Some(lane);
+                this.drag_alt = event.event.modifiers.alt;
+                this.preview_ghost_asset(&path, lane, event.event.position.x, cx);
+            }),
+        )
+        .drag_over::<ClipDrag>(|d, _, _, _| d.bg(rgb(DARK_RAISED())))
+        .on_drop(cx.listener(move |this, drag: &ClipDrag, window, cx| {
+            this.drag_alt = window.modifiers().alt;
+            let Some(idx) = this.dragged(drag) else {
+                return;
+            };
+            let x = this
+                .drag_x
+                .take()
+                .unwrap_or_else(|| window.mouse_position().x);
+            this.move_clip(drag.lane, idx, lane, x, cx)
+        }))
+        .on_drag_move(
+            cx.listener(move |this, event: &DragMoveEvent<ClipDrag>, _, cx| {
+                if !event.bounds.contains(&event.event.position) {
+                    return;
+                }
+                let drag = *event.drag(cx);
+                this.drag_x = Some(event.event.position.x);
+                // The last lane this clip could actually land on: a picture
+                // clip dragged down across A1 on its way to the empty bench
+                // below is still aiming at V1, and the catch-all release must
+                // not hand it the audio lane that refused it on the way past.
+                this.drag_lane = held_lane(this.drag_lane, lane, drag.lane);
+                this.drag_alt = event.event.modifiers.alt;
+                this.preview_ghost(&drag, lane, event.event.position.x, cx);
+            }),
+        )
+        // A caption already on a lane moves along it, or onto another
+        // subtitle track, exactly as a clip does (`Player::move_sub`,
+        // the same call `ui/timeline.rs`'s own bed makes).
+        .drag_over::<SubDrag>(|d, _, _, _| d.bg(rgb(DARK_RAISED())))
+        .on_drop(cx.listener(move |this, drag: &SubDrag, window, cx| {
+            this.drag_alt = window.modifiers().alt;
+            let x = this
+                .drag_x
+                .take()
+                .unwrap_or_else(|| window.mouse_position().x);
+            this.move_sub(drag, lane, x, cx);
+        }))
+        .on_drag_move(
+            cx.listener(move |this, event: &DragMoveEvent<SubDrag>, _, cx| {
+                if !event.bounds.contains(&event.event.position) {
+                    return;
+                }
+                let drag = *event.drag(cx);
+                this.drag_x = Some(event.event.position.x);
+                this.drag_lane = held_lane(this.drag_lane, lane, drag.lane);
+                this.drag_alt = event.event.modifiers.alt;
+                this.preview_ghost_sub(&drag, lane, event.event.position.x, cx);
+            }),
+        )
+        .drag_over::<SubPick>(|d, _, _, _| d.bg(rgb(DARK_RAISED())))
+        .on_drop(cx.listener(move |this, drag: &SubPick, window, cx| {
+            this.drag_alt = window.modifiers().alt;
+            let x = this
+                .drag_x
+                .take()
+                .unwrap_or_else(|| window.mouse_position().x);
+            this.place_sub(drag.0, lane, x, cx);
+        }))
+        .on_drag_move(
+            cx.listener(move |this, event: &DragMoveEvent<SubPick>, _, cx| {
+                if !event.bounds.contains(&event.event.position) {
+                    return;
+                }
+                let track = event.drag(cx).0;
+                this.drag_x = Some(event.event.position.x);
+                this.drag_lane = Some(lane);
+                this.drag_alt = event.event.modifiers.alt;
+                this.preview_ghost_pick(track, lane, event.event.position.x, cx);
+            }),
+        )
         .child(
             // Pinned track head: its drag handle remains the lane label; verbs
             // stay separate pointer targets so a mix/remove click never starts
@@ -993,7 +1127,7 @@ fn lane_row(
                 // DESIGN Â§7: the lanes scroll BEHIND the pinned heads. A
                 // clip whose start is left of the view sits at a negative
                 // `left`, and without a clip mask gpui paints it -- and its
-                // hitbox -- straight over the 72px head column, so V1/A1 and
+                // hitbox -- straight over the `HEAD_W` px head column, so V1/A1 and
                 // their verbs vanish under it. The mask cuts painting and
                 // hit-testing at the bed's own edges together, so the visible
                 // half of a half-scrolled clip still drags and trims and the
@@ -1019,15 +1153,6 @@ fn lane_row(
                         .h_full()
                         .bg(rgba(DARK_SEAM())),
                 )
-                .drag_over::<AssetDrag>(|d, _, _, _| d.bg(rgb(DARK_RAISED())))
-                .on_drop(cx.listener(move |this, drag: &AssetDrag, window, cx| {
-                    let x = this
-                        .drag_x
-                        .take()
-                        .unwrap_or_else(|| window.mouse_position().x);
-                    let at = this.place_frame(x).0;
-                    this.insert_source(&drag.0.clone(), drag.1, Some(lane), Some(at), cx)
-                }))
                 // Right-click on empty bed space: the "Close Gap" door. A
                 // clip's own right-click handler (`clip_box`/`sub_box`) never
                 // stops propagation, so this fires on that press too --
@@ -1058,81 +1183,6 @@ fn lane_row(
                             // is the bench itself (DESIGN §9).
                             None => this.open_bench_menu(event.position, cx),
                         }
-                    }),
-                )
-                // The landing shadow (`Player::preview_ghost_asset`, the same
-                // setter `ui/timeline.rs`'s own bed calls) -- guarded on the
-                // pointer actually being inside this bed's own bounds, since
-                // `on_drag_move` fires on every painted element of the drag's
-                // type, not just the one under the pointer.
-                .on_drag_move(
-                    cx.listener(move |this, event: &DragMoveEvent<AssetDrag>, _, cx| {
-                        if !event.bounds.contains(&event.event.position) {
-                            return;
-                        }
-                        let path = event.drag(cx).0.clone();
-                        this.drag_x = Some(event.event.position.x);
-                        this.preview_ghost_asset(&path, lane, event.event.position.x, cx);
-                    }),
-                )
-                .drag_over::<ClipDrag>(|d, _, _, _| d.bg(rgb(DARK_RAISED())))
-                .on_drop(cx.listener(move |this, drag: &ClipDrag, window, cx| {
-                    let Some(idx) = this.dragged(drag) else {
-                        return;
-                    };
-                    let x = this
-                        .drag_x
-                        .take()
-                        .unwrap_or_else(|| window.mouse_position().x);
-                    this.move_clip(drag.lane, idx, lane, x, cx)
-                }))
-                .on_drag_move(
-                    cx.listener(move |this, event: &DragMoveEvent<ClipDrag>, _, cx| {
-                        if !event.bounds.contains(&event.event.position) {
-                            return;
-                        }
-                        let drag = *event.drag(cx);
-                        this.drag_x = Some(event.event.position.x);
-                        this.preview_ghost(&drag, lane, event.event.position.x, cx);
-                    }),
-                )
-                // A caption already on a lane moves along it, or onto another
-                // subtitle track, exactly as a clip does (`Player::move_sub`,
-                // the same call `ui/timeline.rs`'s own bed makes).
-                .drag_over::<SubDrag>(|d, _, _, _| d.bg(rgb(DARK_RAISED())))
-                .on_drop(cx.listener(move |this, drag: &SubDrag, window, cx| {
-                    let x = this
-                        .drag_x
-                        .take()
-                        .unwrap_or_else(|| window.mouse_position().x);
-                    this.move_sub(drag, lane, x, cx);
-                }))
-                .on_drag_move(
-                    cx.listener(move |this, event: &DragMoveEvent<SubDrag>, _, cx| {
-                        if !event.bounds.contains(&event.event.position) {
-                            return;
-                        }
-                        let drag = *event.drag(cx);
-                        this.drag_x = Some(event.event.position.x);
-                        this.preview_ghost_sub(&drag, lane, event.event.position.x, cx);
-                    }),
-                )
-                .drag_over::<SubPick>(|d, _, _, _| d.bg(rgb(DARK_RAISED())))
-                .on_drop(cx.listener(move |this, drag: &SubPick, window, cx| {
-                    let x = this
-                        .drag_x
-                        .take()
-                        .unwrap_or_else(|| window.mouse_position().x);
-                    this.place_sub(drag.0, lane, x, cx);
-                }))
-                .on_drag_move(
-                    cx.listener(move |this, event: &DragMoveEvent<SubPick>, _, cx| {
-                        if !event.bounds.contains(&event.event.position) {
-                            return;
-                        }
-                        let track = event.drag(cx).0;
-                        this.drag_x = Some(event.event.position.x);
-                        this.preview_ghost_pick(track, lane, event.event.position.x, cx);
                     }),
                 )
                 .tooltip(crate::ui::widgets::tip_hover("Lane bed", "drop media here", None))
@@ -1210,6 +1260,9 @@ fn lane_row(
 
 /// The bench's content: pinned ruler, pinned heads, lane stack -- compressed
 /// evenly to [`LANES_COMPRESS`] rows and then scrolling (DESIGN §7).
+/// The bench's side gutter, spent inside [`render`]'s own content box.
+const BENCH_GUTTER: f32 = 12.;
+
 pub(crate) fn render(
     player: &mut Player,
     box_h: f32,
@@ -1272,6 +1325,72 @@ pub(crate) fn render(
         // stops propagation, so a notch over a track never reaches this.
         .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
             this.timeline_wheel(event, cx);
+        }))
+        // The bench's side gutter, spent here rather than by the `bench` div
+        // above, so this element's bounds -- and the catch-all release below
+        // with them -- reach the window edge (note at `ui::stance::bench`).
+        .px(px(BENCH_GUTTER))
+        // The catch-all release: a clip let go of anywhere on the bench that is
+        // not a lane row -- left of the tracks, in the gap between two rows, on
+        // the empty bench below the last one -- lands on the lane and the x the
+        // last live sample of that same drag was over (`Player::drag_lane`,
+        // `Player::drag_x`), which is exactly what the shadow was drawn at. A
+        // release that reaches no drop target at all is the one thing a drag
+        // may never do: a hand that has aimed a clip and let go has made an
+        // edit, and "nothing happened" is not one of the answers an editor
+        // accepts. A row's own listener stops propagation when it answers, so
+        // this only ever runs when none did -- and it would answer with the
+        // same frame if it did run, since both read the one sample.
+        .on_drop(cx.listener(move |this, drag: &ClipDrag, window, cx| {
+            let (Some(lane), Some(idx)) = (this.drag_lane, this.dragged(drag)) else {
+                return;
+            };
+            let x = this
+                .drag_x
+                .take()
+                .unwrap_or_else(|| window.mouse_position().x);
+            this.drag_alt = window.modifiers().alt;
+            this.move_clip(drag.lane, idx, lane, x, cx);
+        }))
+        // The same catch-all for the other three things a hand can be holding
+        // over the bench -- a library row, a caption already down, a palette
+        // row. Each lands on the lane its last live sample was over, through
+        // the very door that row's own release uses, so the engine words the
+        // refusal when that lane cannot hold it. Without these, letting one go
+        // off the rows reached nothing at all.
+        .on_drop(cx.listener(move |this, drag: &AssetDrag, window, cx| {
+            let Some(lane) = this.drag_lane else {
+                return;
+            };
+            let x = this
+                .drag_x
+                .take()
+                .unwrap_or_else(|| window.mouse_position().x);
+            this.drag_alt = window.modifiers().alt;
+            let at = this.place_frame(x).0;
+            this.insert_source(&drag.0.clone(), drag.1, Some(lane), Some(at), cx);
+        }))
+        .on_drop(cx.listener(move |this, drag: &SubDrag, window, cx| {
+            let Some(lane) = this.drag_lane else {
+                return;
+            };
+            let x = this
+                .drag_x
+                .take()
+                .unwrap_or_else(|| window.mouse_position().x);
+            this.drag_alt = window.modifiers().alt;
+            this.move_sub(drag, lane, x, cx);
+        }))
+        .on_drop(cx.listener(move |this, drag: &SubPick, window, cx| {
+            let Some(lane) = this.drag_lane else {
+                return;
+            };
+            let x = this
+                .drag_x
+                .take()
+                .unwrap_or_else(|| window.mouse_position().x);
+            this.drag_alt = window.modifiers().alt;
+            this.place_sub(drag.0, lane, x, cx);
         }))
         .child(
             // Pinned ruler: click/drag to seek (reuses `Player::scrub_to`,
