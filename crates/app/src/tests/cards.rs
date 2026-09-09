@@ -2041,39 +2041,55 @@ fn darkroom_preview_mounts_stop_and_drag_scrub() {
     );
 }
 
-/// Source management must stay reachable in the Darkroom itself: per-row
-/// stand-in control/progress, pointer Add-at-playhead alongside its `↵` chord,
-/// and the three legacy source questions as dock filters. The test reads the
+/// Source management must stay reachable in the Darkroom itself: pointer
+/// Add-at-playhead alongside its `↵` chord on the row, and -- since cleanse
+/// round 2 (2026-09-10) took the `▷` and `○` ghosts off the row -- preview
+/// and the per-file stand-in in the row's own right-click menu, each still
+/// calling the one implementation it always called. The test reads the
 /// mounted dock source because this binary has no `TestAppContext` to inspect
 /// GPUI's painted controls.
 #[test]
-fn darkroom_source_rows_keep_proxy_add_and_media_audio_text_paths() {
+fn darkroom_source_rows_keep_proxy_add_and_preview_doors() {
     let dock = src_text("ui/dock_stance.rs");
     let row_at = dock.find("fn source_row(").expect("Darkroom source row");
     let row = &dock[row_at..];
     for needle in [
-        "dock-proxy-toggle",
-        "toggle_proxy(&proxy_path, proxy_stops, cx)",
-        "proxy_progress.map",
         "dock-add-at-playhead",
         "Add at playhead — ↵ does the same",
         "this.insert_source(",
     ] {
         assert!(
             row.contains(needle),
-            "Darkroom source row lost `{needle}`: a source must keep its proxy control/progress \
-             and mouse-reachable Add-at-playhead path"
+            "Darkroom source row lost `{needle}`: a source must keep its \
+             mouse-reachable Add-at-playhead path"
         );
     }
+    // The two former ghosts, in the menu the same row opens.
+    assert!(
+        crate::ROW_ITEMS.contains(&crate::RowItem::Preview)
+            && crate::ROW_ITEMS.contains(&crate::RowItem::Proxy),
+        "the row menu lost Preview or Proxy"
+    );
+    let actions = src_text("player/actions.rs");
     for needle in [
-        "LIBRARY_TABS.map",
-        "dock-source-filter",
-        "player.library_tab.holds(&row.path)",
-        "true => player.library_tab.empty().to_string(),",
+        "self.open_preview(&menu.path, menu.stream, cx);",
+        "self.toggle_proxy(&menu.path, stops, cx);",
     ] {
         assert!(
-            dock.contains(needle),
-            "Darkroom Sources lost `{needle}`: Media, Audio, and Text must remain distinct paths"
+            actions.contains(needle),
+            "the row menu's `{needle}` is a second implementation, not the door"
+        );
+    }
+    // One list, no sub-tabs: a row says its kind on its own metadata line.
+    for gone in [
+        "LIBRARY_TABS",
+        "library_tab",
+        "dock-source-filter",
+        "dock.sort.cycle",
+    ] {
+        assert!(
+            !dock.contains(gone),
+            "the dock still carries `{gone}`: Sources is one list now"
         );
     }
 }

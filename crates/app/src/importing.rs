@@ -2,54 +2,12 @@
 
 use crate::*;
 
-/// The library's three categories, in the order the giants list them: the
-/// pictures, the sound, and the words. A file is in exactly one of them, so a
-/// tab is a question with an answer rather than a filter with a guess.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum LibraryTab {
-    Media,
-    Audio,
-    Text,
-}
-
-pub(crate) const LIBRARY_TABS: [LibraryTab; 3] =
-    [LibraryTab::Media, LibraryTab::Audio, LibraryTab::Text];
-
-impl LibraryTab {
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            LibraryTab::Media => "Media",
-            LibraryTab::Audio => "Audio",
-            LibraryTab::Text => "Text",
-        }
-    }
-
-    /// Whether a source belongs on this tab. Text mirrors Media/Audio's own
-    /// rule -- an extension-only kind check, [`is_subtitle`] -- rather than
-    /// the `false` it used to hardcode: a standalone `.srt`/`.vtt`/`.ass` is
-    /// a Text source in the same sense an `.mp3` is an Audio one. A track
-    /// *inside* a container (a Matroska's embedded track) never reaches this
-    /// check at all -- the Text tab's rows are built from
-    /// [`crate::subs::subtitle_rows`] grouped by source, not filtered off
-    /// [`crate::library_meta::library_rows`] the way Media/Audio's are -- so
-    /// this only ever gates a standalone subtitle file.
-    pub(crate) fn holds(self, path: &Path) -> bool {
-        match self {
-            LibraryTab::Media => !engine::is_audio(path),
-            LibraryTab::Audio => engine::is_audio(path),
-            LibraryTab::Text => is_subtitle(path),
-        }
-    }
-
-    /// What an empty tab says instead of being a blank column.
-    pub(crate) fn empty(self) -> &'static str {
-        match self {
-            LibraryTab::Media => "No video",
-            LibraryTab::Audio => "none",
-            LibraryTab::Text => "No subtitles",
-        }
-    }
-}
+// The library's three categories -- `LibraryTab::Media/Audio/Text`, their
+// `holds` filter and their three empty nouns -- went with cleanse round 2
+// (2026-09-10): the dock shows one list of everything and a row says its own
+// kind on its metadata line, so there is no tab to answer and no third empty
+// word to keep in step. `is_subtitle` (subs.rs) is still the kind check the
+// import fork reads.
 
 /// What is known about a source's audio. Three states and not two, because a
 /// file whose peaks have not come back yet must not be drawn as one that has no

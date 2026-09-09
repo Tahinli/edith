@@ -131,7 +131,7 @@ impl Player {
         // would be a right-click that opens nothing.
         let idx = match menu.on {
             MenuOn::Clip(idx) => Some(idx),
-            MenuOn::Gap(..) | MenuOn::Bench | MenuOn::Head => None,
+            MenuOn::Gap(..) | MenuOn::Bench | MenuOn::Head | MenuOn::Dock => None,
         };
         let clip = idx.and_then(|idx| session.lane_clips(menu.lane).get(idx).copied());
         let source = clip.and_then(|clip| session.sources().get(clip.source).cloned());
@@ -272,6 +272,7 @@ impl Player {
             // the label and the chord still come out of the registry.
             let actions = match menu.on {
                 MenuOn::Bench => BENCH_ITEMS.to_vec(),
+                MenuOn::Dock => DOCK_ITEMS.to_vec(),
                 MenuOn::Head => lane_items(menu.lane),
                 _ => menu_items(ctx),
             };

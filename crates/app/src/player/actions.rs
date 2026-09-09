@@ -486,6 +486,20 @@ impl Player {
                 self.library_menu = None;
                 self.remove_source_and_clips(&menu.path, menu.stream, cx);
             }
+            // The row's two former ghosts (`▷`, `○`), each still the one
+            // implementation it always called (cleanse round 2).
+            RowItem::Preview => {
+                self.library_menu = None;
+                self.open_preview(&menu.path, menu.stream, cx);
+            }
+            RowItem::Proxy => {
+                self.library_menu = None;
+                let stops = matches!(
+                    self.proxies.get(&menu.path),
+                    Some(Proxy::Making(_) | Proxy::Cancelling(_))
+                );
+                self.toggle_proxy(&menu.path, stops, cx);
+            }
             RowItem::Reveal => {
                 self.library_menu = None;
                 // Another process starting: off the UI thread, exactly as the

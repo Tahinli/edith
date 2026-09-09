@@ -22,6 +22,12 @@ pub(crate) enum MenuOn {
     /// A lane head: the verbs of the track itself, on the lane the menu
     /// already names ([`oracle::lane_items`]).
     Head,
+    /// The dock's Sources body, anywhere its rows are not: the ways *in*
+    /// ([`DOCK_ITEMS`]). Cleanse round 2 took `Paste path` and `Import
+    /// subtitles` out of the footer, and this is the door they kept -- an
+    /// empty library included, which is exactly when a pasted path is worth
+    /// most. The lane field means nothing here and no row reads it.
+    Dock,
 }
 
 /// An open clip menu: what it was opened on, where it hangs, and whether it
@@ -127,6 +133,14 @@ pub(crate) type ChoiceRow = (Choice, SharedString, SharedString, bool);
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum RowItem {
     Add,
+    /// Play the source outside the timeline ([`Player::open_preview`]). The
+    /// row's `▷` ghost until cleanse round 2 (2026-09-10); a double-click on
+    /// the row is the other door.
+    Preview,
+    /// Make or delete the source's stand-in ([`Player::toggle_proxy`]) -- the
+    /// row's `○` ghost until the same cleanse. Settings carries the policy;
+    /// this is the one file.
+    Proxy,
     Remove,
     /// Remove that first deletes every clip playing the row. The plain
     /// [`RowItem::Remove`] is refused while any clip plays a source (the
@@ -139,8 +153,10 @@ pub(crate) enum RowItem {
     Properties,
 }
 
-pub(crate) const ROW_ITEMS: [RowItem; 5] = [
+pub(crate) const ROW_ITEMS: [RowItem; 7] = [
     RowItem::Add,
+    RowItem::Preview,
+    RowItem::Proxy,
     RowItem::Remove,
     RowItem::RemoveWithClips,
     RowItem::Reveal,
@@ -151,6 +167,8 @@ impl RowItem {
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Add => "Add at playhead",
+            Self::Preview => "Preview",
+            Self::Proxy => "Proxy",
             Self::Remove => "Remove from library",
             // The consequence is in the label now rather than in the hint
             // column beside a label identical to the plain remove's: that
@@ -179,7 +197,12 @@ impl RowItem {
     pub(crate) fn hint(self) -> &'static str {
         match self {
             Self::Add => "↵",
-            Self::Remove | Self::RemoveWithClips | Self::Reveal | Self::Properties => "",
+            Self::Preview
+            | Self::Proxy
+            | Self::Remove
+            | Self::RemoveWithClips
+            | Self::Reveal
+            | Self::Properties => "",
         }
     }
 }
@@ -248,6 +271,16 @@ pub(crate) const BENCH_ITEMS: [ActionId; 10] = [
     ActionId::ToggleSnap,
     ActionId::Undo,
     ActionId::Redo,
+];
+
+/// What a right-click on the dock's Sources body offers: the three ways a
+/// file gets in. Every one is an [`ActionId`] the keyboard already reaches,
+/// so the row's label and its chord come out of the registry -- the dock
+/// itself only draws one of them (`Add`) as a row of its own now.
+pub(crate) const DOCK_ITEMS: [ActionId; 3] = [
+    ActionId::AddFiles,
+    ActionId::PasteFilePath,
+    ActionId::ImportSubtitles,
 ];
 
 /// The tracks a lane head's menu can add, in the order it lists them. Its
