@@ -247,6 +247,17 @@ pub(crate) fn drag_scrim(cx: &mut Context<Player>) -> Div {
 /// dragging right now ([`Player::split_drag`]), which the pointer leaves on the
 /// first move -- so the lit line has to come from the model, not from `hover`.
 ///
+/// What the *hand* aims at is wider than what the eye is given: the press and
+/// the resize cursor live on a [`GRAB_W`] band centred on the *line the eye
+/// sees* -- one row above the strip, so it reaches past the panel edge the
+/// strip stands in front of rather than being centred on the strip -- mounted
+/// absolutely so it overlays its neighbours instead of pushing them (the strip
+/// keeps its [`SPLIT_W`] of layout, and `layout::split_drag_size` keeps
+/// answering in strip coordinates). A 6 px target missed by 5 px is a resize
+/// the hand cannot find, which is the same as no resize at all (user
+/// 2026-09-09: "panes should be enlargable and shrinkable" -- they already
+/// were).
+///
 /// A double press resets the seam to the window's own share
 /// ([`Splits::clear`]): the cheap way back from a layout dragged somewhere
 /// unusable, and the one every editor's dividers answer to.
@@ -269,23 +280,42 @@ pub(crate) fn divider(split: Split, held: bool, cx: &mut Context<Player>) -> Div
         .when(!held, |d| {
             d.hover(|s| s.border_color(rgb(STROKE_DIVIDER())))
         })
-        .on_mouse_down(
-            MouseButton::Left,
-            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                match event.click_count >= 2 {
-                    // The reset is written where a release would have written
-                    // the drag, the same small round trip: a seam put back by
-                    // hand must not come back on the next launch.
-                    true => {
-                        this.split_drag = None;
-                        this.splits.clear(split);
-                        crate::layout::save_stance_splits(&this.splits);
-                    }
-                    false => this.split_drag = Some(split),
-                }
-                cx.notify();
-                cx.stop_propagation();
-            }),
+        .relative()
+        .child(
+            div()
+                .absolute()
+                .when(across, |d| {
+                    d.left_0()
+                        .right_0()
+                        .top(px(-1.))
+                        .h(px(GRAB_W))
+                        .cursor_row_resize()
+                })
+                .when(!across, |d| {
+                    d.top_0()
+                        .bottom_0()
+                        .left(px(-1.))
+                        .w(px(GRAB_W))
+                        .cursor_col_resize()
+                })
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                        match event.click_count >= 2 {
+                            // The reset is written where a release would have written
+                            // the drag, the same small round trip: a seam put back by
+                            // hand must not come back on the next launch.
+                            true => {
+                                this.split_drag = None;
+                                this.splits.clear(split);
+                                crate::layout::save_stance_splits(&this.splits);
+                            }
+                            false => this.split_drag = Some(split),
+                        }
+                        cx.notify();
+                        cx.stop_propagation();
+                    }),
+                ),
         )
 }
 

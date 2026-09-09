@@ -93,6 +93,13 @@ pub(crate) const EXPORT_KEY_W: f32 = 26.;
 pub(crate) const MENU_W: f32 = 260.;
 pub(crate) const MENU_ROW_H: f32 = HIT_MIN;
 pub(crate) const MENU_PAD: f32 = 6.;
+/// The breathing room a hanging menu keeps against every window edge. Without
+/// it `menu_at`'s clamp let a menu sit flush on the bottom edge -- the last row
+/// touching the frame reads as a list cut off rather than a list that ended,
+/// which is what the user saw at 1280x720 (`f-clip-menu.png`, rows running to
+/// y=720 exactly). Taken out of the room the list may fill as well as off the
+/// clamp, so a floored menu never grows back up over the picture to buy it.
+pub(crate) const MENU_EDGE: f32 = 4.;
 
 /// A cue's text, and the line it sits on. Fixed rather than a share of the
 /// picture: the video region is 108 px tall at the 640x360 floor and a
@@ -292,6 +299,18 @@ impl Split {
 /// is why every editor that ships this draws a strip rather than the hairline
 /// it looks like.
 pub(crate) const SPLIT_W: f32 = 6.;
+
+/// How wide the same seam is *aimed at*. The strip above is what the layout
+/// spends and the hairline is what the eye is given; this is the band the hand
+/// gets, centred on the strip and overlaid on the two panels it parts, so
+/// growing it moves nothing. 6 px asked the hand for precision it does not
+/// have -- the lead's own press one row into the bench missed the seam by 5 px
+/// and focused the bench instead ("panes should be enlargable and shrinkable",
+/// of panes that already resized). 12 px is the ±6 px of aim every editor's
+/// dividers allow, and it is hung one row above the strip rather than centred
+/// on it: what a hand aims at is the line it can see (the panel's own edge at
+/// the strip's far side), not the six transparent pixels in front of it.
+pub(crate) const GRAB_W: f32 = 14.;
 
 /// The most of the window one side column may be dragged to. A third each, so
 /// the picture keeps the middle at every size -- the rule [`library_w`] and

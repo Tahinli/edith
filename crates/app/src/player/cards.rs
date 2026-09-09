@@ -244,7 +244,7 @@ impl Player {
             return;
         }
         let Some(session) = &self.session else {
-            self.notify_user("no timeline to grade — open a file first".into());
+            self.notify_user("no timeline to grade — no file open".into());
             cx.notify();
             return;
         };
@@ -262,8 +262,7 @@ impl Player {
                     Some(half) => Some(half),
                     None => {
                         self.notify_user(
-                            "NOTHING TO GRADE — a caption has no picture; group it with a clip \
-                             first (ctrl-click both, then Group)"
+                            "NOTHING TO GRADE — a caption has no picture"
                                 .into(),
                         );
                         cx.notify();
@@ -400,7 +399,7 @@ impl Player {
             return;
         }
         let Some(session) = &self.session else {
-            self.notify_user("no timeline to place — open a file first".into());
+            self.notify_user("no timeline to place — no file open".into());
             cx.notify();
             return;
         };
@@ -410,8 +409,7 @@ impl Player {
                     Some(half) => Some(half),
                     None => {
                         self.notify_user(
-                            "NOTHING TO PLACE — a caption has no picture; group it with a clip \
-                             first (ctrl-click both, then Group)"
+                            "NOTHING TO PLACE — a caption has no picture"
                                 .into(),
                         );
                         cx.notify();
@@ -533,7 +531,7 @@ impl Player {
             return;
         }
         let Some(session) = &self.session else {
-            self.notify_user("no timeline to re-time — open a file first".into());
+            self.notify_user("no timeline to re-time — no file open".into());
             cx.notify();
             return;
         };
@@ -551,8 +549,7 @@ impl Player {
                     Some(half) => Some(half),
                     None => {
                         self.notify_user(
-                            "NOTHING TO RE-TIME — a caption has no speed of its own; group it \
-                             with a clip first (ctrl-click both, then Group)"
+                            "NOTHING TO RE-TIME — a caption has no speed of its own"
                                 .into(),
                         );
                         cx.notify();
@@ -696,7 +693,7 @@ impl Player {
             return;
         }
         let Some(session) = &self.session else {
-            self.notify_user("no timeline to scan — open a file first".into());
+            self.notify_user("no timeline to scan — no file open".into());
             cx.notify();
             return;
         };
@@ -714,8 +711,7 @@ impl Player {
                     Some(half) => Some(half),
                     None => {
                         self.notify_user(
-                            "NOTHING TO SCAN — a caption has no sound of its own; group it with \
-                             the take's sound first (ctrl-click both, then Group)"
+                            "NOTHING TO SCAN — a caption has no sound of its own"
                                 .into(),
                         );
                         cx.notify();
@@ -870,6 +866,45 @@ impl Player {
     /// Nothing here is a clip's or even the project's -- it never reaches the
     /// export, which never burns a cue into the picture -- so like the mix
     /// card it opens with no timeline required and nothing to refuse.
+    /// The settings page's Picture row: the next file this machine can write
+    /// ([`ui::settings_stance::next_picture`] -- codec and container in one
+    /// cycle now), through [`Self::set_format`] like every other pick, so the
+    /// destination follows the format and a refusal is still said out loud.
+    pub(crate) fn cycle_export_picture(&mut self) {
+        let next = crate::ui::settings_stance::next_picture(self.format, |f| {
+            self.session
+                .as_ref()
+                .and_then(|session| format_refusal(session, f))
+                .is_some()
+        });
+        self.set_format(next);
+    }
+
+    /// The Sound row: the next rate in [`engine::export::AUDIO_KBPS`], and
+    /// nothing at all where the picked format's codec carries no rate -- the
+    /// row shows no chord there either.
+    pub(crate) fn cycle_audio_kbps(&mut self) {
+        if !crate::ui::settings_stance::sound_codec(self.format).1 {
+            return;
+        }
+        let at = AUDIO_KBPS
+            .iter()
+            .position(|&kbps| kbps == self.audio_kbps)
+            .unwrap_or_default();
+        self.audio_kbps = AUDIO_KBPS[(at + 1) % AUDIO_KBPS.len()];
+    }
+
+    /// The Encoder row: the next seat, through [`Self::apply_encoder`] so the
+    /// pick is said and saved with the project exactly as the card's own list
+    /// row saves it.
+    pub(crate) fn cycle_encoder(&mut self, cx: &mut Context<Self>) {
+        let at = EncoderSeat::ALL
+            .iter()
+            .position(|&seat| seat == self.encoder_seat())
+            .unwrap_or_default();
+        self.apply_encoder(EncoderSeat::ALL[(at + 1) % EncoderSeat::ALL.len()], cx);
+    }
+
     /// Opens the settings page (PROJECT rows beside EDITOR rows,
     /// `ui::settings_stance`): the one door for "edit project and editor
     /// settings" -- refused while an export is running, same as every other
@@ -1161,7 +1196,7 @@ impl Player {
         if self.silence_marks.is_empty() {
             self.notify_user(
                 format!(
-                    "no silence under {:.0} dBFS lasting {:.2} s — raise the threshold or forgive less",
+                    "no silence under {:.0} dBFS lasting {:.2} s",
                     self.silence.threshold_db, self.silence.min_silence
                 )
                 .into(),
@@ -1213,7 +1248,7 @@ impl Player {
                 self.reset_after_reseek();
                 self.notify_user(
                     format!(
-                        "{count} SILENCES CUT {reach} — {} shorter, {} takes it back",
+                        "{count} SILENCES CUT {reach} — {} shorter · undo {}",
                         secs_label(saved),
                         self.keymap.display(ActionId::Undo)
                     )
@@ -1252,7 +1287,7 @@ impl Player {
                 self.reset_after_reseek();
                 self.notify_user(
                     format!(
-                        "{count} SILENCES AT {rate} {reach} — {} takes it back",
+                        "{count} SILENCES AT {rate} {reach} · undo {}",
                         self.keymap.display(ActionId::Undo)
                     )
                     .into(),
@@ -1392,13 +1427,13 @@ impl Player {
             _ => self.selected.anchor(),
         };
         let refusal = match (anchor, &self.session) {
-            (_, None) => Some("NO TIMELINE — open a file first".to_string()),
+            (_, None) => Some("NO TIMELINE — no file open".to_string()),
             (None, _) => Some(format!(
-                "NOTHING SELECTED — click an audio clip or press {}, then ask again",
+                "NOTHING SELECTED · select all {}",
                 self.keymap.display(ActionId::Select)
             )),
             (Some((lane, _)), _) if lane.kind != LaneKind::Audio => Some(
-                "NOT AN AUDIO CLIP — the equalizer works on the sound, so pick a clip in an audio lane".to_string(),
+                "NOT AN AUDIO CLIP — the equalizer works on sound".to_string(),
             ),
             _ => None,
         };
@@ -1495,7 +1530,7 @@ impl Player {
         if self.eq_params.bands.len() >= EQ_BANDS_MAX {
             self.notify_user(
                 format!(
-                    "EQUALIZER FULL — {EQ_BANDS_MAX} bands is all this card holds; move one instead"
+                    "EQUALIZER FULL — {EQ_BANDS_MAX} bands"
                 )
                 .into(),
             );
@@ -1512,7 +1547,7 @@ impl Player {
     /// is a card with nothing to edit, and flattening is what "off" means here.
     pub(crate) fn remove_band(&mut self, cx: &mut Context<Self>) {
         if self.eq_params.bands.len() <= 1 {
-            self.notify_user("LAST BAND — flatten it instead (r), or close the card".into());
+            self.notify_user("LAST BAND · flatten r".into());
             cx.notify();
             return;
         }
@@ -1785,6 +1820,20 @@ impl Player {
                 edit.digit(digit);
             } else {
                 return false;
+            }
+            return true;
+        }
+        // The settings page's EXPORT rows: `c` steps the file, `b` the rate
+        // its sound is coded at and `e` the encoder seat. Card-local like the
+        // colour and transform branches above -- and only these three, so
+        // escape still closes the page and every other key falls through to
+        // the room.
+        if self.settings_open {
+            match key {
+                "c" => self.cycle_export_picture(),
+                "b" => self.cycle_audio_kbps(),
+                "e" => self.cycle_encoder(cx),
+                _ => return false,
             }
             return true;
         }

@@ -8,7 +8,7 @@ pub(crate) const NO_FILE: &str = "no file open";
 
 /// What a press of play says when there is nothing to play: no timeline at all
 /// and an emptied one are the same answer to the user, so they are one line.
-pub(crate) const NOTHING_TO_PLAY: &str = "NOTHING TO PLAY — put a clip on the timeline first";
+pub(crate) const NOTHING_TO_PLAY: &str = "NOTHING TO PLAY — the timeline is empty";
 
 /// Whether a press of play would have anything to play. No timeline at all and
 /// one every clip has been taken off are the same state to a transport, and the

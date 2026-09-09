@@ -73,7 +73,7 @@ impl Player {
                 self.selected.clear();
             } else {
                 self.notify_user(
-                    "NOTHING TO REGROUP — put the playhead where two clips meet, on frames that were cut apart"
+                    "NOTHING TO REGROUP — no cut under the playhead"
                         .into(),
                 );
             }
@@ -98,7 +98,7 @@ impl Player {
                 }
             }
             (Some(_), None) => {
-                self.notify_user("NOTHING DETACHED — click the take to take apart first".into())
+                self.notify_user("NOTHING DETACHED — nothing selected".into())
             }
             (None, _) => {}
         }
@@ -127,7 +127,7 @@ impl Player {
         let picks = self.marks().0;
         match (&mut self.session, self.selected.anchor(), picks.len()) {
             (_, None, _) => {
-                self.notify_user("NOTHING GROUPED — click one of the halves first".into())
+                self.notify_user("NOTHING GROUPED — nothing selected".into())
             }
             // The hand's group: every pick, one id.
             (Some(session), _, 2..) => {
@@ -147,8 +147,7 @@ impl Player {
                     }
                 }
                 None => self.notify_user(
-                    "NOTHING TO GROUP WITH — no clip on another track covers exactly these \
-                         frames; ctrl-click the clips to group instead"
+                    "NOTHING TO GROUP WITH — no clip covers these frames"
                         .into(),
                 ),
             },
@@ -239,7 +238,7 @@ impl Player {
                 }
             }
             (Some(_), None) => {
-                self.notify_user("NOTHING LIFTED — click the half to remove first".into())
+                self.notify_user("NOTHING LIFTED — nothing selected".into())
             }
             (None, _) => {}
         }
@@ -407,7 +406,7 @@ impl Player {
             // cannot be dragged.
             false if from.kind != to.kind => self.notify_user(
                 format!(
-                    "NOT ON {} — that is a {kind} clip; drop it on a {lanes} lane",
+                    "NOT ON {} — a {kind} clip takes a {lanes} lane",
                     to.label()
                 )
                 .into(),
@@ -530,10 +529,10 @@ impl Player {
             // The row is greyed and says why in the list; here it says why at
             // the moment somebody tried to use it anyway.
             (None, Some(_)) => Some(
-                "NOT PLACED — that subtitle track has no cues to place; the list says why"
+                "NOT PLACED — that subtitle track has no cues"
                     .to_string(),
             ),
-            (_, None) => Some("NOT PLACED — open a file first".to_string()),
+            (_, None) => Some("NOT PLACED — no file open".to_string()),
         };
         match (text, marked) {
             (Some(text), _) => self.notify_user(text.into()),
@@ -679,7 +678,7 @@ impl Player {
             .is_some_and(|session| session.lift_sub(lane, idx));
         let text = match lifted {
             true => format!(
-                "CAPTION LIFTED — {} puts it back",
+                "CAPTION LIFTED · undo {}",
                 self.keymap.display(ActionId::Undo)
             ),
             false => "NOTHING LIFTED — that caption is not there any more".to_string(),
@@ -1254,7 +1253,7 @@ impl Player {
                 };
                 self.notify_user(
                     format!(
-                        "GAP CLOSED on {where_} — {} takes it back",
+                        "GAP CLOSED on {where_} · undo {}",
                         self.keymap.display(ActionId::Undo)
                     )
                     .into(),
@@ -1291,12 +1290,12 @@ impl Player {
         let notice = match (report.closed, skipped) {
             (0, 0) => format!("NO GAPS TO CLOSE on {}", lane.label()),
             (0, 1) => format!(
-                "NO GAPS CLOSED on {} — 1 skipped at {}; match linked gaps or detach",
+                "NO GAPS CLOSED on {} — 1 linked gap skipped at {}",
                 lane.label(),
                 report.skipped[0].start
             ),
             (0, n) => format!(
-                "NO GAPS CLOSED on {} — {n} skipped; match linked gaps or detach",
+                "NO GAPS CLOSED on {} — {n} linked gaps skipped",
                 lane.label()
             ),
             (n, 0) => format!(
@@ -1592,7 +1591,7 @@ impl Player {
             _ => self.selected.anchor(),
         }) else {
             self.notify_user(
-                "NOTHING TO CROSSFADE — select an audio clip that has a neighbour".into(),
+                "NOTHING TO CROSSFADE — no audio clip selected".into(),
             );
             cx.notify();
             return;
@@ -1601,7 +1600,7 @@ impl Player {
         if let Some(session) = &mut self.session {
             if !session.crossfade(lane, idx, frames) {
                 self.notify_user(
-                    "NOTHING TO CROSSFADE — it takes two audio clips sitting end to end on one lane"
+                    "NOTHING TO CROSSFADE — no neighbour end to end"
                         .into(),
                 );
             }
@@ -1624,7 +1623,7 @@ impl Player {
             _ => self.selected.anchor(),
         }) else {
             self.notify_user(
-                "NOTHING TO DISSOLVE — select a video clip that has a neighbour".into(),
+                "NOTHING TO DISSOLVE — no video clip selected".into(),
             );
             cx.notify();
             return;
@@ -1641,7 +1640,7 @@ impl Player {
         };
         if !session.set_transition_out(lane, idx, frames) {
             self.notify_user(
-                "NOTHING TO DISSOLVE — it takes two video clips sitting end to end on one lane"
+                "NOTHING TO DISSOLVE — no neighbour end to end"
                     .into(),
             );
         } else if removing {
