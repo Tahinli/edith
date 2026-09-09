@@ -2823,3 +2823,74 @@ fn the_lane_bed_clips_its_clips_at_the_pinned_heads() {
          pinned lane heads: {bed}"
     );
 }
+
+/// A source row is its name first (user 2026-09-09: "clunky, crowded and
+/// problematic"). At DOCK_W 280 the name used to be the only flexible child
+/// among six, so it measured 0px and the library showed
+/// `● V1 A1 · 2 uses Preview Add ↵ ○` -- every part of a row except the one
+/// thing the row is for. The fix is subtraction, not a hover gate (DESIGN §8):
+/// the name keeps 60% of the row, usage joins the metadata line under it, and
+/// the three verbs shrink to glyph ghosts at the right edge.
+#[test]
+fn a_source_row_shows_its_name_before_anything_else() {
+    let dock = src_text("ui/dock_stance.rs");
+    let start = dock.find("fn source_row(").expect("the source row");
+    let row = &dock[start..dock.find("/// Imported subtitle tracks").expect("its end")];
+    assert!(
+        row.contains(".min_w(relative(0.6))"),
+        "the row name can still collapse under its siblings"
+    );
+    assert!(
+        !row.contains(".min_w(px(0.))"),
+        "the row name is still allowed to measure nothing"
+    );
+    // The usage moved to the second line, beside codec/length, in ink3.
+    assert!(
+        row.contains(r#".child(format!("{usage} · {under}"))"#),
+        "usage is not folded into the metadata line"
+    );
+    // Preview / Add / proxy are glyph+chord ghosts now, not word buttons:
+    // ~66px for the three together, inside the 96px the name can spare.
+    for glyph in [r#".child("▷")"#, r#".child("+")"#, r#".child("↵")"#] {
+        assert!(row.contains(glyph), "the right-edge verbs lost {glyph}");
+    }
+    for word in [r#".child("Preview")"#, r#".child("Add")"#] {
+        assert!(!row.contains(word), "{word} still spends the name's width");
+    }
+    // Every verb keeps its own hitmap name and its chord.
+    for id in ["source.{i}.preview", "source.{i}.add", "source.{i}.proxy"] {
+        assert!(row.contains(id), "{id} lost its hitmap entry");
+    }
+    // DESIGN §8: the permanent footer telling the editor how to use a list
+    // ("drag · ↵ add · double-click plays") is instructional copy and is gone.
+    assert!(
+        !dock.contains("double-click plays"),
+        "the dock still carries an instruction footer"
+    );
+    // ...and an Audio tab with no audio-only file in it is a single noun, not
+    // the claim `No sound` over a source whose A1 stream is on the bench.
+    assert_eq!(crate::LibraryTab::Audio.empty(), "none");
+}
+
+/// Focus and selection rings are drawn, never inserted: a `when(focused,
+/// border_1())` puts a pixel of box into the flow and every row in the dock
+/// steps sideways the moment the surface takes focus (hunter: h-clip-tab.png
+/// vs i-library-menu.png).
+#[test]
+fn a_dock_ring_never_moves_what_it_rings() {
+    let dock = src_text("ui/dock_stance.rs");
+    for gate in [
+        ".when(picked, |d| d.border_1()",
+        ".when(focused, |d| d.border_1()",
+    ] {
+        assert!(
+            !dock.contains(gate),
+            "a dock ring is still added on state ({gate}), shifting its content"
+        );
+    }
+    assert_eq!(
+        dock.matches("gpui::transparent_black()").count(),
+        4,
+        "a dock ring lost its at-rest transparent border"
+    );
+}
