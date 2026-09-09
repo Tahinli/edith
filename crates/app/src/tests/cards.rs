@@ -985,6 +985,19 @@ fn the_export_moment_is_three_rows_one_chip_and_no_list() {
     for gone in ["Advanced", "preset", "Quality", "Subtitles", "GPU: ", "Built in"] {
         assert!(!body.contains(gone), "the old card's {gone} is still here");
     }
+    // Row 1 is one line at every width: the stem ellipsizes and the
+    // extension rides beside it (at 1280 the nested block child wrapped
+    // `.mp4` onto a second line and the moment read as four rows).
+    let name = &body[body.find("\"destination\"").expect("the file row")..];
+    let name = &name[..name.find("\"budget\"").unwrap_or(name.len())];
+    assert!(
+        name.contains(".truncate()"),
+        "the file name wraps again -- it must ellipsize on one line"
+    );
+    assert!(
+        name.contains(".flex_none()") && name.contains("ext.to_string()"),
+        "the extension must sit beside the stem, not under it"
+    );
     // Its three rows, each reachable by pointer as well as by chord.
     for id in ["destination", "budget", "budget-track", "export-confirm"] {
         assert!(body.contains(&format!("\"{id}\"")), "{id} is on no row");

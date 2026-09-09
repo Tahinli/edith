@@ -359,15 +359,21 @@ impl Player {
             .cursor_pointer()
             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.pick_destination(cx)))
             .child(
+                // One line, always: the stem gives way with an ellipsis and
+                // the extension rides beside it. A nested block child would
+                // wrap it under the name instead, which is what the narrow
+                // window showed.
                 div()
                     .flex_1()
                     .min_w(px(0.))
-                    .truncate()
+                    .flex()
+                    .items_baseline()
                     .type_style(type_scale::mono(18., gpui::FontWeight::BOLD))
                     .text_color(rgb(INK1()))
-                    .child(stem.to_string())
+                    .child(div().min_w(px(0.)).truncate().child(stem.to_string()))
                     .child(
                         div()
+                            .flex_none()
                             .text_color(rgb(INK2()))
                             .child(ext.to_string()),
                     ),
