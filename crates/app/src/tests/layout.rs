@@ -1618,12 +1618,15 @@ fn darkroom_lane_header_verbs_are_targeted_and_visible() {
     ] {
         assert!(bench.contains(door), "lane header lost {door}");
     }
+    // Cleanse round 2 (2026-09-10): the monitoring cluster left the band
+    // (chord + KEYS row only). What the band still owes a pointer is the
+    // export range's two grips on the contact strip.
     let time_band = src_text("ui/timeband_stance.rs");
     for door in [
-        "fn volume_slider(",
-        "\"stance-tb-volume-bar\"",
-        "this.drag_volume(event.position.x, cx)",
-        ".child(volume_slider(player, cx))",
+        "fn mark_grip(",
+        "\"stance-strip-mark-in\"",
+        "\"stance-strip-mark-out\"",
+        "MARK_DRAG.with(|m| m.set(Some(action)))",
     ] {
         assert!(time_band.contains(door), "time band lost {door}");
     }
@@ -2512,6 +2515,66 @@ fn every_action_has_a_darkroom_widget_home_or_explicit_owner() {
         // gave every one of them a door on the thing it acts on -- the clip
         // menu, the ruler's, the lane head's -- and the staleness check below
         // is what deleted their entries as each landed.
+        // Cleanse round 2 (2026-09-10, user "seems cool, let's apply"): the
+        // time band kept the timecode, one three-glyph transport, the
+        // odometer, the contact strip and Export. Everything below left it.
+        // Each keeps its chord and its KEYS-tab row; the ruler menu already
+        // owns the ones that act on the ruler (zoom/fit/snap). Named here
+        // rather than re-mounted, per DESIGN §5's amendment: the geography of
+        // a verb is the thing it acts on, and playback has no thing.
+        (
+            ActionId::JumpBack,
+            "KEYS tab + key: the shuttle pair left the band in cleanse round 2",
+        ),
+        (
+            ActionId::JumpForward,
+            "KEYS tab + key: the shuttle pair left the band in cleanse round 2",
+        ),
+        (
+            ActionId::GoStart,
+            "KEYS tab + key: home/end left the band in cleanse round 2 -- the \
+             contact strip's own ends are the pointer's version",
+        ),
+        (
+            ActionId::GoEnd,
+            "KEYS tab + key: home/end left the band in cleanse round 2 -- the \
+             contact strip's own ends are the pointer's version",
+        ),
+        (
+            ActionId::PrevSyncPoint,
+            "KEYS tab + key: the sync pair left the band in cleanse round 2",
+        ),
+        (
+            ActionId::NextSyncPoint,
+            "KEYS tab + key: the sync pair left the band in cleanse round 2",
+        ),
+        (
+            ActionId::Loop,
+            "KEYS tab + key: the loop toggle left the band in cleanse round 2",
+        ),
+        (
+            ActionId::ToggleMute,
+            "KEYS tab + key: the monitoring cluster left the band in cleanse round 2",
+        ),
+        (
+            ActionId::VolumeUp,
+            "KEYS tab + key: the monitoring cluster left the band in cleanse round 2",
+        ),
+        (
+            ActionId::VolumeDown,
+            "KEYS tab + key: the monitoring cluster left the band in cleanse round 2",
+        ),
+        (
+            ActionId::ClearRange,
+            "KEYS tab + key: `I O ×` left the band in cleanse round 2 -- in and out \
+             became the contact strip's own grips, and clearing both at once is \
+             not a thing on the film to point at",
+        ),
+        (
+            ActionId::Save,
+            "KEYS tab + key: the ledger says `saved`/`unsaved · ^s`, which is the \
+             state this verb is about (cleanse round 2)",
+        ),
         (
             ActionId::Screenshot,
             "the picture the frame is written from is the *watched* frame and \
@@ -2519,6 +2582,22 @@ fn every_action_has_a_darkroom_widget_home_or_explicit_owner() {
              and the KEYS card, like the selection accelerators above",
         ),
     ];
+    /// `ActionId::Loop` is a prefix of `ActionId::LoopTrim`, and the keys
+    /// menu's own label arm (`ActionId::ToggleMute | ActionId::Paste =>
+    /// format!("{verb} (global)")`) shapes a string rather than opening a
+    /// door -- neither is a widget home, so neither counts as a mention.
+    fn mentions(text: &str, name: &str) -> bool {
+        text.lines()
+            .filter(|l| !l.contains("=> format!(\"{verb} (global)\")"))
+            .any(|line| {
+                line.match_indices(&format!("ActionId::{name}")).any(|(i, m)| {
+                    !line[i + m.len()..]
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_alphanumeric() || c == '_')
+                })
+            })
+    }
     let darkroom = [
         "ui/bench_stance.rs",
         "ui/cards.rs",
@@ -2541,14 +2620,14 @@ fn every_action_has_a_darkroom_widget_home_or_explicit_owner() {
             // has mounted the action, the entry has to go, or the sweep
             // goes blind on an action that is covered.
             assert!(
-                !darkroom.contains(&format!("ActionId::{action:?}")),
+                !mentions(&darkroom, &format!("{action:?}")),
                 "ActionId::{action:?} has a darkroom home now -- delete its \
                  EXPLICITLY_OWNED_ELSEWHERE entry ({owner})"
             );
             continue;
         }
         let name = format!("{action:?}");
-        let mentioned = darkroom.contains(&format!("ActionId::{name}"))
+        let mentioned = mentions(&darkroom, &name)
             || (action == ActionId::Resolution && darkroom.contains("Pick::Resolution"))
             || (action == ActionId::SubtitleStyle && darkroom.contains("open_subtitle_style(cx)"));
         let hitmap_id = crate::ui::hitmap::action_id(action);
@@ -2669,6 +2748,8 @@ fn hitmap_names_every_darkroom_pointer_entry_surface() {
                 "timeline.contact-strip",
                 "stance-strip-grip-lt",
                 "stance-strip-grip-rb",
+                "stance-strip-mark-in",
+                "stance-strip-mark-out",
             ][..],
         ),
         ("ui/preview.rs", &["preview.stop", "preview.scrub"][..]),
@@ -3289,46 +3370,26 @@ fn the_time_band_never_paints_outside_its_own_column() {
     assert!(crate::ui::timeband_stance::STRIP_MIN_W >= 120.);
 }
 
-/// DESIGN §7's ladder, one layer per threshold: the four things the band is
-/// *for* -- timecode, cut readout, contact strip, Export -- survive every
-/// rung, and the sheddable groups go in a fixed order (chords, then the
-/// monitoring cluster, then sync/loop, then the range marks), never all at
-/// once. Thresholds are the measured group widths; this pins their order and
-/// the 1280x720 column (939px measured when a 56px rail still stood left of
-/// it; the rail is gone since 2026-09-09, so the same window measures ~989px)
-/// landing on the
-/// marks-only rung, which is what makes Export fit there (it ended at x=991
-/// inside a column ending at 995, against x=1113 under the dock before).
+/// DESIGN §7's ladder, cleanse round 2 (2026-09-10): the band is five
+/// things -- timecode, the three transport glyphs, the odometer, the contact
+/// strip and Export -- and the only sheddable layer left is the chord row
+/// under the glyphs. This pins the one threshold (measured in the harness:
+/// 454px of fixed groups + `STRIP_MIN_W`, rounded up -- a 640x600 window
+/// reads 539px of band and draws no chords, a 1280x720 one reads 982px and
+/// draws them) and that it never comes back off.
 #[test]
-fn the_band_sheds_one_layer_per_threshold_in_a_fixed_order() {
+fn the_band_sheds_its_chords_and_nothing_else() {
     use crate::ui::timeband_stance::band_layers;
-    let ladder = [2000., 1300., 1100., 939., 800., 0.]
-        .map(|w| band_layers(w))
-        .map(|l| (l.chords, l.volume, l.sync, l.marks));
     assert_eq!(
-        ladder,
-        [
-            (true, true, true, true),
-            (false, true, true, true),
-            (false, false, true, true),
-            (false, false, false, true),
-            (false, false, false, false),
-            (false, false, false, false),
-        ],
-        "the band must drop chords, then the monitoring cluster, then sync/loop, then the marks"
+        [2000., 982., 580., 579., 539., 0.].map(|w| band_layers(w).chords),
+        [true, true, true, false, false, false],
+        "the band's one rung is the chord row at 580px"
     );
     // Monotone: a wider band never shows less than a narrower one.
     let mut prev = band_layers(0.);
     for w in (0..2400).step_by(10).map(|w| w as f32) {
         let now = band_layers(w);
-        for (a, b) in [
-            (prev.chords, now.chords),
-            (prev.volume, now.volume),
-            (prev.sync, now.sync),
-            (prev.marks, now.marks),
-        ] {
-            assert!(b || !a, "layer came back off at {w}px");
-        }
+        assert!(now.chords || !prev.chords, "layer came back off at {w}px");
         prev = now;
     }
 }
@@ -3336,7 +3397,9 @@ fn the_band_sheds_one_layer_per_threshold_in_a_fixed_order() {
 /// Every door in this band is at least `HIT_MIN` wide and tall (WCAG 2.5.8).
 /// The hitmap read `SetIn w=8`, `VolumeDown w=12`, `Loop w=13`, `SetOut w=15`,
 /// `Prev/NextSyncPoint w=16` before this: padding on the shared `ghost`, not a
-/// bigger glyph.
+/// bigger glyph. Those five glyphs left the band in cleanse round 2; the
+/// three that stayed are drawn by the same `ghost`, so the floor is still
+/// checked where it is spent.
 #[test]
 fn every_ghost_in_the_time_band_carries_a_full_hit_area() {
     let src = src_text("ui/timeband_stance.rs");
@@ -3349,21 +3412,15 @@ fn every_ghost_in_the_time_band_carries_a_full_hit_area() {
 }
 
 /// Mute wore `"{volume}%"` as its glyph while the slider beside it drew the
-/// same value: one number, two places, and a toggle with no verb of its own.
-/// The level is a mono readout beside the slider now, once.
+/// same value: one number, two places. Cleanse round 2 (2026-09-10) settled
+/// it the other way -- the whole monitoring cluster left the band (mute is
+/// `m`, the level is the `-`/`=` pair), so the band writes no level at all.
 #[test]
-fn the_level_is_written_once_and_mute_wears_a_glyph() {
+fn the_band_writes_no_monitoring_level() {
     let src = src_text("ui/timeband_stance.rs");
-    assert_eq!(
-        src.matches(r#"player.volume.percent()"#).count(),
-        1,
-        "the volume level must be written in exactly one place in the band"
-    );
-    assert!(
-        src.contains(r#"if player.volume.muted { "◁×" } else { "◁))" }"#),
-        "mute must wear a speaker glyph, struck when muted"
-    );
-    assert!(src.contains("fn volume_readout("), "the level readout is the one place it is written");
+    for gone in ["player.volume.percent()", "fn volume_readout(", "fn volume_slider("] {
+        assert!(!src.contains(gone), "the monitoring cluster is back in the band: {gone}");
+    }
 }
 
 /// `Play` and `StepForward` drew the same solid right-triangle: two verbs one
@@ -3375,7 +3432,9 @@ fn transport_verbs_differ_by_shape_not_only_by_chord() {
         let at = src.find(&format!("ActionId::{action},")).expect("the call");
         src[..at].rsplit('"').nth(1).expect("its glyph").to_string()
     };
-    let shapes = ["Play", "StepBack", "StepForward", "JumpBack", "JumpForward"].map(glyph);
+    // Cleanse round 2: the shuttle pair left the band, so the three that
+    // stayed are what must still differ by shape.
+    let shapes = ["Play", "StepBack", "StepForward"].map(glyph);
     let mut seen = shapes.to_vec();
     seen.sort();
     seen.dedup();
