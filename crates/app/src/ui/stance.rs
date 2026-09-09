@@ -449,195 +449,32 @@ fn ghost(
         ))
         .text_color(rgb(INK2()))
         .child(glyph.to_string())
-        // Every command wears its chord (DESIGN §4) -- including the one
-        // whose glyph IS its stroke: `?` reads as `?` over a dimmer `?`,
-        // the same glyph-over-chord anatomy every other spine ghost draws,
-        // rather than as the one control on the rail with nothing under it.
-        .child(
-            div()
-                .type_style(type_scale::mono(
-                    type_scale::CHORD_METADATA_MIN_PX,
-                    gpui::FontWeight::MEDIUM,
-                ))
-                .text_color(rgb(INK3()))
-                // FAULT 1: the badge shows the primary chord, compact --
-                // same rule as every glyph in `spine_stance`.
-                .child(player.keymap.chord(action)),
-        )
-}
-
-/// The keys overlay (DESIGN §9, §12 step 7): every bound command, sectioned
-/// by [`keymap::Category`] exactly as the legacy actions card files them
-/// ([`keys_rows`]) -- reusing that registry-driven order is what makes an
-/// action added anywhere land here without a second list to forget. Held
-/// open by `?` -- [`crate::ui::stance::render`]'s own `on_key_down` opens it
-/// on the press (bypassing the modal `overlaid()` guard, which would
-/// otherwise swallow the second `?` down while the first is still up) and
-/// its `on_key_up` closes it on release, so this is the room dimming one
-/// fill step for as long as the key is held, never a latch (DESIGN §9:
-/// hold-to-peek, click also dismisses). The scrim also closes on a press,
-/// same contract every other card's scrim answers, so a hand that lets go
-/// of `?` before reading the list still has a door out without touching the
-/// keyboard again.
-///
-/// corner-cut, named explicitly in DESIGN §9's own 2026-08-20 amendment
-/// rather than silently shipped against the section's original text: it
-/// wants chords surfaced *in place beside their controls* across every
-/// region, and this is one scrolling list plate instead, anchored over the
-/// bench/ledger footprint so it never reaches the screen (§11.6 holds).
-/// Ceiling: DESIGN §12 step 7's full geographic pass (each region draws its
-/// own rows while held) -- §9's amendment names the 56 actions still
-/// without a home.
-fn keys_overlay(player: &Player, bench_h: f32, cx: &mut Context<Player>) -> impl IntoElement {
-    div()
-        .id("stance-keys-overlay")
-        .absolute()
-        .bottom_0()
-        .left_0()
-        .right_0()
-        // The live `bench_h` the caller already measures for `bench`,
-        // not the fixed `BENCH_H` default: a hand-dragged
-        // bench taller than the default left this scrim short of the real
-        // footprint, so the overlay stopped mid-bench instead of covering it.
-        .h(px(bench_h + LEDGER_H))
-        .bg(rgba(SCRIM()))
-        .flex()
-        // The plate's inset lives on the scrim, not on the plate's own
-        // margins: a margin under a fixed `h()` left the list flush with the
-        // window's bottom edge and its last rows cut over the ledger. Padding
-        // here takes the room off the footprint before the plate is measured.
-        .pl(px(12.))
-        .pt(px(8.))
-        .pb(px(8.))
-        // Bottom-left, not centred: the `?` control that opens this lives at
-        // the foot of the spine ([`spine`]'s last child), and this overlay
-        // mounts inside the *centre* column next to it -- anchoring the list
-        // to this column's own bottom-left edge puts it flush against the
-        // spine side, beside the control that opened it, instead of adrift
-        // in the middle of the bench/ledger footprint (user report).
-        .items_end()
-        // Click also dismisses (DESIGN §9): the hold-`?`-release above is
-        // the fast door, this is the same scrim-press-closes contract every
-        // other card's scrim answers, so a hand that let go of `?` before
-        // reading the list still has a way to shut it without the keyboard.
-        .on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                this.close_card();
-                cx.notify();
-                cx.stop_propagation();
-            }),
-        )
-        .child(
-            div()
-                .id("stance-keys-list")
-                // Capped to the bench+ledger footprint less the scrim's own
-                // inset, so the bottom border is on screen and the rows
-                // scroll inside it (DESIGN §9).
-                .h(px((bench_h + LEDGER_H - 16.).max(0.)))
-                .w(px(460.))
-                .overflow_y_scroll()
-                .p(px(10.))
-                .rounded(px(4.))
-                .bg(rgb(DARK_PANEL()))
-                .border_1()
-                .border_color(rgba(DARK_SEAM()))
-                .on_mouse_down(MouseButton::Left, swallow)
-                .flex()
-                .flex_col()
-                .gap(px(3.))
-                // DESIGN §8, no instructional copy: the heading is the
-                // single noun, and the way out is a chord on the right like
-                // every other row here -- not a sentence that lied anyway
-                // (a click-opened plate does not close on a release).
-                .child(
-                    div()
-                        .flex_none()
-                        .flex()
-                        .justify_between()
-                        .gap(px(12.))
-                        .child(section_head("keys"))
-                        .child(
-                            div()
-                                .type_style(type_scale::mono(
-                                    type_scale::CHORD_METADATA_MIN_PX,
-                                    gpui::FontWeight::MEDIUM,
-                                ))
-                                .text_color(rgb(INK3()))
-                                .child("esc"),
-                        ),
-                )
-                .children(keys_rows().into_iter().map(|row| {
-                    match row {
-                        KeyRow::Head(category) => div()
-                            .flex_none()
-                            .pt(px(4.))
-                            .type_style(type_scale::head())
-                            .text_color(rgb(INK3()))
-                            .child(category.label().to_uppercase())
-                            .into_any_element(),
-                        KeyRow::Act(action) => div()
-                            .flex()
-                            .justify_between()
-                            .gap(px(12.))
-                            .child(
-                                div()
-                                    .type_style(type_scale::label(
-                                        type_scale::CHORD_METADATA_MIN_PX,
-                                        gpui::FontWeight::MEDIUM,
-                                    ))
-                                    .text_color(rgb(INK2()))
-                                    .child(action.label()),
-                            )
-                            .child(
-                                div()
-                                    .type_style(type_scale::mono(
-                                        type_scale::CHORD_METADATA_MIN_PX,
-                                        gpui::FontWeight::MEDIUM,
-                                    ))
-                                    .text_color(rgb(INK3()))
-                                    // The keys overlay is the full-truth surface
-                                    // (FAULT 1): every chord an action answers to,
-                                    // not the badge's primary-only compact form.
-                                    .child(player.keymap.display(action)),
-                            )
-                            .into_any_element(),
-                        KeyRow::Fixed(i) => {
-                            let f = &keymap::FIXED[i];
-                            div()
-                                .flex()
-                                .justify_between()
-                                .gap(px(12.))
-                                .child(
-                                    div()
-                                        .type_style(type_scale::label(
-                                            type_scale::CHORD_METADATA_MIN_PX,
-                                            gpui::FontWeight::MEDIUM,
-                                        ))
-                                        .text_color(rgb(INK2()))
-                                        .child(f.label),
-                                )
-                                .child(
-                                    div()
-                                        .type_style(type_scale::mono(
-                                            type_scale::CHORD_METADATA_MIN_PX,
-                                            gpui::FontWeight::MEDIUM,
-                                        ))
-                                        .text_color(rgb(INK3()))
-                                        .child(f.chord.clone()),
-                                )
-                                .into_any_element()
-                        }
-                    }
-                })),
-        )
+        // Every command wears its chord (DESIGN §4) -- except the one whose
+        // glyph already IS its stroke: `?` over `?` read as two question
+        // marks on the rail and the user asked why ("why two ? exists").
+        // A badge that only repeats the glyph says nothing, so it is not
+        // drawn; every other ghost still wears its chord under it.
+        .when(player.keymap.chord(action) != glyph, |el| {
+            el.child(
+                div()
+                    .type_style(type_scale::mono(
+                        type_scale::CHORD_METADATA_MIN_PX,
+                        gpui::FontWeight::MEDIUM,
+                    ))
+                    .text_color(rgb(INK3()))
+                    // FAULT 1: the badge shows the primary chord, compact --
+                    // same rule as every glyph in `spine_stance`.
+                    .child(player.keymap.chord(action)),
+            )
+        })
 }
 
 /// The spine: 56px, left, full height. Frame only -- grouped rows, task
 /// frequency, glyph-over-chord grammar and every click all live in
 /// [`crate::ui::spine_stance`] now (MOCK-SPEC.md "Spine"); this fn keeps
 /// the panel's own surface and the `?` row, which stays part of the frame
-/// since it opens [`keys_overlay`] right here rather than through `act`.
+/// since it swings the dock to its KEYS tab right here rather than through
+/// `act`.
 fn spine(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
     div()
         .id("stance-spine")
@@ -983,15 +820,25 @@ pub(crate) fn render(
                     Player::discard_sidecar(&sidecar);
                 }
             }
-            // DESIGN §9: "`?` held ... surfaces chords ... release restores.
-            // No modal cheat-sheet." Opened here, ahead of the modal guard
-            // below (which would otherwise swallow a second `?` down once
-            // `keys_open` is already true) -- `on_key_up` is the only thing
-            // that closes it, so there is no latch to fall through to.
+            // DESIGN §9 as amended 2026-09-09: `?` swings the dock to its
+            // KEYS tab and a second `?` swings it back -- no plate, no hold,
+            // no modal cheat-sheet. Asked ahead of the modal guard below so
+            // the stroke is heard whatever else is up, and toggling here
+            // rather than latching is what makes the same key the way out.
             if key == "?" && !ctrl {
-                if !this.keys_open {
-                    this.show_actions(cx);
+                match this.keys_open {
+                    true => this.keys_open = false,
+                    false => this.show_actions(cx),
                 }
+                cx.notify();
+                return;
+            }
+            // The other way back to the tab underneath (the tab strip being
+            // the third): only when no card is up, so escape still shuts a
+            // card first -- the KEYS tab is a dock tab now, not an overlay,
+            // and nothing about it owns the keyboard.
+            if key == "escape" && this.keys_open && !this.card_open() {
+                this.keys_open = false;
                 cx.notify();
                 return;
             }
@@ -1113,16 +960,6 @@ pub(crate) fn render(
                 this.act(action, window, cx);
             }
         }))
-        // The release half of the `?` hold above: whatever opened it, this is
-        // the one thing that closes it -- there is nothing else in the
-        // darkroom that sets `keys_open` true, so this cannot close a card
-        // `?` did not open.
-        .on_key_up(cx.listener(|this, event: &KeyUpEvent, _, cx| {
-            if event.keystroke.key.as_str() == "?" {
-                this.keys_open = false;
-                cx.notify();
-            }
-        }))
         // The seam drag is tracked on the root, same reason the legacy
         // ruler-scrub is (render.rs): the pointer outruns the 6px divider
         // hitbox on the first move, so only the whole-window root keeps
@@ -1171,9 +1008,6 @@ pub(crate) fn render(
                 .child(divider(Split::Bench, player.split_drag == Some(Split::Bench), cx))
                 .child(bench(player, bench_h, window, cx))
                 .child(ledger(player, position))
-                .when(player.keys_open, |el| {
-                    el.child(keys_overlay(player, bench_h, cx))
-                })
                 .when(player.settings_open, |el| {
                     el.child(settings_stance::render(player, window_size, cx))
                 })

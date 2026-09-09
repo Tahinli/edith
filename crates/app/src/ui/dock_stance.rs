@@ -199,8 +199,15 @@ fn dock_tab(
         .when(active, |d| d.border_t_1().border_color(rgb(INK1())))
         .cursor_pointer()
         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-            this.dock_src_active = label_text == "SOURCES";
-            save(this.dock_src_active);
+            // KEYS is a *look*, not a place the room reopens in: it rides
+            // `keys_open` and is never written to the dock-tab file, so the
+            // pair underneath it (`dock_src_active`) is still what a press on
+            // KEYS comes back to.
+            this.keys_open = label_text == "KEYS";
+            if !this.keys_open {
+                this.dock_src_active = label_text == "SOURCES";
+                save(this.dock_src_active);
+            }
             cx.notify();
         }))
         .children(hitmap::control(id, label_text, true))
@@ -1424,6 +1431,85 @@ fn clip_tab(
         )
 }
 
+/// The KEYS tab (DESIGN §9, amended 2026-09-09): every bound command,
+/// sectioned by [`keymap::Category`] exactly as [`keys_rows`] files them --
+/// reusing that registry-driven order is what makes an action added anywhere
+/// land here without a second list to forget. It lives in the dock beside
+/// SOURCES and CLIP rather than on a plate over the bench: stable geography,
+/// occludes nothing, scrolls like its neighbours, and the tab strip itself is
+/// the way back, so there is no heading prose and no `esc` hint to write.
+///
+/// An action the room would refuse right now greys to `ink4`, the same ink a
+/// refused verb wears (DESIGN §8) -- never hidden: the list is the full truth
+/// about the keyboard, including the strokes that would answer `No` today.
+fn keys_tab(player: &Player) -> impl IntoElement {
+    let row_label = label(type_scale::CHORD_METADATA_MIN_PX, FontWeight::MEDIUM);
+    let row_chord = mono(type_scale::CHORD_METADATA_MIN_PX, FontWeight::MEDIUM);
+    let pair = move |text: String, chord: String, ink: u32| {
+        div()
+            .flex_none()
+            .flex()
+            .justify_between()
+            .gap(px(12.))
+            .child(
+                div()
+                    // The label gives way, never the chord: a long parenthetical
+                    // ("Previous sync point (a cut here is copied...)") pushed
+                    // the chord column clean off the dock's right edge until
+                    // this row took `min_w(0)` + ellipsis, the same shape a
+                    // source row's name already uses.
+                    .flex_1()
+                    .min_w(px(0.))
+                    .truncate()
+                    .font(row_label.font.clone())
+                    .text_size(row_label.size)
+                    .text_color(rgb(ink))
+                    .child(text),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .font(row_chord.font.clone())
+                    .text_size(row_chord.size)
+                    .text_color(rgb(if ink == INK4() { INK4() } else { INK3() }))
+                    .child(chord),
+            )
+            .into_any_element()
+    };
+    div()
+        .id("dock-keys-rows")
+        .flex_1()
+        .min_h(px(0.))
+        .flex()
+        .flex_col()
+        .gap(px(3.))
+        .p(px(8.))
+        .overflow_y_scroll()
+        .children(keys_rows().into_iter().map(|row| match row {
+            KeyRow::Head(category) => div()
+                .flex_none()
+                .pt(px(4.))
+                .child(section_head(category.label().to_uppercase()))
+                .into_any_element(),
+            // The full-truth surface: every chord the action answers to
+            // (`display`), not the badge's primary-only compact form.
+            KeyRow::Act(action) => pair(
+                action.label().to_string(),
+                player.keymap.display(action),
+                match player.enable(action, None) {
+                    Enable::Yes => INK2(),
+                    _ => INK4(),
+                },
+            ),
+            // A fixed stroke is the window's, not an action the room can
+            // refuse, so it never greys.
+            KeyRow::Fixed(i) => {
+                let f = &keymap::FIXED[i];
+                pair(f.label.to_string(), f.chord.to_string(), INK2())
+            }
+        }))
+}
+
 /// The dock's content, under `stance.rs::dock()`'s tab-bar-and-body frame:
 /// the tab row, then whichever tab is showing.
 ///
@@ -1442,7 +1528,8 @@ pub(crate) fn render(
     window: &mut Window,
     cx: &mut Context<Player>,
 ) -> impl IntoElement {
-    let src_active = player.dock_src_active;
+    let keys = player.keys_open;
+    let src_active = player.dock_src_active && !keys;
     div()
         .id("stance-dock-body")
         .flex_1()
@@ -1459,11 +1546,13 @@ pub(crate) fn render(
                 .border_b_1()
                 .border_color(rgb(DARK_HAIRLINE()))
                 .child(dock_tab("dock-tab-src", "SOURCES", src_active, cx))
-                .child(dock_tab("dock-tab-clip", "CLIP", !src_active, cx)),
+                .child(dock_tab("dock-tab-clip", "CLIP", !src_active && !keys, cx))
+                .child(dock_tab("dock-tab-keys", "KEYS", keys, cx)),
         )
-        .child(match src_active {
-            true => sources_tab(player, window, cx).into_any_element(),
-            false => clip_tab(player, width, window_size, window, cx).into_any_element(),
+        .child(match (keys, src_active) {
+            (true, _) => keys_tab(player).into_any_element(),
+            (false, true) => sources_tab(player, window, cx).into_any_element(),
+            (false, false) => clip_tab(player, width, window_size, window, cx).into_any_element(),
         })
 }
 
