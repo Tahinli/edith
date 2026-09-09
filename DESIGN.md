@@ -208,6 +208,14 @@ string over ~4 words that instructs rather than reports state is a defect.
 - **Right-click = verbs of the thing under the cursor** (clip menu: clip verbs; lane head: lane
   verbs; source dot: ink acts). Plate styling, chords on every row, destructive verbs below a
   rule line. Never a junk drawer.
+
+  **Amendment (2026-09-09), R4:** the floor a menu is kept below is the picture's **painted
+  edge**, not the screen region's bottom. The region letterboxes — with a 3840x1608 film in a
+  2560x1440 window ~99px of the region's bottom is black bar, not picture, and §5's "nothing
+  occludes the picture" has nothing to say about black. A menu takes that room (and may open
+  *above* its pointer to use it), never a pixel of the frame; still too tall for what is left, it
+  scrolls inside its own plate as before.
+
 - **`?` held** dims the room one fill step and surfaces chords *in place* beside their controls;
   release restores, and a click on the scrim also dismisses it. Hold-to-peek, not a latch;
   learning stays geographic. The film keeps playing.
