@@ -2967,6 +2967,49 @@ fn a_source_row_shows_its_name_before_anything_else() {
     assert_eq!(crate::LibraryTab::Audio.empty(), "none");
 }
 
+/// A room key pressed while the ring sits in the dock has to reach the room.
+/// Two ways it did not: the dock's own handler could stop a key it does not
+/// answer, and the body the dock mounts could leave the focused
+/// `FocusHandle` with no element -- gpui dispatches only along the rendered
+/// focus node's ancestors (`gpui-0.2.2` `window.rs:3982`, falling back to the
+/// *window* root, which is not the room's div), so an orphaned handle kills
+/// every key until the next click. Measured 2026-09-09: with KEYS open, a
+/// second `?` and `space` reached no listener at all.
+#[test]
+fn every_dock_body_mounts_the_ring_it_is_standing_in_for() {
+    let dock = src_text("ui/dock_stance.rs");
+    for (body, id) in [
+        ("sources", "\"dock-sources\""),
+        ("clip", "\"dock-clip\""),
+        ("keys", "\"dock-keys-rows\""),
+    ] {
+        let after = dock
+            .split(id)
+            .nth(1)
+            .unwrap_or_else(|| panic!("the dock's {body} body is gone"));
+        let head: String = after.lines().take(4).collect();
+        assert!(
+            head.contains(".track_focus(") && head.contains(".on_key_down("),
+            "the dock's {body} body mounts no focus handle: a ring left on it dies"
+        );
+    }
+    // ...and the shared handler answers exactly two keys, stopping the stroke
+    // only there; anything else bubbles to `ui::stance::render`'s handler.
+    let handler = dock
+        .split("fn cycle_on_key_down(")
+        .nth(1)
+        .expect("the dock's shared key handler is gone");
+    let body = handler.split("\n}\n").next().unwrap();
+    assert_eq!(
+        body.matches("cx.stop_propagation()").count(),
+        3,
+        "the dock's key handler stops a stroke outside its tab/escape branches"
+    );
+    for branch in ["is_focus_cycle_key(key)", "is_focus_exit_key(key)"] {
+        assert!(body.contains(branch), "{branch} left the dock's key handler");
+    }
+}
+
 /// Focus and selection rings are drawn, never inserted: a `when(focused,
 /// border_1())` puts a pixel of box into the flow and every row in the dock
 /// steps sideways the moment the surface takes focus (hunter: h-clip-tab.png
