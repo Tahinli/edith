@@ -2814,3 +2814,142 @@ fn the_lane_bed_clips_its_clips_at_the_pinned_heads() {
          pinned lane heads: {bed}"
     );
 }
+
+/// The export moment holds the file and the budget; everything a project is
+/// *delivered as* is a settings row now (user: the export card was "too
+/// complicated"). Four rows, and a fifth would be the card growing back --
+/// this is a source scan for the same reason every guard on this page is.
+#[test]
+fn the_export_section_is_four_rows_and_no_fifth() {
+    let source = src_text("ui/settings_stance.rs");
+    let start = source
+        .find("fn export_section(")
+        .expect("the export section");
+    let body = &source[start..];
+    let end = body.find("\n/// The page itself").expect("the page's render fn");
+    let body = &body[..end];
+    let rows = [
+        "settings-export-picture",
+        "settings-export-sound",
+        "settings-export-encoder",
+        "settings-export-range",
+    ];
+    for row in rows {
+        assert!(body.contains(row), "the EXPORT section has no {row} row");
+    }
+    // The Sound row is written twice -- a rated codec's keyed row and an
+    // unrated one's readout, never both at once -- so the count is by label,
+    // not by id.
+    for label in ["\"Picture\"", "\"Sound\"", "\"Encoder\"", "\"Range\""] {
+        assert!(body.contains(label), "the EXPORT section has no {label} row");
+    }
+    let ids = body.match_indices("\"settings-export-").count();
+    assert_eq!(ids, 5, "the EXPORT section grew a row past the four (the two Sound rows are one row's two shapes)");
+    assert!(
+        source.contains("what a delivery is written as"),
+        "the section lost its head"
+    );
+    // Every row wears its chord (DESIGN §4): three keyed rows plus the
+    // range's own marks, which are keymap actions.
+    for chord in ["\"c\"", "\"b\"", "\"e\"", "ActionId::SetIn"] {
+        assert!(body.contains(chord), "an EXPORT row lost its chord {chord}");
+    }
+}
+
+/// `c` walks the nine files in one order -- a codec's two boxes side by side,
+/// the sound-only formats last -- and never stops on a format this machine
+/// cannot write, because [`Player::set_format`] would only refuse it back.
+#[test]
+fn the_picture_row_cycles_codec_and_container_together_and_skips_a_refusal() {
+    use crate::ui::settings_stance::{PICTURE_CYCLE, next_picture, picture_label};
+    assert_eq!(
+        PICTURE_CYCLE,
+        [
+            Format::Mp4,
+            Format::Av1Mp4,
+            Format::Av1,
+            Format::Hevc,
+            Format::HevcMp4,
+            Format::Wav,
+            Format::Flac,
+            Format::Mp3,
+            Format::Ogg,
+        ]
+    );
+    // Nothing refused: the whole ring, wrapping back to the head.
+    let mut at = Format::Mp4;
+    let mut walked = vec![at];
+    for _ in 1..PICTURE_CYCLE.len() {
+        at = next_picture(at, |_| false);
+        walked.push(at);
+    }
+    assert_eq!(walked, PICTURE_CYCLE.to_vec());
+    assert_eq!(next_picture(at, |_| false), Format::Mp4);
+
+    // HEVC unavailable (no plugin): `c` steps over both of its boxes rather
+    // than parking on a pick the setter refuses.
+    let no_hevc = |f: Format| matches!(f, Format::Hevc | Format::HevcMp4);
+    assert_eq!(next_picture(Format::Av1, no_hevc), Format::Wav);
+    // Everything refused: the row keeps what it has instead of cycling to
+    // nothing.
+    assert_eq!(next_picture(Format::Mp4, |_| true), Format::Mp4);
+
+    assert_eq!(picture_label(Format::Mp4), "H.264 · MP4");
+    assert_eq!(picture_label(Format::Av1), "AV1 · MKV");
+    assert_eq!(picture_label(Format::Av1Mp4), "AV1 · MP4");
+    assert_eq!(picture_label(Format::Wav), "WAV");
+}
+
+/// A refused codec is greyed with its reason, never hidden (DESIGN §8), and
+/// the reason is short enough to sit beside a value: six words, the rest of
+/// the sentence still said by the export moment's own banner. The sound row
+/// wears a chord only where its codec has a rate to step.
+#[test]
+fn a_refusal_is_six_words_beside_the_value_and_soundless_codecs_wear_no_chord() {
+    use crate::ui::settings_stance::{encoder_word, short_reason, sound_codec};
+    let long = "HEVC needs the VA-API plugin, which this machine has not built";
+    assert_eq!(short_reason(long), "HEVC needs the VA-API plugin, which");
+    assert!(short_reason(long).split_whitespace().count() <= 6);
+    assert_eq!(short_reason("no encoder here"), "no encoder here");
+
+    for (format, codec, rated) in [
+        (Format::Mp4, "AAC", true),
+        (Format::Av1, "AAC", true),
+        (Format::Mp3, "MP3", true),
+        (Format::Wav, "PCM", false),
+        (Format::Flac, "FLAC", false),
+        (Format::Ogg, "Vorbis", false),
+    ] {
+        assert_eq!(sound_codec(format), (codec, rated), "{format:?}");
+    }
+
+    assert_eq!(encoder_word(EncoderSeat::Auto), "auto");
+    assert_eq!(encoder_word(EncoderSeat::Hardware), "GPU");
+    assert_eq!(encoder_word(EncoderSeat::Software), "software");
+}
+
+/// The one amber line on the page is the AV1-on-the-GPU seat, and it is the
+/// only hue the EXPORT rows introduce -- every other value is an ink.
+#[test]
+fn the_only_hue_in_the_export_section_is_the_av1_gpu_notice() {
+    let source = src_text("ui/settings_stance.rs");
+    let start = source
+        .find("fn export_section(")
+        .expect("the export section");
+    let body = &source[start..];
+    let body = &body[..body.find("\n/// The page itself").expect("the render fn")];
+    assert!(
+        body.contains("NOTICE_LOOK()"),
+        "the AV1-on-the-GPU row lost its amber"
+    );
+    assert_eq!(
+        crate::ui::settings_stance::AV1_GPU_NOTICE,
+        "ignores the budget \u{2014} constant quality"
+    );
+    for hue in ["ACCENT_", "STATUS_", "NOTICE_TELL", "NOTICE_DECIDE"] {
+        assert!(
+            !body.contains(hue),
+            "the EXPORT rows reached for a second hue ({hue})"
+        );
+    }
+}
