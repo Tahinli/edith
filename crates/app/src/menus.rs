@@ -13,6 +13,15 @@ pub(crate) enum MenuOn {
     /// `(start, frames)` of the gap, in timeline frames -- what
     /// [`Player::close_gap`] ripples shut.
     Gap(u32, u32),
+    /// The bench itself: the ruler, or the empty stretch below the last lane.
+    /// Nothing under the pointer is a clip, so what the menu offers is what
+    /// the *timeline* can be told -- walking its cuts, its zoom, its snap and
+    /// the undo pair ([`BENCH_ITEMS`]). The lane field means nothing here and
+    /// no row reads it.
+    Bench,
+    /// A lane head: the verbs of the track itself, on the lane the menu
+    /// already names ([`oracle::lane_items`]).
+    Head,
 }
 
 /// An open clip menu: what it was opened on, where it hangs, and whether it
@@ -179,15 +188,22 @@ impl RowItem {
 /// action a stroke already reaches -- the menu is a second way *to* the actions
 /// and never a second version of them -- so both the label and the hint come
 /// out of the keymap registry and the two can never disagree.
-pub(crate) const MENU_ITEMS: [ActionId; 16] = [
+pub(crate) const MENU_ITEMS: [ActionId; 21] = [
     ActionId::Cut,
+    // The cut machinery (DESIGN.md §6) on the very clip it is about: the
+    // trims, their trim-to-playhead pair and the loop-trim were strokes the
+    // spine rail listed and nothing else did, and the subject cut a
+    // right-click names is exactly the one they act on.
+    ActionId::TrimIn,
+    ActionId::TrimOut,
+    ActionId::TrimInToPlayhead,
+    ActionId::TrimOutToPlayhead,
+    ActionId::LoopTrim,
     // The clipboard pair, which had no door but a chord: copy takes the clip the
     // menu names, and paste is the timeline's rather than this clip's -- the
     // same kind of global item the mute below already is.
     ActionId::Copy,
     ActionId::Paste,
-    ActionId::Delete,
-    ActionId::Lift,
     ActionId::Regroup,
     ActionId::Detach,
     ActionId::Group,
@@ -205,7 +221,55 @@ pub(crate) const MENU_ITEMS: [ActionId; 16] = [
     ActionId::Transform,
     ActionId::Fit,
     ActionId::ToggleMute,
+    // Last, under the rule line the render draws before the first of them
+    // (DESIGN §9): the two that take the clip off the lane.
+    ActionId::Delete,
+    ActionId::Lift,
 ];
+
+/// What a right-click on the bench itself offers -- the ruler and the empty
+/// stretch under the lanes. The verbs of the *timeline*: walking its cuts at
+/// either stride (DESIGN §6's odometer), what it is looked at through, and the
+/// undo pair, which is the one thing every editor expects on empty canvas.
+/// Not a junk drawer (§9): nothing here acts on a clip, and everything here
+/// acts on the thing the pointer is over.
+pub(crate) const BENCH_ITEMS: [ActionId; 10] = [
+    ActionId::WalkCutPrev,
+    ActionId::WalkCutNext,
+    ActionId::WalkCutPrev10,
+    ActionId::WalkCutNext10,
+    ActionId::ZoomOut,
+    ActionId::ZoomIn,
+    ActionId::ZoomFit,
+    ActionId::ToggleSnap,
+    ActionId::Undo,
+    ActionId::Redo,
+];
+
+/// The tracks a lane head's menu can add, in the order it lists them. Its
+/// remove is the one of the clicked lane's own kind and comes from
+/// [`oracle::lane_items`], which is what puts it under the rule line.
+pub(crate) const HEAD_ADDS: [ActionId; 3] = [
+    ActionId::AddVideoLane,
+    ActionId::AddAudioLane,
+    ActionId::AddSubtitleLane,
+];
+
+/// Whether a menu row takes something away -- what DESIGN §9 puts below a rule
+/// line, wherever the row is listed. One answer, so the clip menu and the lane
+/// head's menu cannot come to disagree about which of their rows is the
+/// dangerous one.
+pub(crate) fn destructive(action: ActionId) -> bool {
+    matches!(
+        action,
+        ActionId::Delete
+            | ActionId::Lift
+            | ActionId::RemoveVideoLane
+            | ActionId::RemoveAudioLane
+            | ActionId::RemoveSubtitleLane
+    )
+}
+
 
 /// One row of the actions card, in the order it lists them: a heading, then
 /// every action the registry files under it, then the strokes the modal cards

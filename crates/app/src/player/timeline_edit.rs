@@ -1212,6 +1212,49 @@ impl Player {
         cx.notify();
     }
 
+    /// Opens the bench's own menu: what a right-click on the ruler, or on the
+    /// empty stretch under the last lane, names -- the timeline rather than
+    /// anything on it ([`BENCH_ITEMS`]). No lane and no selection: the lane
+    /// field is `V1` because the struct has one, and no row reads it.
+    ///
+    /// Refused with no timeline open, like every menu here: a card that paints
+    /// nothing while `overlaid()` swallows the keys is an invisible modal
+    /// (`tests/cards.rs`'s FAULT 2 rule).
+    pub(crate) fn open_bench_menu(&mut self, at: Point<Pixels>, cx: &mut Context<Self>) {
+        if self.modal() || self.session.is_none() {
+            return;
+        }
+        self.context_menu = Some(ContextMenu {
+            lane: Lane::V1,
+            on: MenuOn::Bench,
+            at,
+            details: false,
+        });
+        cx.notify();
+    }
+
+    /// Opens a lane head's menu on the track that was right-clicked: the tracks
+    /// a project can gain, and the one remove that applies to this lane's kind
+    /// ([`oracle::lane_items`]). Nothing is selected -- a head owns no clip --
+    /// which is [`Player::open_gap_menu`]'s rule on the other empty target.
+    pub(crate) fn open_head_menu(
+        &mut self,
+        lane: Lane,
+        at: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.modal() || self.session.is_none() {
+            return;
+        }
+        self.context_menu = Some(ContextMenu {
+            lane,
+            on: MenuOn::Head,
+            at,
+            details: false,
+        });
+        cx.notify();
+    }
+
     /// Closes the gap `(start, frames)` -- Premiere's "Close Gap", scoped to
     /// `lane` and, when the gap borders a take, to the take's other lane too
     /// ([`engine::PlaybackSession::gap_take_scope`]): a lane not sharing the

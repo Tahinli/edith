@@ -335,10 +335,12 @@ fn a_caption_is_deleted_by_the_same_row_and_stroke_every_box_is() {
         menu_items(cap),
         vec![
             ActionId::Paste,
-            ActionId::Delete,
             ActionId::Detach,
             ActionId::Group,
             ActionId::ToggleMute,
+            // Below the rule line the render draws before it, like every
+            // other row that takes something away (DESIGN §9).
+            ActionId::Delete,
         ],
         "the caption's menu is its removal, its group rows, and the global ones",
     );
@@ -1964,7 +1966,7 @@ fn trim_to_playhead_needs_a_subject_cut_with_the_playhead_on_it() {
     };
     assert_eq!(
         enable(ActionId::TrimOutToPlayhead, off),
-        Enable::No("playhead is outside the subject cut")
+        Enable::No("the playhead is off this cut")
     );
     let on = Ctx {
         clip: Some((clip, Lane::V1)),
@@ -2719,4 +2721,78 @@ fn escape_with_nothing_open_empties_the_selection() {
         Some(ActionId::Deselect),
         "bare escape must still route to Deselect for that arm to ever run"
     );
+}
+
+/// The gate that keeps "option C" honest. The spine rail is gone -- nothing on
+/// screen lists these verbs any more -- so every verb it used to carry has to
+/// be a row on the menu of the thing it acts on, or it is a verb only a person
+/// who already knows its chord can reach. Listed by action id rather than by
+/// label, so a reworded row cannot make this pass while the door is gone.
+///
+/// And the rule line's own half of DESIGN §9: the destructive rows come last
+/// in every list here, which is what lets the render draw one seam before the
+/// first of them instead of scattering seams through the plate.
+#[test]
+fn every_verb_the_spine_carried_is_a_right_click_row() {
+    use keymap::ActionId;
+    // The heads a project can have, so the removes are checked on the lane
+    // each of them belongs to.
+    let heads: Vec<ActionId> = [Lane::V1, Lane::A1, Lane::S1]
+        .into_iter()
+        .flat_map(lane_items)
+        .collect();
+    for (action, menu) in [
+        // EDIT
+        (ActionId::Cut, "clip"),
+        (ActionId::Lift, "clip"),
+        (ActionId::Undo, "bench"),
+        (ActionId::Redo, "bench"),
+        // CUT
+        (ActionId::WalkCutPrev, "bench"),
+        (ActionId::WalkCutNext, "bench"),
+        (ActionId::WalkCutPrev10, "bench"),
+        (ActionId::WalkCutNext10, "bench"),
+        (ActionId::TrimIn, "clip"),
+        (ActionId::TrimOut, "clip"),
+        (ActionId::TrimInToPlayhead, "clip"),
+        (ActionId::TrimOutToPlayhead, "clip"),
+        (ActionId::LoopTrim, "clip"),
+        // VIEW
+        (ActionId::ZoomOut, "bench"),
+        (ActionId::ZoomIn, "bench"),
+        (ActionId::ZoomFit, "bench"),
+        (ActionId::ToggleSnap, "bench"),
+        // TRACK
+        (ActionId::AddVideoLane, "lane head"),
+        (ActionId::AddAudioLane, "lane head"),
+        (ActionId::AddSubtitleLane, "lane head"),
+        (ActionId::RemoveVideoLane, "lane head"),
+        (ActionId::RemoveAudioLane, "lane head"),
+        (ActionId::RemoveSubtitleLane, "lane head"),
+    ] {
+        assert!(
+            MENU_ITEMS.contains(&action)
+                || BENCH_ITEMS.contains(&action)
+                || heads.contains(&action),
+            "{action:?} reaches no menu: the spine listed it and the {menu} menu does not"
+        );
+    }
+    // Every menu is a list of actions the keyboard already reaches, so every
+    // row can wear its chord (DESIGN §4): a row built here out of an id the
+    // registry never files would print an empty column.
+    for action in MENU_ITEMS.into_iter().chain(BENCH_ITEMS).chain(heads.iter().copied()) {
+        assert!(
+            ActionId::ALL.contains(&action),
+            "{action:?} is a menu row and not a registered action"
+        );
+    }
+    for list in [MENU_ITEMS.to_vec(), BENCH_ITEMS.to_vec(), lane_items(Lane::A1)] {
+        let first = list.iter().position(|&a| destructive(a));
+        if let Some(first) = first {
+            assert!(
+                list[first..].iter().all(|&a| destructive(a)),
+                "a safe row sits below the rule line: {list:?}"
+            );
+        }
+    }
 }

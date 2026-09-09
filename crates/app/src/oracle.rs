@@ -314,7 +314,7 @@ pub(crate) fn enable(action: ActionId, ctx: Ctx) -> Enable {
         ActionId::TrimInToPlayhead | ActionId::TrimOutToPlayhead => match ctx.clip {
             None => Enable::No("no subject cut"),
             Some((clip, _)) if ctx.playhead < clip.start || ctx.playhead > clip.end() => {
-                Enable::No("playhead is outside the subject cut")
+                Enable::No("the playhead is off this cut")
             }
             _ => Enable::Yes,
         },
@@ -356,6 +356,25 @@ pub(crate) fn enable_lane(action: ActionId, lane: Lane, ctx: Ctx) -> Enable {
         | (ActionId::RemoveAudioLane, LaneKind::Audio) => enable(action, ctx),
         _ => Enable::Hidden("this verb does not apply to this lane"),
     }
+}
+
+/// The rows a lane head's menu draws: the three tracks a project can gain,
+/// and -- under the rule line the render draws before it ([`destructive`]) --
+/// the one remove that means anything on the lane that was right-clicked. A
+/// video head never offers to take an audio track off: DESIGN §9's "verbs of
+/// the thing under the cursor", read literally.
+///
+/// The removes take the *last* track of the kind (the engine's own rule,
+/// which their labels say), so this lists at most one of them and never a
+/// second row arguing about the same act.
+pub(crate) fn lane_items(lane: Lane) -> Vec<ActionId> {
+    let mut items = HEAD_ADDS.to_vec();
+    items.push(match lane.kind {
+        LaneKind::Video => ActionId::RemoveVideoLane,
+        LaneKind::Audio => ActionId::RemoveAudioLane,
+        LaneKind::Subtitle => ActionId::RemoveSubtitleLane,
+    });
+    items
 }
 
 /// The rows a clip menu draws, for the clip it was opened on: the registry
