@@ -2814,3 +2814,84 @@ fn the_lane_bed_clips_its_clips_at_the_pinned_heads() {
          pinned lane heads: {bed}"
     );
 }
+
+
+/// The ruler's right edge was soup: `bench-select-all` sits `right(4.)` over
+/// the tick band while tick suppression only guarded the LEFT plate, so the
+/// `00:20` label drew straight under the `all` chord. The control's band is
+/// reserved now -- a label whose right edge would enter it is dropped, the
+/// mirror of the left rule.
+#[test]
+fn the_ruler_reserves_a_band_for_its_select_all_control() {
+    use crate::ui::bench_stance::{SELECT_ALL_PAD, char_w};
+    use crate::ui::type_scale::{CHORD_METADATA_MIN_PX, FLOOR_PX};
+    let bench = src_text("ui/bench_stance.rs");
+    assert!(
+        bench.contains("x + label_w <= bed_w - all_w"),
+        "the tick loop no longer keeps the select-all band clear"
+    );
+    // The rule itself, with the shipped widths: `all` + `^a` at the chord
+    // size, a `00:20` label at the floor size, a 850 px bed.
+    let all_w = ("all".len() + "^a".len()) as f32 * char_w(CHORD_METADATA_MIN_PX) + SELECT_ALL_PAD;
+    let label_w = "00:20".len() as f32 * char_w(FLOOR_PX);
+    let clear = |x: f32| x + label_w <= 850. - all_w;
+    assert!(!clear(820.), "a tick at the right edge still draws under `all`");
+    assert!(
+        !clear(850. - all_w - label_w + 1.),
+        "the band's own edge leaks"
+    );
+    assert!(clear(700.), "the rule eats ticks that clear the band");
+}
+
+/// Clicking `all` selected all AND scrubbed: the control lives inside
+/// `bench-ruler`, whose `on_mouse_down` seeks, and the press reached it (the
+/// playhead jumped 00:00:11:12 -> 00:00:20:14). The scrub refuses the
+/// control's reserved band now -- a `stop_propagation` on the control is what
+/// this looks like at first and it does NOT work: gpui builds the control's
+/// own click out of that same mouse-down, so stopping it drops the selection
+/// (measured live, run 20260909-174243-jZzccm/after-all.png: nothing but the
+/// hover changed).
+#[test]
+fn a_press_on_the_select_all_band_does_not_scrub_the_ruler() {
+    use crate::ui::bench_stance::select_all_band;
+    let bench = src_text("ui/bench_stance.rs");
+    let at = bench.find(r#".id("bench-ruler")"#).expect("no ruler");
+    let listener = &bench[at..at + bench[at..].find(".children(ticks").expect("its ticks")];
+    assert!(
+        listener.contains("bed_w - band") && listener.contains("select_all_band("),
+        "the ruler's scrub takes the select-all band's presses again: {listener}"
+    );
+    assert!(
+        !bench[at..].contains("cx.stop_propagation()"),
+        "a press stopped inside the ruler also swallows the control's own click"
+    );
+    // The rule the listener runs, at the shipped widths: a 850 px bed, `^a`.
+    let band = select_all_band("^a");
+    assert!(band > 30. && band < 70., "the band is not a control's width: {band}");
+    assert!(850. - 4. >= 850. - band, "a press on the control still seeks");
+    assert!(500. < 850. - band, "a press mid-ruler stopped seeking");
+}
+
+/// DESIGN §4/§5: the hero timecode leads the time band and the ledger carries
+/// position. The ruler's left plate was a third resting copy of the same
+/// reading -- it stays only for the state change it belongs to, a live scrub.
+#[test]
+fn the_ruler_plate_shows_the_timecode_only_while_a_scrub_is_live() {
+    let bench = src_text("ui/bench_stance.rs");
+    let at = bench
+        .find(".child(playhead_tc)")
+        .expect("no playhead timecode in the ruler");
+    let before = &bench[..at];
+    let guard = before
+        .rfind(".when(player.scrubbing")
+        .expect("the ruler plate draws its timecode at rest -- the third copy");
+    assert!(
+        before[guard..].matches(".child(").count() <= 2,
+        "the scrubbing guard is not the plate's own: {}",
+        &before[guard..guard + 200]
+    );
+    assert!(
+        bench.contains("let plate_w = if player.scrubbing { PLATE_W } else { 0. };"),
+        "the ticks still lose the plate's width at rest"
+    );
+}
