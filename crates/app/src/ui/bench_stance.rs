@@ -829,6 +829,17 @@ fn lane_row(
         .h(px(h))
         .flex()
         .relative()
+        // The wheel, matched to the legacy timeline's own mapping: ctrl+wheel
+        // zooms about the pointer, a bare wheel scrolls the bed along the film
+        // (`Player::timeline_wheel`). On the whole row -- head column and bed
+        // alike -- not on the bed alone: a hand rolls the wheel wherever it
+        // left the pointer, and aiming at a clip first is a tax. Stopped here
+        // so gpui's own overflow scroll on the lane column (`bench-lanes`) and
+        // `bench-content`'s catch-all below never answer the same notch again.
+        .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
+            cx.stop_propagation();
+            this.timeline_wheel(event, cx);
+        }))
         // Dragged, the whole track moves in the stack (`LaneDrag`,
         // `Player::reorder_lane`) -- let go anywhere along the row, not just
         // over the head column, since a slot is what is being aimed at.
@@ -1148,15 +1159,6 @@ fn lane_row(
                         this.preview_ghost_pick(track, lane, event.event.position.x, cx);
                     }),
                 )
-                // The wheel, matched to the legacy timeline's own mapping:
-                // ctrl+wheel zooms about the pointer, a bare wheel scrolls
-                // the bed along the film (`Player::timeline_wheel`). Stopped
-                // here so gpui's own overflow scroll on the lane column
-                // (`bench-lanes`) never answers the same notch a second time.
-                .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
-                    cx.stop_propagation();
-                    this.timeline_wheel(event, cx);
-                }))
                 .children(hitmap::dynamic(
                     move || {
                         (
@@ -1290,6 +1292,15 @@ pub(crate) fn render(
         .flex()
         .flex_col()
         .gap(px(ROW_GAP))
+        // The wheel over the WHOLE bench region, not just a bed: the ruler,
+        // the strip left of it, the gaps between rows and the space below the
+        // last track all answer a notch here with the same mapping every row
+        // gives (`Player::timeline_wheel`; the ruler's own former listener
+        // folded into this one, so no strip answers a notch twice). A row
+        // stops propagation, so a notch over a track never reaches this.
+        .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
+            this.timeline_wheel(event, cx);
+        }))
         .child(
             // Pinned ruler: click/drag to seek (reuses `Player::scrub_to`,
             // the same call the legacy ruler makes), tick marks with mono
@@ -1313,13 +1324,6 @@ pub(crate) fn render(
                         this.scrub_to(event.position.x, true, cx);
                     }),
                 )
-                // Ctrl+wheel zooms about the pointer, a bare one scrolls the
-                // bed along -- the same mapping every bed below gives, and
-                // the legacy ruler's own (`ui/timeline.rs`'s
-                // `on_scroll_wheel` at its ruler strip).
-                .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
-                    this.timeline_wheel(event, cx);
-                }))
                 .children(ticks.into_iter().map(|(x, label)| {
                     div().absolute().top_0().left(px(x)).child(
                         div()
