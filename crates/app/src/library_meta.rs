@@ -125,7 +125,54 @@ pub(crate) fn library_rows(
             });
         }
     }
+    disambiguate(&mut rows);
     rows
+}
+
+/// Two files whose rows read the same word ("2026-09-09 18-05-50" twice, user
+/// 2026-09-10 -- two screen recordings) are told apart on the metadata line
+/// rather than left as a pair of identical rows: the folder they came out of
+/// when that differs, and a `#n` in arrival order when even the folder is
+/// shared. Compared on the stem, because the stem is what the row draws.
+fn disambiguate(rows: &mut [Row]) {
+    let named: Vec<(String, PathBuf)> = rows
+        .iter()
+        .map(|row| (crate::files::stem(&row.path), row.path.clone()))
+        .collect();
+    for i in 0..rows.len() {
+        let mut twins: Vec<&PathBuf> = Vec::new();
+        for (name, path) in &named {
+            if *name == named[i].0 && !twins.contains(&path) {
+                twins.push(path);
+            }
+        }
+        if twins.len() < 2 {
+            continue;
+        }
+        let folder = rows[i]
+            .path
+            .parent()
+            .and_then(Path::file_name)
+            .map(|f| f.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let alone_in_it = twins
+            .iter()
+            .filter(|p| p.parent() == rows[i].path.parent())
+            .count()
+            == 1;
+        let mark = match alone_in_it && !folder.is_empty() {
+            true => folder,
+            false => format!(
+                "#{}",
+                twins
+                    .iter()
+                    .position(|p| **p == rows[i].path)
+                    .expect("a row finds itself")
+                    + 1
+            ),
+        };
+        rows[i].detail = join_detail(&rows[i].detail, &mark);
+    }
 }
 
 /// The row's second line: what the stream is and then either how long it is or

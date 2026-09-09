@@ -78,6 +78,8 @@ Two faces, fixed roles (bundled, no runtime deps):
 
 Scale: 18px hero timecode (700, colons in `ink3`) · 15px labels/rows (500) · 13–14px chords
 and metadata (500) · 12px section heads (Archivo 700, uppercase, +0.14em letter-spacing, `ink3`).
+Room/column heads (Settings) are 15px Archivo 700 `ink1`; in-list section heads stay 12px `ink3`
+(2026-09-10 -- the settings columns read as body text and a person could not find them).
 Nothing below 10px. Every size is a whole pixel (no half-pixel sizes -- they put glyph baselines
 off the pixel grid and blurred cosmic-text's AA). No italics. Tabular figures wherever digits
 align.
