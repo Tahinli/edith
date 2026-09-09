@@ -188,44 +188,48 @@ impl RowItem {
 /// action a stroke already reaches -- the menu is a second way *to* the actions
 /// and never a second version of them -- so both the label and the hint come
 /// out of the keymap registry and the two can never disagree.
-pub(crate) const MENU_ITEMS: [ActionId; 21] = [
+pub(crate) const MENU_ITEMS: [ActionId; 16] = [
     ActionId::Cut,
     // The cut machinery (DESIGN.md §6) on the very clip it is about: the
-    // trims, their trim-to-playhead pair and the loop-trim were strokes the
-    // spine rail listed and nothing else did, and the subject cut a
-    // right-click names is exactly the one they act on.
+    // trims and the loop-trim were strokes the spine rail listed and nothing
+    // else did, and the subject cut a right-click names is exactly the one
+    // they act on. Their trim-to-playhead pair is *not* here: `^[` and `^]`
+    // are the keyboard's own version of a gesture the pointer already has --
+    // drag the edge to where you want it -- so a row for them in the menu the
+    // pointer opens is the junk drawer §9 forbids. They keep their chords and
+    // their KEYS rows.
     ActionId::TrimIn,
     ActionId::TrimOut,
-    ActionId::TrimInToPlayhead,
-    ActionId::TrimOutToPlayhead,
     ActionId::LoopTrim,
-    // The clipboard pair, which had no door but a chord: copy takes the clip the
-    // menu names, and paste is the timeline's rather than this clip's -- the
-    // same kind of global item the mute below already is.
+    // The clipboard pair, which had no door but a chord: copy takes the clip
+    // the menu names, and paste is the timeline's rather than this clip's.
     ActionId::Copy,
     ActionId::Paste,
-    ActionId::Regroup,
-    ActionId::Detach,
-    ActionId::Group,
-    ActionId::Equalizer,
-    ActionId::Speed,
-    // The scan is a clip card like the two above it -- opened on whichever half
-    // was clicked -- and a card only a stroke could open is one a pointer never
-    // finds.
-    ActionId::Silence,
-    // The dissolve is a video clip's own join, same door as the crossfade
-    // above it would be for sound -- a stroke-only pair, opened here on
-    // whichever half was clicked.
+    // The two joins, one per kind, each hidden over the other kind
+    // (`oracle::enable`, DESIGN §8's class refusal): sound crossfades, picture
+    // dissolves, and neither is ever offered over the wrong waveform.
+    ActionId::Crossfade,
     ActionId::Dissolve,
+    // The picture cards...
     ActionId::Color,
     ActionId::Transform,
+    // ...and the sound ones, the same class refusal the other way round.
+    ActionId::Equalizer,
+    ActionId::Silence,
+    ActionId::Speed,
     ActionId::Fit,
-    ActionId::ToggleMute,
     // Last, under the rule line the render draws before the first of them
     // (DESIGN §9): the two that take the clip off the lane.
     ActionId::Delete,
     ActionId::Lift,
 ];
+
+// Not rows, and deliberately: the group trio (`Group`, `Detach`, `Regroup`)
+// is the ctrl-click grammar plus its chords -- a group is made by picking the
+// halves and taking it apart the same way -- and the mute is the *mix's*,
+// which the transport already carries a button for. A clip menu is what this
+// clip can be told (DESIGN §9, "Never a junk drawer"); those are told to the
+// selection and to the project.
 
 /// What a right-click on the bench itself offers -- the ruler and the empty
 /// stretch under the lanes. The verbs of the *timeline*: walking its cuts at

@@ -335,14 +335,11 @@ fn a_caption_is_deleted_by_the_same_row_and_stroke_every_box_is() {
         menu_items(cap),
         vec![
             ActionId::Paste,
-            ActionId::Detach,
-            ActionId::Group,
-            ActionId::ToggleMute,
             // Below the rule line the render draws before it, like every
             // other row that takes something away (DESIGN §9).
             ActionId::Delete,
         ],
-        "the caption's menu is its removal, its group rows, and the global ones",
+        "the caption's menu is its removal and the one global row left",
     );
     // ...and the same reading with a clip under it is the clip menu, untouched:
     // the flag is off wherever a `Clip` was clicked.
@@ -802,7 +799,6 @@ fn the_clip_menu_dims_what_the_playhead_is_not_on_and_stays_in_the_window() {
     // split off -- a row the next click of the playhead lights.
     for rows in [menu(a1, false, 30), menu(v1, false, 30), menu(v1, true, 30)] {
         assert!(rows.contains(&ActionId::Cut), "{rows:?}");
-        assert!(rows.contains(&ActionId::Detach), "{rows:?}");
     }
     // The actions card is the other half of the rule: it lists the whole
     // registry, so a class refusal is dimmed there with its reason and never
@@ -2761,8 +2757,11 @@ fn every_verb_the_spine_carried_is_a_right_click_row() {
         (ActionId::WalkCutNext10, "bench"),
         (ActionId::TrimIn, "clip"),
         (ActionId::TrimOut, "clip"),
-        (ActionId::TrimInToPlayhead, "clip"),
-        (ActionId::TrimOutToPlayhead, "clip"),
+        // The trim-to-playhead pair is *not* in this list: `^[` and `^]` are
+        // the keyboard's version of dragging a clip edge to a spot, a gesture
+        // the pointer already has, so the clip menu leaves them out (DESIGN §9,
+        // "Never a junk drawer"). They keep their chords and their KEYS rows,
+        // which is what the layout sweep's exemption for them names.
         (ActionId::LoopTrim, "clip"),
         // VIEW
         (ActionId::ZoomOut, "bench"),

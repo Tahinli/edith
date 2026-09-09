@@ -210,7 +210,9 @@ pub(crate) fn enable(action: ActionId, ctx: Ctx) -> Enable {
         // -- class: what kind of thing the action is about. The equalizer
         // filters samples, and a video clip has none of its own here: the sound
         // is the audio lane's, clip for clip.
-        ActionId::Equalizer => match ctx.clip {
+        // The crossfade is the sound join, for the same reason: it fades one
+        // clip's samples into the next one's, and a picture has none.
+        ActionId::Equalizer | ActionId::Crossfade => match ctx.clip {
             Some((_, lane)) if lane.kind != LaneKind::Audio => {
                 Enable::Hidden("this clip is picture")
             }
@@ -218,7 +220,10 @@ pub(crate) fn enable(action: ActionId, ctx: Ctx) -> Enable {
         },
         // A grade is a picture setting and an audio clip has no picture. A fit
         // policy is a picture setting for the same reason.
-        ActionId::Color | ActionId::Fit | ActionId::Transform => match ctx.clip {
+        // The dissolve is the picture join and the crossfade's mirror: two
+        // pictures cross, and there is no picture on a waveform to cross.
+        ActionId::Color | ActionId::Fit | ActionId::Transform | ActionId::Dissolve => match ctx.clip
+        {
             Some((_, lane)) if lane.kind != LaneKind::Video => Enable::Hidden("this clip is sound"),
             _ => Enable::Yes,
         },
