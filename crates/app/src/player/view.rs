@@ -133,7 +133,7 @@ impl Player {
             return;
         }
         let Some(session) = &mut self.session else {
-            self.notify_user("no timeline to fit — no file open".into());
+            self.notify_user("NOTHING TO FIT — no file open".into());
             cx.notify();
             return;
         };
@@ -165,7 +165,7 @@ impl Player {
             other => other.or_else(|| session.video_clip_at(session.now())),
         };
         let Some((lane, idx)) = target else {
-            self.notify_user("no clip under the playhead to fit".into());
+            self.notify_user("NOTHING TO FIT — no clip under the playhead".into());
             cx.notify();
             return;
         };

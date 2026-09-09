@@ -244,7 +244,7 @@ impl Player {
             return;
         }
         let Some(session) = &self.session else {
-            self.notify_user("no timeline to grade — no file open".into());
+            self.notify_user("NOTHING TO GRADE — no file open".into());
             cx.notify();
             return;
         };
@@ -289,7 +289,7 @@ impl Player {
                 self.pending_color = None;
                 self.context_menu = None;
             }
-            None => self.notify_user("no clip under the playhead to grade".into()),
+            None => self.notify_user("NOTHING TO GRADE — no clip under the playhead".into()),
         }
         cx.notify();
     }
@@ -399,7 +399,7 @@ impl Player {
             return;
         }
         let Some(session) = &self.session else {
-            self.notify_user("no timeline to place — no file open".into());
+            self.notify_user("NOTHING TO PLACE — no file open".into());
             cx.notify();
             return;
         };
@@ -430,7 +430,7 @@ impl Player {
                 self.pending_transform = None;
                 self.context_menu = None;
             }
-            None => self.notify_user("no clip under the playhead to place".into()),
+            None => self.notify_user("NOTHING TO PLACE — no clip under the playhead".into()),
         }
         cx.notify();
     }
@@ -531,7 +531,7 @@ impl Player {
             return;
         }
         let Some(session) = &self.session else {
-            self.notify_user("no timeline to re-time — no file open".into());
+            self.notify_user("NOTHING TO RE-TIME — no file open".into());
             cx.notify();
             return;
         };
@@ -569,7 +569,7 @@ impl Player {
                 self.pending_speed = None;
                 self.context_menu = None;
             }
-            None => self.notify_user("no clip under the playhead to re-time".into()),
+            None => self.notify_user("NOTHING TO RE-TIME — no clip under the playhead".into()),
         }
         cx.notify();
     }
@@ -693,7 +693,7 @@ impl Player {
             return;
         }
         let Some(session) = &self.session else {
-            self.notify_user("no timeline to scan — no file open".into());
+            self.notify_user("NOTHING TO SCAN — no file open".into());
             cx.notify();
             return;
         };
@@ -774,7 +774,7 @@ impl Player {
                     ScanPlan::Wait => {}
                 }
             }
-            None => self.notify_user("no clip under the playhead to scan".into()),
+            None => self.notify_user("NOTHING TO SCAN — no clip under the playhead".into()),
         }
         cx.notify();
     }
@@ -1196,7 +1196,7 @@ impl Player {
         if self.silence_marks.is_empty() {
             self.notify_user(
                 format!(
-                    "no silence under {:.0} dBFS lasting {:.2} s",
+                    "NO SILENCE — under {:.0} dBFS lasting {:.2} s",
                     self.silence.threshold_db, self.silence.min_silence
                 )
                 .into(),

@@ -253,7 +253,7 @@ pub(crate) fn enable(action: ActionId, ctx: Ctx) -> Enable {
                     .split_at(clip.len(), ctx.playhead - clip.start)
                     .is_none() =>
             {
-                Enable::No("this speed holds one frame here — step to the next")
+                Enable::No("this speed holds one frame here")
             }
             _ => Enable::Yes,
         },
@@ -282,14 +282,14 @@ pub(crate) fn enable(action: ActionId, ctx: Ctx) -> Enable {
         // words itself.
         ActionId::Group => match ctx.picks {
             2.. if ctx.pick_lanes == ctx.picks => Enable::Yes,
-            2.. => Enable::No("a group is one clip per lane: keep one pick per track"),
+            2.. => Enable::No("a lane is picked twice"),
             _ => Enable::Yes,
         },
         // The three that act on the marked clip and on nothing else: with none
         // marked they would silently do nothing, which is what the Delete
         // button's own dimming has always said.
         ActionId::Copy | ActionId::Delete | ActionId::Lift if ctx.clip.is_none() => {
-            Enable::No("click a clip first")
+            Enable::No("nothing selected")
         }
         // The cut machinery (DESIGN.md §6): the odometer, the trim pair and
         // the loop-trim all act on the subject cut, and with none marked
@@ -335,7 +335,7 @@ pub(crate) fn enable(action: ActionId, ctx: Ctx) -> Enable {
         // nothing: the transport says so by being dim, which is what its own
         // ad-hoc boolean used to say before the oracle knew the question.
         ActionId::Play | ActionId::Loop if !ctx.playable => {
-            Enable::No("put a clip on a lane first")
+            Enable::No("the timeline is empty")
         }
         // A rate applies to a clip of either kind and to its whole group, so
         // there is no lane it means nothing on, and the engine words the one
