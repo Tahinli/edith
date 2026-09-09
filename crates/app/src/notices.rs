@@ -51,6 +51,37 @@ pub(crate) fn audio_notice(session: &PlaybackSession) -> Option<String> {
         .map(|reason| format!(" — NO AUDIO: {reason}"))
 }
 
+/// The strip's own width is finite and its message is one line: what a
+/// too-long line must never do is lose its *state* word, which sits at the
+/// front, or stop mid-word with nothing saying it stopped (user report,
+/// `OPENED he_is_not_the_only_one.mp4 — 1 subtitle track(s) in `). Every
+/// message is a handful of words plus a file name now (DESIGN §8), so the one
+/// part long enough to overflow the strip alone is the name -- elided through
+/// its middle here, head and tail kept, before gpui's own end ellipsis
+/// ([`crate::ui::stance`]) ever has to cut a word.
+pub(crate) const LEDGER_WORD_MAX: usize = 28;
+
+pub(crate) fn ledger_line(message: &str) -> String {
+    message
+        .split(' ')
+        .map(|word| match word.chars().count() > LEDGER_WORD_MAX {
+            false => word.to_string(),
+            // Chars, not bytes: a name is whatever the filesystem holds.
+            true => {
+                let chars: Vec<char> = word.chars().collect();
+                let head = LEDGER_WORD_MAX / 2 - 1;
+                let tail = LEDGER_WORD_MAX - head - 1;
+                format!(
+                    "{}…{}",
+                    chars[..head].iter().collect::<String>(),
+                    chars[chars.len() - tail..].iter().collect::<String>()
+                )
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -82,5 +113,21 @@ mod tests {
         // whole, not truncated, because `push_notice` never touches a
         // message's text.
         assert_eq!(notices.back().unwrap().as_ref(), refusal);
+    }
+
+    /// The line the strip paints keeps its state word and never stops
+    /// mid-word without a sign: a long name loses its middle, everything
+    /// short is untouched, and the count at the end survives.
+    #[test]
+    fn a_long_name_loses_its_middle_rather_than_the_state_word() {
+        assert_eq!(ledger_line("SNAP OFF"), "SNAP OFF");
+        let long = ledger_line("OPENED he_is_not_the_only_one_at_all_here.mp4 · 1 subtitle track(s)");
+        assert!(long.starts_with("OPENED "), "{long}");
+        assert!(long.ends_with(" · 1 subtitle track(s)"), "{long}");
+        assert!(long.contains('…'), "{long}");
+        assert!(
+            long.split(' ').all(|w| w.chars().count() <= LEDGER_WORD_MAX),
+            "{long}"
+        );
     }
 }

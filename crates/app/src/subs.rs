@@ -320,10 +320,10 @@ pub(crate) type Subs = engine::Result<Vec<engine::subtitle::SubtitleTrack>>;
 /// argv named, an import, and an import into an empty window cannot say the same
 /// thing differently, whichever thread read the cues.
 ///
-/// Worded for where they actually land: a *list* beside the media and nothing
-/// over the picture -- a track shows when it is dragged onto a subtitle lane
-/// ([`Player::subtitle_overlay`]), so the tail says the next move rather than
-/// letting a count read as "and there they are on screen".
+/// A count and nothing else (DESIGN §8: the room never explains itself in
+/// prose). The tracks land in a *list* beside the media, not over the picture
+/// ([`Player::subtitle_overlay`] shows one once it is on a subtitle lane) --
+/// where they went is the list's own geography to say, not this line's.
 ///
 /// `None` for a file that gave none and for one whose tracks are on the timeline
 /// already -- an import that adds nothing says nothing about subtitles. A
@@ -334,8 +334,7 @@ pub(crate) fn subtitle_tail(session: &mut PlaybackSession, subs: Subs) -> Option
         Ok(tracks) => match session.add_subtitle_tracks(tracks) {
             0 => None,
             n => Some(format!(
-                " — {n} subtitle track(s) in the file, in the subtitle list: drag one onto a \
-                 subtitle track to show it"
+                " · {n} subtitle track(s)"
             )),
         },
         Err(e) => Some(format!(" — SUBTITLES UNREAD: {e}")),
