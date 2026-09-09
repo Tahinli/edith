@@ -829,6 +829,11 @@ fn dock(
 ) -> impl IntoElement {
     div()
         .id("stance-dock")
+        // The library's own answer to a file dragged in from outside: the
+        // same raised fill every other drop target in the darkroom lifts to
+        // (DESIGN §8's affordance, no plate and no copy). The drop itself is
+        // heard by the room root (`render`), which covers this panel too.
+        .drag_over::<gpui::ExternalPaths>(|d, _, _, _| d.bg(rgb(DARK_RAISED())))
         .flex_none()
         .w(px(dock_w))
         .h_full()
@@ -1047,6 +1052,25 @@ pub(crate) fn render(
         // ruler-scrub is (render.rs): the pointer outruns the 6px divider
         // hitbox on the first move, so only the whole-window root keeps
         // hearing it once a `Split::Dock`/`Split::Bench` drag has started.
+        // A file dropped from outside the window (gpui's `ExternalPaths`,
+        // Wayland's `text/uri-list`) lands on the room itself, not on the
+        // centre column: the dock's Sources panel and the spine are the
+        // centre's flex siblings, so a handler mounted there heard no drop
+        // over the library at all -- the shipped "drag and drop import does
+        // not work on the library panel" defect. Here it is the one surface
+        // under every region, so a drop anywhere in the darkroom is heard.
+        // No prior press starts this -- the drop itself arrives as a
+        // `MouseUp` (gpui `window.rs`).
+        .on_drop(cx.listener(|this, paths: &gpui::ExternalPaths, _, cx| {
+            // `Player::import` is the one door a project or media path
+            // already goes through (argv, the Import button, Paste path) --
+            // it forks on `.edith` vs everything else itself (`arrival`) and
+            // already refuses during an export, so a drop names nothing this
+            // loop has to.
+            for path in paths.paths() {
+                this.import(path, cx);
+            }
+        }))
         .on_mouse_move(cx.listener(Player::drag_move))
         .on_mouse_up(MouseButton::Left, cx.listener(Player::drag_release))
         .size_full()
@@ -1058,31 +1082,15 @@ pub(crate) fn render(
         .child(
             div()
                 .id("stance-centre")
+                // Same drag affordance the dock lifts to, on the other half
+                // of the room: the drop is heard by the root above, this
+                // only says where the file will land.
+                .drag_over::<gpui::ExternalPaths>(|d, _, _, _| d.bg(rgb(DARK_RAISED())))
                 .relative()
                 .flex_1()
                 .min_w(px(0.))
                 .flex()
                 .flex_col()
-                // A file dropped from outside the window (gpui's
-                // `ExternalPaths`, Wayland's `text/uri-list`) lands here: the
-                // one room-wide surface under everything else drawn below,
-                // so a drop anywhere in the darkroom is heard. No prior
-                // press starts this -- the drop itself arrives as a
-                // `MouseUp` (`window.rs`) -- and the tint is the same
-                // raised fill every other drop target in the darkroom
-                // answers a drag with, DESIGN §8's affordance without a
-                // word of copy on it.
-                .drag_over::<gpui::ExternalPaths>(|d, _, _, _| d.bg(rgb(DARK_RAISED())))
-                .on_drop(cx.listener(|this, paths: &gpui::ExternalPaths, _, cx| {
-                    // `Player::import` is the one door a project or media
-                    // path already goes through (argv, the Import button,
-                    // Paste path) -- it forks on `.edith` vs everything else
-                    // itself (`arrival`) and already refuses during an
-                    // export, so a drop names nothing this loop has to.
-                    for path in paths.paths() {
-                        this.import(path, cx);
-                    }
-                }))
                 .child(screen(player, position, window, cx))
                 .child(time_band(player, position, cx))
                 .child(divider(Split::Bench, cx))
