@@ -207,7 +207,6 @@ struct Player {
     /// Which category of the library is being looked at. A tab and not a
     /// filter box: the categories are what the media *is*, and every editor
     /// this one is measured against splits its pool the same way.
-    library_tab: LibraryTab,
     /// Which of the darkroom dock's Src/Clip tabs is showing (DESIGN §5).
     /// `Player`-owned rather than the process-global static it used to be
     /// (VIOLATION 3), and persisted the way `ui::theme`'s pick is
@@ -222,7 +221,6 @@ struct Player {
     pub(crate) dock_filter: String,
     pub(crate) dock_filter_edit: bool,
     /// Which of the four sort chips is showing (MOCK-SPEC "Dock" §3).
-    pub(crate) dock_sort: ui::dock_stance::DockSort,
     /// What is known about each source's audio, taken once and kept. Keyed on
     /// the path *and stream* -- two streams of one file are two envelopes -- and
     /// the key is inserted the moment the decode is *started*: presence means
@@ -908,11 +906,9 @@ fn main() {
                     picker: None,
                     library_menu: None,
                     selected_asset: None,
-                    library_tab: LibraryTab::Media,
                     dock_src_active: ui::dock_stance::load(),
                     dock_filter: String::new(),
                     dock_filter_edit: false,
-                    dock_sort: ui::dock_stance::DockSort::Recent,
                     waves: HashMap::new(),
                     thumbs: HashMap::new(),
                     proxies: HashMap::new(),

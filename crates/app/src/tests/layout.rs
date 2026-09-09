@@ -1210,46 +1210,54 @@ fn the_subtitles_toggle_says_what_is_placed_and_never_the_picked_row() {
     );
 }
 
-/// The door this editor answers "don't make me import the film again" with,
-/// and it is in the dock's IMPORT section beside the other two imports
-/// (`ui/dock_stance.rs`'s own doc comment: it moved off the old rail's crowded
-/// TRACK group here): reads a file's subtitle tracks onto the open timeline
-/// -- a release's `.mkv`, an `.srt` beside it -- while the file itself
-/// joins nothing. It is the *action* and not a second implementation of it,
-/// so the button, the stroke and the actions card cannot drift apart, and
-/// it is oracle-gated like every other verb in the dock, so with no timeline
-/// open it dims and says why instead of opening a chooser for nothing.
+/// The door this editor answers "don't make me import the film again" with:
+/// it reads a file's subtitle tracks onto the open timeline -- a release's
+/// `.mkv`, an `.srt` beside it -- while the file itself joins nothing.
+///
+/// Cleanse round 2 (2026-09-10) took its ghost row out of the dock's footer
+/// along with the `IMPORT` head: one `Add` row is the dock's one door, and
+/// `Add` itself forks a subtitle file to the same place. The verb keeps its
+/// stroke, its KEYS row, and a pointer door of its own -- the dock's
+/// right-click menu ([`DOCK_ITEMS`]), which an *empty* library carries too.
+/// It is the action and not a second implementation of it, so the row, the
+/// stroke and the actions card cannot drift apart, and the menu row is
+/// oracle-gated like every other, so with no timeline open it dims and says
+/// why instead of opening a chooser for nothing.
 #[test]
-fn the_text_tab_carries_the_add_subtitles_door() {
-    let dock = src_text("ui/dock_stance.rs");
-    let at = dock
-        .find("\"dock-import-subtitles\"")
-        .expect("no import-subtitles control in the dock");
-    let block = &dock[at..(at + 500).min(dock.len())];
+fn the_dock_menu_carries_the_add_subtitles_door() {
+    use crate::{ActionId, DOCK_ITEMS};
     assert!(
-        block.contains("ActionId::ImportSubtitles"),
-        "the button is a door of its own rather than the action: {block}"
+        DOCK_ITEMS.contains(&ActionId::ImportSubtitles)
+            && DOCK_ITEMS.contains(&ActionId::PasteFilePath)
+            && DOCK_ITEMS.contains(&ActionId::AddFiles),
+        "the dock's right-click menu lost one of the three ways in"
     );
+    // ...and that menu is actually opened from the Sources body.
+    let dock = src_text("ui/dock_stance.rs");
     assert!(
-        block.contains("this.act(ActionId::ImportSubtitles"),
-        "the button does not dispatch through the action oracle: {block}"
+        dock.contains("on: MenuOn::Dock,"),
+        "nothing in the dock opens the menu that now carries the two imports"
+    );
+    // The rows are drawn from `DOCK_ITEMS` by the one menu render.
+    let overlays = src_text("ui/overlays.rs");
+    assert!(
+        overlays.contains("MenuOn::Dock => DOCK_ITEMS.to_vec(),"),
+        "the dock menu draws something other than the three import actions"
     );
     // `act(ActionId::ImportSubtitles, ...)` routes to `pick_and_add_subtitles`
-    // -- the button names the action, not a second implementation of it.
+    // -- the row names the action, not a second implementation of it.
     let actions = src_text("player/actions.rs");
     assert!(
         actions.contains("ActionId::ImportSubtitles => self.pick_and_add_subtitles(cx)"),
         "ImportSubtitles no longer opens the subtitle chooser"
     );
-    // `ghost_verb` is the oracle-gated one: dimmed with the refusal in the
-    // oracle's own words (`player.enable(action, None)` in its own body).
+    // A subtitle file taken through the plain `Add files` door lands as
+    // subtitles rather than as a source that cannot be read.
+    let library = src_text("player/library.rs");
     assert!(
-        dock[..at].ends_with("ghost_verb(\n                    "),
-        "the add-subtitles button is not built from the oracle-gated ghost_verb"
+        library.contains("if is_subtitle(path) {"),
+        "Add files no longer forks a .srt/.vtt to the subtitle list"
     );
-    // ...and the empty tab stays a noun, not a sentence pointing at the
-    // button (DESIGN §8, 2026-08-27: no instructional copy).
-    assert_eq!(crate::LibraryTab::Text.empty(), "No subtitles");
 }
 
 /// The Darkroom keeps imported subtitle tracks in the Text tab itself (moved
@@ -2644,9 +2652,9 @@ fn hitmap_names_every_darkroom_pointer_entry_surface() {
     for needle in [
         "subtitle.{group_ord}.{track}.row",
         "subtitle.{group_ord}.{track}.select",
-        "source.{i}.preview",
-        "source.{i}.proxy",
-        "Proxy making",
+        "source.{i}.row",
+        "source.{i}.add",
+        "dock.filter",
     ] {
         assert!(
             dock.contains(needle),
@@ -2939,32 +2947,54 @@ fn a_source_row_shows_its_name_before_anything_else() {
         !row.contains(".min_w(px(0.))"),
         "the row name is still allowed to measure nothing"
     );
-    // The usage moved to the second line, beside codec/length, in ink3.
+    // Cleanse round 2: the name is what the editor calls the film, not what
+    // the filesystem calls the bytes.
     assert!(
-        row.contains(r#".child(format!("{usage} · {under}"))"#),
-        "usage is not folded into the metadata line"
+        row.contains("let name: SharedString = stem(&row.name).into();"),
+        "the row name still wears its extension"
     );
-    // Preview / Add / proxy are glyph+chord ghosts now, not word buttons:
-    // ~66px for the three together, inside the 96px the name can spare.
-    for glyph in [r#".child("▷")"#, r#".child("+")"#, r#".child("↵")"#] {
-        assert!(row.contains(glyph), "the right-edge verbs lost {glyph}");
+    assert_eq!(
+        crate::ui::dock_stance::stem("he_is_not_the_only_one.mp4"),
+        "he_is_not_the_only_one"
+    );
+    // A file with several audio streams keeps the stream half of its name and
+    // loses only the extension; a name that is all extension keeps it.
+    assert_eq!(
+        crate::ui::dock_stance::stem("A Film.mkv [audio 2]"),
+        "A Film [audio 2]"
+    );
+    assert_eq!(crate::ui::dock_stance::stem(".srt"), ".srt");
+    // One ghost on the right edge, and one only: preview and the stand-in
+    // moved into the row's own menu (`RowItem::Preview`/`Proxy`).
+    for glyph in [r#".child("+")"#, r#".child("↵")"#] {
+        assert!(row.contains(glyph), "the right-edge verb lost {glyph}");
     }
-    for word in [r#".child("Preview")"#, r#".child("Add")"#] {
-        assert!(!row.contains(word), "{word} still spends the name's width");
+    for gone in [r#".child("▷")"#, "dock-proxy-toggle", "dock-preview"] {
+        assert!(!row.contains(gone), "the row still carries `{gone}`");
     }
-    // Every verb keeps its own hitmap name and its chord.
-    for id in ["source.{i}.preview", "source.{i}.add", "source.{i}.proxy"] {
-        assert!(row.contains(id), "{id} lost its hitmap entry");
-    }
+    assert!(
+        row.contains("source.{i}.add"),
+        "the add ghost lost its hitmap entry"
+    );
+    // The metadata line is codec · length · lanes: no decoder seat, no use
+    // count (`usage_line` and the `seats` filter above it).
+    assert!(
+        row.contains(".map(Backend::label);") && row.contains(".child(under)"),
+        "the metadata line no longer drops the decoder seat"
+    );
+    let usage = &dock[dock.find("fn usage_line(").expect("the usage line")..start];
+    assert!(!usage.contains("use{}"), "the metadata line still counts uses");
     // DESIGN §8: the permanent footer telling the editor how to use a list
     // ("drag · ↵ add · double-click plays") is instructional copy and is gone.
     assert!(
         !dock.contains("double-click plays"),
         "the dock still carries an instruction footer"
     );
-    // ...and an Audio tab with no audio-only file in it is a single noun, not
-    // the claim `No sound` over a source whose A1 stream is on the bench.
-    assert_eq!(crate::LibraryTab::Audio.empty(), "none");
+    // ...and an empty list is a single noun, whatever emptied it.
+    assert!(
+        dock.contains(r#".child("none"),"#),
+        "the empty dock says something other than the one noun"
+    );
 }
 
 /// A room key pressed while the ring sits in the dock has to reach the room.
@@ -3744,8 +3774,12 @@ fn every_hitmap_control_wears_a_hover_line() {
             }
         }
     }
+    // The floor moved 40 -> 35 with cleanse round 2 (2026-09-10): the dock
+    // gave up five named controls in one diff (the three sub-tabs, the sort
+    // cycle, the row's preview and stand-in ghosts, against one Add row kept)
+    // and a floor above the true count is a red gate, not a blindness check.
     assert!(
-        controls >= 40,
+        controls >= 35,
         "the hover sweep found only {controls} controls -- it has gone blind"
     );
     assert!(

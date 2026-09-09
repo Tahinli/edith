@@ -449,6 +449,10 @@ pub(crate) fn row_enable(item: RowItem, ctx: RowCtx) -> Enable {
         // Dimmed and saying why rather than clicked and refused afterwards: the
         // row's own grey already says the file cannot join this timeline.
         RowItem::Add if !ctx.usable => Enable::No("it cannot join this one"),
+        // A file the engine cannot read has nothing to play and nothing to
+        // make a stand-in from: hidden rather than dimmed, the way the two
+        // removes are, because neither verb has a state that would light it.
+        RowItem::Preview | RowItem::Proxy if !ctx.usable => Enable::Hidden("it cannot be read"),
         // The two removes are one verb with two shapes, and exactly one of
         // them is ever on the plate: the plain one while nothing plays the
         // source, the clips-too one while something does. Hidden rather than

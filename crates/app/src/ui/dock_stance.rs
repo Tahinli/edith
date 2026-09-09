@@ -68,44 +68,6 @@ pub(crate) fn save_maximized(maximized: bool) {
     let _ = std::fs::write(path, if maximized { "1\n" } else { "0\n" });
 }
 
-/// The Sources tab's four sort chips (MOCK-SPEC "Dock" §3). `Recent` is the
-/// library's own arrival order -- the only order this editor tracks without
-/// a fourth field to keep it in.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub(crate) enum DockSort {
-    #[default]
-    Recent,
-    Name,
-    Usage,
-    Unused,
-}
-
-impl DockSort {
-    const ALL: [DockSort; 4] = [
-        DockSort::Recent,
-        DockSort::Name,
-        DockSort::Usage,
-        DockSort::Unused,
-    ];
-    fn label(self) -> &'static str {
-        match self {
-            DockSort::Recent => "Recent",
-            DockSort::Name => "Name",
-            DockSort::Usage => "Usage",
-            DockSort::Unused => "Unused",
-        }
-    }
-
-    /// The next chip in the cycle, wrapping back to `Recent` -- the whole
-    /// row collapsed to one ghost control that cycles on click instead of
-    /// four chips fighting for the same line (user 2026-08-27: "too much
-    /// chrome").
-    fn next(self) -> DockSort {
-        let idx = Self::ALL.iter().position(|s| *s == self).unwrap_or(0);
-        Self::ALL[(idx + 1) % Self::ALL.len()]
-    }
-}
-
 /// A ghost verb (DESIGN §4): borderless glyph/label in `ink2`, its chord in
 /// `ink3` beside it, read live off the keymap so it can never drift from the
 /// key that does the same thing. Hover is one fill step and an ink brighten;
@@ -246,9 +208,10 @@ fn section_head(text: impl Into<SharedString>) -> impl IntoElement {
 }
 
 /// Every lane a source plays on right now, as its own `V1`/`A1` labels
-/// (MOCK-SPEC "Dock" §4's usage line), plus how many clips altogether --
-/// [`Player::row_ctx`]'s `placed` count, the same number the library card's
-/// Remove refusal reads.
+/// (MOCK-SPEC "Dock" §4's usage line). The clip *count* that used to trail it
+/// ("2 uses") is gone with cleanse round 2 (2026-09-10): the lanes are the
+/// answer to "is it in the film?", the number is a statistic, and the
+/// Properties side of the row menu still prints it whole.
 fn usage_line(player: &Player, source_idx: usize, placed: usize) -> String {
     if placed == 0 {
         return "unused".to_string();
@@ -266,11 +229,26 @@ fn usage_line(player: &Player, source_idx: usize, placed: usize) -> String {
             .map(Lane::label)
             .collect()
     });
-    format!(
-        "{} · {placed} use{}",
-        lanes.join(" "),
-        if placed == 1 { "" } else { "s" }
-    )
+    lanes.join(" ")
+}
+
+/// The file's name without its extension -- what the editor calls the film,
+/// not what the filesystem calls the bytes (cleanse round 2). A row that
+/// names several streams of one file keeps the stream half it was given
+/// ([`library_meta::row_name`] appends it after the file name).
+///
+/// corner-cut: private to the dock while U2's shared `stem()` is unlanded;
+/// the lead reconciles the two into `ui/widgets.rs` or `files.rs`.
+pub(crate) fn stem(name: &str) -> String {
+    let (file, tail) = match name.split_once(" [") {
+        Some((file, tail)) => (file, format!(" [{tail}")),
+        None => (name, String::new()),
+    };
+    match file.rsplit_once('.') {
+        // A name that is *all* extension (".srt") keeps it: it is the name.
+        Some(("", _)) | None => format!("{file}{tail}"),
+        Some((base, _)) => format!("{base}{tail}"),
+    }
 }
 
 /// One source row, two lines (MOCK-SPEC "Dock" §4): an ink dot, the name in
@@ -289,70 +267,43 @@ fn source_row(
     cx: &mut Context<Player>,
 ) -> impl IntoElement {
     let usable = row.unusable.is_none();
-    let name: SharedString = row.name.clone().into();
+    let name: SharedString = stem(&row.name).into();
+    // The decoder seat (`HW`/`SW`) is off the row with cleanse round 2: the
+    // codec is what the file *is*, the seat is how this machine happens to
+    // read it today, and the transport line and the Properties side both
+    // still say it. Read off `Backend::label` rather than a copy of those
+    // words, so a renamed seat cannot leave a stale filter behind.
+    let seats = [
+        Backend::Opening,
+        Backend::Hardware,
+        Backend::Software,
+        Backend::Still,
+        Backend::Gap,
+    ]
+    .map(Backend::label);
+    let detail = row
+        .detail
+        .split(" · ")
+        .filter(|part| !seats.contains(part))
+        .collect::<Vec<_>>()
+        .join(" · ");
     let under: String = match &row.unusable {
         Some(why) => why.clone(),
         None => join_detail(
-            &row.detail,
-            &timecode(f64::from(row.frames) / player.fps, player.fps),
+            &join_detail(
+                &detail,
+                &timecode(f64::from(row.frames) / player.fps, player.fps),
+            ),
+            &usage_line(player, row.tint, placed),
         ),
     };
-    let usage = usage_line(player, row.tint, placed);
     let (path, stream) = (row.path.clone(), row.stream);
     let dragged = (path.clone(), stream);
-    let preview_path = path.clone();
     let dot_path = path.clone();
     let menu_path = path.clone();
     let add_path = path.clone();
-    let proxy_path = path.clone();
     let ghost = name.clone();
     let can_insert = usable && player.session.is_some() && player.exporting().is_none();
-    let (proxy_glyph, proxy_on, proxy_progress, proxy_waiting, proxy_tip) =
-        match player.proxies.get(&row.path) {
-            Some(Proxy::Ready) => (
-                "●",
-                true,
-                None,
-                false,
-                format!("Stand-in ON for {} — click to delete it", row.name),
-            ),
-            Some(Proxy::Making(job)) => (
-                "■",
-                true,
-                Some(job.progress()),
-                false,
-                format!("Stop making the stand-in for {}", row.name),
-            ),
-            Some(Proxy::Cancelling(_)) => (
-                "■",
-                true,
-                None,
-                true,
-                format!("Stopping the stand-in for {}…", row.name),
-            ),
-            Some(Proxy::Asked(_)) => (
-                "○",
-                false,
-                None,
-                true,
-                format!("Preparing the stand-in for {}…", row.name),
-            ),
-            _ => (
-                "○",
-                false,
-                None,
-                false,
-                format!("Stand-in OFF for {} — click to make one", row.name),
-            ),
-        };
-    let proxy_stops = proxy_glyph == "■";
-    let proxy_label = match (proxy_on, proxy_waiting, proxy_progress) {
-        (_, true, _) => "Proxy cancelling".to_string(),
-        (true, false, Some(progress)) => format!("Proxy making {:.0}%", progress * 100.),
-        (true, false, None) => "Proxy ready".to_string(),
-        (false, false, _) => "Proxy off".to_string(),
-    };
-    let proxy_tip: SharedString = proxy_tip.into();
     div()
         .id(("dock-source", i))
         .flex_none()
@@ -491,38 +442,11 @@ fn source_row(
                         .text_color(rgb(INK1()))
                         .child(name)
                 })
-                .when(usable, |d| {
-                    d.child({
-                        let style = label(type_scale::FLOOR_PX, FontWeight::MEDIUM);
-                        div()
-                            .id(("dock-preview", i))
-                            .flex_none()
-                            .px(px(4.))
-                            .py(px(2.))
-                            .rounded(px(3.))
-                            .cursor_pointer()
-                            .hover(|s| s.bg(rgb(DARK_RAISED())).text_color(rgb(INK1())))
-                            .tooltip(move |_, cx| {
-                                cx.new(|_| Tip("Preview — play this source outside the timeline".into()))
-                                    .into()
-                            })
-                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                cx.stop_propagation();
-                                this.open_preview(&preview_path, stream, cx);
-                            }))
-                            .children(hitmap::dynamic(
-                                move || (format!("source.{i}.preview"), "Preview source".into()),
-                                true,
-                            ))
-                            .child(
-                                div()
-                                    .font(style.font)
-                                    .text_size(style.size)
-                                    .text_color(rgb(INK2()))
-                                    .child("▷"),
-                            )
-                    })
-                })
+                // Preview (`▷`) and the stand-in toggle (`○`) are off the
+                // row with cleanse round 2: a double-click starts the source playing
+                // and the row menu carries `Preview`, the stand-in lives in
+                // that same menu's `Proxy` row and in Settings. What is left
+                // on the right edge is the one verb a source row is *for*.
                 .when(usable, |d| {
                     d.child({
                         let label_style = label(type_scale::FLOOR_PX, FontWeight::MEDIUM);
@@ -583,54 +507,6 @@ fn source_row(
                                     .child("↵"),
                             )
                     })
-                    .child({
-                        let style = mono(type_scale::LABEL_ROW_PX, FontWeight::MEDIUM);
-                        div()
-                            .id(("dock-proxy-toggle", i))
-                            .flex_none()
-                            .flex()
-                            .flex_col()
-                            .items_center()
-                            .gap(px(2.))
-                            .px(px(4.))
-                            .py(px(2.))
-                            .rounded(px(3.))
-                            .when(proxy_on, |d| d.bg(rgb(DARK_RAISED())))
-                            .when(proxy_waiting, |d| d.opacity(0.55))
-                            .cursor_pointer()
-                            .hover(|s| s.bg(rgb(DARK_RAISED())).text_color(rgb(INK1())))
-                            .tooltip(move |_, cx| cx.new(|_| Tip(proxy_tip.clone())).into())
-                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                cx.stop_propagation();
-                                this.toggle_proxy(&proxy_path, proxy_stops, cx);
-                            }))
-                            .children(hitmap::dynamic(
-                                move || (format!("source.{i}.proxy"), proxy_label),
-                                !proxy_waiting,
-                            ))
-                            .child(
-                                div()
-                                    .font(style.font)
-                                    .text_size(style.size)
-                                    .text_color(rgb(if proxy_on { INK1() } else { INK3() }))
-                                    .child(proxy_glyph),
-                            )
-                            .children(proxy_progress.map(|progress| {
-                                div()
-                                    .flex_none()
-                                    .w(px(20.))
-                                    .h(px(2.))
-                                    .rounded(px(1.))
-                                    .bg(rgb(DARK_HAIRLINE()))
-                                    .child(
-                                        div()
-                                            .h_full()
-                                            .w(px(20. * progress.clamp(0., 1.)))
-                                            .rounded(px(1.))
-                                            .bg(rgb(INK2())),
-                                    )
-                            }))
-                    })
                 }),
         )
         .child({
@@ -641,7 +517,7 @@ fn source_row(
                 .font(style.font)
                 .text_size(style.size)
                 .text_color(rgb(INK3()))
-                .child(format!("{usage} · {under}"))
+                .child(under)
         })
 }
 
@@ -924,80 +800,88 @@ fn subtitle_tab_rows(player: &Player, cx: &mut Context<Player>) -> (usize, Vec<A
     (count, rows)
 }
 
-/// The Sources tab, built off MOCK-SPEC.md's "Dock" section: count line,
-/// filter, sort chips, rows, IMPORT, hint -- none of it the legacy
-/// Media/Audio/Text panel `library.rs` draws. That panel's row facts
-/// ([`library_rows`]) are still what every row here is built from.
+/// The dock's own menu ([`DOCK_ITEMS`]): the three ways a file gets in, on a
+/// right-click anywhere in the Sources body a row does not claim first. It is
+/// where `Paste path` and `Import subtitles` went when cleanse round 2 took
+/// their footer rows, so both keep a pointer door -- including on an empty
+/// library, which is when a pasted path is worth most.
+fn opens_dock_menu(
+    cx: &mut Context<Player>,
+) -> impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static {
+    cx.listener(|this, event: &MouseDownEvent, _, cx| {
+        if this.modal() || this.session.is_none() {
+            return;
+        }
+        cx.stop_propagation();
+        this.context_menu = Some(ContextMenu {
+            lane: Lane::V1,
+            on: MenuOn::Dock,
+            at: event.position,
+            details: false,
+        });
+        cx.notify();
+    })
+}
+
+/// The Sources tab, cleanse round 2 (2026-09-10, user "seems cool, let's
+/// apply"): one filter and one list of everything this project holds --
+/// picture, sound, and the subtitle tracks beside them -- with what a row
+/// *is* read off its own metadata line instead of off a sub-tab the editor
+/// had to pick first. The `MEDIA` head, the `Media / Audio / Text` strip, the
+/// `↕ Recent` sort cycle and the `IMPORT` head are all gone with it; the row
+/// facts are still [`library_rows`]' and [`subtitle_tab_rows`]'.
 fn sources_tab(
     player: &Player,
     _window: &mut Window,
     cx: &mut Context<Player>,
 ) -> impl IntoElement {
-    let text_tab = player.library_tab == LibraryTab::Text;
-    // Text has no per-stream `Row` to fill -- its rows are subtitle tracks
-    // grouped by source ([`subtitle_tab_rows`]), not `library_rows`' files --
-    // so it takes its own branch instead of a `Row` shape that would not fit
-    // it. `dock_filter`/`dock_sort` stay Media/Audio's own: a subtitle track
-    // has no "unused" count and its own row order is the file's own order,
-    // the same reason the old palette never carried either control.
-    let (total, unused_count, row_elements): (usize, usize, Vec<AnyElement>) = if text_tab {
-        let (count, elements) = subtitle_tab_rows(player, cx);
-        (count, 0, elements)
-    } else {
-        let sources = player
-            .session
-            .as_ref()
-            .map_or(&[][..], PlaybackSession::sources);
-        let all_rows: Vec<Row> = library_rows(
-            sources,
-            &player.streams,
-            &player.decoders,
-            player.timeline_audio(),
-            |path| {
-                player
-                    .session
-                    .as_ref()
-                    .map_or(0, |session| session.file_frames(path))
-            },
-        );
-        let filter = player.dock_filter.to_lowercase();
-        let mut rows: Vec<(Row, usize)> = all_rows
-            .into_iter()
-            .filter(|row| player.library_tab.holds(&row.path))
-            .map(|row| {
-                let placed = player.row_ctx(&row.path, row.stream).placed;
-                (row, placed)
-            })
-            .filter(|(row, placed)| {
-                filter.is_empty()
-                    || row.name.to_lowercase().contains(&filter)
-                    || row.detail.to_lowercase().contains(&filter)
-                    || ("unused".contains(&filter) && *placed == 0)
-            })
-            .collect();
-        let unused_count = rows.iter().filter(|(_, placed)| *placed == 0).count();
-        match player.dock_sort {
-            DockSort::Recent => {}
-            DockSort::Name => {
-                rows.sort_by(|(a, _), (b, _)| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-            }
-            DockSort::Usage => rows.sort_by(|(_, a), (_, b)| b.cmp(a)),
-            DockSort::Unused => rows.sort_by_key(|(_, placed)| *placed > 0),
-        }
-        let total = rows.len();
-        let elements: Vec<AnyElement> = rows
-            .iter()
-            .enumerate()
-            .map(|(i, (row, placed))| {
-                let picked = player
-                    .selected_asset
-                    .as_ref()
-                    .is_some_and(|p| *p == (row.path.clone(), row.stream));
-                source_row(player, i, row, *placed, picked, cx).into_any_element()
-            })
-            .collect();
-        (total, unused_count, elements)
-    };
+    let sources = player
+        .session
+        .as_ref()
+        .map_or(&[][..], PlaybackSession::sources);
+    let all_rows: Vec<Row> = library_rows(
+        sources,
+        &player.streams,
+        &player.decoders,
+        player.timeline_audio(),
+        |path| {
+            player
+                .session
+                .as_ref()
+                .map_or(0, |session| session.file_frames(path))
+        },
+    );
+    let filter = player.dock_filter.to_lowercase();
+    let rows: Vec<(Row, usize)> = all_rows
+        .into_iter()
+        .map(|row| {
+            let placed = player.row_ctx(&row.path, row.stream).placed;
+            (row, placed)
+        })
+        .filter(|(row, placed)| {
+            filter.is_empty()
+                || row.name.to_lowercase().contains(&filter)
+                || row.detail.to_lowercase().contains(&filter)
+                || ("unused".contains(&filter) && *placed == 0)
+        })
+        .collect();
+    let mut row_elements: Vec<AnyElement> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, (row, placed))| {
+            let picked = player
+                .selected_asset
+                .as_ref()
+                .is_some_and(|p| *p == (row.path.clone(), row.stream));
+            source_row(player, i, row, *placed, picked, cx).into_any_element()
+        })
+        .collect();
+    // The subtitle tracks join the same list rather than hiding behind a tab
+    // of their own: a standalone `.srt` is a source in the sense that matters
+    // here -- something that came in and can go on a lane -- and the tracks
+    // inside a container stay grouped under the file that carries them.
+    let (_, subtitles) = subtitle_tab_rows(player, cx);
+    row_elements.extend(subtitles);
     let filter_text: SharedString = player.dock_filter.clone().into();
     div()
         .id("dock-sources")
@@ -1005,6 +889,11 @@ fn sources_tab(
         .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
             cycle_on_key_down(Surface::Dock)(this, event, window, cx)
         }))
+        // Right-click anywhere the rows are not: the ways *in* (Add files,
+        // Paste path, Import subtitles), which is what the dock itself can be
+        // told -- and the door those last two kept when their rows left the
+        // footer. A row's own right-click stops here first (`source_row`).
+        .on_mouse_down(MouseButton::Right, opens_dock_menu(cx))
         // The focus ring is not painted (user 2026-09-09: "clicking through
         // timeline draws a white overlay around the timeline, same happens
         // for library section too"). The border stays in flow, transparent in
@@ -1018,22 +907,6 @@ fn sources_tab(
         .gap(px(6.))
         .p(px(8.))
         .overflow_y_scroll()
-        .child({
-            let style = head();
-            let hint: SharedString = match text_tab {
-                true => format!("{total} total"),
-                false => format!("{total} total · {unused_count} unused"),
-            }
-            .into();
-            div()
-                .id("dock-header")
-                .flex_none()
-                .font(style.font)
-                .text_size(style.size)
-                .text_color(rgb(INK3()))
-                .tooltip(move |_, cx| cx.new(|_| Tip(hint.clone())).into())
-                .child(player.library_tab.label().to_uppercase())
-        })
         .child({
             let style = mono(type_scale::CHORD_METADATA_MAX_PX, FontWeight::MEDIUM);
             div()
@@ -1053,81 +926,12 @@ fn sources_tab(
                 }))
                 .tooltip(crate::ui::widgets::tip_hover("Filter sources", "type to narrow", None))
                 .children(hitmap::control("dock.filter", "Filter sources", true))
+                // The glass alone at rest: the word "filter" beside it was
+                // the box telling the editor what a filter box is (DESIGN §8).
                 .child(match player.dock_filter.is_empty() {
-                    true => "⌕ filter".to_string(),
+                    true => "⌕".to_string(),
                     false => format!("⌕ {filter_text}"),
                 })
-        })
-        .child(
-            div()
-                .flex_none()
-                .flex()
-                .gap(px(4.))
-                .children(LIBRARY_TABS.map(|tab| {
-                    let on = tab == player.library_tab;
-                    let style = label(type_scale::FLOOR_PX, FontWeight::MEDIUM);
-                    div()
-                        .id(("dock-source-filter", tab as usize))
-                        .flex_none()
-                        .px(px(6.))
-                        .py(px(2.))
-                        .rounded(px(3.))
-                        .font(style.font)
-                        .text_size(style.size)
-                        .when(on, |d| d.bg(rgb(DARK_RAISED())).text_color(rgb(INK1())))
-                        .when(!on, |d| d.text_color(rgb(INK3())))
-                        .cursor_pointer()
-                        .hover(|s| s.bg(rgb(DARK_RAISED())))
-                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                            this.library_tab = tab;
-                            cx.notify();
-                        }))
-                        .tooltip(crate::ui::widgets::tip_hover(&format!("Show {} only", tab.label().to_lowercase()), "", None))
-                        .children(hitmap::dynamic(
-                            move || {
-                                (
-                                    format!("dock.filter.{}", tab.label()),
-                                    format!("Filter {}", tab.label()),
-                                )
-                            },
-                            true,
-                        ))
-                        .child(tab.label())
-                })),
-        )
-        // The sort cycle is Media/Audio's own: a subtitle track's order is
-        // its file's own order, not a pick among Recent/Name/Usage/Unused.
-        .when(!text_tab, |d| {
-            d.child({
-                let current = player.dock_sort;
-                let style = label(type_scale::FLOOR_PX, FontWeight::MEDIUM);
-                div()
-                    .id("dock-sort-cycle")
-                    .flex_none()
-                    .px(px(6.))
-                    .py(px(2.))
-                    .rounded(px(3.))
-                    .font(style.font)
-                    .text_size(style.size)
-                    .text_color(rgb(INK2()))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(rgb(DARK_RAISED())).text_color(rgb(INK1())))
-                    .tooltip(crate::ui::widgets::tip_hover("Sort sources", "click to cycle", None))
-                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                        this.dock_sort = this.dock_sort.next();
-                        cx.notify();
-                    }))
-                    .children(hitmap::dynamic(
-                        move || {
-                            (
-                                "dock.sort.cycle".to_string(),
-                                format!("Sort: {} — click to cycle", current.label()),
-                            )
-                        },
-                        true,
-                    ))
-                    .child(format!("↕ {}", current.label()))
-            })
         })
         .child(
             div()
@@ -1138,6 +942,10 @@ fn sources_tab(
                 .flex_col()
                 .gap(px(2.))
                 .overflow_y_scroll()
+                // The list fills the dock, so the empty stretch under the last
+                // row is *this* element and not its parent: the menu opens off
+                // both, or a right-click below the rows finds nothing.
+                .on_mouse_down(MouseButton::Right, opens_dock_menu(cx))
                 .when(row_elements.is_empty(), |d| {
                     let style = label(type_scale::LABEL_ROW_PX, FontWeight::MEDIUM);
                     d.child(
@@ -1145,53 +953,27 @@ fn sources_tab(
                             .font(style.font)
                             .text_size(style.size)
                             .text_color(rgb(INK3()))
-                            .child(match text_tab || player.dock_filter.is_empty() {
-                                true => player.library_tab.empty().to_string(),
-                                false => "nothing matches the filter".to_string(),
-                            }),
+                            // One noun for both empties -- nothing imported and
+                            // nothing matching are the same sight, and neither
+                            // is a sentence (DESIGN §8).
+                            .child("none"),
                     )
                 })
                 .children(row_elements),
         )
-        .child(section_head("IMPORT"))
-        .child(
-            div()
-                .flex_none()
-                .flex()
-                .flex_col()
-                .children(ghost_verb(
-                    "dock-import-files",
-                    "Add files",
-                    ActionId::AddFiles,
-                    false,
-                    player,
-                    cx.listener(|this, _: &ClickEvent, _, cx| this.pick_and_import(cx)),
-                ))
-                .children(ghost_verb(
-                    "dock-paste-path",
-                    "Paste path",
-                    ActionId::PasteFilePath,
-                    false,
-                    player,
-                    cx.listener(|this, _: &ClickEvent, _, cx| this.paste_file_path(cx)),
-                ))
-                // Subtitles come in through the same door every other file
-                // does. This row is `↓S`'s new geographic home: the spine's
-                // TRACK group carried it as a two-glyph badge on a 56px rail
-                // that no longer had the height for it (user 2026-08-21:
-                // "the spine menu is too crowded"), and an import belongs
-                // beside the other two imports, not beside the lane verbs.
-                .children(ghost_verb(
-                    "dock-import-subtitles",
-                    "Import subtitles",
-                    ActionId::ImportSubtitles,
-                    false,
-                    player,
-                    cx.listener(|this, _: &ClickEvent, window, cx| {
-                        this.act(ActionId::ImportSubtitles, window, cx)
-                    }),
-                )),
-        )
+        // One door in, at the bottom. `Paste path` (`^l`) and `Import
+        // subtitles` (`^i`) keep their strokes, their KEYS rows and the
+        // dock's own right-click menu; `Add files` takes a `.srt`/`.vtt` as
+        // happily as an `.mkv` (`Player::import` forks on `is_subtitle`), so
+        // subtitles arrive through this row too.
+        .children(ghost_verb(
+            "dock-import-files",
+            "Add",
+            ActionId::AddFiles,
+            false,
+            player,
+            cx.listener(|this, _: &ClickEvent, _, cx| this.pick_and_import(cx)),
+        ))
 }
 
 /// The transition a clip carries into its immediate successor, if any -- a

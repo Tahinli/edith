@@ -135,8 +135,19 @@ Fixed geography; nothing moves, nothing occludes the picture:
   cursor to be right-clicked on. `ink3` + chord, hover raises to `ink2` with the room's own
   plate, `CC` reads `ink1` + fill while subtitles are shown. State lives here, notices rise
   from here.
-- **Dock** (right, the only side panel): Sources tab (assembly: filter, usage chips, import),
-  Clip tab (verbs: Speed / Colour / Transform / EQ as ghost verbs over param rows) and KEYS tab.
+- **Dock** (right, the only side panel): SOURCES tab, CLIP tab, KEYS tab.
+  **Cleanse round 2 (2026-09-10):** SOURCES is a filter and *one* list. The filter is the glass
+  alone (`⌕`, no placeholder word); the list holds every source together — picture, sound and
+  subtitle tracks — in arrival order, with no `Media / Audio / Text` sub-tabs, no sort row, no
+  `MEDIA` or `IMPORT` head. A row is: dot · name **without its extension** (ellipsized, ≥60% of
+  the width) · one right-edge ghost `+↵`; under it one metadata line, `H.264 · 01:39:18 · V1 A1`
+  — codec, length, the lanes that play it (no decoder seat, no use count), which is also where a
+  row says what kind it is. Preview is a double-click or the row menu's `Preview`; the stand-in
+  is that menu's `Proxy` plus Settings. The foot is one row, `Add ^o`, and it takes a `.srt`/
+  `.vtt` as readily as an `.mkv`; `Paste path ^l` and `Import subtitles ^i` keep their strokes,
+  their KEYS rows and the dock's own right-click menu. Empty list: the one noun `none`.
+  CLIP tab: the per-clip verbs (Speed / Colour / Transform / EQ / Silence / Mix / Fit) as plain
+  ghost rows — label + chord, no head styling — over the param rows they open.
 
 **Amendment (2026-09-09), user decision "option C":** there is no rail. The 56px spine — every
 command as a ghost glyph + chord down the left edge — is deleted, and the picture, time band,
