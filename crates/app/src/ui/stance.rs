@@ -620,6 +620,38 @@ fn bench(
         .child(bench_stance::render(player, bench_h - BENCH_CHROME_H, cx))
 }
 
+/// DESIGN §8's "needs a decision" notice, and the only one the room raises:
+/// a red 3px spine, the state word, and the verbs that answer it -- state
+/// plus verb·chord, never a sentence. It rises where notices rise, directly
+/// above the ledger, so it is never over the picture. The keys behind it live
+/// in the root `on_key_down` above.
+fn decision_plate() -> impl IntoElement {
+    div()
+        .id("stance-quit-ask")
+        .flex_none()
+        .h(px(LEDGER_H))
+        .bg(rgb(DARK_PANEL()))
+        .border_t_1()
+        .border_color(rgba(DARK_SEAM()))
+        .flex()
+        .items_center()
+        // The spine is a child, not a border: a border colours all four sides
+        // at once and the seam above this strip is the panel's, not the
+        // notice's severity (the clip spine in `bench_stance` is drawn the
+        // same way for the same reason).
+        .child(div().flex_none().w(px(3.)).h_full().bg(rgb(STATUS_ERROR())))
+        .child(
+            div()
+                .pl(px(12.))
+                .type_style(type_scale::mono(
+                    type_scale::CHORD_METADATA_MIN_PX,
+                    gpui::FontWeight::MEDIUM,
+                ))
+                .text_color(rgb(INK1()))
+                .child("UNSAVED — save ↵ · discard d · stay esc"),
+        )
+}
+
 /// Thin strip at the bottom of the centre column: project identity, last
 /// action, export progress, position. Notices rise from here (DESIGN §5, §8).
 fn ledger(player: &Player, position: f64, cx: &mut Context<Player>) -> impl IntoElement {
@@ -856,6 +888,35 @@ pub(crate) fn render(
             if event.is_held && !repeats(this.repeat_scope(), key, this.keymap.lookup(key, ctrl)) {
                 return;
             }
+            // The unsaved-work question (user 2026-09-10: "if timeline is not
+            // empty and user does alt+f4 or exit somehow, ask user to save the
+            // file if it's not already saved"). Asked ahead of every branch
+            // below because while the plate is up it owns the keyboard: three
+            // answers and nothing else -- `↵` saves and goes, `d` goes without
+            // saving, `esc` stays, any other key does nothing at all.
+            if this.quit_ask {
+                match key {
+                    "enter" => {
+                        // The Save action's own door, so the notice, the
+                        // sidecar cleanup and the dirty flag are the ones a
+                        // ctrl+s writes. corner-cut: a project with no path
+                        // yet says "NOTHING TO SAVE — no file open" and the
+                        // window still goes; this app has no save-as dialog
+                        // anywhere to route to (no file picker exists in the
+                        // tree), and every timeline with a clip on it got a
+                        // path from its first import (`project_path`).
+                        this.save_project(cx);
+                        window.remove_window();
+                    }
+                    "d" => window.remove_window(),
+                    "escape" => {
+                        this.quit_ask = false;
+                        cx.notify();
+                    }
+                    _ => {}
+                }
+                return;
+            }
             // The recovery notice reads a key as more than "answered" (legacy
             // `render.rs`'s own rule): `enter` loads the sidecar it named, any
             // other key declines it. Asked before the generic dismiss below
@@ -1055,6 +1116,7 @@ pub(crate) fn render(
                 .child(time_band(player, position, cx))
                 .child(divider(Split::Bench, player.split_drag == Some(Split::Bench), cx))
                 .child(bench(player, bench_h, window, cx))
+                .when(player.quit_ask, |el| el.child(decision_plate()))
                 .child(ledger(player, position, cx))
                 .when(player.settings_open, |el| {
                     el.child(settings_stance::render(player, window_size, cx))
