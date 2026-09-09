@@ -663,6 +663,21 @@ pub(crate) fn export_settings(
     }
 }
 
+/// The same settings with the budget taken out -- what the seat probe is asked
+/// and keyed on ([`crate::Player::cache_export_seat`]). A bitrate does not
+/// decide whether this machine has a VA-API seat or whether the picture's
+/// packets can be copied; leaving it in the key meant every wheel notch on the
+/// budget row invalidated the answer and opened a real VA-API encoder to ask it
+/// again -- measured at ten opens for ten notches, 5-32 ms of GPU work each,
+/// against the player's own decoder, which is the "freezes a little" this row
+/// was reported for.
+pub(crate) fn probe_settings(format: Format, audio_kbps: u32, seat: EncoderSeat) -> ExportSettings {
+    ExportSettings {
+        bitrate: None,
+        ..export_settings(0, format, audio_kbps, seat)
+    }
+}
+
 /// The budget's bounds, the engine's own (`engine::export`'s `MIN_BITRATE`
 /// and `MAX_EXPLICIT_BITRATE`): a number outside them would be written as a
 /// different one, so the lever and the field clamp to exactly these.
