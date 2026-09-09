@@ -111,11 +111,11 @@ fn a_lane_refuses_the_files_it_cannot_hold_before_the_release_says_so() {
     let movie = Path::new("/media/take.mp4");
     assert_eq!(
         lane_refuses(sound, video, false).as_deref(),
-        Some("NOT ON V1 — take.mp3 has no picture; drop it on an audio lane")
+        Some("NOT ON V1 — take.mp3 has no picture")
     );
     assert_eq!(
         lane_refuses(still, audio, true).as_deref(),
-        Some("NOT ON A1 — card.png is a still image; drop it on a video lane")
+        Some("NOT ON A1 — card.png is a still image")
     );
     // ...and every lane a file *can* go on says nothing at all, which is a
     // ghost drawn in the file's own colour.
@@ -131,7 +131,7 @@ fn a_lane_refuses_the_files_it_cannot_hold_before_the_release_says_so() {
     // twin above got -- `has_video` is what decides it now, not the suffix.
     assert_eq!(
         lane_refuses(movie, video, false).as_deref(),
-        Some("NOT ON V1 — take.mp4 has no picture; drop it on an audio lane")
+        Some("NOT ON V1 — take.mp4 has no picture")
     );
     // ...and a subtitle lane holds none of the three: a caption comes off the
     // Subtitles list, which is where the refusal points.

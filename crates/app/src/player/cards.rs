@@ -244,7 +244,7 @@ impl Player {
             return;
         }
         let Some(session) = &self.session else {
-            self.notify_user("no timeline to grade — open a file first".into());
+            self.notify_user("no timeline to grade — no file open".into());
             cx.notify();
             return;
         };
@@ -262,8 +262,7 @@ impl Player {
                     Some(half) => Some(half),
                     None => {
                         self.notify_user(
-                            "NOTHING TO GRADE — a caption has no picture; group it with a clip \
-                             first (ctrl-click both, then Group)"
+                            "NOTHING TO GRADE — a caption has no picture"
                                 .into(),
                         );
                         cx.notify();
@@ -400,7 +399,7 @@ impl Player {
             return;
         }
         let Some(session) = &self.session else {
-            self.notify_user("no timeline to place — open a file first".into());
+            self.notify_user("no timeline to place — no file open".into());
             cx.notify();
             return;
         };
@@ -410,8 +409,7 @@ impl Player {
                     Some(half) => Some(half),
                     None => {
                         self.notify_user(
-                            "NOTHING TO PLACE — a caption has no picture; group it with a clip \
-                             first (ctrl-click both, then Group)"
+                            "NOTHING TO PLACE — a caption has no picture"
                                 .into(),
                         );
                         cx.notify();
@@ -533,7 +531,7 @@ impl Player {
             return;
         }
         let Some(session) = &self.session else {
-            self.notify_user("no timeline to re-time — open a file first".into());
+            self.notify_user("no timeline to re-time — no file open".into());
             cx.notify();
             return;
         };
@@ -551,8 +549,7 @@ impl Player {
                     Some(half) => Some(half),
                     None => {
                         self.notify_user(
-                            "NOTHING TO RE-TIME — a caption has no speed of its own; group it \
-                             with a clip first (ctrl-click both, then Group)"
+                            "NOTHING TO RE-TIME — a caption has no speed of its own"
                                 .into(),
                         );
                         cx.notify();
@@ -696,7 +693,7 @@ impl Player {
             return;
         }
         let Some(session) = &self.session else {
-            self.notify_user("no timeline to scan — open a file first".into());
+            self.notify_user("no timeline to scan — no file open".into());
             cx.notify();
             return;
         };
@@ -714,8 +711,7 @@ impl Player {
                     Some(half) => Some(half),
                     None => {
                         self.notify_user(
-                            "NOTHING TO SCAN — a caption has no sound of its own; group it with \
-                             the take's sound first (ctrl-click both, then Group)"
+                            "NOTHING TO SCAN — a caption has no sound of its own"
                                 .into(),
                         );
                         cx.notify();
@@ -1161,7 +1157,7 @@ impl Player {
         if self.silence_marks.is_empty() {
             self.notify_user(
                 format!(
-                    "no silence under {:.0} dBFS lasting {:.2} s — raise the threshold or forgive less",
+                    "no silence under {:.0} dBFS lasting {:.2} s",
                     self.silence.threshold_db, self.silence.min_silence
                 )
                 .into(),
@@ -1213,7 +1209,7 @@ impl Player {
                 self.reset_after_reseek();
                 self.notify_user(
                     format!(
-                        "{count} SILENCES CUT {reach} — {} shorter, {} takes it back",
+                        "{count} SILENCES CUT {reach} — {} shorter · undo {}",
                         secs_label(saved),
                         self.keymap.display(ActionId::Undo)
                     )
@@ -1252,7 +1248,7 @@ impl Player {
                 self.reset_after_reseek();
                 self.notify_user(
                     format!(
-                        "{count} SILENCES AT {rate} {reach} — {} takes it back",
+                        "{count} SILENCES AT {rate} {reach} · undo {}",
                         self.keymap.display(ActionId::Undo)
                     )
                     .into(),
@@ -1392,13 +1388,13 @@ impl Player {
             _ => self.selected.anchor(),
         };
         let refusal = match (anchor, &self.session) {
-            (_, None) => Some("NO TIMELINE — open a file first".to_string()),
+            (_, None) => Some("NO TIMELINE — no file open".to_string()),
             (None, _) => Some(format!(
-                "NOTHING SELECTED — click an audio clip or press {}, then ask again",
+                "NOTHING SELECTED · select all {}",
                 self.keymap.display(ActionId::Select)
             )),
             (Some((lane, _)), _) if lane.kind != LaneKind::Audio => Some(
-                "NOT AN AUDIO CLIP — the equalizer works on the sound, so pick a clip in an audio lane".to_string(),
+                "NOT AN AUDIO CLIP — the equalizer works on sound".to_string(),
             ),
             _ => None,
         };
@@ -1495,7 +1491,7 @@ impl Player {
         if self.eq_params.bands.len() >= EQ_BANDS_MAX {
             self.notify_user(
                 format!(
-                    "EQUALIZER FULL — {EQ_BANDS_MAX} bands is all this card holds; move one instead"
+                    "EQUALIZER FULL — {EQ_BANDS_MAX} bands"
                 )
                 .into(),
             );
@@ -1512,7 +1508,7 @@ impl Player {
     /// is a card with nothing to edit, and flattening is what "off" means here.
     pub(crate) fn remove_band(&mut self, cx: &mut Context<Self>) {
         if self.eq_params.bands.len() <= 1 {
-            self.notify_user("LAST BAND — flatten it instead (r), or close the card".into());
+            self.notify_user("LAST BAND · flatten r".into());
             cx.notify();
             return;
         }
