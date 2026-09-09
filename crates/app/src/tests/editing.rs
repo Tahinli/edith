@@ -1670,7 +1670,7 @@ fn a_row_dropped_on_the_open_bed_lands_under_the_pointer() {
     // bed: ten seconds in, five seconds past the end of the timeline, and
     // no mark anywhere near enough to pull it back.
     let clips = [session.lane_clips(Lane::V1), session.lane_clips(Lane::A1)];
-    let marks = snap_marks(&clips, None, None, frame_at(session.now(), fps));
+    let marks = snap_marks(&clips, None, None, frame_at(session.now(), fps), None);
     let under = frame_at(scale.time_at(px_along(px(212.), bed)), fps);
     let (at, cue) = landing(under, 0, 0, true, scale.snap_frames(fps), &marks);
     assert_eq!((at, cue), (300, None), "the pointer is on frame 300");

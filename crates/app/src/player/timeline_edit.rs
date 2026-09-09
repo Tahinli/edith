@@ -887,12 +887,35 @@ impl Player {
             self.set_ghost(Vec::new(), cx);
             return;
         };
+        // What the release would refuse: a lane of the other kind, and a head
+        // let go on top of a take already there ([`Project::move_selection`]
+        // changes nothing rather than overwrite one). Drawn as refused so a
+        // drop that will not happen is seen before the hand lets go, never as a
+        // silent no-op. The neighbours are the destination lane's clips less
+        // whatever travels with this one -- itself and its link group.
+        let neighbours: Vec<(u32, u32)> = self
+            .session
+            .as_ref()
+            .map(|session| {
+                session
+                    .lane_clips(to)
+                    .iter()
+                    .enumerate()
+                    .filter(|&(i, clip)| {
+                        (to, i) != (drag.lane, idx)
+                            && !(clip.link.is_some() && clip.link == drag.clip.link)
+                    })
+                    .map(|(_, clip)| (clip.start, clip.end()))
+                    .collect()
+            })
+            .unwrap_or_default();
         let anchor = Ghost {
             lane: to,
             start,
             frames: drag.clip.frames(),
             tint: self.clip_tint(drag.clip.source),
-            refused: drag.lane.kind != to.kind,
+            refused: drag.lane.kind != to.kind
+                || collides(start, drag.clip.frames(), &neighbours),
         };
         let mut ghosts = vec![anchor];
         if self.selected.contains((drag.lane, idx)) && self.selected.len() > 1 {
@@ -1046,13 +1069,13 @@ impl Player {
             .flatten()
         });
         let skip = skip.and_then(|(lane, idx)| Some((lanes.iter().position(|&l| l == lane)?, idx)));
-        snap_marks(&clips, skip, skip_link, frame_at(session.now(), self.fps))
-    }
-
-    /// Where a gesture at `raw` lands and the mark that pulled it there, with
-    /// the switch honoured: snapping off, nothing moves and no line is drawn.
-    pub(crate) fn snap_to(&self, raw: u32, len: u32, marks: &[u32]) -> (u32, Option<u32>) {
-        snap_cue(self.snap_live(), raw, len, self.snap_frames(), marks)
+        snap_marks(
+            &clips,
+            skip,
+            skip_link,
+            frame_at(session.now(), self.fps),
+            self.range,
+        )
     }
 
     /// Every timeline frame that is a *source* sync point: each clip's own
@@ -1459,7 +1482,16 @@ impl Player {
         // The edge is pulled onto the same marks a whole clip is, by itself:
         // there is no other end travelling with it, so it snaps at length zero.
         let marks = self.snap_targets(Some((trim.lane, trim.idx)));
-        let (at, cue) = self.snap_to(self.frame_under(x), 0, &marks);
+        // The same 10 px of aim a drop is given ([`DROP_SNAP_PX`]): one
+        // threshold for every gesture on this bed, so an edge and a whole clip
+        // grip a cut at the same distance from it.
+        let (at, cue) = snap_cue(
+            self.snap_live(),
+            self.frame_under(x),
+            0,
+            self.drop_snap_frames(),
+            &marks,
+        );
         let Some((lo, hi)) = self.session.as_ref().and_then(|session| {
             match trim.lane.kind == LaneKind::Subtitle {
                 // The walls a caption's edge has -- its neighbour, its own

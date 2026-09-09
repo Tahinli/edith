@@ -932,9 +932,7 @@ fn lane_row(
                 // clip dragged down across A1 on its way to the empty bench
                 // below is still aiming at V1, and the catch-all release must
                 // not hand it the audio lane that refused it on the way past.
-                if drag.lane.kind == lane.kind {
-                    this.drag_lane = Some(lane);
-                }
+                this.drag_lane = held_lane(this.drag_lane, lane, drag.lane);
                 this.drag_alt = event.event.modifiers.alt;
                 this.preview_ghost(&drag, lane, event.event.position.x, cx);
             }),
