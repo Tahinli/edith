@@ -36,7 +36,7 @@ Surfaces (dark-only; no light theme, ever):
 | Token | Value | Role |
 |---|---|---|
 | `canvas` | `#050607` | app ground, bench background |
-| `panel` | `#0E1013` | spine, dock, ledger, plates' parent surfaces |
+| `panel` | `#0E1013` | dock, ledger, plates' parent surfaces |
 | `raised` | `#14171B` – `#17191D` | hover fill step, active verb fill |
 | `hairline` | `#22262B` | 1px separations *within* a panel |
 | seam | `rgba(0,0,0,.7)` | 1px panel-to-panel boundary |
@@ -91,9 +91,9 @@ align.
   (Export). If a second boxed control ever appears on one surface, one of them is wrong.
 - **Readouts are plates:** dark (`canvas`-on-`panel`) rectangles carrying mono text. Notices,
   menus, chips, cues, and tooltips are all the same plate.
-- **Every command wears its chord**, everywhere it appears — spine, menus, verbs, the `?`
-  overlay. Nothing lives only in a menu; nothing lives only on a key. (This kills the
-  shortcut-sync defect class permanently: the UI *is* the shortcut sheet.)
+- **Every command wears its chord**, everywhere it appears — right-click menus, regional verbs,
+  the ledger's room verbs, the KEYS tab. Nothing lives only in a menu; nothing lives only on a
+  key. (This kills the shortcut-sync defect class permanently: the UI *is* the shortcut sheet.)
 - **The most-read element anchors its region** — timecode leads the time band; the film leads
   the room.
 - Radii: 0 for lanes/clips/room chrome · 2px plates · 3px verbs/controls · 4–6px floating
@@ -105,23 +105,23 @@ align.
 Fixed geography; nothing moves, nothing occludes the picture:
 
 ```
-┌──┬──────────────────────────────┬──────┐
-│  │           SCREEN             │      │
-│sp│    (picture — top, never     │ dock │
-│in│         occluded)            │ Src/ │
-│e │                              │ Clip │
-│  ├──────────────────────────────┤ tabs │
-│56│ TIME BAND: timecode → ghost  │      │
-│px│  transport → cut readout →   │      │
-│  │  contact strip → [Export]    │      │
-│  ├──────────────────────────────┤      │
-│  │ BENCH (lanes V/A/S)          │      │
-│  ├──────────────────────────────┤      │
-│  │ LEDGER (project · state)     │      │
-└──┴──────────────────────────────┴──────┘
+┌─────────────────────────────────┬──────┐
+│             SCREEN              │      │
+│      (picture — top, never      │ dock │
+│           occluded)             │ Src/ │
+│                                 │ Clip │
+├─────────────────────────────────┤ KEYS │
+│ TIME BAND: timecode → ghost     │ tabs │
+│  transport → cut readout →      │      │
+│  contact strip → [Export]       │      │
+├─────────────────────────────────┤      │
+│ BENCH (lanes V/A/S)             │      │
+├─────────────────────────────────┤      │
+│ LEDGER (project · state · room  │      │
+│  verbs · position)              │      │
+└─────────────────────────────────┴──────┘
 ```
 
-- **Spine** (56px, left): every command as ghost glyph + chord, grouped by task frequency.
 - **Screen**: the picture. Never covered — not by drawers, notices, drags, or menus. Two-up
   OUT|IN judging renders *in* the screen at rest on a cut.
 - **Time band**: timecode leads; ghost transport; cut readout (`14/37`); the **contact strip**
@@ -129,10 +129,22 @@ Fixed geography; nothing moves, nothing occludes the picture:
   jumps, drag pans); boxed **Export** at the end.
 - **Bench**: lanes. Clip anatomy = ink spine (3px left edge) + real thumbnails/waveform in the
   source's ink + name plate + splice gaps in lamp white.
-- **Ledger**: project identity (`name.edith · saved`), last action, export progress, position.
-  State lives here, notices rise from here.
-- **Dock** (right, the only side panel): Sources tab (assembly: filter, usage chips, import) and
-  Clip tab (verbs: Speed / Colour / Transform / EQ as ghost verbs over param rows).
+- **Ledger**: project identity (`name.edith · saved`), last action, export progress, and at the
+  right end, before the position: the **room verbs** as ghosts (`CC t · settings ^, · keys ? ·
+  full f11`) — the four commands that act on the room itself and so have no thing under the
+  cursor to be right-clicked on. `ink3` + chord, hover raises to `ink2` with the room's own
+  plate, `CC` reads `ink1` + fill while subtitles are shown. State lives here, notices rise
+  from here.
+- **Dock** (right, the only side panel): Sources tab (assembly: filter, usage chips, import),
+  Clip tab (verbs: Speed / Colour / Transform / EQ as ghost verbs over param rows) and KEYS tab.
+
+**Amendment (2026-09-09), user decision "option C":** there is no rail. The 56px spine — every
+command as a ghost glyph + chord down the left edge — is deleted, and the picture, time band,
+bench and ledger take its width. Nothing on screen lists the room's commands, because **the
+geography of a verb is the thing it acts on**: a verb reaches its target by right-click on that
+target, by its key, and says its own name through the hover plate under the pointer. The one
+list left is the dock's **KEYS** tab (§9), and the one exception is the ledger's room verbs
+above — those four act on the room, which is not a thing the cursor can be over.
 
 Session continuity: a room reopens exactly as left — playhead, subject cut, viewport, dock tab.
 
@@ -235,10 +247,15 @@ string over ~4 words that instructs rather than reports state is a defect.
   room would refuse right now greys to `ink4` like any refused verb (§8) rather than vanishing.
   `?` swings the dock to that tab and a second `?` (or `escape`, or a press on another tab)
   swings it back — a toggle, not a hold and not a modal: nothing about the KEYS tab owns the
-  keyboard, so the film keeps playing and every other stroke keeps meaning what the spine says it
-  means. The spine's `?` glyph wears no chord badge, because its chord *is* its glyph. The
-  ceiling above is unchanged: the 56 homeless actions still owe a geographic home, and this tab
-  is what they read from until they get one.
+  keyboard, so the film keeps playing and every other stroke keeps meaning what the keymap says
+  it means. The ledger's `keys ?` ghost is the tab's pointer door and wears no second `?`,
+  because its chord *is* its own name — the rule the deleted rail's last glyph was given.
+
+  **Amendment (2026-09-09), user decision "option C":** the rail the fifteen chord-wearing
+  glyphs stood on is deleted (§5). The ceiling above is unchanged in *count* but changes in
+  *shape*: a homeless action's geographic home is now the right-click menu of the thing it acts
+  on, its key, and the hover plate — not a widget parked on a rail. The KEYS tab is what every
+  action still reads from.
 
 ## 10. The joy layer
 
@@ -281,7 +298,7 @@ If a feature fails the checklist, either the feature changes or this document do
 
 1. Token substrate in `crates/app/src/ui/theme.rs` (extend the 34-role system; keep the
    `no_colour_is_written_outside_the_theme` guard green).
-2. The stance behind a flag (spine / screen / time band / bench / ledger / dock skeleton).
+2. The stance behind a flag (screen / time band / bench / ledger / dock skeleton).
 3. Cut machinery (`,` `.` `[` `]` `/`, two-up, readout) — before cosmetics.
 4. Dock (Sources assembly + Clip verbs).
 5. Ink extraction + grading pipeline; source dots; selection ink.
