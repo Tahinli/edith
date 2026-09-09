@@ -45,7 +45,7 @@ impl LibraryTab {
     pub(crate) fn empty(self) -> &'static str {
         match self {
             LibraryTab::Media => "No video",
-            LibraryTab::Audio => "No sound",
+            LibraryTab::Audio => "none",
             LibraryTab::Text => "No subtitles",
         }
     }
