@@ -288,6 +288,18 @@ impl Split {
 /// it looks like.
 pub(crate) const SPLIT_W: f32 = 6.;
 
+/// How wide the same seam is *aimed at*. The strip above is what the layout
+/// spends and the hairline is what the eye is given; this is the band the hand
+/// gets, centred on the strip and overlaid on the two panels it parts, so
+/// growing it moves nothing. 6 px asked the hand for precision it does not
+/// have -- the lead's own press one row into the bench missed the seam by 5 px
+/// and focused the bench instead ("panes should be enlargable and shrinkable",
+/// of panes that already resized). 12 px is the ±6 px of aim every editor's
+/// dividers allow, and it is hung one row above the strip rather than centred
+/// on it: what a hand aims at is the line it can see (the panel's own edge at
+/// the strip's far side), not the six transparent pixels in front of it.
+pub(crate) const GRAB_W: f32 = 14.;
+
 /// The most of the window one side column may be dragged to. A third each, so
 /// the picture keeps the middle at every size -- the rule [`library_w`] and
 /// [`inspector_w`] already lay an untouched window out by, kept once the hand
