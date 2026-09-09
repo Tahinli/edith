@@ -2814,3 +2814,157 @@ fn the_lane_bed_clips_its_clips_at_the_pinned_heads() {
          pinned lane heads: {bed}"
     );
 }
+
+
+/// The band overflowed its own column at 1280x720 (`$EDITH_HITMAP`:
+/// `action.Export x=1113 w=80` with the column ending at x=995, the contact
+/// strip measured `w=0`), so the Export chip was invisible under the dock and
+/// a click on blank dock space at (1130,435) opened the export card. Three
+/// things hold that shut: the row clips itself, the strip keeps a floor, and
+/// the ladder sheds groups above it.
+#[test]
+fn the_time_band_never_paints_outside_its_own_column() {
+    let src = src_text("ui/timeband_stance.rs");
+    let start = src.find(r#".id("stance-time-band-row")"#).expect("the band row");
+    let row = &src[start..start + src[start..].find(".child(hero_timecode(").expect("the timecode")];
+    assert!(
+        row.contains(".overflow_hidden()"),
+        "the band row lets its children paint (and be clicked) under the dock: {row}"
+    );
+    assert!(
+        src.contains(".min_w(px(STRIP_MIN_W))"),
+        "the contact strip is the flex_1 that absorbs the slack; without a floor it measures 0"
+    );
+    assert!(crate::ui::timeband_stance::STRIP_MIN_W >= 120.);
+}
+
+/// DESIGN §7's ladder, one layer per threshold: the four things the band is
+/// *for* -- timecode, cut readout, contact strip, Export -- survive every
+/// rung, and the sheddable groups go in a fixed order (chords, then the
+/// monitoring cluster, then sync/loop, then the range marks), never all at
+/// once. Thresholds are the measured group widths; this pins their order and
+/// the 1280x720 column (939px measured, spine 56 + dock 285) landing on the
+/// marks-only rung, which is what makes Export fit there (it ended at x=991
+/// inside a column ending at 995, against x=1113 under the dock before).
+#[test]
+fn the_band_sheds_one_layer_per_threshold_in_a_fixed_order() {
+    use crate::ui::timeband_stance::band_layers;
+    let ladder = [2000., 1300., 1100., 939., 800., 0.]
+        .map(|w| band_layers(w))
+        .map(|l| (l.chords, l.volume, l.sync, l.marks));
+    assert_eq!(
+        ladder,
+        [
+            (true, true, true, true),
+            (false, true, true, true),
+            (false, false, true, true),
+            (false, false, false, true),
+            (false, false, false, false),
+            (false, false, false, false),
+        ],
+        "the band must drop chords, then the monitoring cluster, then sync/loop, then the marks"
+    );
+    // Monotone: a wider band never shows less than a narrower one.
+    let mut prev = band_layers(0.);
+    for w in (0..2400).step_by(10).map(|w| w as f32) {
+        let now = band_layers(w);
+        for (a, b) in [
+            (prev.chords, now.chords),
+            (prev.volume, now.volume),
+            (prev.sync, now.sync),
+            (prev.marks, now.marks),
+        ] {
+            assert!(b || !a, "layer came back off at {w}px");
+        }
+        prev = now;
+    }
+}
+
+/// Every door in this band is at least `HIT_MIN` wide and tall (WCAG 2.5.8).
+/// The hitmap read `SetIn w=8`, `VolumeDown w=12`, `Loop w=13`, `SetOut w=15`,
+/// `Prev/NextSyncPoint w=16` before this: padding on the shared `ghost`, not a
+/// bigger glyph.
+#[test]
+fn every_ghost_in_the_time_band_carries_a_full_hit_area() {
+    let src = src_text("ui/timeband_stance.rs");
+    let start = src.find("fn ghost(").expect("the band's ghost");
+    let ghost = &src[start..start + src[start..].find(".child(glyph.into())").expect("its glyph")];
+    for needle in [".min_w(px(HIT_MIN))", ".min_h(px(HIT_MIN))"] {
+        assert!(ghost.contains(needle), "the band's ghost lost {needle}: {ghost}");
+    }
+    assert!(HIT_MIN >= 24.);
+}
+
+/// Mute wore `"{volume}%"` as its glyph while the slider beside it drew the
+/// same value: one number, two places, and a toggle with no verb of its own.
+/// The level is a mono readout beside the slider now, once.
+#[test]
+fn the_level_is_written_once_and_mute_wears_a_glyph() {
+    let src = src_text("ui/timeband_stance.rs");
+    assert_eq!(
+        src.matches(r#"player.volume.percent()"#).count(),
+        1,
+        "the volume level must be written in exactly one place in the band"
+    );
+    assert!(
+        src.contains(r#"if player.volume.muted { "◁×" } else { "◁))" }"#),
+        "mute must wear a speaker glyph, struck when muted"
+    );
+    assert!(src.contains("fn volume_readout("), "the level readout is the one place it is written");
+}
+
+/// `Play` and `StepForward` drew the same solid right-triangle: two verbs one
+/// shape, told apart only by their chords. Step wears the frame-step pair.
+#[test]
+fn transport_verbs_differ_by_shape_not_only_by_chord() {
+    let src = src_text("ui/timeband_stance.rs");
+    let glyph = |action: &str| {
+        let at = src.find(&format!("ActionId::{action},")).expect("the call");
+        src[..at].rsplit('"').nth(1).expect("its glyph").to_string()
+    };
+    let shapes = ["Play", "StepBack", "StepForward", "JumpBack", "JumpForward"].map(glyph);
+    let mut seen = shapes.to_vec();
+    seen.sort();
+    seen.dedup();
+    assert_eq!(seen.len(), shapes.len(), "two transport verbs share one glyph: {shapes:?}");
+}
+
+/// DESIGN §6: "the cut readout is the odometer". Keyed off the selection it
+/// read `cut —/—` immediately after a split -- two clips on the bench, the
+/// playhead resting on the new cut, nothing picked. It reads the playhead
+/// now: the cut under it, else the next one ahead, else the selection.
+#[test]
+fn the_cut_readout_counts_from_the_playhead() {
+    use crate::ui::timeband_stance::odometer_cut;
+    let at = |start: u32, len: u32| Clip {
+        fade_in: 0,
+        fade_out: 0,
+        transition_out: 0,
+        start,
+        in_frame: 0,
+        out_frame: len,
+        source: 0,
+        link: None,
+        eq: None,
+        color: None,
+        transform: None,
+        fit: FitPolicy::Fit,
+        speed: Speed::NORMAL,
+    };
+    let lane = [at(0, 30), at(30, 30)];
+    assert_eq!(odometer_cut(&lane, 0), Some(0));
+    assert_eq!(odometer_cut(&lane, 29), Some(0));
+    // The split's own frame: the playhead rests on the SECOND cut's head.
+    assert_eq!(odometer_cut(&lane, 30), Some(1));
+    assert_eq!(odometer_cut(&lane, 59), Some(1));
+    // Past the last cut there is nothing to count -- the selection answers.
+    assert_eq!(odometer_cut(&lane, 60), None);
+    // In a gap: the next cut ahead of the playhead.
+    let gapped = [at(0, 10), at(40, 10)];
+    assert_eq!(odometer_cut(&gapped, 20), Some(1));
+    assert_eq!(odometer_cut(&[], 0), None);
+    assert!(
+        src_text("ui/timeband_stance.rs").contains("odometer_cut(s.lane_clips(lane), frame)"),
+        "the readout must derive its odometer from the playhead"
+    );
+}
