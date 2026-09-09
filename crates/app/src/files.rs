@@ -92,7 +92,7 @@ pub(crate) fn pick_file(title: &str) -> Result<Option<PathBuf>, &'static str> {
         ("kdialog", vec!["--getopenfilename".into()]),
     ])
     .ok_or(
-        "NO FILE CHOOSER — install zenity or kdialog, or drag the file onto this window to import it",
+        "NO FILE CHOOSER — install zenity or kdialog",
     )
 }
 
@@ -116,7 +116,7 @@ pub(crate) fn pick_save(default: &std::path::Path) -> Result<Option<PathBuf>, &'
         ("kdialog", vec!["--getsavefilename".into(), default]),
     ])
     .ok_or(
-        "NO FILE CHOOSER — install zenity or kdialog to choose where; exporting beside the source",
+        "NO FILE CHOOSER — exporting beside the source",
     )
 }
 

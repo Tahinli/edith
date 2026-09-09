@@ -3211,3 +3211,100 @@ fn the_cut_readout_counts_from_the_playhead() {
         "the readout must derive its odometer from the playhead"
     );
 }
+
+/// DESIGN §8's rejected pattern, swept over the source rather than argued
+/// per message: "the room never explains itself in prose ... any new string
+/// over ~4 words that instructs rather than reports state is a defect". The
+/// notices are what the ledger strip paints, and a sentence there is what cut
+/// mid-word in the user's own screenshot (`OPENED ... 1 subtitle track(s) in `).
+///
+/// The scan reads every notice-shaped literal -- one whose first word is a
+/// state word in capitals, which is how every message this window pushes
+/// opens -- and refuses one that is both long (over eight words) and
+/// instructional (an imperative tell). A refusal *claim* may still be long:
+/// those are the allowlist below, each one naming a genuine absent capability,
+/// never a lesson in how to use the room.
+#[test]
+fn no_notice_teaches_the_room_in_prose() {
+    // Long refusal claims that report a capability genuinely absent from this
+    // machine (DESIGN §8, "a refusal string is a claim"), kept whole on
+    // purpose: the remedy is not a chord in this room because the missing
+    // thing is not in this room.
+    const ALLOWED: &[&str] = &["NO FILE CHOOSER"];
+    const TELLS: &[&str] = &[
+        "drag ",
+        "press ",
+        "pick ",
+        "type ",
+        "click ",
+        "to show",
+        "to use",
+        "takes it back",
+        "puts it back",
+        "first",
+        "instead",
+    ];
+    let mut offenders = Vec::new();
+    for path in source_files() {
+        let text = std::fs::read_to_string(&path).expect("a source file");
+        for literal in string_literals(&text) {
+            // A notice opens with its state in capitals -- placeholders in
+            // front of it (`{count} SILENCES CUT`) are stepped over.
+            let head = literal
+                .split_whitespace()
+                .find(|word| !word.starts_with('{'))
+                .unwrap_or("");
+            let shouty = head.len() >= 2
+                && head
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c == '-' || c == ':');
+            if !shouty || ALLOWED.iter().any(|allowed| literal.starts_with(allowed)) {
+                continue;
+            }
+            let long = literal.split_whitespace().count() > 8;
+            if long && TELLS.iter().any(|tell| literal.contains(tell)) {
+                offenders.push(format!("{}: {literal}", path.display()));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "a notice that instructs instead of reporting state (DESIGN §8):\n{}",
+        offenders.join("\n")
+    );
+}
+
+/// Every string literal in `text`, comments dropped first so the prose about
+/// a message is never read as the message.
+fn string_literals(text: &str) -> Vec<String> {
+    let code: String = text
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut out = Vec::new();
+    let mut chars = code.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '"' {
+            continue;
+        }
+        let mut literal = String::new();
+        while let Some(c) = chars.next() {
+            match c {
+                // A line continuation joins the halves of a wrapped message;
+                // every other escape is not a word either way.
+                '\\' => {
+                    if chars.next() == Some('\n') {
+                        while chars.peek() == Some(&' ') {
+                            chars.next();
+                        }
+                    }
+                }
+                '"' => break,
+                _ => literal.push(c),
+            }
+        }
+        out.push(literal);
+    }
+    out
+}
