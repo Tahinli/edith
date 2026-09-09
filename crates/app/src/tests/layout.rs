@@ -2988,31 +2988,54 @@ fn a_dock_ring_never_moves_what_it_rings() {
         4,
         "a dock ring lost its at-rest transparent border"
     );
+    // ...and the focus ring is not painted at all (user 2026-09-09:
+    // "clicking through timeline draws a white overlay around the timeline,
+    // same happens for library section too"). Keyboard focus is unchanged --
+    // only the paint is gone -- so no dock surface may reach for the focus
+    // stroke or for `ink1` on a focused border.
+    assert!(
+        !dock.contains("STROKE_FOCUS"),
+        "a dock surface paints the focus ring again"
+    );
+    assert!(
+        !dock.contains("is_focused(window)"),
+        "a dock surface reads focus for paint again"
+    );
+    assert!(
+        dock.contains(".track_focus(&player.focus_dock)")
+            && dock.contains(".track_focus(&player.focus_inspector)"),
+        "dropping the ring's paint took the surface's keyboard focus with it"
+    );
 }
 
-/// DESIGN §9 as amended 2026-09-09: the keys list is the dock's third tab,
-/// not a plate over the bench. The overlay the user asked about ("clicking
-/// them opens a menu ... probably location problem") is gone with its scrim,
-/// the tab strip lists all three tabs, and the rows still come off
-/// `keys_rows` with the refused ones greyed rather than hidden (§8).
+/// DESIGN §9 as amended 2026-09-09: the keys list lives in the dock BODY,
+/// not a plate over the bench and not a tab of its own (user: "remove keys
+/// section from here since we also have it next to ledger"). The strip is
+/// the SOURCES/CLIP pair; the list rides `keys_open` under a KEYS section
+/// head, and the rows still come off `keys_rows` with the refused ones
+/// greyed rather than hidden (§8).
 #[test]
-fn the_keys_list_is_a_dock_tab_and_the_plate_is_gone() {
+fn the_keys_list_is_dock_body_state_not_a_tab() {
     let stance = src_text("ui/stance.rs");
     assert!(
         !stance.contains("keys_overlay") && !stance.contains("stance-keys-overlay"),
         "the keys plate is still mounted over the bench"
     );
     let dock = src_text("ui/dock_stance.rs");
-    for (id, label) in [
-        ("dock-tab-src", "SOURCES"),
-        ("dock-tab-clip", "CLIP"),
-        ("dock-tab-keys", "KEYS"),
-    ] {
+    for (id, label) in [("dock-tab-src", "SOURCES"), ("dock-tab-clip", "CLIP")] {
         assert!(
             dock.contains(&format!("dock_tab(\"{id}\", \"{label}\"")),
             "the dock's tab strip lost {label}"
         );
     }
+    assert!(
+        !dock.contains("dock-tab-keys"),
+        "KEYS is still a tab in the strip"
+    );
+    assert!(
+        dock[dock.find("fn keys_tab(").unwrap()..].contains("section_head(\"KEYS\")"),
+        "the keys list draws no KEYS head in the dock body"
+    );
     assert!(
         dock.contains("fn keys_tab(") && dock.contains("keys_rows()"),
         "the KEYS tab draws something other than the action registry"
@@ -3023,7 +3046,7 @@ fn the_keys_list_is_a_dock_tab_and_the_plate_is_gone() {
     );
     assert!(
         dock[dock.find("fn keys_tab(").unwrap()..].contains(".overflow_y_scroll()"),
-        "the KEYS tab does not scroll like its neighbours"
+        "the keys list does not scroll like its neighbours"
     );
     // The Sources filter box belongs to Sources: it is built inside
     // `sources_tab`, never in the shared frame `render` draws.
