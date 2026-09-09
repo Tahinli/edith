@@ -80,6 +80,10 @@ pub(crate) const KEYS_ROW_H: f32 = HIT_MIN;
 /// scrim showing either side of it.
 /// The export moment's height (the approved artboard's 200px): three rows,
 /// never a scroll -- the card it replaced grew a capped, scrolling list.
+/// Unchanged by the picture and sound readouts row 3 now carries (user
+/// 2026-09-09: "resolution and audio bitrate should be seen in export menu
+/// too"): measured at 1280 wide, the whole line still fits on one line, so
+/// the row wraps only below this editor's own 640px floor.
 pub(crate) const EXPORT_MOMENT_H: f32 = 200.;
 
 pub(crate) const EXPORT_W: f32 = 420.;
