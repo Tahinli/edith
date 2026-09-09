@@ -2649,3 +2649,48 @@ fn hitmap_names_every_darkroom_pointer_entry_surface() {
         }
     }
 }
+
+/// An external file drag (gpui `ExternalPaths`, Wayland `text/uri-list`) has
+/// to be heard over the DOCK -- the Sources/library panel -- and not only
+/// over the centre column: the dock and the spine are the centre's flex
+/// siblings, so the handler `stance-centre` used to carry covered none of
+/// the library panel, which is exactly the shipped "drag and drop file
+/// import is not working on library panel" defect. The listener therefore
+/// belongs to the room root (`stance-room`), above every region, and it must
+/// route the dropped paths through `import` -- the same door the Import
+/// action uses.
+///
+/// A scan, not a click: this crate has no gpui `VisualTestContext` harness
+/// (nothing in `tests/` opens a window), and a drop cannot be simulated
+/// without one -- the compositor half (`wl_data_device`) is out of reach of
+/// the test process either way.
+#[test]
+fn an_external_file_drop_is_heard_by_the_whole_room_and_imports() {
+    let stance = src_text("ui/stance.rs");
+    let root_at = stance
+        .find(".id(\"stance-room\")")
+        .expect("no stance root div");
+    let centre_at = stance
+        .find(".id(\"stance-centre\")")
+        .expect("no stance centre column");
+    let drop_at = stance
+        .find(".on_drop(cx.listener(|this, paths: &gpui::ExternalPaths")
+        .expect("no external-file drop handler in the stance");
+    assert!(
+        drop_at > root_at && drop_at < centre_at,
+        "the external drop handler is not on the room root -- \
+         a drop over the dock's library panel is heard by nothing"
+    );
+    let body = &stance[drop_at..(drop_at + 700).min(stance.len())];
+    assert!(
+        body.contains("this.import(path, cx)"),
+        "a dropped file does not go through the import door: {body}"
+    );
+    // ...and the library panel says so while the file is over it.
+    let dock_at = stance.find(".id(\"stance-dock\")").expect("no dock div");
+    let dock = &stance[dock_at..(dock_at + 700).min(stance.len())];
+    assert!(
+        dock.contains(".drag_over::<gpui::ExternalPaths>"),
+        "the dock answers an external file drag with nothing: {dock}"
+    );
+}
