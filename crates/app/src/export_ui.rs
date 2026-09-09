@@ -66,156 +66,6 @@ pub(crate) fn sample_rate_choices(current: Option<u32>) -> Vec<ChoiceRow> {
     rows
 }
 
-/// What the export card offers, top to bottom. Bitrate is the only thing the
-/// encoder actually takes: the codec and the container are what this program
-/// can write and nothing else, so the card states them rather than offering
-/// them.
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub(crate) enum Quality {
-    Exact,
-    Auto,
-    Low,
-    Medium,
-    High,
-    Custom,
-}
-
-impl Quality {
-    pub(crate) const ALL: [Quality; 6] = [
-        Quality::Exact,
-        Quality::Auto,
-        Quality::Low,
-        Quality::Medium,
-        Quality::High,
-        Quality::Custom,
-    ];
-
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            Quality::Exact => "Exact",
-            Quality::Auto => "Auto",
-            Quality::Low => "Low",
-            Quality::Medium => "Medium",
-            Quality::High => "High",
-            Quality::Custom => "Custom",
-        }
-    }
-
-    /// The figure the row stands for, said in the units the row is chosen by.
-    pub(crate) fn detail(self, custom_mbps: u32) -> String {
-        match self {
-            // corner-cut: worded without naming the mechanism (which codec,
-            // which container) -- DESIGN.md §8 keeps a card's detail line a
-            // fact about the *output*, not an instruction about how to get
-            // there; [`exact_refusal`] is where the mechanism's own limits
-            // are said, once the row has actually been picked.
-            Quality::Exact => "input quality — copy where cuts allow".to_string(),
-            Quality::Auto => "from the picture size and frame rate".to_string(),
-            Quality::Custom => {
-                format!("{custom_mbps} Mbps — wheel or ± steps, n types one, {MBPS_MIN}–{MBPS_MAX}")
-            }
-            other => format!(
-                "{} Mbps",
-                export_settings(other, 0, Format::Mp4, DEFAULT_AUDIO_KBPS, EncoderSeat::Auto)
-                    .bitrate
-                    .unwrap_or_default()
-                    / 1_000_000
-            ),
-        }
-    }
-}
-
-/// The primary pane's one row: the format-and-quality bundles most exports
-/// actually are, named the way a person asks for one rather than by codec and
-/// megabits apart. Every bundle is still exactly a [`Format`] and a
-/// [`Quality`] the Advanced pane's own rows already know how to set -- this
-/// is a shortcut to the pair, not a third setting kept beside them, so a
-/// bundle picked here and a codec picked below never disagree about what is
-/// in force. `Custom` sets nothing; it only opens the Advanced pane, for a
-/// combination none of the bundles name.
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub(crate) enum ExportPreset {
-    Web,
-    Small,
-    Master,
-    AudioOnly,
-    Custom,
-}
-
-impl ExportPreset {
-    pub(crate) const ALL: [ExportPreset; 5] = [
-        ExportPreset::Web,
-        ExportPreset::Small,
-        ExportPreset::Master,
-        ExportPreset::AudioOnly,
-        ExportPreset::Custom,
-    ];
-
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            ExportPreset::Web => "Web",
-            ExportPreset::Small => "Small file",
-            ExportPreset::Master => "Master",
-            ExportPreset::AudioOnly => "Audio only",
-            ExportPreset::Custom => "Custom",
-        }
-    }
-
-    /// The key that picks this row, none of the sixteen the card's other rows
-    /// already own (`n`, the digits, the codec row's `m/a/h/w/f/p/o`, and
-    /// `c/q/b/e/d/g/r/s`): a letter out of the name itself where its initial is
-    /// one of those (`smaLl`, `masTer`, `aUdio`), and a free one where every
-    /// letter in the name already belongs to another row (`Web`'s w, e and b
-    /// all are). `Custom` shares Advanced's own `s` -- the row does exactly what
-    /// that key already does, not a second name for a third thing.
-    pub(crate) fn key(self) -> &'static str {
-        match self {
-            ExportPreset::Web => "v",
-            ExportPreset::Small => "l",
-            ExportPreset::Master => "t",
-            ExportPreset::AudioOnly => "u",
-            ExportPreset::Custom => "s",
-        }
-    }
-
-    pub(crate) fn detail(self) -> &'static str {
-        match self {
-            ExportPreset::Web => "H.264 · MP4 · medium quality — plays everywhere",
-            ExportPreset::Small => "AV1 · MP4 · low quality — smallest file",
-            ExportPreset::Master => "HEVC · MP4 · high quality — intra-only, for re-editing later",
-            ExportPreset::AudioOnly => "FLAC — lossless sound, no picture",
-            ExportPreset::Custom => "no fixed codec or quality",
-        }
-    }
-
-    /// The format and quality this bundle sets, or `None` for `Custom` --
-    /// which changes nothing itself, it only opens the pane where the two are
-    /// set apart.
-    pub(crate) fn bundle(self) -> Option<(Format, Quality)> {
-        match self {
-            ExportPreset::Web => Some((Format::Mp4, Quality::Medium)),
-            ExportPreset::Small => Some((Format::Av1Mp4, Quality::Low)),
-            // HEVC, not H.264: a master is for cutting again later, and HEVC's
-            // intra-only rows say why that is the one that keeps its promise --
-            // every frame already a cut point, where H.264's are not.
-            ExportPreset::Master => Some((Format::HevcMp4, Quality::High)),
-            ExportPreset::AudioOnly => Some((Format::Flac, Quality::Auto)),
-            ExportPreset::Custom => None,
-        }
-    }
-
-    /// Which bundle the card's current format and quality already are, or
-    /// `Custom` where they match none of them -- so the primary pane always
-    /// says something true about what is actually going to be written rather
-    /// than defaulting to a bundle nobody picked.
-    pub(crate) fn from_state(format: Format, quality: Quality) -> ExportPreset {
-        ExportPreset::ALL
-            .into_iter()
-            .find(|p| p.bundle() == Some((format, quality)))
-            .unwrap_or(ExportPreset::Custom)
-    }
-}
-
 /// The export card's format rows: the key that picks one, its name, and what it
 /// writes -- or, where this program cannot write it, the reason it cannot. A
 /// format with no entry at all would read as an oversight, and a menu of three
@@ -273,6 +123,10 @@ pub(crate) const FORMATS: [(&[Format], &str, &str, &str); 8] = [
 
 /// The boxes one codec may be written into, in the order its container row
 /// cycles them. Empty for a codec this program cannot write at all.
+/// Not on the export moment any more: the Settings surface is what shows
+/// this (`ui::settings_stance`). Kept and named rather than deleted -- the
+/// state and its setter are the same ones the moment used to drive.
+#[allow(dead_code)]
 pub(crate) fn containers(format: Format) -> &'static [Format] {
     FORMATS
         .into_iter()
@@ -284,6 +138,10 @@ pub(crate) fn containers(format: Format) -> &'static [Format] {
 /// This row's format under the container `current` is already in, or the row's
 /// first when it has no such box: an AV1 picked from a WAV lands in Matroska,
 /// and picked from an mp4 stays in the mp4.
+/// Not on the export moment any more: the Settings surface is what shows
+/// this (`ui::settings_stance`). Kept and named rather than deleted -- the
+/// state and its setter are the same ones the moment used to drive.
+#[allow(dead_code)]
 pub(crate) fn same_box(row: &[Format], current: Format) -> Option<Format> {
     row.iter()
         .copied()
@@ -294,32 +152,16 @@ pub(crate) fn same_box(row: &[Format], current: Format) -> Option<Format> {
 /// The next box for the same codec, wrapping -- what the container row's key
 /// does. The format itself for a codec with only one, so the stroke cannot
 /// change what it is not offering.
+/// Not on the export moment any more: the Settings surface is what shows
+/// this (`ui::settings_stance`). Kept and named rather than deleted -- the
+/// state and its setter are the same ones the moment used to drive.
+#[allow(dead_code)]
 pub(crate) fn next_container(format: Format) -> Format {
     let row = containers(format);
     let at = row.iter().position(|&f| f == format).unwrap_or(0);
     row.get((at + 1) % row.len().max(1))
         .copied()
         .unwrap_or(format)
-}
-
-/// Why the quality rows say nothing about this format, or `None` where they
-/// decide the picture. Only a picture encoder is given a bitrate here: the two
-/// lossless audio formats have none to give and MP3 is written at one fixed
-/// figure, so a live row over either would be a control that changes nothing.
-pub(crate) fn bitrate_refusal(format: Format) -> Option<&'static str> {
-    match format {
-        Format::Wav | Format::Flac => Some("lossless audio — no bitrate to pick"),
-        Format::Mp3 => Some("sound only — its rate is the Sound row"),
-        // The guard is the question and not a list of names: an audio format
-        // added without a line of its own above would otherwise show live
-        // quality rows over a file that has no picture to spend a bitrate on.
-        // OGG is exactly that format -- and it wants this sentence rather than
-        // one of its own, because its *Sound* row already says the Vorbis half
-        // ("quality-coded — Vorbis holds no rate to pick") and two rows saying
-        // the same thing is one of them wasted.
-        _ if !format.has_video() => Some("sound only — no picture to spend a bitrate on"),
-        _ => None,
-    }
 }
 
 /// What one of the colour card's own strokes does. Its keys are card-local --
@@ -680,6 +522,10 @@ pub(crate) fn encoder_choices(current: EncoderSeat) -> Vec<ChoiceRow> {
 /// vendored AV1 encoder (2026-08-10), so the pick is theirs to make and the
 /// risk is theirs to be told about. `None` for every other pair, which is what
 /// keeps this from becoming a row nobody reads.
+/// Not on the export moment any more: the Settings surface is what shows
+/// this (`ui::settings_stance`). Kept and named rather than deleted -- the
+/// state and its setter are the same ones the moment used to drive.
+#[allow(dead_code)]
 pub(crate) fn av1_hw_warning(format: Format, seat: EncoderSeat) -> Option<&'static str> {
     (seat == EncoderSeat::Hardware && matches!(format, Format::Av1 | Format::Av1Mp4))
         .then_some("AV1 on the GPU reset this machine's driver once — Software is the safe seat")
@@ -731,45 +577,6 @@ pub(crate) fn next_resolution(current: (u32, u32), native: (u32, u32)) -> (u32, 
     sizes[at.map_or(0, |at| (at + 1) % sizes.len())]
 }
 
-/// The first of the two lines the card keeps above its button: what will be
-/// *inside* the file. [`format_line`]'s codec and box, then the project's own
-/// picture size and rate -- which is what a video export is written at however
-/// many sizes and rates the media on the timeline are -- and last what the
-/// sound will be, or that there is none. Every field here is one `ffprobe`
-/// reads back off the finished file, so the line is checkable rather than a
-/// promise.
-pub(crate) fn summary_head(
-    format: Format,
-    picture: Option<((u32, u32), f64)>,
-    audio: &str,
-) -> String {
-    let line = match picture.filter(|_| format.has_video()) {
-        Some(((w, h), fps)) => {
-            format!("{} · {w}x{h} · {} fps", format_line(format), fps_label(fps))
-        }
-        None => format_line(format).to_string(),
-    };
-    join_detail(&line, audio)
-}
-
-/// The second: where it lands, roughly how big, and what will encode the
-/// picture -- the seat as the probe found it (`…` until it lands, never a
-/// guess), which is what the running export then names on its progress line.
-pub(crate) fn summary_tail(
-    path: &Path,
-    bytes: Option<u64>,
-    seat: Option<&'static str>,
-    video: bool,
-) -> String {
-    let size = bytes.map_or_else(String::new, |bytes| format!("≈ {}", size_label(bytes)));
-    let seat = match (video, seat) {
-        (true, Some(seat)) => seat,
-        (true, None) => "encoder …",
-        (false, _) => "",
-    };
-    join_detail(&join_detail(&file_name(path), &size), seat)
-}
-
 /// A frame rate as a person writes it: `30`, not `30.000`, and `23.976` for the
 /// rate that is a ratio.
 pub(crate) fn fps_label(fps: f64) -> String {
@@ -782,48 +589,26 @@ pub(crate) fn fps_label(fps: f64) -> String {
     }
 }
 
-/// About how big a *chosen* bitrate makes the file: the picture's bits over the
-/// timeline's length, in bytes -- the unit the line is written in is
-/// [`size_label`]'s to pick. `None` for `Auto`, whose figure is the encoder's to
-/// decide, and for a format with no bitrate at all -- a number nobody picked is
-/// not an estimate. The sound and the container's own overhead are not in it,
-/// which is why the card says "≈".
-pub(crate) fn estimated_bytes(bitrate: Option<u64>, duration: f64) -> Option<u64> {
-    let bitrate = bitrate.filter(|&b| b > 0 && duration > 0.)?;
-    Some((bitrate as f64 * duration / 8.).round() as u64)
+/// About how big the budget makes the file: every bit that is written --
+/// the picture's rate and the sound's -- over the exported range, in bytes.
+/// The container's own overhead is not in it, which is why the row says "≈".
+pub(crate) fn estimated_bytes(bps: u64, seconds: f64) -> u64 {
+    ((bps as f64) * seconds.max(0.) / 8.).round() as u64
 }
 
-/// A size in the largest unit that can state it, [`rate_scale`]'s rule:
-/// megabytes for an export of any length, kilobytes below the one a whole
-/// megabyte rounds away. A three second clip at the floor bitrate really is
-/// 375 kB, and "≈ 0 MB" would be this line saying the file it is about to write
-/// is empty -- the one thing the size field is there to deny. Never "0 kB"
-/// either: an estimate that exists is at least a kilobyte of file.
+/// A size as the budget row says it: gigabytes with two decimals once the
+/// file is one, whole megabytes under that. Never a decimal megabyte -- the
+/// estimate is an "≈" and a tenth of a megabyte is precision it does not have.
 pub(crate) fn size_label(bytes: u64) -> String {
-    match (bytes as f64 / 1e6).round() as u64 {
-        0 => format!("{} kB", (bytes as f64 / 1e3).round().max(1.) as u64),
-        mb => format!("{mb} MB"),
+    match bytes >= 1_000_000_000 {
+        true => format!("{:.2} GB", bytes as f64 / 1e9),
+        false => format!("{} MB", (bytes as f64 / 1e6).round() as u64),
     }
 }
 
-/// What is in the file and what box it is in, which is the head of the summary.
-/// Terse on purpose: the fields after it (size, rate, sound) are what the line
-/// is *for*, and a head that spent its width on prose used to push the whole
-/// summary onto a second line -- what each codec means is on its row.
-pub(crate) fn format_line(format: Format) -> &'static str {
-    match format {
-        Format::Mp4 => "H.264 · MP4",
-        Format::Av1 => "AV1 · MKV",
-        Format::Av1Mp4 => "AV1 · MP4",
-        Format::Hevc => "HEVC intra · MKV",
-        Format::HevcMp4 => "HEVC intra · MP4",
-        // The three whose codec *is* their box: naming it twice would be the
-        // only field on this line that says nothing.
-        Format::Wav => "16-bit PCM · WAV",
-        Format::Flac => "FLAC · lossless",
-        Format::Mp3 => "MP3 · lossy",
-        Format::Ogg => "Vorbis · OGG",
-    }
+/// The budget itself, in Mbps to one decimal: the number the lever reads.
+pub(crate) fn rate_label(bps: u64) -> String {
+    format!("{:.1}", bps as f64 / 1e6)
 }
 
 /// The row a format is picked by, which is what a refusal calls it: the codec,
@@ -845,77 +630,127 @@ pub(crate) fn retarget(path: &std::path::Path, format: Format) -> PathBuf {
     path
 }
 
-/// The card's rows as the engine takes them. `Auto` leaves the bitrate to the
-/// exporter, which derives it from the picture; the fixed rows are figures that
-/// hold from 720p to 1080p, and a typed one is passed exactly as typed -- the
-/// engine clamps every explicit bitrate to 1..50 Mbps (`MAX_EXPLICIT_BITRATE`), so this
-/// must not clamp it a second time and disagree about where the edge is.
+/// The moment's one number as the engine takes it. The budget is always
+/// explicit now -- the lever opens on the engine's own automatic figure
+/// ([`auto_bps`]) rather than on nothing, so there is no "Auto" left to send
+/// as `None` -- and the engine clamps it to `MIN_BITRATE..MAX_EXPLICIT_BITRATE`
+/// exactly where [`BPS_MIN`]/[`BPS_MAX`] do, so neither can disagree about the
+/// edges.
 ///
 /// The bitrate travels even for an audio format, where the engine ignores it:
-/// one settings value, and a row the card has dimmed cannot have been changed.
+/// one settings value, and a row the moment does not show cannot have been
+/// changed.
 pub(crate) fn export_settings(
-    quality: Quality,
-    custom_mbps: u32,
+    bitrate: u64,
     format: Format,
     audio_kbps: u32,
     seat: EncoderSeat,
 ) -> ExportSettings {
     ExportSettings {
         format,
-        // Always travels, exactly as the picture's bitrate does above: the
-        // engine ignores it where nothing encodes the sound, and a row the card
-        // has dimmed cannot have been changed.
         audio_kbps: Some(audio_kbps),
-        bitrate: match quality {
-            // A copied span carries its source's own bits, and a fallback
-            // re-encode -- the only case `bitrate` reaches an encoder under
-            // Exact -- is the automatic figure ([`engine::export::run`]),
-            // not a preset's, so this asks for neither.
-            Quality::Exact | Quality::Auto => None,
-            Quality::Low => Some(2_000_000),
-            Quality::Medium => Some(6_000_000),
-            Quality::High => Some(12_000_000),
-            Quality::Custom => Some(u64::from(custom_mbps) * 1_000_000),
-        },
-        exact: quality == Quality::Exact,
-        // The card's own row now ([`encoder_choices`]), kept with the project:
-        // it was a `VE_SW_ENC` env pin and nothing else, which is a switch
-        // nobody exporting a film would ever find.
+        bitrate: Some(bitrate),
+        // The copy path (the old `Quality::Exact`) is off this surface: the
+        // moment is one budget, and a copy is the absence of one.
+        // `engine::export` keeps the path and its own tests; nothing in the
+        // app asks for it.
+        exact: false,
         seat,
-        // The picked track is put on by `start_export`, which is the only
-        // caller that writes a file; the rest of them are asking about the
-        // bitrate and the format.
         subtitles: Vec::new(),
-        // Neither is a delivery setting: both belong to the stand-ins
-        // [`engine::proxy`] writes -- every frame a key frame costs bits
-        // nobody delivering wants, and a file kept in its source's colour
-        // space is one for this editor to read back rather than to hand
-        // anybody.
         intra_only: false,
         keep_source_colour: false,
-        // Set by `start_export`, which knows the player's mark; this helper is
-        // also asked for the estimate alone, which has no range to give.
         range: None,
     }
 }
 
-/// What the engine will code an explicit bitrate at, in whole Mbps: outside
-/// this it clamps (`export.rs` `MIN_BITRATE`/`MAX_EXPLICIT_BITRATE`), so a
-/// number typed past either end would be written as a different one. The field
-/// refuses it instead of clamping quietly -- a card that changes the user's
-/// number without saying so is the one thing a field like this must never do.
-///
-/// The ceiling was 20, which was never a limit of any encoder here: it was the
-/// top of the range the exporter *derives* an automatic bitrate in, borrowed as
-/// the cap on a typed one. A 1080p master or a 4K edit wants more than that, so
-/// the asked-for rate has its own ceiling now and this is it.
-pub(crate) const MBPS_MIN: u32 = 1;
-pub(crate) const MBPS_MAX: u32 = 50;
+/// The budget's bounds, the engine's own (`engine::export`'s `MIN_BITRATE`
+/// and `MAX_EXPLICIT_BITRATE`): a number outside them would be written as a
+/// different one, so the lever and the field clamp to exactly these.
+pub(crate) const BPS_MIN: u64 = 1_000_000;
+pub(crate) const BPS_MAX: u64 = 50_000_000;
 
-/// How many digits the field takes. Two reach the ceiling; the third is there so
-/// a number *past* it can be typed whole and refused in its own words, rather
-/// than being dropped keystroke by keystroke.
-pub(crate) const MBPS_DIGITS: usize = 3;
+/// A wheel notch, and a notch with shift held: 0.1 and 1 Mbps. Fifty presses
+/// is not a way across this range, and a tenth is the smallest step the row's
+/// own readout can show.
+pub(crate) const BPS_FINE: u64 = 100_000;
+pub(crate) const BPS_COARSE: u64 = 1_000_000;
+
+/// The engine's automatic figure for a picture of this size and rate
+/// (`engine::export`'s `BITS_PER_PIXEL` rule and the range it clamps the
+/// derived number into), which is what the lever opens on before anybody has
+/// chosen: a budget row reading 0 Mbps -- the old `custom_mbps: 0` default --
+/// was a promise to write an empty file.
+const BITS_PER_PIXEL: f64 = 0.1;
+const BPS_AUTO_MAX: u64 = 20_000_000;
+
+pub(crate) fn auto_bps(width: u32, height: u32, fps: f64) -> u64 {
+    let raw = f64::from(width) * f64::from(height) * fps * BITS_PER_PIXEL;
+    (raw as u64).clamp(BPS_MIN, BPS_AUTO_MAX)
+}
+
+/// What was typed into the budget field, as a rate. Four ways to say one:
+/// `850k` and `6.5M` are rates in their own units, a bare `6.5` is Mbps (the
+/// unit the row reads in), and `1.2G` is a *file size* -- the one thing a
+/// person actually wants to hit -- converted through the exported range and
+/// the sound's own rate into the picture rate that lands there.
+///
+/// Clamped to the engine's bounds rather than refused: the moment shows the
+/// parsed number immediately, so a clamp is visible in the same keystroke.
+/// `None` is only ever "that is not a number".
+pub(crate) fn parse_budget(text: &str, seconds: f64, audio_bps: u64) -> Option<u64> {
+    let text = text.trim().to_ascii_lowercase();
+    let text = text.trim_end_matches("bps").trim_end_matches('b').trim_end();
+    let (digits, unit) = match text.chars().last()? {
+        c @ ('k' | 'm' | 'g') => (&text[..text.len() - c.len_utf8()], c),
+        _ => (text, 'm'),
+    };
+    let n: f64 = digits.trim().parse().ok()?;
+    if !n.is_finite() || n <= 0. {
+        return None;
+    }
+    let bps = match unit {
+        'k' => n * 1e3,
+        'm' => n * 1e6,
+        _ => {
+            if seconds <= 0. {
+                return None;
+            }
+            (n * 1e9 * 8. / seconds) - audio_bps as f64
+        }
+    };
+    Some((bps.max(0.) as u64).clamp(BPS_MIN, BPS_MAX))
+}
+
+/// The faintest line on the moment: what the export resolved to on its own --
+/// the codec, the sound, whether it is the whole film or the marked span, and
+/// which seat writes the picture. A readout, never a control: everything in it
+/// is set in Settings now.
+pub(crate) fn plan_line(
+    format: Format,
+    audio: &str,
+    marks: Option<&str>,
+    hardware: bool,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if format.has_video() {
+        parts.push(format_label(format).to_string());
+    }
+    if !audio.is_empty() {
+        parts.push(audio.to_string());
+    }
+    parts.push(match (marks, format.has_video()) {
+        (Some(marks), _) => format!("marks {marks}"),
+        (None, true) => "whole film".to_string(),
+        (None, false) => "sound only".to_string(),
+    });
+    if format.has_video() {
+        parts.push(match hardware {
+            true => "GPU".to_string(),
+            false => "SW".to_string(),
+        });
+    }
+    parts.join(" · ")
+}
 
 /// A clip's share of the lane. A timeline with no length reads as one full-width
 /// box rather than as NaN, which gpui would carry into layout.
@@ -932,41 +767,6 @@ pub(crate) const MBPS_DIGITS: usize = 3;
 /// cannot say what the timeline says (`export::copy_audio`), so none of them is
 /// a refusal any more -- and every video format carries the sound, so there is
 /// nothing here that is one format's alone.
-/// Why the Exact row would refuse this project's own picked format right
-/// now, asked before the button is pressed rather than minutes into a
-/// worker -- [`engine::export::exact_refusal`] is the same gate `start`
-/// checks again, so a caller here and the worker can never disagree about
-/// whether Exact is honoured. `None` for every quality but `Exact` itself,
-/// since nothing else has anything to refuse.
-pub(crate) fn exact_refusal(
-    session: &PlaybackSession,
-    format: Format,
-    quality: Quality,
-) -> Option<String> {
-    if quality != Quality::Exact {
-        return None;
-    }
-    let (project, meta) = session.export_snapshot();
-    let settings = export_settings(quality, 0, format, DEFAULT_AUDIO_KBPS, EncoderSeat::Auto);
-    engine::export::exact_refusal(&project, &meta, &settings)
-}
-
-/// Which format picking Exact should set, from the source's own codec --
-/// "the input's own quality" means the input's own codec, so this is what
-/// `Player::pick_quality` derives the format from rather than leaving
-/// whatever format a previous pick left behind. `None` for a codec Exact has
-/// no copy path for at all (h264); the row itself still refuses through
-/// [`exact_refusal`] in that case, since a mixed-source project can fail the
-/// same way after the format is set.
-pub(crate) fn exact_format(session: &PlaybackSession) -> Option<Format> {
-    let (_, meta) = session.export_snapshot();
-    match meta.codec {
-        engine::demux::Codec::Hevc => Some(Format::Hevc),
-        engine::demux::Codec::Av1 => Some(Format::Av1),
-        _ => None,
-    }
-}
-
 pub(crate) fn format_refusal(session: &PlaybackSession, format: Format) -> Option<String> {
     if !format.has_video() {
         return None;

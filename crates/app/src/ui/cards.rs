@@ -259,23 +259,32 @@ fn dark_ghost_button(
         })
 }
 
+/// Where an export lands, said the way the destination row says it: the
+/// directory under `~` where it is one, so the row is a place a person
+/// recognises rather than an absolute path that will not fit on the line.
+fn dest_dir(path: &Path) -> String {
+    let dir = path.parent().unwrap_or(path).to_string_lossy().to_string();
+    match std::env::var("HOME") {
+        Ok(home) if !home.is_empty() && dir.starts_with(&home) => {
+            format!("~{}", &dir[home.len()..])
+        }
+        _ => dir,
+    }
+}
+
 impl Player {
-    /// What an export is going to be, before there is one: the codec, the box
-    /// it goes into, the bitrate, where it lands -- and, above the button, the
-    /// two lines that state the file all of that adds up to. The same scrim and
-    /// row shape as the keybindings overlay (two cards of different builds over
-    /// one window read as two different programs) and the same plain divs, so
-    /// the root keeps the keyboard and the custom row's field is typed into
-    /// through it ([`NumberEdit`]).
+    /// The export moment (DESIGN §4/§8/§10, the approved artboard): three
+    /// lines, ~200px, no scroll, no sections and no prose. Where it lands
+    /// (`d` opens the save dialog), what it costs (one lever, read as a rate
+    /// and as a size), and what it resolved to on its own beside the one
+    /// boxed chip.
     ///
-    /// Every row carries the key that picks it, so the card is drivable end to
-    /// end without a pointer *and* without a legend to memorise -- and every
-    /// row is clickable, the bitrate's steppers included, so it is drivable end
-    /// to end without a keyboard as well.
-    ///
-    /// Two shapes of it, behind `g` and `r`: sections against one flat list,
-    /// and the codecs with no encoder collapsed into a footer against a dimmed
-    /// row each. Grouped and collapsed is what opens.
+    /// Everything the old card asked apart -- codec, container, sound rate,
+    /// encoder seat, the presets, the Advanced pane -- keeps its state and
+    /// its setters and is simply not on this surface: an export is one
+    /// decision, the budget, and the rest is a preference that belongs in
+    /// Settings (user 2026-09-09: "too complicated plus I can only give mbps
+    /// level bitrate").
     pub(crate) fn export_card(
         &self,
         viewport: Size<Pixels>,
@@ -284,673 +293,292 @@ impl Player {
         if !self.export_open {
             return None;
         }
-        // The cap is what keeps the card inside the smallest window; a taller
-        // one gets a taller list rather than a scroll past empty space, and the
-        // card is still only as tall as the rows it has.
-        // DESIGN §4: plate surface, mono for what the film says, ghost rows,
-        // one bordered chip for the commit action.
-        let ink_secondary = INK3();
-        let bg_hover = DARK_RAISED();
-        let bg_selected = DARK_RAISED();
-        // Archivo for what the row *says as a verb* (its label), mono for
-        // what the film says through it (its detail/key) -- DESIGN §3.
-        let label_style = Some(type_scale::label(
-            type_scale::LABEL_ROW_PX,
-            gpui::FontWeight::MEDIUM,
-        ));
-        let mono_style = Some(type_scale::mono(
-            type_scale::CHORD_METADATA_MAX_PX,
-            gpui::FontWeight::MEDIUM,
-        ));
-        let head_style = Some(type_scale::head());
-        let row = |id: (&'static str, usize)| {
-            div()
-                .id(id)
-                .flex()
-                // The floor, not the height: the destination's path wraps on a
-                // long name and must not paint over the row under it. Which it
-                // did: inside a capped, scrolling list a row shrinks to fit by
-                // default, so a wrapped detail was drawn over the row beneath
-                // it (the Sound row's "the source's own packets are copied…"
-                // over Subtitles). The list scrolls -- a row is as tall as what
-                // it has to say.
-                .flex_none()
-                .min_h(px(KEYS_ROW_H))
-                .items_center()
-                .justify_between()
-                .gap(px(12.))
-                .px(px(6.))
-                .rounded(px(3.))
+        let budget = self.budget_bps();
+        let seconds = self.export_seconds();
+        // Both halves of the file, which is what a person means by "how big":
+        // the picture's budget and the sound's own rate over the same span.
+        let bytes = estimated_bytes(budget + self.audio_bps(), seconds);
+        let fill = ((budget.saturating_sub(BPS_MIN)) as f32 / (BPS_MAX - BPS_MIN) as f32).clamp(0., 1.);
+        let name = file_name(&self.export_path);
+        let (stem, ext) = match name.rfind('.') {
+            Some(at) => name.split_at(at),
+            None => (name.as_str(), ""),
         };
-        // A row that cannot be picked is dimmed and takes no click, exactly as
-        // an inapplicable item in the clip menu is: it still says its piece.
-        let live = |d: Stateful<Div>, enabled: bool| {
-            d.when(!enabled, |d| {
-                d.cursor_not_allowed().text_color(rgb(ink_secondary))
-            })
-            .when(enabled, |d| {
-                d.cursor_pointer().hover(|s| s.bg(rgb(bg_hover)))
-            })
-        };
-        // A row as this card writes them: the mark saying which one is picked,
-        // the key that picks it, its name, and what the choice means. The mark
-        // is a glyph and not only a colour -- a background alone is gone the
-        // moment a hover lands on the row, and invisible to anyone who cannot
-        // tell the two greys apart (WCAG 1.4.1).
-        let entry = |id: (&'static str, usize),
-                     key: &str,
-                     label: SharedString,
-                     detail: SharedString,
-                     picked: bool,
-                     enabled: bool| {
-            // The small print of a picked row sits on the highlight, where the
-            // dim ink is only 3.3:1 -- the row it lands on lifts it (WCAG
-            // 1.4.3, and the fit test pins both numbers).
-            // DESIGN §2's ink ladder, applied to a row rather than to a
-            // whole card (user 2026-08-21: the export card's "colors are not
-            // aligning a little so hard to read"). Two faults it fixes: the
-            // detail of a picked row was drawn BRIGHTER than the label it
-            // belongs to -- the loudest thing on the row was its small print
-            // -- and the resting rows' detail sat at `ink3` on `panel`, the
-            // metadata step, for text that is the row's actual content and
-            // has to be read at a glance. Label leads its row (`ink1`
-            // picked, `ink2` resting), detail follows one step behind
-            // (`ink2` picked, `ink2` resting -- never `ink3`, which stays
-            // for the key column and the summary's small print).
-            let ink = INK2();
-            let label_ink = match picked {
-                true => INK1(),
-                false => INK2(),
-            };
-            let key_ink = INK3();
-            live(row(id), enabled)
-                .when(picked, |d| d.bg(rgb(bg_selected)))
-                .child(
-                    div()
-                        .flex()
-                        .flex_none()
-                        .items_center()
-                        .gap(px(8.))
-                        .child(div().w(px(10.)).child(match picked {
-                            true => "✓",
-                            false => " ",
-                        }))
-                        .child(
-                            div()
-                                .w(px(EXPORT_KEY_W))
-                                .text_size(px(11.))
-                                .text_color(rgb(key_ink))
-                                .when_some(mono_style.clone(), |d, style| {
-                                    d.font(style.font).text_size(style.size)
-                                })
-                                .child(SharedString::from(key.to_string())),
-                        )
-                        .child(
-                            // A fixed label column in the darkroom: the
-                            // details are the long half and they wrap, so
-                            // without one they start at a different x on
-                            // every row and a wrapped line reads as if it
-                            // began left of the label it belongs to.
-                            div()
-                                .map(|d| d.w(px(92.)).flex_none().text_color(rgb(label_ink)))
-                                .when_some(label_style.clone(), |d, style| {
-                                    d.font(style.font).text_size(style.size)
-                                })
-                                .child(label),
-                        ),
-                )
-                // Wraps rather than runs off the row: a refusal is the longest
-                // thing in this column and the half of it past the edge is the
-                // half that says what to do instead.
-                .child(
-                    div()
-                        .min_w(px(0.))
-                        .flex_shrink()
-                        .text_size(px(11.))
-                        .text_color(rgb(ink))
-                        .when_some(mono_style.clone(), |d, style| {
-                            d.font(style.font).text_size(style.size)
-                        })
-                        .child(detail),
-                )
-        };
-        let header = |text: &'static str| {
-            div()
-                .flex_none()
-                .px(px(6.))
-                .pt(px(4.))
-                .text_size(px(10.))
-                .text_color(rgb(ink_secondary))
-                .when_some(head_style.clone(), |d, style| {
-                    d.font(style.font).text_size(style.size)
-                })
-                .child(text)
-                .into_any_element()
-        };
-        let mut list: Vec<AnyElement> = Vec::new();
-        // The primary pane: destination first (the one thing every export
-        // needs regardless of what it is), then the bundles most exports
-        // actually are, then the button to the rest. Everything under it is
-        // exactly the codec, quality, sound and encoder rows the old flat
-        // card opened on -- a bundle here only sets the same two fields the
-        // Advanced pane's own Format and Quality rows set, so nothing here
-        // is a setting of its own to fall out of step with them.
-        let destination = entry(
-            ("destination", 0),
-            "d",
-            "Destination".into(),
-            file_name(&self.export_path).into(),
-            false,
-            true,
-        )
-        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.pick_destination(cx)))
-        .into_any_element();
-        list.push(destination);
-        let current_preset = ExportPreset::from_state(self.format, self.quality);
-        for (i, preset) in ExportPreset::ALL.into_iter().enumerate() {
-            // A bundle whose format this timeline refuses (an audio-only edit
-            // against Web, Small or Master) is the same kind of row the codec
-            // rows already carry: dimmed, unclickable, its reason in place of
-            // the detail -- not bright and pickable over a click that would
-            // only bounce off `set_format`'s own guard.
-            let refusal = preset.bundle().and_then(|(format, _)| {
-                self.session
-                    .as_ref()
-                    .and_then(|s| format_refusal(s, format))
-            });
-            let detail: SharedString = match &refusal {
-                Some(why) => why.clone().into(),
-                None => preset.detail().into(),
-            };
-            let mut r = entry(
-                ("preset", i),
-                preset.key(),
-                preset.label().into(),
-                detail,
-                preset == current_preset,
-                refusal.is_none(),
-            );
-            if refusal.is_none() {
-                r = r.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                    this.pick_preset(preset);
-                    cx.notify();
-                }));
-            }
-            list.push(r.into_any_element());
-        }
-        let advanced_detail = match self.export_advanced_open {
-            true => "codec, container, quality, sound, encoder, subtitles — s collapses them"
-                .to_string(),
-            false => {
-                "codec, container, quality, sound, encoder, subtitles — s for the rows".to_string()
-            }
-        };
-        list.push(
-            entry(
-                ("export-advanced", 0),
-                "s",
-                "Advanced".into(),
-                advanced_detail.into(),
-                self.export_advanced_open,
-                true,
-            )
-            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                this.export_advanced_open = !this.export_advanced_open;
-                cx.notify();
-            }))
-            .into_any_element(),
-        );
-        // Everything from here down is the Advanced pane: the codec, its
-        // container, the quality rows, sound, encoder, subtitles, the two
-        // display switches and what this machine can encode with -- all of
-        // it built exactly as the flat card built it, only not pushed at all
-        // while the pane is shut.
-        if self.export_advanced_open {
-            if self.export_grouped {
-                list.push(header("FORMAT"));
-            }
-            // The codecs first: which one is being written decides whether every
-            // row under it means anything. One a *this* timeline cannot be written
-            // as (an audio-only edit, for a picture codec) reads exactly like one
-            // there is no encoder for -- dimmed, unclickable, and carrying its own
-            // reason where its detail was, with nothing to click to find that out.
-            let mut refusals: Vec<String> = Vec::new();
-            for (i, (boxes, key, label, detail)) in FORMATS.into_iter().enumerate() {
-                let format = same_box(boxes, self.format);
-                let refused = format
-                    .zip(self.session.as_ref())
-                    .and_then(|(f, s)| format_refusal(s, f));
-                // A codec with no encoder here at all is the other kind of refusal,
-                // and the one the footer collects: it can never become pickable, so
-                // a row each is dead rows above the fold.
-                if format.is_none() {
-                    refusals.push(format!("{label} — {detail}"));
-                    if !self.export_refusals_inline {
-                        continue;
-                    }
-                }
-                let detail: SharedString = match &refused {
-                    Some(why) => why.clone().into(),
-                    None => detail.into(),
-                };
-                let format = format.filter(|_| refused.is_none());
-                let mut r = entry(
-                    ("format", i),
-                    key,
-                    label.into(),
-                    detail,
-                    boxes.contains(&self.format),
-                    format.is_some(),
-                );
-                if let Some(format) = format {
-                    r = r.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.set_format(format);
-                        cx.notify();
-                    }));
-                }
-                list.push(r.into_any_element());
-            }
-            if self.export_grouped {
-                list.push(header("DETAILS"));
-            }
-            // The container, and only where the picked codec has more than one box:
-            // a row offering a single choice reads as a choice.
-            let boxes = containers(self.format);
-            if boxes.len() > 1 {
-                let next = next_container(self.format);
-                list.push(
-                    entry(
-                        ("container", 0),
-                        "c",
-                        "Container".into(),
-                        format!(
-                            "{} — c for {}",
-                            self.format.ext().to_uppercase(),
-                            next.ext().to_uppercase()
-                        )
-                        .into(),
-                        false,
-                        true,
-                    )
-                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                        this.cycle_container();
-                        cx.notify();
-                    }))
-                    .into_any_element(),
-                );
-            }
-            match bitrate_refusal(self.format) {
-                // One dimmed row carrying the reason, rather than five rows of a
-                // figure that will not be written: the quality rows are the
-                // *picture's* bitrate, and this file has no picture in it.
-                Some(why) => list.push(
-                    entry(
-                        ("quality", 0),
-                        "q",
-                        "Quality".into(),
-                        why.into(),
-                        false,
-                        false,
-                    )
-                    .into_any_element(),
-                ),
-                None => {
-                    for (i, quality) in Quality::ALL.into_iter().enumerate() {
-                        // The custom row is a field: `n` opens it, a click in it
-                        // opens it too, and while it is open the row shows what is
-                        // being typed with a caret in it rather than the number in
-                        // force. The other four are picked whole.
-                        let field = self
-                            .mbps_edit
-                            .as_ref()
-                            .filter(|_| quality == Quality::Custom);
-                        // Exact's own row carries whatever [`exact_refusal`] says of
-                        // the format currently picked, whether or not Exact is the
-                        // row in force -- the same reason `start_export` would give,
-                        // said here instead of only after the button is pressed.
-                        let exact_why = (quality == Quality::Exact)
-                            .then(|| self.session.as_ref())
-                            .flatten()
-                            .and_then(|s| exact_refusal(s, self.format, quality));
-                        let mut r = entry(
-                            ("quality", i),
-                            match quality {
-                                Quality::Custom => "n",
-                                _ => "q",
-                            },
-                            quality.label().into(),
-                            match (&exact_why, field) {
-                                (Some(why), _) => why.clone().into(),
-                                (None, Some(edit)) => edit.detail().into(),
-                                (None, None) => quality.detail(self.custom_mbps).into(),
-                            },
-                            self.quality == quality,
-                            true,
-                        )
-                        .on_click(cx.listener(
-                            move |this, _: &ClickEvent, _, cx| {
-                                match quality {
-                                    Quality::Custom => this.edit_mbps(),
-                                    _ => this.pick_quality(quality),
-                                }
-                                cx.notify();
-                            },
-                        ));
-                        if quality == Quality::Custom {
-                            // The wheel anywhere over the row moves the number, the
-                            // buttons being one step each: the range is fifty wide
-                            // now, and a number only a repeated press can walk to is
-                            // a number nobody walks to. Swallowed, so the notch that
-                            // moved the bitrate does not scroll the list under it as
-                            // well -- one gesture, one thing changed.
-                            r = r
-                                .on_scroll_wheel(cx.listener(
-                                    |this, event: &ScrollWheelEvent, _, cx| {
-                                        this.wheel_mbps(event);
-                                        cx.stop_propagation();
-                                        cx.notify();
-                                    },
-                                ))
-                                .child(self.mbps_steppers(cx));
-                        }
-                        list.push(r.into_any_element());
-                    }
-                }
-            }
-            // The other half of the file, and the one this card used to write at a
-            // fixed rate without saying so: what the *sound* is coded at, for every
-            // format that codes it -- the AAC inside a video export as much as an
-            // MP3. Four rates, so the pointer gets the *list* of them
-            // ([`Pick::AudioRate`]) rather than a button clicked round -- the
-            // resolution row's rule, and the key still steps as `ctrl+r` still
-            // does. Dimmed with the reason where this timeline has no rate to pick,
-            // like the quality rows are.
-            let sound = self.audio_rate_refusal();
-            let mut r = entry(
-                ("sound", 0),
-                "b",
-                "Sound".into(),
-                match sound {
-                    Some(why) => why.into(),
-                    None => format!("{} kbps — b steps", self.audio_kbps).into(),
-                },
-                false,
-                sound.is_none(),
-            );
-            if sound.is_none() {
-                r = r.on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
-                    this.open_picker(Pick::AudioRate, event.position(), cx)
-                }));
-            }
-            list.push(r.into_any_element());
-            // Which encoder writes the picture, which was an env pin and therefore
-            // no choice at all. Three seats, so the pointer gets the *list* of them
-            // ([`Pick::Encoder`]) and never a button clicked round -- the Sound
-            // row's rule, one row above. Only where there is a picture to encode:
-            // a WAV has no seat to pick and the row would be a question about
-            // nothing.
-            if self.format.has_video() {
-                let seat = self.encoder_seat();
-                list.push(
-                    entry(
-                        ("encoder", 0),
-                        "e",
-                        "Encoder".into(),
-                        format!("{} — e steps", encoder_label(seat)).into(),
-                        false,
-                        true,
-                    )
-                    .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
-                        this.open_picker(Pick::Encoder, event.position(), cx)
-                    }))
-                    .into_any_element(),
-                );
-                // ...and, under it, the one thing about that pick a person cannot
-                // know from the words in the list: this box's driver reset itself
-                // on the vendored AV1 encoder. A dimmed row and not a modal -- the
-                // pick is theirs, and the export runs.
-                if let Some(warning) = av1_hw_warning(self.format, seat) {
-                    list.push(
-                        entry(
-                            ("encoder-av1", 0),
-                            "",
-                            "".into(),
-                            warning.into(),
-                            false,
-                            false,
-                        )
-                        .into_any_element(),
-                    );
-                }
-            }
-            // What happens to the subtitles on this timeline, in one line: how many
-            // are written into the file and under what names, or the reason each one
-            // is not. Which tracks travel is not a pick -- everything with a cue on
-            // the timeline goes ([`Player::export_subs`]) -- so the row says rather
-            // than offers, like the machine lines below.
-            // ...and the ones that do not travel are named here too, which they were
-            // not: `export_subs` had already filtered a track with no cue on *this*
-            // timeline out of the engine's sight, so the card said nothing about a
-            // row the list was still showing ([`subtitle_plan`]).
-            let plan = self.subtitle_line();
-            // The row used to end in "click for <fmt> in MKV" whenever the picture
-            // was going into an mp4, on the grounds that only Matroska carries a
-            // text track. An mp4 carries one now (`Mp4Muxer::write_subtitles` writes
-            // `tx3g`), so that was a refusal offering a way out of nothing: the
-            // container the card is already set to embeds them. The refusals left in
-            // `planned_subtitles` are the true ones -- a sound-only format has
-            // nowhere to put a track, and a PGS track is pictures whatever the box.
-            list.push(
-                entry(
-                    ("subtitles", 0),
-                    "",
-                    "Subtitles".into(),
-                    plan.into(),
-                    false,
-                    false,
-                )
-                .into_any_element(),
-            );
-            // The card's own two layout switches. They were `g` and `r` and nothing
-            // else, while the status line under the title advertised both of them:
-            // a hand on the mouse read what they do and had nothing to press.
-            list.push(
-                entry(
-                    ("export-layout", 0),
-                    "g",
-                    "Layout".into(),
-                    match self.export_grouped {
-                        true => "sections — g for one flat list".into(),
-                        false => "one flat list — g for sections".into(),
-                    },
-                    self.export_grouped,
-                    true,
-                )
-                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                    this.export_grouped = !this.export_grouped;
-                    cx.notify();
-                }))
-                .into_any_element(),
-            );
-            list.push(
-                entry(
-                    ("export-refusals", 0),
-                    "r",
-                    "Codecs with no encoder".into(),
-                    match self.export_refusals_inline {
-                        true => "a dimmed row each — r collapses them".into(),
-                        false => "one line at the foot — r shows a row each".into(),
-                    },
-                    self.export_refusals_inline,
-                    true,
-                )
-                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                    this.export_refusals_inline = !this.export_refusals_inline;
-                    cx.notify();
-                }))
-                .into_any_element(),
-            );
-            if !self.export_refusals_inline && !refusals.is_empty() {
-                // Last, and one line: the reason travels with the name (a footer
-                // that only listed them would be the "why not?" the rows exist to
-                // answer), but nothing here can ever be picked, so it sits under
-                // every row that can rather than above them.
-                list.push(
-                    div()
-                        .flex_none()
-                        .px(px(6.))
-                        .py(px(2.))
-                        .text_size(px(11.))
-                        .text_color(rgb(ink_secondary))
-                        .when_some(mono_style.clone(), |d, style| {
-                            d.font(style.font).text_size(style.size)
-                        })
-                        .child(format!("cannot write: {}", refusals.join(" · ")))
-                        .into_any_element(),
-                );
-            }
-            // What is doing the work, on this machine and in this build: the GPU
-            // half is asked of the driver through the plugin (a different answer on
-            // every machine, and "none" where there is no plugin at all), the build
-            // half is the crates that were compiled in. Last in the list, because it
-            // is what a user checks rather than what they pick -- and a listing
-            // rather than rows, since none of it can be clicked.
-            if self.export_grouped {
-                list.push(header("THIS MACHINE"));
-            }
-            let note = |text: String| {
-                div()
-                    .flex_none()
-                    .px(px(6.))
-                    .py(px(2.))
-                    .text_size(px(11.))
-                    .text_color(rgb(ink_secondary))
-                    .when_some(mono_style.clone(), |d, style| {
-                        d.font(style.font).text_size(style.size)
-                    })
-                    .child(text)
-                    .into_any_element()
-            };
-            list.push(note(format!(
-                "GPU: {}",
-                self.hw_caps.clone().unwrap_or_else(|| "asking…".into())
-            )));
-            list.push(note(format!("Built in: {}", engine::caps::software())));
-        } // self.export_advanced_open
-        // What the rows add up to, which is the one thing that has to be right:
-        // codec, box, size, rate, sound, where it goes and about how big. Two
-        // lines, outside the scrolling list, so it is on screen whatever the
-        // list is scrolled to and whatever is picked.
-        let picture = self
+        // The picture's own seat, as the probe found it -- `SW` until it says
+        // otherwise is a promise; `GPU` is what `planned_seats` measured.
+        let hardware = self
+            .export_seat
+            .as_ref()
+            .and_then(|(.., seats)| *seats)
+            .and_then(|(video, _)| video)
+            .is_some_and(|seat| seat.contains("VA-API") || seat.contains("GPU"));
+        let audio = self
             .session
             .as_ref()
-            .map(|s| (s.resolution(), s.meta().frame_rate));
-        // The probe's answer where it has one -- the export's own decision,
-        // sound included ([`engine::export::planned_seats`]) -- and the pure
-        // prediction from the format alone until it lands, which is the same
-        // line this card always showed.
-        let seats = self.export_seat.as_ref().and_then(|(.., seats)| *seats);
-        let audio = seats.map_or_else(
-            || {
-                self.session
-                    .as_ref()
-                    .map_or("", |s| s.planned_audio(self.format, self.range.is_some()))
-            },
-            |(_, audio)| audio,
-        );
-        let settings = export_settings(
-            self.quality,
-            self.custom_mbps,
-            self.format,
-            self.audio_kbps,
-            self.encoder_seat(),
-        );
-        let size = estimated_bytes(
-            settings.bitrate.filter(|_| self.format.has_video()),
-            self.session.as_ref().map_or(0., |s| match self.range {
-                Some((start, end)) => f64::from(end - start) / s.meta().frame_rate,
-                None => s.timeline_duration(),
-            }),
-        );
-        let head = summary_head(self.format, picture, audio);
-        let tail = summary_tail(
-            &self.export_path,
-            size,
-            seats.and_then(|(video, _)| video),
-            self.format.has_video(),
-        );
-        // The button says the refusal *before* it is pressed: the picked codec
-        // can go invalid one edit after it was picked (a cleared video lane),
-        // and a button that looks ready until it is pressed is the lie the
-        // dimmed rows above it are there to avoid.
+            .map_or("", |s| s.planned_audio(self.format, self.range.is_some()));
+        let marks = self.range.map(|(start, end)| {
+            format!(
+                "{}\u{2013}{}",
+                timecode(f64::from(start) / self.fps, self.fps),
+                timecode(f64::from(end) / self.fps, self.fps),
+            )
+        });
+        let plan = plan_line(self.format, audio, marks.as_deref(), hardware);
+        // The refusal the button used to carry, said before it is pressed and
+        // in the readout's own place: a few words and the chord that fixes it,
+        // never the sentence the old card wrapped over three lines.
         let blocked = self
             .session
             .as_ref()
-            .and_then(|s| format_refusal(s, self.format));
-        let action: SharedString = match &blocked {
-            Some(why) => {
-                format!("Cannot export — {}", why.split(" — ").next().unwrap_or(why)).into()
+            .and_then(|s| format_refusal(s, self.format))
+            .map(|why| {
+                format!(
+                    "{} — sound format in settings {}",
+                    why.split(" — ").next().unwrap_or("cannot export"),
+                    self.keymap.chord(ActionId::Settings)
+                )
+            });
+        let chord = |key: &'static str| {
+            div()
+                .flex_none()
+                .type_style(type_scale::mono(
+                    type_scale::CHORD_METADATA_MIN_PX,
+                    gpui::FontWeight::MEDIUM,
+                ))
+                .text_color(rgb(INK3()))
+                .child(key)
+        };
+        // Row 1: the file. A readout -- `d` is the one way to change it, the
+        // desktop's own save dialog, exactly as the old row's `d` was.
+        let file_row = div()
+            .id("destination")
+            .flex_none()
+            .flex()
+            .items_baseline()
+            .gap(px(16.))
+            .cursor_pointer()
+            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.pick_destination(cx)))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .truncate()
+                    .type_style(type_scale::mono(18., gpui::FontWeight::BOLD))
+                    .text_color(rgb(INK1()))
+                    .child(stem.to_string())
+                    .child(
+                        div()
+                            .text_color(rgb(INK2()))
+                            .child(ext.to_string()),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .gap(px(10.))
+                    .type_style(type_scale::mono(
+                        type_scale::CHORD_METADATA_MIN_PX,
+                        gpui::FontWeight::MEDIUM,
+                    ))
+                    .text_color(rgb(INK3()))
+                    .child(dest_dir(&self.export_path))
+                    .child("d"),
+            );
+        // Row 2: the budget. One lever, in bits per second, read as a rate and
+        // as a size -- the wheel moves it (shift by whole Mbps), `n` types one
+        // (`850k`, `6.5M`, `6.5`, `1.2G` of file), the track sets it by hand.
+        let reading: Vec<AnyElement> = match &self.budget_edit {
+            Some(text) => {
+                let parsed = parse_budget(text, seconds, self.audio_bps());
+                vec![
+                    div()
+                        .type_style(type_scale::mono(18., gpui::FontWeight::BOLD))
+                        .text_color(rgb(INK1()))
+                        .child(format!("{text}\u{258f}"))
+                        .into_any_element(),
+                    div()
+                        .type_style(type_scale::mono(15., gpui::FontWeight::MEDIUM))
+                        .text_color(rgb(INK2()))
+                        .child(match parsed {
+                            Some(bps) => format!(
+                                "{} Mbps ≈ {}",
+                                rate_label(bps),
+                                size_label(estimated_bytes(bps + self.audio_bps(), seconds))
+                            ),
+                            None => "↵ takes it · esc leaves it".to_string(),
+                        })
+                        .into_any_element(),
+                ]
             }
-            None => "Export".into(),
+            None => vec![
+                div()
+                    .flex()
+                    .items_baseline()
+                    .type_style(type_scale::mono(18., gpui::FontWeight::BOLD))
+                    .text_color(rgb(INK1()))
+                    .child(rate_label(budget))
+                    .child(
+                        div()
+                            .type_style(type_scale::mono(
+                                type_scale::CHORD_METADATA_MIN_PX,
+                                gpui::FontWeight::MEDIUM,
+                            ))
+                            .text_color(rgb(INK2()))
+                            .child(" Mbps"),
+                    )
+                    .into_any_element(),
+                div()
+                    .type_style(type_scale::mono(15., gpui::FontWeight::MEDIUM))
+                    .text_color(rgb(INK2()))
+                    .child(format!("≈ {}", size_label(bytes)))
+                    .into_any_element(),
+            ],
         };
-        let status_line = match (&self.mbps_edit, self.notices.front()) {
-            // A field being typed into says so here as well as in its row:
-            // this line is outside the scrolling list and on screen at every
-            // window size, and at 360 px the custom row itself can be below
-            // the fold -- a number typed where it cannot be seen is the
-            // blind capture this field replaced.
-            (Some(edit), _) => SharedString::from(format!("Custom bitrate {}", edit.detail())),
-            (None, Some(notice)) => notice.clone(),
-            // `g`/`r` only do anything once Advanced is open -- they moved
-            // off the front pane with the rows they reshape -- so a shut
-            // pane advertises `s` instead of a pair of keys with nothing on
-            // screen for them to touch.
-            // Short enough to read at a glance in the plate's own head row:
-            // the long four-clause sentence was 11px `ink3` mono across the
-            // whole sheet and read as noise above the rows it was meant to
-            // explain (user 2026-08-21: "hard to read").
-            (None, None) => match self.export_advanced_open {
-                true => "↵ exports · esc closes · g/r layout".into(),
-                false => "↵ exports · esc closes · s Advanced".into(),
-            },
-        };
-        // The darkroom's own language, not the corner-card sheet the legacy
-        // tree drew before it was removed --
-        // a plate (canvas-on-panel, §4), positioned over the bench+
-        // ledger footprint it can sit over rather than centred over the
-        // whole window (§11 check 6: the picture stays uncovered). The
-        // click-catcher behind it is `size_full` so a click anywhere
-        // still closes the card exactly as the legacy scrim's does, but
-        // paints nothing (`SCRIM()` is deliberately not applied here) --
-        // an invisible catcher changes zero picture pixels while a
-        // dimming one would still tint the screen it must never cover.
-        // The plate is the room's below-picture footprint, not a 340px
-        // corner card (user 2026-08-21: "export section is not aligning
-        // with our design"). Measured at 1280x720 the corner card's own
-        // max-height was ~9px taller than the footprint it had to fit
-        // in, so its scrolling row list collapsed to a single visible
-        // row: the presets, Advanced and every codec row under them were
-        // unreachable by pointer, and the long status sentence wrapped to
-        // three lines over the top of them. Two columns instead -- rows
-        // left, what-it-adds-up-to and the one bordered chip right --
-        // inside the same bench+ledger footprint every menu already
-        // hangs in, so the picture stays uncovered (§11 check 6) and the
-        // list gets the whole height rather than a fraction of it.
+        let budget_row = div()
+            .id("budget")
+            .flex_none()
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
+                this.wheel_budget(event);
+                cx.stop_propagation();
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .flex()
+                    .items_baseline()
+                    .gap(px(16.))
+                    .id("budget-read")
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.edit_budget();
+                        cx.notify();
+                    }))
+                    .children(reading)
+                    .child(div().flex_1())
+                    .child(chord("n")),
+            )
+            .child(
+                // 1px to look at, a whole row to grab (WCAG 2.5.8) -- the
+                // ruler's own split between what is drawn and what is hit.
+                div()
+                    .id("budget-track")
+                    .relative()
+                    .h(px(KEYS_ROW_H))
+                    .cursor_pointer()
+                    .child(bounds_probe(self.budget_bar.clone()))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                            this.drag_budget(event.position.x);
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    )
+                    .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                        if event.pressed_button == Some(MouseButton::Left) {
+                            this.drag_budget(event.position.x);
+                            cx.notify();
+                        }
+                    }))
+                    .child(
+                        div()
+                            .absolute()
+                            .left_0()
+                            .right_0()
+                            .top(px(KEYS_ROW_H / 2.))
+                            .h(px(1.))
+                            .bg(rgb(DARK_HAIRLINE())),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .left_0()
+                            .top(px(KEYS_ROW_H / 2.))
+                            .h(px(1.))
+                            .w(relative(fill))
+                            .bg(rgb(INK2())),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .left(relative(fill))
+                            .top(px(KEYS_ROW_H / 2. - 4.))
+                            .w(px(2.))
+                            .h(px(9.))
+                            .bg(rgb(INK1())),
+                    ),
+            );
+        // Row 3: what auto resolved to, in the faintest ink -- or, where the
+        // press would be refused, the refusal in its place -- and the one
+        // boxed chip in the room (§4).
+        let commit_row = div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(16.))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .truncate()
+                    .type_style(type_scale::mono(
+                        type_scale::CHORD_METADATA_MIN_PX,
+                        gpui::FontWeight::MEDIUM,
+                    ))
+                    .text_color(rgb(match blocked.is_some() {
+                        true => STATUS_WARNING(),
+                        false => INK4(),
+                    }))
+                    .child(blocked.clone().unwrap_or(plan)),
+            )
+            .child(
+                div()
+                    .id("export-confirm")
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(10.))
+                    .h(px(32.))
+                    .px(px(22.))
+                    .rounded(px(3.))
+                    .border_1()
+                    .border_color(rgb(match blocked.is_some() {
+                        true => INK4(),
+                        false => INK3(),
+                    }))
+                    .when(blocked.is_none(), |d| {
+                        d.cursor_pointer().hover(|s| s.bg(rgb(DARK_RAISED())))
+                    })
+                    .when(blocked.is_some(), |d| d.cursor_not_allowed())
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.start_export(cx)))
+                    .type_style(type_scale::label(
+                        type_scale::LABEL_ROW_PX,
+                        gpui::FontWeight::MEDIUM,
+                    ))
+                    .text_color(rgb(match blocked.is_some() {
+                        true => INK4(),
+                        false => INK1(),
+                    }))
+                    .child("Export")
+                    .child(
+                        div()
+                            .type_style(type_scale::mono(
+                                type_scale::CHORD_METADATA_MIN_PX,
+                                gpui::FontWeight::MEDIUM,
+                            ))
+                            .text_color(rgb(INK3()))
+                            .child(self.keymap.chord(ActionId::Export)),
+                    ),
+            );
         let floor = crate::ui::stance::below_picture_floor(
             f32::from(viewport.height),
             self.split_px(Split::Bench, viewport),
         );
-        let summary = |text: SharedString, ink: u32| {
-            div()
-                .flex_none()
-                .px(px(6.))
-                .type_style(type_scale::mono(
-                    type_scale::CHORD_METADATA_MAX_PX,
-                    gpui::FontWeight::MEDIUM,
-                ))
-                .text_color(rgb(ink))
-                .child(text)
-        };
         Some(
             div()
                 .id("export-click-catcher")
@@ -960,11 +588,9 @@ impl Player {
                 .left_0()
                 .right_0()
                 .flex()
+                .items_end()
                 // Below the time band, not merely below the picture: the
-                // transport and the Export chip that opened this card are
-                // on that band, and a sheet drawn over them hides the
-                // control the editor just pressed. The bench and the
-                // ledger are what this plate is allowed to cover.
+                // chip that opened this moment is on that band.
                 .pt(px(floor + crate::ui::stance::TIME_BAND_H + 6.))
                 .pb(px(6.))
                 .px(px(6.))
@@ -981,140 +607,24 @@ impl Player {
                         .id("export-plate")
                         .flex_1()
                         .min_w(px(0.))
+                        // The artboard is 784 wide; wider windows give the
+                        // moment room, never a 2000px line of three words.
+                        .max_w(px(EXPORT_W * 2.))
+                        .h(px(EXPORT_MOMENT_H))
                         .on_mouse_down(MouseButton::Left, swallow)
                         .flex()
                         .flex_col()
-                        .gap(px(4.))
-                        .p(px(10.))
+                        .justify_between()
+                        .pt(px(22.))
+                        .pb(px(20.))
+                        .px(px(28.))
                         .rounded(px(4.))
                         .bg(rgb(DARK_PANEL()))
                         .border_1()
                         .border_color(rgba(DARK_SEAM()))
-                        .child(
-                            div()
-                                .flex_none()
-                                .flex()
-                                .items_baseline()
-                                .justify_between()
-                                .gap(px(12.))
-                                .px(px(6.))
-                                .child(
-                                    div()
-                                        .type_style(type_scale::head())
-                                        .text_color(rgb(INK3()))
-                                        .child("EXPORT"),
-                                )
-                                .child(
-                                    div()
-                                        .min_w(px(0.))
-                                        .truncate()
-                                        .type_style(type_scale::mono(
-                                            type_scale::CHORD_METADATA_MAX_PX,
-                                            gpui::FontWeight::MEDIUM,
-                                        ))
-                                        .text_color(rgb(INK2()))
-                                        .child(status_line),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_h(px(0.))
-                                .flex()
-                                .gap(px(10.))
-                                .child(
-                                    div()
-                                        .id("export-rows")
-                                        .flex_1()
-                                        .min_w(px(0.))
-                                        .h_full()
-                                        .flex()
-                                        .flex_col()
-                                        .gap(px(2.))
-                                        .overflow_y_scroll()
-                                        .children(list),
-                                )
-                                .child(
-                                    div()
-                                        .flex_none()
-                                        .w(px(300.))
-                                        .h_full()
-                                        .flex()
-                                        .flex_col()
-                                        .justify_end()
-                                        .gap(px(4.))
-                                        .border_l_1()
-                                        .border_color(rgb(DARK_HAIRLINE()))
-                                        .pl(px(8.))
-                                        .child(summary(head.into(), INK2()))
-                                        .children(self.range.map(|(start, end)| {
-                                            summary(
-                                                format!(
-                                                    "RANGE {}\u{2013}{} ({})",
-                                                    timecode(f64::from(start) / self.fps, self.fps),
-                                                    timecode(f64::from(end) / self.fps, self.fps),
-                                                    frames_timecode(end - start, self.fps),
-                                                )
-                                                .into(),
-                                                INK3(),
-                                            )
-                                        }))
-                                        .child(summary(tail.into(), INK3()))
-                                        // §4: "the single bordered chip in
-                                        // the whole room" -- ghosts
-                                        // everywhere else in this card, one
-                                        // border here, wearing its chord
-                                        // live off the keymap so a rebind
-                                        // cannot leave it stale.
-                                        .child(
-                                            div()
-                                                .id("export-confirm")
-                                                .mt(px(4.))
-                                                .flex()
-                                                .items_center()
-                                                .justify_center()
-                                                .gap(px(6.))
-                                                .h(px(CONTROL_H))
-                                                .px(px(10.))
-                                                .rounded(px(3.))
-                                                .border_1()
-                                                .border_color(rgb(match blocked.is_some() {
-                                                    true => INK4(),
-                                                    false => INK2(),
-                                                }))
-                                                .when(blocked.is_none(), |d| d.cursor_pointer())
-                                                .when(blocked.is_some(), |d| d.cursor_not_allowed())
-                                                .hover(|s| s.bg(rgb(DARK_RAISED())))
-                                                .on_click(cx.listener(
-                                                    |this, _: &ClickEvent, _, cx| {
-                                                        this.start_export(cx)
-                                                    },
-                                                ))
-                                                .type_style(type_scale::label(
-                                                    type_scale::LABEL_ROW_PX,
-                                                    gpui::FontWeight::MEDIUM,
-                                                ))
-                                                .text_color(rgb(match blocked.is_some() {
-                                                    true => INK4(),
-                                                    false => INK1(),
-                                                }))
-                                                .child(action)
-                                                .when(blocked.is_none(), |d| {
-                                                    d.child(
-                                                        div()
-                                                            .type_style(type_scale::mono(
-                                                                type_scale::CHORD_METADATA_MIN_PX,
-                                                                gpui::FontWeight::MEDIUM,
-                                                            ))
-                                                            .text_color(rgb(INK3()))
-                                                            .child(
-                                                                self.keymap.chord(ActionId::Export),
-                                                            ),
-                                                    )
-                                                }),
-                                        ),
-                                ),
-                        )
+                        .child(file_row)
+                        .child(budget_row)
+                        .child(commit_row)
                         .into_any_element(),
                 )
                 .into_any_element(),
@@ -1269,36 +779,6 @@ impl Player {
                         ),
                 ),
         )
-    }
-
-    /// The custom bitrate's two pointer buttons. The typed digits were the last
-    /// control in this card a mouse could not reach at all -- and a number that
-    /// can only be typed is a number a hand on the pointer has to leave the
-    /// card to change. `HIT_MIN` square, like every other target here.
-    pub(crate) fn mbps_steppers(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let step = |id: &'static str, label: &'static str, by: i32, cx: &mut Context<Self>| {
-            div()
-                .id(id)
-                .flex()
-                .w(px(HIT_MIN))
-                .h(px(HIT_MIN))
-                .items_center()
-                .justify_center()
-                .rounded(px(3.))
-                .bg(rgb(BG_PANEL()))
-                .cursor_pointer()
-                .hover(|s| s.bg(rgb(BG_HOVER())))
-                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                    this.nudge_mbps(by);
-                    cx.notify();
-                }))
-                .child(label)
-        };
-        div()
-            .flex()
-            .gap(px(4.))
-            .child(step("mbps-down", "−", -1, cx))
-            .child(step("mbps-up", "+", 1, cx))
     }
 
     /// The equalizer of one audio clip: its frequency response drawn as a

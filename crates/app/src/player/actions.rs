@@ -443,7 +443,7 @@ impl Player {
         // A number being typed is a value under the arrows, exactly as a card's
         // slider is -- so a held arrow runs it. Asked before the export card
         // below, which otherwise repeats nothing.
-        if self.mbps_edit.is_some() {
+        if self.budget_edit.is_some() {
             Repeat::Card
         } else if self.keys_open || self.export_open || self.exporting().is_some() {
             Repeat::Nothing

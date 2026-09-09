@@ -613,31 +613,7 @@ pub enum Reach {
     Gesture,
 }
 
-/// The codec row's keys, from the export card's own table. Typed out here once,
-/// it named six of the seven codecs the same row's label advertised -- OGG had
-/// a key (`o`) that this card never said.
-fn codec_chord() -> String {
-    crate::FORMATS
-        .iter()
-        .map(|(_, stroke, ..)| *stroke)
-        .filter(|stroke| !stroke.is_empty())
-        .collect::<Vec<_>>()
-        .join(" / ")
-}
-
-/// The preset row's keys, from [`crate::ExportPreset::key`] -- `Custom`
-/// excepted, which shares Advanced's own `s` and so is that row's line, not a
-/// second one here.
-fn preset_chord() -> String {
-    crate::ExportPreset::ALL
-        .into_iter()
-        .filter(|p| *p != crate::ExportPreset::Custom)
-        .map(|p| p.key())
-        .collect::<Vec<_>>()
-        .join(" / ")
-}
-
-pub static FIXED: std::sync::LazyLock<[Fixed; 35]> = std::sync::LazyLock::new(|| {
+pub static FIXED: std::sync::LazyLock<[Fixed; 27]> = std::sync::LazyLock::new(|| {
     [
         // Not a chord at all but a way of pressing one, and the only place the
         // editor can say so: holding a key that moves a *value* runs it, and
@@ -665,50 +641,27 @@ pub static FIXED: std::sync::LazyLock<[Fixed; 35]> = std::sync::LazyLock::new(||
         },
         Fixed {
             chord: "n".into(),
-            label: "Open the custom export bitrate field — ↑↓ step it",
+            label: "Say the export budget: 850k, 6.5M, 6.5 or 1.2G of file",
             category: Category::File,
-            reach: Reach::Click("quality"),
+            reach: Reach::Click("budget"),
+        },
+        Fixed {
+            chord: "− / + / ← →".into(),
+            label: "Move the export budget — shift steps whole megabits",
+            category: Category::File,
+            reach: Reach::Click("budget-track"),
         },
         Fixed {
             chord: "0–9".into(),
-            label: "Type into that field — nothing outside it",
+            label: "Type into an open field — the budget, or a clip's duration",
             category: Category::File,
-            reach: Reach::Click("mbps-up"),
+            reach: Reach::Click("budget"),
         },
         Fixed {
-            chord: codec_chord(),
-            label: "Pick the export codec: H.264, AV1, HEVC, WAV, FLAC, MP3 or OGG",
+            chord: "backspace".into(),
+            label: "Erase a character in the budget or duration field",
             category: Category::File,
-            reach: Reach::Click("format"),
-        },
-        // The rest of the export card's own rows, each on the letter its row is
-        // named after. They shadow the clip keys of the same letter while the card
-        // is up, exactly as its digits shadow nothing and its arrows would: a modal
-        // card owns the keyboard, and cutting a clip under it is not a thing that
-        // can happen anyway.
-        Fixed {
-            chord: "c".into(),
-            label: "Switch the export container: Matroska or MP4",
-            category: Category::File,
-            reach: Reach::Click("container"),
-        },
-        Fixed {
-            chord: "q".into(),
-            label: "Step through the export quality rows",
-            category: Category::File,
-            reach: Reach::Click("quality"),
-        },
-        Fixed {
-            chord: "b".into(),
-            label: "Step through the export sound bitrates",
-            category: Category::File,
-            reach: Reach::Click("sound"),
-        },
-        Fixed {
-            chord: "e".into(),
-            label: "Step the export encoder seat: Auto, Hardware or Software",
-            category: Category::File,
-            reach: Reach::Click("encoder"),
+            reach: Reach::Click("budget"),
         },
         Fixed {
             chord: "d".into(),
@@ -717,40 +670,10 @@ pub static FIXED: std::sync::LazyLock<[Fixed; 35]> = std::sync::LazyLock::new(||
             reach: Reach::Click("destination"),
         },
         Fixed {
-            chord: preset_chord(),
-            label: "Pick an export bundle: Web, Small file, Master or Audio only",
-            category: Category::File,
-            reach: Reach::Click("preset"),
-        },
-        Fixed {
-            chord: "s".into(),
-            label: "Export card: open or close the Advanced pane",
-            category: Category::File,
-            reach: Reach::Click("export-advanced"),
-        },
-        Fixed {
-            chord: "g".into(),
-            label: "Export card: sections or one flat list",
-            category: Category::File,
-            reach: Reach::Click("export-layout"),
-        },
-        Fixed {
-            chord: "r".into(),
-            label: "Export card: the formats with no encoder as rows or as one line",
-            category: Category::File,
-            reach: Reach::Click("export-refusals"),
-        },
-        Fixed {
             chord: "enter".into(),
-            label: "Start the export — or commit the bitrate field",
+            label: "Start the export — or take the budget being typed",
             category: Category::File,
             reach: Reach::Click("export-confirm"),
-        },
-        Fixed {
-            chord: "backspace".into(),
-            label: "Erase a digit in the bitrate field",
-            category: Category::File,
-            reach: Reach::Click("mbps-down"),
         },
         // The equalizer card's own input, for the same reason the export card has
         // its own: a band nothing but a drag can reach is a band half the users of
@@ -1770,46 +1693,6 @@ mod tests {
         assert_eq!(k.chord(ActionId::CancelExport), "^esc");
         assert_eq!(k.chord(ActionId::Play), "spc");
         assert_eq!(whole("edith-keys 1\n").chord(ActionId::Cut), "--");
-    }
-
-    /// The one row of [`FIXED`] that speaks for a whole table elsewhere: it
-    /// named six keys for seven codecs, and OGG's `o` was a stroke the card
-    /// never mentioned. The chord is generated from `FORMATS` now, and this
-    /// holds the *label* to the same table -- a codec added there with no name
-    /// in this row fails here rather than in a user's hands.
-    #[test]
-    fn the_codec_row_says_every_codec_the_export_card_offers() {
-        let row = super::FIXED
-            .iter()
-            .find(|f| f.label.starts_with("Pick the export codec"))
-            .expect("the codec row");
-        let keys: Vec<&str> = row.chord.split(" / ").collect();
-        for (boxes, stroke, label, _) in crate::FORMATS {
-            if stroke.is_empty() {
-                // A codec this program cannot write at all has no key and no
-                // business in this row.
-                assert!(boxes.is_empty(), "{label} has a box but no stroke");
-                assert!(!keys.contains(&stroke));
-                continue;
-            }
-            assert!(
-                keys.contains(&stroke),
-                "{label}'s key {stroke:?} is not in {:?}",
-                row.chord
-            );
-            assert!(
-                row.label.contains(label),
-                "{label} is not named in {:?}",
-                row.label
-            );
-        }
-        assert_eq!(
-            keys.len(),
-            crate::FORMATS
-                .iter()
-                .filter(|(_, s, ..)| !s.is_empty())
-                .count()
-        );
     }
 
     #[test]

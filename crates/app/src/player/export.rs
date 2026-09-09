@@ -1,7 +1,6 @@
 //! What is cached about the media and the machine, and the export the
 //! two of them decide.
 
-use crate::ui::widgets::NumberEdit;
 use crate::*;
 
 impl Player {
@@ -353,8 +352,7 @@ impl Player {
             return;
         };
         let settings = export_settings(
-            self.quality,
-            self.custom_mbps,
+            self.budget_bps(),
             self.format,
             self.audio_kbps,
             self.encoder_seat(),
@@ -460,18 +458,19 @@ impl Player {
         // was waiting in. Nor may a half-typed number: the card opens on the
         // bitrate it will write, never on digits left behind by a closed one.
         self.keys_open = false;
-        self.mbps_edit = None;
+        self.budget_edit = None;
         cx.notify();
     }
 
-    /// A format row was clicked. The destination follows it at once -- a WAV
-    /// written to a path ending in `.mp4` is a file every player will lie
-    /// about -- keeping whatever stem the save dialog last left there. `false`
-    /// on a refusal, so a caller that has more than the format to write (a
-    /// preset's own quality) knows not to write the rest of it either.
+    /// A format row, from Settings. The destination follows it at once -- a
+    /// WAV written to a path ending in `.mp4` is a file every player will lie
+    /// about -- keeping whatever stem the save dialog last left there.
+    /// `false` on a refusal, so a caller with more than the format to write
+    /// knows not to write the rest of it either.
+    #[allow(dead_code)] // shown by Settings now, not by the moment
     pub(crate) fn set_format(&mut self, format: Format) -> bool {
-        // The one door both the row and its initial go through, so a format the
-        // card greys out cannot be picked by keyboard either.
+        // The one door both the row and its initial go through, so a format
+        // the room greys out cannot be picked by keyboard either.
         if let Some(why) = self
             .session
             .as_ref()
@@ -485,46 +484,11 @@ impl Player {
         true
     }
 
-    /// A preset row, by click or by its own key. `Custom` opens the pane where
-    /// the codec and the quality are picked apart and changes nothing itself;
-    /// the rest are exactly the bundle they name -- and nothing at all on a
-    /// refusal, because [`set_format`](Self::set_format) already fired the
-    /// banner and a quality written after it declined would be a row that
-    /// looks picked over a format that was not.
-    pub(crate) fn pick_preset(&mut self, preset: ExportPreset) {
-        match preset.bundle() {
-            Some((format, quality)) => {
-                if self.set_format(format) {
-                    self.quality = quality;
-                }
-            }
-            None => self.export_advanced_open = true,
-        }
-    }
-
-    /// A quality row, by click or by its own key (`Custom` goes through
-    /// [`Self::edit_mbps`] instead). Exact is the one row that is also a
-    /// format decision -- "the input's own quality" means the input's own
-    /// codec, so picking it derives the container from the source rather
-    /// than leaving whatever format a previous pick left behind for
-    /// [`exact_refusal`] to refuse minutes later. A source this cannot copy
-    /// (h264, mixed sources) leaves the format alone; the row itself
-    /// ([`crate::ui::cards`]'s quality list) already says why.
-    pub(crate) fn pick_quality(&mut self, quality: Quality) {
-        self.quality = quality;
-        if quality != Quality::Exact {
-            return;
-        }
-        let Some(format) = self.session.as_ref().and_then(exact_format) else {
-            return;
-        };
-        self.set_format(format);
-    }
-
     /// The container row: the same codec in the other box, which retargets the
     /// destination exactly as picking a codec does -- and does nothing at all
     /// for a codec with only one box, so the stroke cannot invent a choice the
     /// card is not offering.
+    #[allow(dead_code)] // shown by Settings now, not by the moment
     pub(crate) fn cycle_container(&mut self) {
         self.set_format(next_container(self.format));
     }
@@ -561,51 +525,134 @@ impl Player {
         }
     }
 
-    /// The custom bitrate by pointer: the typed digits were the only control in
-    /// this card a mouse could not reach. Clamped to the range the row states
-    /// (the engine's own 1..50 Mbps), and picking the row is part of the step --
-    /// a stepper that moves a number nobody is using would move nothing.
-    pub(crate) fn nudge_mbps(&mut self, step: i32) {
-        self.custom_mbps =
-            (self.custom_mbps as i32 + step).clamp(MBPS_MIN as i32, MBPS_MAX as i32) as u32;
-        self.quality = Quality::Custom;
+    /// The budget in force: what was chosen, or -- before anybody has chosen
+    /// -- the engine's own automatic figure for the picture that is open
+    /// ([`auto_bps`], its `BITS_PER_PIXEL` rule). Never zero, which is the
+    /// whole point: the lever it feeds is a promise about the file.
+    pub(crate) fn budget_bps(&self) -> u64 {
+        if self.custom_bps > 0 {
+            return self.custom_bps;
+        }
+        self.session.as_ref().map_or(BPS_MIN * 6, |s| {
+            let (w, h) = s.resolution();
+            auto_bps(w, h, s.meta().frame_rate)
+        })
     }
 
-    /// The same number under the wheel, one step a notch, up for more: fifty
-    /// presses of a stepper is not a way to reach the top of this range, and the
-    /// wheel is what this editor already moves a value with (the timeline's
-    /// zoom and scroll are the same gesture). Hold-to-run stays the keyboard's,
-    /// as it is on every other card here -- a button that repeats while held is
-    /// not a thing this program has.
-    ///
-    /// It moves the *field* while one is open, exactly as ↑↓ do, so the two
-    /// ways in never disagree about which number is being changed.
-    pub(crate) fn wheel_mbps(&mut self, event: &ScrollWheelEvent) {
+    /// What the sound costs over the same span, in bits per second -- the
+    /// other half of "how big is it": zero for a format that writes no sound
+    /// and for a timeline that has none.
+    pub(crate) fn audio_bps(&self) -> u64 {
+        match self.audio_rate_refusal().is_none() {
+            true => u64::from(self.audio_kbps) * 1_000,
+            false => 0,
+        }
+    }
+
+    /// How many seconds of film the export writes: the marked span where
+    /// there is one, the whole timeline otherwise. The size on the budget row
+    /// is this times the rate.
+    pub(crate) fn export_seconds(&self) -> f64 {
+        self.session.as_ref().map_or(0., |s| match self.range {
+            Some((start, end)) => f64::from(end - start) / s.meta().frame_rate,
+            None => s.timeline_duration(),
+        })
+    }
+
+    /// The lever by `steps` notches -- a tenth of a Mbps each, a whole Mbps
+    /// with shift. Clamped to the engine's own bounds, so the number on the
+    /// row is the number the encoder is given.
+    pub(crate) fn nudge_budget(&mut self, steps: i32, coarse: bool) {
+        let step = i64::from(steps)
+            * match coarse {
+                true => BPS_COARSE as i64,
+                false => BPS_FINE as i64,
+            };
+        let at = self.budget_bps() as i64 + step;
+        self.custom_bps = (at.max(0) as u64).clamp(BPS_MIN, BPS_MAX);
+    }
+
+    /// The same number under the wheel, a notch a step, up for more -- the
+    /// gesture this editor already moves a value with. Shift takes whole
+    /// megabits: fifty tenths is not a way across this range.
+    pub(crate) fn wheel_budget(&mut self, event: &ScrollWheelEvent) {
         let by = wheel_delta(event);
         if by == 0. {
             return;
         }
-        let by = by.signum() as i32;
-        match &mut self.mbps_edit {
-            Some(edit) => edit.step(by),
-            None => self.nudge_mbps(by),
+        self.nudge_budget(by.signum() as i32, event.modifiers.shift);
+    }
+
+    /// A press or a drag on the track, read against the box the last paint
+    /// recorded ([`Self::budget_bar`]): linear across the engine's range,
+    /// which is what the fill and the knob draw.
+    pub(crate) fn drag_budget(&mut self, x: Pixels) {
+        let along = frac_along(x, self.budget_bar.get());
+        let span = (BPS_MAX - BPS_MIN) as f32;
+        self.custom_bps = (BPS_MIN as f32 + along * span).round() as u64;
+        self.custom_bps = self.custom_bps.clamp(BPS_MIN, BPS_MAX);
+    }
+
+    /// Opens the budget's field, empty: `n` is a way to *say* a budget
+    /// (`850k`, `6.5M`, `6.5`, `1.2G` of file), not a way to edit digits, and
+    /// the number in force is still on the row until enter takes the new one.
+    pub(crate) fn edit_budget(&mut self) {
+        self.budget_edit = Some(String::new());
+    }
+
+    /// Takes what was typed, or says nothing and keeps the field open: a
+    /// number that parses is clamped into the engine's range (and shown
+    /// clamped, in the same keystroke), and one that does not is left to be
+    /// fixed in place.
+    pub(crate) fn commit_budget(&mut self) {
+        let Some(text) = self.budget_edit.clone() else {
+            return;
+        };
+        let (seconds, audio) = (self.export_seconds(), self.audio_bps());
+        if let Some(bps) = parse_budget(&text, seconds, audio) {
+            self.custom_bps = bps;
+            self.budget_edit = None;
         }
     }
 
-    /// Opens the custom bitrate's field on the number the row is carrying, and
-    /// picks the row while it is at it: a field typed into is the row being
-    /// chosen, and a number nobody is using would be a number typed at nothing.
-    /// Nothing is committed here -- until enter, the card still exports at the
-    /// bitrate it had.
-    pub(crate) fn edit_mbps(&mut self) {
-        self.quality = Quality::Custom;
-        self.mbps_edit = Some(NumberEdit::new(
-            self.custom_mbps,
-            MBPS_MIN,
-            MBPS_MAX,
-            MBPS_DIGITS,
-            "Mbps",
-        ));
+    /// Every stroke the moment answers, and the reason it answers *all* of
+    /// them: a chord this surface consumes must never also reach the room's
+    /// keymap underneath it (the shipped defect where `n` opened the field
+    /// *and* toggled the timeline snap). While the moment is up it owns the
+    /// keyboard -- `d`, `n`, `e`/`↵`, `−`/`+`/arrows, escape do their thing,
+    /// and everything else is swallowed rather than falling through.
+    ///
+    /// Escape retreats one step at a time (DESIGN.md:146): the field first,
+    /// the moment second.
+    pub(crate) fn export_moment_key(&mut self, key: &str, shift: bool, cx: &mut Context<Self>) -> bool {
+        if !self.export_open {
+            return false;
+        }
+        if let Some(text) = &mut self.budget_edit {
+            match key {
+                ESCAPE => self.budget_edit = None,
+                "enter" => self.commit_budget(),
+                "backspace" => {
+                    text.pop();
+                }
+                "up" | "right" => self.nudge_budget(1, shift),
+                "down" | "left" => self.nudge_budget(-1, shift),
+                // One character a stroke, which is all a rate is made of.
+                k if k.chars().count() == 1 => text.push_str(k),
+                _ => {}
+            }
+            return true;
+        }
+        match key {
+            ESCAPE => self.close_card(),
+            "d" => self.pick_destination(cx),
+            "n" => self.edit_budget(),
+            "e" | "enter" => self.start_export(cx),
+            "up" | "right" | "+" | "=" => self.nudge_budget(1, shift),
+            "down" | "left" | "-" => self.nudge_budget(-1, shift),
+            _ => {}
+        }
+        true
     }
 
     /// The card's Destination row: the desktop's save dialog, on a background
@@ -683,6 +730,7 @@ impl Player {
     /// That list in the card's words ([`subtitle_plan`]): what travels, and the
     /// reason beside every track that does not -- including the ones
     /// [`Self::export_subs`] filtered out before the engine ever saw them.
+    #[allow(dead_code)] // shown by Settings now, not by the moment
     pub(crate) fn subtitle_line(&self) -> String {
         let Some(session) = self.session.as_ref() else {
             return "none".to_string();
@@ -709,8 +757,7 @@ impl Player {
             return;
         }
         let mut settings = export_settings(
-            self.quality,
-            self.custom_mbps,
+            self.budget_bps(),
             self.format,
             self.audio_kbps,
             self.encoder_seat(),
@@ -741,14 +788,6 @@ impl Player {
         // edit away -- so the button asks again rather than starting a worker
         // that will only settle with the same refusal minutes later.
         if let Some(why) = format_refusal(session, self.format) {
-            self.notify_user(format!("NOT EXPORTED — {why}").into());
-            cx.notify();
-            return;
-        }
-        // Exact asks the same question format_refusal just did, for the same
-        // reason: the row can be picked, then the cut or the format changed
-        // under it, and this is the fence with a keystroke to blame.
-        if let Some(why) = exact_refusal(session, self.format, self.quality) {
             self.notify_user(format!("NOT EXPORTED — {why}").into());
             cx.notify();
             return;

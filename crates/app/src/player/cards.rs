@@ -1314,9 +1314,9 @@ impl Player {
         self.keys_open = false;
         self.settings_open = false;
         self.export_open = false;
-        // The two things typed *into* the export card go with it: a field left
-        // open would take the next keystroke for a card that is gone.
-        self.mbps_edit = None;
+        // The two things typed *into* the export moment go with it: a field
+        // left open would take the next keystroke for a card that is gone.
+        self.budget_edit = None;
         self.picker = None;
         self.eq_open = None;
         self.eq_dragging = false;
@@ -1788,29 +1788,12 @@ impl Player {
             }
             return true;
         }
-        // The export card's custom bitrate field: the mouse door is the
-        // steppers and the row's own click (`Player::edit_mbps`), but the
-        // `0–9`/backspace/enter/esc chords `keymap::FIXED` already
-        // advertises need a keyboard door too, or a hand with no mouse
-        // could open the field and never fill it in.
-        if self.export_open {
-            if let Some(edit) = &mut self.mbps_edit {
-                if key == ESCAPE {
-                    self.mbps_edit = None;
-                } else if key == "enter" {
-                    if let Some(mbps) = edit.commit() {
-                        self.custom_mbps = mbps;
-                        self.mbps_edit = None;
-                    }
-                } else if key == "backspace" {
-                    edit.backspace();
-                } else if let Ok(digit) = key.parse::<u32>() {
-                    edit.digit(digit);
-                } else {
-                    return false;
-                }
-                return true;
-            }
+        // The export moment: its own chords, and every other stroke
+        // swallowed while it is up -- a chord this surface consumes must
+        // never also reach the room's keymap underneath it
+        // ([`Player::export_moment_key`]).
+        if self.export_moment_key(key, shift, cx) {
+            return true;
         }
         false
     }

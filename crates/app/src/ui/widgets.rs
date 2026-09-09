@@ -342,6 +342,7 @@ impl NumberEdit {
     /// first press up is the row's minimum and not a jump to some remembered
     /// value -- and stays inside the range, because a step is a walk through
     /// the legal numbers rather than a way out of them.
+    #[allow(dead_code)] // the budget field is free text; the transition row still types digits
     pub(crate) fn step(&mut self, by: i32) {
         let at = self
             .text
@@ -359,6 +360,7 @@ impl NumberEdit {
     /// whose own stepper already clamps silently, use [`Self::commit_clamped`]
     /// instead -- refusing there would be a stricter rule than the mouse door
     /// enforces.
+    #[allow(dead_code)] // as above: `commit_clamped` is the transition row's door
     pub(crate) fn commit(&mut self) -> Option<u32> {
         match self.text.parse::<u32>() {
             Ok(v) if (self.min..=self.max).contains(&v) => {
