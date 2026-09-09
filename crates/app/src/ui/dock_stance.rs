@@ -196,15 +196,13 @@ fn dock_tab(
         .when(active, |d| d.border_t_1().border_color(rgb(INK1())))
         .cursor_pointer()
         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-            // KEYS is a *look*, not a place the room reopens in: it rides
-            // `keys_open` and is never written to the dock-tab file, so the
-            // pair underneath it (`dock_src_active`) is still what a press on
-            // KEYS comes back to.
-            this.keys_open = label_text == "KEYS";
-            if !this.keys_open {
-                this.dock_src_active = label_text == "SOURCES";
-                save(this.dock_src_active);
-            }
+            // The keys list is body state, not a tab (user 2026-09-09:
+            // "remove keys section from here since we also have it next to
+            // ledger") -- picking either tab is also the way out of it, and
+            // the pair itself (`dock_src_active`) is what the file keeps.
+            this.keys_open = false;
+            this.dock_src_active = label_text == "SOURCES";
+            save(this.dock_src_active);
             cx.notify();
         }))
         .tooltip(crate::ui::widgets::tip_hover(&format!("Show {}", label_text.to_lowercase()), "", None))
@@ -912,8 +910,11 @@ fn subtitle_tab_rows(player: &Player, cx: &mut Context<Player>) -> (usize, Vec<A
 /// filter, sort chips, rows, IMPORT, hint -- none of it the legacy
 /// Media/Audio/Text panel `library.rs` draws. That panel's row facts
 /// ([`library_rows`]) are still what every row here is built from.
-fn sources_tab(player: &Player, window: &mut Window, cx: &mut Context<Player>) -> impl IntoElement {
-    let focused = player.focus_dock.is_focused(window);
+fn sources_tab(
+    player: &Player,
+    _window: &mut Window,
+    cx: &mut Context<Player>,
+) -> impl IntoElement {
     let text_tab = player.library_tab == LibraryTab::Text;
     // Text has no per-stream `Row` to fill -- its rows are subtitle tracks
     // grouped by source ([`subtitle_tab_rows`]), not `library_rows`' files --
@@ -986,11 +987,12 @@ fn sources_tab(player: &Player, window: &mut Window, cx: &mut Context<Player>) -
         .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
             cycle_on_key_down(Surface::Dock)(this, event, window, cx)
         }))
+        // The focus ring is not painted (user 2026-09-09: "clicking through
+        // timeline draws a white overlay around the timeline, same happens
+        // for library section too"). The border stays in flow, transparent in
+        // every state, so keyboard focus still moves and nothing shifts.
         .border_1()
-        .border_color(match focused {
-            true => rgb(STROKE_FOCUS()).into(),
-            false => gpui::transparent_black(),
-        })
+        .border_color(gpui::transparent_black())
         .flex_1()
         .min_h(px(0.))
         .flex()
@@ -1280,10 +1282,9 @@ fn clip_tab(
     player: &Player,
     width: f32,
     window_size: Size<Pixels>,
-    window: &mut Window,
+    _window: &mut Window,
     cx: &mut Context<Player>,
 ) -> impl IntoElement {
-    let focused = player.focus_inspector.is_focused(window);
     // The room actually given here, not the window's: `eq_card_w`/
     // `card_max_w` are asked "how wide may I draw" and answered with the
     // *whole viewport's* width when handed `window_size` verbatim -- but this
@@ -1301,11 +1302,12 @@ fn clip_tab(
         .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
             cycle_on_key_down(Surface::Inspector)(this, event, window, cx)
         }))
+        // The focus ring is not painted (user 2026-09-09: "clicking through
+        // timeline draws a white overlay around the timeline, same happens
+        // for library section too"). The border stays in flow, transparent in
+        // every state, so keyboard focus still moves and nothing shifts.
         .border_1()
-        .border_color(match focused {
-            true => rgb(STROKE_FOCUS()).into(),
-            false => gpui::transparent_black(),
-        })
+        .border_color(gpui::transparent_black())
         .flex_1()
         .min_h(px(0.))
         .flex()
@@ -1482,6 +1484,9 @@ fn keys_tab(player: &Player) -> impl IntoElement {
         .gap(px(3.))
         .p(px(8.))
         .overflow_y_scroll()
+        // The list no longer wears a tab, so it says its own name the way
+        // every other dock body section does -- MEDIA / IMPORT's head.
+        .child(section_head("KEYS"))
         .children(keys_rows().into_iter().map(|row| match row {
             KeyRow::Head(category) => div()
                 .flex_none()
@@ -1543,8 +1548,7 @@ pub(crate) fn render(
                 .border_b_1()
                 .border_color(rgb(DARK_HAIRLINE()))
                 .child(dock_tab("dock-tab-src", "SOURCES", src_active, cx))
-                .child(dock_tab("dock-tab-clip", "CLIP", !src_active && !keys, cx))
-                .child(dock_tab("dock-tab-keys", "KEYS", keys, cx)),
+                .child(dock_tab("dock-tab-clip", "CLIP", !src_active && !keys, cx)),
         )
         .child(match (keys, src_active) {
             (true, _) => keys_tab(player).into_any_element(),
