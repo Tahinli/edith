@@ -1393,9 +1393,10 @@ fn a_choice_list_offers_every_value_and_fits_the_smallest_window() {
         assert_eq!(*picked, *size == (1280, 720));
     }
     // The media's own size says so: it is the one rung a person cannot read
-    // off a number they chose.
+    // off a number they chose -- in the one word the sample-rate list says
+    // the same fact in, since prose gets cut by `MENU_W` (user: "word cut").
     let (.., native_detail, _) = &rows[3];
-    assert!(native_detail.contains("the media's own"), "{native_detail}");
+    assert!(native_detail.ends_with(" source"), "{native_detail}");
     // A project at a size nobody listed still gets the whole list, with
     // nothing marked rather than a wrong row marked.
     assert!(
@@ -2092,4 +2093,44 @@ fn the_seat_probe_is_not_keyed_on_the_budget() {
         fn_body("start_export").contains("self.budget_bps()"),
         "the export no longer writes at the budget on the row"
     );
+}
+
+/// DESIGN §8, the class behind the user's "word cut" (2026-09-09): a picker
+/// row's tail is a *state word* -- at most two -- because the plate is
+/// `MENU_W` wide and prose loses its last word to the truncation on exactly
+/// the row a reader is looking at (the resolution list's checked row read
+/// "3840x2160 · the medi…"). The same rule for the settings page's own row
+/// values: a value slot carries the state, never the door's noun elided to
+/// an ellipsis ("Subtitle font  Font…", "Mix  Tracks…").
+#[test]
+fn picker_row_tails_are_state_words_and_settings_values_carry_no_ellipsis() {
+    let lists = [
+        resolution_choices((1280, 720), (3840, 2160)),
+        pending_resolution_choices(Some(RESOLUTIONS[1])),
+        pending_fps_choices(Some(FRAME_RATES[0])),
+        sample_rate_choices(None),
+    ];
+    for (.., detail, _) in lists.iter().flatten() {
+        let words = detail.split_whitespace().count();
+        assert!(
+            words <= 2,
+            "picker row tail {detail:?} is {words} words -- `MENU_W` cuts prose"
+        );
+        assert!(
+            !detail.contains('\u{2026}') && !detail.contains('\u{b7}'),
+            "picker row tail {detail:?} carries prose punctuation"
+        );
+    }
+    // Code lines only: the comments above the two rows this fixed quote the
+    // strings the bug shipped as.
+    let settings = src_text("ui/settings_stance.rs");
+    for line in settings
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+    {
+        assert!(
+            !line.contains('\u{2026}'),
+            "a settings row value is elided with an ellipsis again: {line}"
+        );
+    }
 }
