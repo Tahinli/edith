@@ -677,6 +677,29 @@ pub(crate) fn collides(start: u32, len: u32, others: &[(u32, u32)]) -> bool {
         .any(|&(other_start, other_end)| start < other_end && other_start < end)
 }
 
+/// Where a clip staying on its own lane really comes to rest: `want`, clamped
+/// into the gap it is sitting in -- the take behind it and the take in front of
+/// it are walls ([`Project::move_selection`] clamps the delta by exactly these,
+/// it does not refuse), so a clip dragged hard left past its neighbour lands
+/// flush against that neighbour's tail rather than nowhere. `now` is its head
+/// today, which is what names the gap. The shadow reads this, so the box drawn
+/// in flight is the box the release leaves behind.
+pub(crate) fn gap_clamp(now: u32, len: u32, want: u32, others: &[(u32, u32)]) -> u32 {
+    let lo = others
+        .iter()
+        .filter(|&&(_, end)| end <= now)
+        .map(|&(_, end)| end)
+        .max()
+        .unwrap_or(0);
+    let hi = others
+        .iter()
+        .filter(|&&(start, _)| start >= now.saturating_add(len))
+        .map(|&(start, _)| start)
+        .min()
+        .unwrap_or(u32::MAX);
+    want.clamp(lo, hi.saturating_sub(len).max(lo))
+}
+
 /// The lane a release lands on when the pointer is off the rows themselves:
 /// the row under it while its kind can hold what is in the hand, and otherwise
 /// the last one that could -- a picture clip carried down across A1 on its way
@@ -889,6 +912,21 @@ mod drop_landing_tests {
         assert_eq!(held_lane(Some(v2), a1, v1), Some(v2), "audio cannot hold it");
         // Nothing promised yet and nothing that can hold it: no landing.
         assert_eq!(held_lane(None, a1, v1), None);
+    }
+
+    /// A clip dragged hard left past the take in front of it comes to rest
+    /// flush against that take -- the walls of its own gap, which is what the
+    /// engine clamps the drag by -- and one dragged off the head of the
+    /// timeline rests on frame 0.
+    #[test]
+    fn a_drag_past_a_neighbour_rests_flush_against_it() {
+        let others = [(0, 375), (900, 1000)];
+        assert_eq!(gap_clamp(375, 500, 0, &others), 375, "flush with its tail");
+        assert_eq!(gap_clamp(375, 500, 380, &others), 380, "room to spare");
+        assert_eq!(gap_clamp(375, 500, 800, &others), 400, "flush with the next");
+        // An empty lane clamps at the head of the timeline and nowhere else.
+        assert_eq!(gap_clamp(500, 100, 0, &[]), 0);
+        assert_eq!(gap_clamp(500, 100, 9_000, &[]), 9_000);
     }
 
     /// The refused state the shadow draws: a head let go on top of a take

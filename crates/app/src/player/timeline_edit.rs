@@ -909,13 +909,23 @@ impl Player {
                     .collect()
             })
             .unwrap_or_default();
+        // Staying on its own lane, the engine clamps the travel into the gap
+        // the clip sits in rather than refusing it, so the shadow rests where
+        // the release will: flush against the take it was dragged into. Landing
+        // on *another* lane it is refused outright when a take is already
+        // there, and the shadow says so before the hand lets go -- never a
+        // silent no-op.
+        let len = drag.clip.frames();
+        let (start, refused) = match to == drag.lane {
+            true => (gap_clamp(drag.clip.start, len, start, &neighbours), false),
+            false => (start, collides(start, len, &neighbours)),
+        };
         let anchor = Ghost {
             lane: to,
             start,
-            frames: drag.clip.frames(),
+            frames: len,
             tint: self.clip_tint(drag.clip.source),
-            refused: drag.lane.kind != to.kind
-                || collides(start, drag.clip.frames(), &neighbours),
+            refused: drag.lane.kind != to.kind || refused,
         };
         let mut ghosts = vec![anchor];
         if self.selected.contains((drag.lane, idx)) && self.selected.len() > 1 {
