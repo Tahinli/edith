@@ -583,6 +583,7 @@ pub(crate) fn snap_marks(
     skip: Option<(usize, usize)>,
     skip_link: Option<u32>,
     playhead: u32,
+    range: Option<(u32, u32)>,
 ) -> Vec<u32> {
     let mut marks: Vec<u32> = lanes
         .iter()
@@ -599,6 +600,13 @@ pub(crate) fn snap_marks(
         .collect();
     marks.push(playhead);
     marks.push(0);
+    // The in and out points ([`Player::range`]): a hand that has marked a
+    // stretch is working to it, and a clip meets its brackets as readily as it
+    // meets a cut.
+    if let Some((in_, out)) = range {
+        marks.push(in_);
+        marks.push(out);
+    }
     marks
 }
 
@@ -651,6 +659,34 @@ pub(crate) fn landing(
     marks: &[u32],
 ) -> (u32, Option<u32>) {
     snap_cue(on, under.saturating_sub(grab), len, tol, marks)
+}
+
+/// Whether a clip `len` frames long landing at `start` would sit on top of one
+/// of `others` -- `(start, end)` of every clip already on the lane it is being
+/// let go over, less the ones travelling with it. The engine refuses such a
+/// drop ([`Project::move_selection`]'s `move_room`), so the shadow is drawn as
+/// refused rather than promising a landing the release will not make: a drag
+/// that ends in nothing at all is what an editor reads as a broken timeline.
+///
+/// Touching is not overlapping -- a clip laid exactly against the take in front
+/// of it is the whole point of the magnet.
+pub(crate) fn collides(start: u32, len: u32, others: &[(u32, u32)]) -> bool {
+    let end = start.saturating_add(len);
+    others
+        .iter()
+        .any(|&(other_start, other_end)| start < other_end && other_start < end)
+}
+
+/// The lane a release lands on when the pointer is off the rows themselves:
+/// the row under it while its kind can hold what is in the hand, and otherwise
+/// the last one that could -- a picture clip carried down across A1 on its way
+/// to the empty bench below is still aiming at V1. [`Player::drag_lane`]'s
+/// whole rule.
+pub(crate) fn held_lane(prev: Option<Lane>, over: Lane, from: Lane) -> Option<Lane> {
+    match over.kind == from.kind {
+        true => Some(over),
+        false => prev,
+    }
 }
 
 /// Why this file may not go on that lane, in the words the refusal is told in --
@@ -706,7 +742,7 @@ mod drop_landing_tests {
     /// missing mark.
     #[test]
     fn a_pull_near_the_head_of_an_empty_timeline_snaps_to_frame_0() {
-        let marks = snap_marks(&[&[]], None, None, 0);
+        let marks = snap_marks(&[&[]], None, None, 0, None);
         assert!(marks.contains(&0), "an empty timeline still offers frame 0");
         assert_eq!(snapped(4, 0, 10, &marks), 0);
         // Outside the tolerance, the raw ask stands: this is a magnet, not a
@@ -728,7 +764,7 @@ mod drop_landing_tests {
     /// where the timeline is parked.
     #[test]
     fn a_pull_near_the_playhead_snaps_onto_it() {
-        let marks = snap_marks(&[&[]], None, None, 500);
+        let marks = snap_marks(&[&[]], None, None, 500, None);
         assert!(marks.contains(&500));
         assert_eq!(snapped(493, 0, 10, &marks), 500);
     }
@@ -806,5 +842,66 @@ mod drop_landing_tests {
         assert_eq!(snap_cue(snap_live(on, false), 297, 0, 10, &marks), (300, Some(300)));
         // The switch off stays off however the modifier is held.
         assert!(!snap_live(false, false));
+    }
+
+    /// Every target an NLE offers is on the list: frame 0, the playhead, both
+    /// edges of every clip on *every* lane, and the in/out brackets.
+    #[test]
+    fn the_targets_are_zero_the_playhead_the_edges_and_the_marks() {
+        let clip = |start: u32, frames: u32| Clip {
+            fade_in: 0,
+            fade_out: 0,
+            transition_out: 0,
+            start,
+            in_frame: 0,
+            out_frame: frames,
+            source: 0,
+            link: None,
+            eq: None,
+            color: None,
+            transform: None,
+            fit: Default::default(),
+            speed: Default::default(),
+        };
+        let v1 = [clip(100, 50), clip(400, 50)];
+        let a1 = [clip(700, 20)];
+        let marks = snap_marks(&[&v1, &a1], None, None, 900, Some((250, 600)));
+        for want in [0, 900, 100, 150, 400, 450, 700, 720, 250, 600] {
+            assert!(marks.contains(&want), "{want} is not a snap target");
+        }
+        // And each of them actually pulls a drag onto itself.
+        for target in [0, 250, 600, 900] {
+            assert_eq!(snapped(target + 4, 0, 10, &marks), target);
+        }
+    }
+
+    /// A release on the empty bench below the last row, or left of the heads,
+    /// lands on the lane the last live sample was over -- and a lane of the
+    /// wrong kind crossed on the way down never steals it.
+    #[test]
+    fn the_last_lane_that_could_hold_it_keeps_the_drag() {
+        let v1 = Lane::V1;
+        let v2 = Lane::new(LaneKind::Video, 1);
+        let a1 = Lane::A1;
+        // The head column is part of the row, so the row over it is the answer.
+        assert_eq!(held_lane(None, v1, v1), Some(v1));
+        assert_eq!(held_lane(Some(v1), v2, v1), Some(v2));
+        assert_eq!(held_lane(Some(v2), a1, v1), Some(v2), "audio cannot hold it");
+        // Nothing promised yet and nothing that can hold it: no landing.
+        assert_eq!(held_lane(None, a1, v1), None);
+    }
+
+    /// The refused state the shadow draws: a head let go on top of a take
+    /// already on the lane, which the engine changes nothing for. Laid exactly
+    /// against one -- what the magnet is for -- is not a collision.
+    #[test]
+    fn a_landing_on_top_of_a_take_previews_as_refused() {
+        let others = [(100, 200), (400, 500)];
+        assert!(collides(150, 50, &others), "inside the first take");
+        assert!(collides(90, 50, &others), "its head laps the first take");
+        assert!(collides(50, 400, &others), "long enough to swallow both");
+        assert!(!collides(50, 50, &others), "tail meets the head exactly");
+        assert!(!collides(200, 200, &others), "the gap holds it exactly");
+        assert!(!collides(500, 10, &others), "past the last take");
     }
 }
