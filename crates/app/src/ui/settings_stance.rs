@@ -89,6 +89,7 @@ fn row_keyed(
         value,
         hint,
         Some(player.keymap.chord(action).into()),
+        None,
         player,
         on_click,
         INK1(),
@@ -108,7 +109,7 @@ fn row_ink(
     value_ink: u32,
 ) -> impl IntoElement {
     row_full(
-        id, label_text, value, hint, None, player, on_click, value_ink,
+        id, label_text, value, hint, None, None, player, on_click, value_ink,
     )
 }
 
@@ -123,6 +124,7 @@ fn row_full(
     value: impl Into<SharedString>,
     hint: &'static str,
     chord: Option<SharedString>,
+    tail: Option<(SharedString, u32)>,
     player: &Player,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     value_ink: u32,
@@ -162,6 +164,17 @@ fn row_full(
                 .flex()
                 .items_baseline()
                 .gap(px(8.))
+                .children(tail.map(|(tail, ink)| {
+                    let tail_style = type_scale::mono(
+                        type_scale::CHORD_METADATA_MIN_PX,
+                        gpui::FontWeight::MEDIUM,
+                    );
+                    div()
+                        .font(tail_style.font)
+                        .text_size(tail_style.size)
+                        .text_color(rgb(ink))
+                        .child(tail)
+                }))
                 .children(chord.map(|chord| {
                     let chord_style = type_scale::mono(
                         type_scale::CHORD_METADATA_MIN_PX,
@@ -195,6 +208,7 @@ fn row_static(
     label_text: &'static str,
     value: impl Into<SharedString>,
     hint: &'static str,
+    chord: Option<SharedString>,
     value_ink: u32,
 ) -> impl IntoElement {
     let value: SharedString = value.into();
@@ -221,10 +235,27 @@ fn row_static(
         .child(
             div()
                 .flex_none()
-                .font(value_style.font)
-                .text_size(value_style.size)
-                .text_color(rgb(value_ink))
-                .child(value),
+                .flex()
+                .items_baseline()
+                .gap(px(8.))
+                .children(chord.map(|chord| {
+                    let chord_style = type_scale::mono(
+                        type_scale::CHORD_METADATA_MIN_PX,
+                        gpui::FontWeight::MEDIUM,
+                    );
+                    div()
+                        .font(chord_style.font)
+                        .text_size(chord_style.size)
+                        .text_color(rgb(INK3()))
+                        .child(chord)
+                }))
+                .child(
+                    div()
+                        .font(value_style.font)
+                        .text_size(value_style.size)
+                        .text_color(rgb(value_ink))
+                        .child(value),
+                ),
         )
 }
 
@@ -331,6 +362,7 @@ fn project_section(player: &Player, cx: &mut Context<Player>) -> impl IntoElemen
             "HDR reference",
             master_val,
             "the mastering display's own peak white, in cd/m^2, as the grade declared it -- what a 'Reference' tonemap targets before it ever looks at this film's own pixels",
+            None,
             master_ink,
         ))
         .child(row_static(
@@ -338,6 +370,7 @@ fn project_section(player: &Player, cx: &mut Context<Player>) -> impl IntoElemen
             "Content light",
             content_val,
             "MaxCLL/MaxFALL: the brightest single pixel and the brightest frame average measured in the finished encode -- what a 'Reference' tonemap actually rolls off from when the file declares it, ahead of the mastering peak above",
+            None,
             content_ink,
         ))
         .child(row(
@@ -405,6 +438,226 @@ fn editor_section(player: &Player, cx: &mut Context<Player>) -> impl IntoElement
             "the cue plate's own font and size -- kept in ~/.config/edith, never in a project",
             player,
             cx.listener(|this, _: &ClickEvent, _, cx| this.open_subtitle_style(cx)),
+        ))
+}
+
+/// [`row_keyed`] for a stroke that is the *card's* own rather than a binding:
+/// the export rows' `c`/`b`/`e` mean nothing outside this page and so are not
+/// in the keymap, exactly as the colour and transform cards' keys are not.
+/// The badge is drawn from the slot a bound row's is, so no reader can tell --
+/// nor needs to -- which table a stroke came out of (DESIGN §4).
+fn row_chord(
+    id: &'static str,
+    label_text: &'static str,
+    value: impl Into<SharedString>,
+    hint: &'static str,
+    chord: &'static str,
+    tail: Option<(SharedString, u32)>,
+    player: &Player,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    row_full(
+        id,
+        label_text,
+        value,
+        hint,
+        Some(chord.into()),
+        tail,
+        player,
+        on_click,
+        INK1(),
+    )
+}
+
+/// The nine files this editor writes, in the order the Picture row cycles
+/// them: a codec's two boxes side by side (the container question the export
+/// card asked in a row of its own, folded into this one), and the sound-only
+/// formats after the pictures.
+pub(crate) const PICTURE_CYCLE: [Format; 9] = [
+    Format::Mp4,
+    Format::Av1Mp4,
+    Format::Av1,
+    Format::Hevc,
+    Format::HevcMp4,
+    Format::Wav,
+    Format::Flac,
+    Format::Mp3,
+    Format::Ogg,
+];
+
+/// `H.264 · MP4`: the codec by the name it is picked under ([`format_label`])
+/// and the box it lands in. An audio-only format names itself once -- `WAV ·
+/// WAV` would be the one field on the line that says nothing.
+pub(crate) fn picture_label(format: Format) -> String {
+    match format.has_video() {
+        true => format!("{} · {}", format_label(format), format.ext().to_uppercase()),
+        false => format_label(format).to_string(),
+    }
+}
+
+/// The next file in [`PICTURE_CYCLE`] this machine can actually write.
+/// `refused` is the same door [`Player::set_format`] asks, so the stroke never
+/// stops on a codec the setter would only refuse back -- the refused ones are
+/// still *said*, on the row's own greyed tail (DESIGN §8: never hidden).
+/// `current` where every other stop is refused, so `c` cannot cycle to
+/// nothing.
+pub(crate) fn next_picture(current: Format, refused: impl Fn(Format) -> bool) -> Format {
+    let n = PICTURE_CYCLE.len();
+    let at = PICTURE_CYCLE
+        .iter()
+        .position(|&f| f == current)
+        .unwrap_or_default();
+    (1..=n)
+        .map(|step| PICTURE_CYCLE[(at + step) % n])
+        .find(|&f| !refused(f))
+        .unwrap_or(current)
+}
+
+/// What the sound of a file in this format is, and whether that codec takes a
+/// rate: `AAC 256` steps with `b`, `PCM` has no rate to step and so wears no
+/// chord at all.
+pub(crate) fn sound_codec(format: Format) -> (&'static str, bool) {
+    match format {
+        Format::Wav => ("PCM", false),
+        Format::Flac => ("FLAC", false),
+        Format::Ogg => ("Vorbis", false),
+        Format::Mp3 => ("MP3", true),
+        _ => ("AAC", true),
+    }
+}
+
+/// The seat in the words the artboard writes it in -- lowercase `auto` and
+/// `software` because they are what happens, `GPU` because that is the part
+/// of this machine a person picked.
+pub(crate) fn encoder_word(seat: EncoderSeat) -> &'static str {
+    match seat {
+        EncoderSeat::Auto => "auto",
+        EncoderSeat::Hardware => "GPU",
+        EncoderSeat::Software => "software",
+    }
+}
+
+/// The one amber line on this page (`NOTICE_LOOK`, DESIGN §8's "worth a
+/// look"): the plugin's AV1 seat is constant-quality, so the budget the
+/// export moment now asks for is the one thing this pick does not honour.
+pub(crate) const AV1_GPU_NOTICE: &str = "ignores the budget \u{2014} constant quality";
+
+/// A refusal in six words, which is what fits beside a value on one row --
+/// the whole sentence is still said where the pick is actually refused
+/// ([`Player::set_format`]'s own banner).
+pub(crate) fn short_reason(why: &str) -> String {
+    why.split_whitespace().take(6).collect::<Vec<_>>().join(" ")
+}
+
+/// EXPORT: the four choices a film is delivered by, off the export card (user:
+/// it was "too complicated") and into the room where a project's other
+/// once-a-project answers already live. The export moment keeps the file and
+/// the budget; the codec, the sound, the encoder and the range are here.
+fn export_section(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
+    let format = player.format;
+    let refusals: Vec<String> = PICTURE_CYCLE
+        .into_iter()
+        .filter_map(|f| {
+            player
+                .session
+                .as_ref()
+                .and_then(|session| format_refusal(session, f))
+                .map(|why| format!("{} {}", format_label(f), short_reason(&why)))
+        })
+        .collect();
+    // Never hidden (DESIGN §8): a codec this machine has no encoder for stays
+    // on the row, greyed, with the reason beside it -- the export card's own
+    // refusal rows, in the one place a codec is picked now.
+    let refused_tail = (!refusals.is_empty()).then(|| (refusals.join(" \u{b7} ").into(), INK4()));
+    let (codec, rated) = sound_codec(format);
+    let seat = player.encoder_seat();
+    let av1_gpu = seat == EncoderSeat::Hardware && matches!(format, Format::Av1 | Format::Av1Mp4);
+    let range = match player.range {
+        Some((start, end)) => format!(
+            "marks {}\u{2013}{}",
+            timecode(f64::from(start) / player.fps, player.fps),
+            timecode(f64::from(end) / player.fps, player.fps),
+        ),
+        None => "whole film".to_string(),
+    };
+    div()
+        .flex_none()
+        .flex()
+        .flex_col()
+        .gap(px(2.))
+        .child(section_head("EXPORT \u{b7} what a delivery is written as"))
+        .child(row_chord(
+            "settings-export-picture",
+            "Picture",
+            picture_label(format),
+            "the codec the picture is written with and the box it lands in; the export moment asks only for the file and the budget",
+            "c",
+            refused_tail,
+            player,
+            cx.listener(|this, _: &ClickEvent, _, cx| {
+                this.cycle_export_picture();
+                cx.notify();
+            }),
+        ))
+        .children(rated.then(|| {
+            row_chord(
+                "settings-export-sound",
+                "Sound",
+                format!("{codec} {}", player.audio_kbps),
+                "what the sound inside that file is coded at, in kbps",
+                "b",
+                None,
+                player,
+                cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.cycle_audio_kbps();
+                    cx.notify();
+                }),
+            )
+            .into_any_element()
+        }))
+        // A codec with no rate to pick is a readout, not a button that would
+        // do nothing when pressed -- and it wears no chord, because there is
+        // no step for one to take.
+        .children((!rated).then(|| {
+            row_static(
+                "settings-export-sound",
+                "Sound",
+                codec,
+                "this codec carries no rate to pick: it is written as the format itself says",
+                None,
+                INK1(),
+            )
+            .into_any_element()
+        }))
+        .child(row_chord(
+            "settings-export-encoder",
+            "Encoder",
+            encoder_word(seat),
+            "which encoder writes the picture: the GPU where this machine has a seat, or the CPU",
+            "e",
+            av1_gpu.then(|| (AV1_GPU_NOTICE.into(), NOTICE_LOOK())),
+            player,
+            cx.listener(|this, _: &ClickEvent, _, cx| {
+                this.cycle_encoder(cx);
+            }),
+        ))
+        // Read-only: the range is set on the timeline with the marks
+        // themselves ([`keymap::ActionId::SetIn`]/`SetOut`), which is where a
+        // person can see what they are marking.
+        .child(row_static(
+            "settings-export-range",
+            "Range",
+            range,
+            "the span an export writes: the whole timeline, or whatever the in/out marks hold",
+            Some(
+                format!(
+                    "{} {}",
+                    player.keymap.chord(ActionId::SetIn),
+                    player.keymap.chord(ActionId::SetOut)
+                )
+                .into(),
+            ),
+            INK1(),
         ))
 }
 
@@ -513,6 +766,20 @@ pub(crate) fn render(
                                 .border_color(rgb(DARK_HAIRLINE()))
                                 .pl(px(12.))
                                 .child(editor_section(player, cx)),
+                        )
+                        // The third column: what a delivery is written as, the
+                        // rows the export card used to hold (user: it was "too
+                        // complicated"). Beside the other two rather than under
+                        // them -- a fold with no scrollbar is the defect this
+                        // page's own two columns exist to avoid.
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .border_l_1()
+                                .border_color(rgb(DARK_HAIRLINE()))
+                                .pl(px(12.))
+                                .child(export_section(player, cx)),
                         ),
                 ),
         )

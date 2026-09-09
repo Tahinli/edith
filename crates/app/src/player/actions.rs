@@ -251,8 +251,8 @@ impl Player {
         self.snap_cue = None;
         self.ghost.clear();
         self.notify_user(match self.snap {
-            true => "SNAP ON — drags land on clip edges, the playhead and the start".into(),
-            false => "SNAP OFF — drags land exactly where the hand leaves them".into(),
+            true => "SNAP ON".into(),
+            false => "SNAP OFF".into(),
         });
         cx.notify();
     }
@@ -649,7 +649,7 @@ impl Player {
         };
         self.loop_trim = self.cut_span(lane, idx);
         if self.loop_trim.is_some() {
-            self.notify_user("LOOP-TRIM ON — looping the subject cut while you trim".into());
+            self.notify_user("LOOP-TRIM ON".into());
         }
         cx.notify();
     }

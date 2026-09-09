@@ -449,7 +449,7 @@ impl Player {
         // Nothing to write out, and a refusal rather than a card about it: the
         // window is empty and the export path is not even chosen yet.
         if self.session.is_none() {
-            self.notify_user("NOTHING TO EXPORT — open a file first".into());
+            self.notify_user("NOTHING TO EXPORT — no file open".into());
             cx.notify();
             return;
         }
@@ -769,7 +769,7 @@ impl Player {
         settings.subtitles = self.export_subs();
         settings.range = self.range;
         let Some(session) = &mut self.session else {
-            self.notify_user("NOTHING TO EXPORT — open a file first".into());
+            self.notify_user("NOTHING TO EXPORT — no file open".into());
             cx.notify();
             return;
         };

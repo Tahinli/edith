@@ -983,12 +983,14 @@ fn the_clip_menu_dims_what_the_playhead_is_not_on_and_stays_in_the_window() {
     assert_eq!(menu_at(point(px(10.), px(10.)), viewport, 150.), (10., 10.));
     assert_eq!(
         menu_at(point(px(700.), px(380.)), viewport, 150.),
-        (800. - MENU_W, 250.)
+        (800. - crate::layout::MENU_EDGE - MENU_W, 400. - crate::layout::MENU_EDGE - 150.)
     );
-    // A window smaller than the menu loses its bottom, never its top.
+    // A window smaller than the menu loses its bottom, never its top: the
+    // top-left margin wins over the bottom-right one, because the items are
+    // at the top.
     assert_eq!(
         menu_at(point(px(90.), px(40.)), size(px(100.), px(50.)), 150.),
-        (0., 0.)
+        (crate::layout::MENU_EDGE, crate::layout::MENU_EDGE)
     );
     // Every item is an action the registry knows, so the menu and the keys
     // menu say the same thing about it -- and none of them is unreachable
@@ -1015,7 +1017,7 @@ fn the_clip_menu_dims_what_the_playhead_is_not_on_and_stays_in_the_window() {
         menu_at(point(px(0.), px(0.)), floor, {
             MENU_PAD * 2. + menu_rows_h(items, floor)
         }),
-        (0., 0.)
+        (crate::layout::MENU_EDGE, crate::layout::MENU_EDGE)
     );
     // The picker is the same card and the longest list in it is the palette
     // family list, which grows every time somebody asks for more colours.
@@ -1217,6 +1219,67 @@ fn a_menu_offers_only_what_applies_and_is_drawn_inside_the_window() {
     let real = size(px(1280.), px(690.));
     assert_eq!(menu_rows_h(items, real), items as f32 * MENU_ROW_H);
     assert!(menu_rows_h(items, size(px(640.), px(360.))) < items as f32 * MENU_ROW_H);
+}
+
+/// Defects 2 and 3 of the menu-placement lane, as source guards -- this binary
+/// has no `VisualTestContext`, so where an element *mounts* and what its dim
+/// column *says* are read off the source the way every other layout scan here
+/// is.
+///
+/// 1. All three hanging menus mount on the room's ROOT. Mounted inside
+///    `stance-centre` the clip menu's window-coordinate anchor was laid out
+///    from the centre column's own origin and painted under the dock, which is
+///    the "chords cut mid-word" the user photographed.
+/// 2. The library menu hangs a row clear of the pointer, so it cannot cover the
+///    row it is about.
+/// 3. The library rows carry chords, not prose. DESIGN §4 puts the stroke in
+///    that column and §8 forbids the instructional copy that used to sit there.
+#[test]
+fn the_hanging_menus_mount_at_the_room_root_and_their_rows_wear_chords_not_prose() {
+    let stance = src_text("ui/stance.rs");
+    let (centre, root) = stance
+        .split_once(".child(divider(Split::Dock,")
+        .expect("the dock seam splits the centre column from the room root");
+    for menu in [
+        "children(player.context_card(",
+        "children(player.library_card(",
+        "children(player.picker_card(",
+    ] {
+        assert!(
+            root.contains(menu),
+            "{menu} must mount after the dock, on the room root"
+        );
+        assert!(
+            !centre.contains(menu),
+            "{menu} mounted inside stance-centre paints under the dock"
+        );
+    }
+    let library = src_text("ui/library.rs");
+    assert!(
+        library.contains("menu.at.y + px(ROW_CLEAR)"),
+        "the library menu must hang clear of the row it names"
+    );
+    // Exactly one row wears a chord, and it is the one `ui/stance.rs`'s
+    // `enter` branch actually answers; every other row's column is empty.
+    for item in ROW_ITEMS {
+        let hint = item.hint();
+        match item {
+            RowItem::Add => {
+                assert_eq!(hint, "↵");
+                assert!(
+                    stance.contains("if key == \"enter\"\n                && this.dock_src_active"),
+                    "the ↵ this menu advertises must still be the stroke that adds"
+                );
+            }
+            _ => assert!(hint.is_empty(), "{:?} prints prose: {hint:?}", item.label()),
+        }
+        // §9: no junk drawer. A label that fits the plate whole beside its
+        // chord, and never a sentence.
+        assert!(item.label().split_whitespace().count() <= 4, "{}", item.label());
+    }
+    // The two removes must not read as the same verb now that the column
+    // beside them is empty.
+    assert_ne!(RowItem::Remove.label(), RowItem::RemoveWithClips.label());
 }
 
 /// The other half of the keys menu's guarantee, and the audit this batch was

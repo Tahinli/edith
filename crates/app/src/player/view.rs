@@ -55,7 +55,7 @@ impl Player {
     pub(crate) fn select_under_playhead(&mut self, cx: &mut Context<Self>) {
         let under = self.under_playhead();
         let Some(&first) = under.first() else {
-            self.notify_user("NOTHING UNDER THE PLAYHEAD — move it onto a clip first".into());
+            self.notify_user("NOTHING UNDER THE PLAYHEAD".into());
             cx.notify();
             return;
         };
@@ -133,7 +133,7 @@ impl Player {
             return;
         }
         let Some(session) = &mut self.session else {
-            self.notify_user("no timeline to fit — open a file first".into());
+            self.notify_user("no timeline to fit — no file open".into());
             cx.notify();
             return;
         };
@@ -151,8 +151,7 @@ impl Player {
                     Some(half) => Some(half),
                     None => {
                         self.notify_user(
-                            "NOTHING TO FIT — a caption has no picture; group it with a clip \
-                             first (ctrl-click both, then Group)"
+                            "NOTHING TO FIT — a caption has no picture"
                                 .into(),
                         );
                         cx.notify();

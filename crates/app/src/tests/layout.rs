@@ -2206,9 +2206,11 @@ fn every_darkroom_menu_sizes_its_list_against_the_floor_room_not_the_raw_viewpor
          to the picture floor (the 'menu in somewhere nonsense' defect)"
     );
     assert!(
-        library.contains("menu_at(menu.at, viewport"),
-        "ui/library.rs no longer anchors its menu to the pointer through \
-         menu_at -- update this guard"
+        library.contains("menu_at(at, viewport, h)")
+            && library.contains("point(menu.at.x, menu.at.y + px(ROW_CLEAR))"),
+        "ui/library.rs no longer anchors its menu to the pointer -- one row \
+         clear of it, so the menu cannot cover the row it names -- through \
+         menu_at; update this guard"
     );
 }
 
@@ -2724,7 +2726,9 @@ fn the_bench_answers_a_wheel_notch_anywhere_over_it() {
         "the row's wheel lost the mapping or its stop: {}",
         &row_wheel[..200]
     );
-    let content = bench.find(".id(\"bench-content\")").expect("no bench content");
+    let content = bench
+        .find(".id(\"bench-content\")")
+        .expect("no bench content");
     let content_wheel = bench[content..]
         .find(".on_scroll_wheel(")
         .expect("the bench container does not answer the wheel");
@@ -2791,7 +2795,14 @@ fn the_seam_paints_nothing_until_a_pointer_finds_it() {
         body.contains("gpui::transparent_black()"),
         "the divider's line is inked at rest: {body}"
     );
-    for step in [".hover(", "STROKE_DIVIDER()", "INK3()", "border_t_1()", "border_l_1()"] {
+    for step in [
+        ".hover(",
+        "GRAB_W",
+        "STROKE_DIVIDER()",
+        "INK3()",
+        "border_t_1()",
+        "border_l_1()",
+    ] {
         assert!(body.contains(step), "the divider is missing {step}");
     }
 }
@@ -2813,4 +2824,626 @@ fn the_lane_bed_clips_its_clips_at_the_pinned_heads() {
         "the bed lets its clips paint outside itself, straight over the \
          pinned lane heads: {bed}"
     );
+}
+
+/// A source row is its name first (user 2026-09-09: "clunky, crowded and
+/// problematic"). At DOCK_W 280 the name used to be the only flexible child
+/// among six, so it measured 0px and the library showed
+/// `● V1 A1 · 2 uses Preview Add ↵ ○` -- every part of a row except the one
+/// thing the row is for. The fix is subtraction, not a hover gate (DESIGN §8):
+/// the name keeps 60% of the row, usage joins the metadata line under it, and
+/// the three verbs shrink to glyph ghosts at the right edge.
+#[test]
+fn a_source_row_shows_its_name_before_anything_else() {
+    let dock = src_text("ui/dock_stance.rs");
+    let start = dock.find("fn source_row(").expect("the source row");
+    let row = &dock[start..dock.find("/// Imported subtitle tracks").expect("its end")];
+    assert!(
+        row.contains(".min_w(relative(0.6))"),
+        "the row name can still collapse under its siblings"
+    );
+    assert!(
+        !row.contains(".min_w(px(0.))"),
+        "the row name is still allowed to measure nothing"
+    );
+    // The usage moved to the second line, beside codec/length, in ink3.
+    assert!(
+        row.contains(r#".child(format!("{usage} · {under}"))"#),
+        "usage is not folded into the metadata line"
+    );
+    // Preview / Add / proxy are glyph+chord ghosts now, not word buttons:
+    // ~66px for the three together, inside the 96px the name can spare.
+    for glyph in [r#".child("▷")"#, r#".child("+")"#, r#".child("↵")"#] {
+        assert!(row.contains(glyph), "the right-edge verbs lost {glyph}");
+    }
+    for word in [r#".child("Preview")"#, r#".child("Add")"#] {
+        assert!(!row.contains(word), "{word} still spends the name's width");
+    }
+    // Every verb keeps its own hitmap name and its chord.
+    for id in ["source.{i}.preview", "source.{i}.add", "source.{i}.proxy"] {
+        assert!(row.contains(id), "{id} lost its hitmap entry");
+    }
+    // DESIGN §8: the permanent footer telling the editor how to use a list
+    // ("drag · ↵ add · double-click plays") is instructional copy and is gone.
+    assert!(
+        !dock.contains("double-click plays"),
+        "the dock still carries an instruction footer"
+    );
+    // ...and an Audio tab with no audio-only file in it is a single noun, not
+    // the claim `No sound` over a source whose A1 stream is on the bench.
+    assert_eq!(crate::LibraryTab::Audio.empty(), "none");
+}
+
+/// Focus and selection rings are drawn, never inserted: a `when(focused,
+/// border_1())` puts a pixel of box into the flow and every row in the dock
+/// steps sideways the moment the surface takes focus (hunter: h-clip-tab.png
+/// vs i-library-menu.png).
+#[test]
+fn a_dock_ring_never_moves_what_it_rings() {
+    let dock = src_text("ui/dock_stance.rs");
+    for gate in [
+        ".when(picked, |d| d.border_1()",
+        ".when(focused, |d| d.border_1()",
+    ] {
+        assert!(
+            !dock.contains(gate),
+            "a dock ring is still added on state ({gate}), shifting its content"
+        );
+    }
+    assert_eq!(
+        dock.matches("gpui::transparent_black()").count(),
+        4,
+        "a dock ring lost its at-rest transparent border"
+    );
+}
+
+/// The spine is 56px and every pair must fit inside it. Measured at
+/// 1280x720 the full-size halves did not: hitmap `action.WalkCutPrev10
+/// x=-5 w=31`, `action.AddVideoLane x=-2 w=28` -- the `‹10` glyph was cut
+/// at the window's own left edge. Fixed by subtraction (13px + 1px padding
+/// for the paired halves, 3px row gap), so this scan is what keeps a new
+/// pair from being written at the full row size again.
+#[test]
+fn every_paired_spine_glyph_is_drawn_at_the_narrow_size() {
+    let src = src_text("ui/spine_stance.rs");
+    // Inside every `pair(...)` call, both halves come from `small`.
+    let mut rest = src.as_str();
+    let mut pairs = 0;
+    while let Some(at) = rest.find("pair(") {
+        let after = &rest[at..];
+        // The definition and the doc comments are not call sites.
+        if rest[..at].ends_with("fn ") || rest[..at].ends_with('`') {
+            rest = &after[5..];
+            continue;
+        }
+        let mut depth = 0i32;
+        let mut end = after.len();
+        for (i, c) in after.char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let body = &after[..end];
+        assert!(
+            !body.contains("glyph("),
+            "a spine pair draws a full-size glyph, which lays out past the \
+             56px rail: {}",
+            &body[..body.len().min(120)]
+        );
+        pairs += 1;
+        rest = &after[end..];
+    }
+    assert!(pairs >= 8, "the spine's pairs went missing ({pairs} found)");
+    // And `small` is the narrow one: one step down the §3 scale, 1px sides.
+    assert!(
+        src.contains("type_scale::CHORD_METADATA_MIN_PX")
+            && src.contains("let pad = if paired { 1. } else { 3. };"),
+        "the paired size/padding subtraction is gone from spine_stance"
+    );
+    assert!(
+        src.contains(".gap(px(3.))\n        .child(left)"),
+        "the pair row's own gap grew again"
+    );
+}
+
+/// DESIGN §8 (no instructional copy) and §9: the keys plate's heading is one
+/// noun, its way out is a chord like every other row, and its bottom edge is
+/// inside the window -- the shipped plate said `ALL COMMANDS · HOLD ? ·
+/// RELEASE TO CLOSE` while sitting there latched after a click, with its last
+/// rows cut off below y=720.
+#[test]
+fn the_keys_plate_says_one_noun_and_ends_inside_the_window() {
+    let src = src_text("ui/stance.rs");
+    let lower = src.to_lowercase();
+    assert!(
+        !lower.contains("hold ? · release to close") && !lower.contains("all commands"),
+        "the keys plate still tells the hand what to do"
+    );
+    assert!(
+        src.contains("section_head(\"keys\")") && src.contains(".child(\"esc\")"),
+        "the keys plate lost its noun or its escape chord"
+    );
+    assert!(
+        src.contains(".h(px((bench_h + LEDGER_H - 16.).max(0.)))"),
+        "the keys plate is no longer capped inside the bench+ledger footprint"
+    );
+}
+
+
+/// The ruler's right edge was soup: `bench-select-all` sits `right(4.)` over
+/// the tick band while tick suppression only guarded the LEFT plate, so the
+/// `00:20` label drew straight under the `all` chord. The control's band is
+/// reserved now -- a label whose right edge would enter it is dropped, the
+/// mirror of the left rule.
+#[test]
+fn the_ruler_reserves_a_band_for_its_select_all_control() {
+    use crate::ui::bench_stance::{SELECT_ALL_PAD, char_w};
+    use crate::ui::type_scale::{CHORD_METADATA_MIN_PX, FLOOR_PX};
+    let bench = src_text("ui/bench_stance.rs");
+    assert!(
+        bench.contains("x + label_w <= bed_w - all_w"),
+        "the tick loop no longer keeps the select-all band clear"
+    );
+    // The rule itself, with the shipped widths: `all` + `^a` at the chord
+    // size, a `00:20` label at the floor size, a 850 px bed.
+    let all_w = ("all".len() + "^a".len()) as f32 * char_w(CHORD_METADATA_MIN_PX) + SELECT_ALL_PAD;
+    let label_w = "00:20".len() as f32 * char_w(FLOOR_PX);
+    let clear = |x: f32| x + label_w <= 850. - all_w;
+    assert!(!clear(820.), "a tick at the right edge still draws under `all`");
+    assert!(
+        !clear(850. - all_w - label_w + 1.),
+        "the band's own edge leaks"
+    );
+    assert!(clear(700.), "the rule eats ticks that clear the band");
+}
+
+/// Clicking `all` selected all AND scrubbed: the control lives inside
+/// `bench-ruler`, whose `on_mouse_down` seeks, and the press reached it (the
+/// playhead jumped 00:00:11:12 -> 00:00:20:14). The scrub refuses the
+/// control's reserved band now -- a `stop_propagation` on the control is what
+/// this looks like at first and it does NOT work: gpui builds the control's
+/// own click out of that same mouse-down, so stopping it drops the selection
+/// (measured live, run 20260909-174243-jZzccm/after-all.png: nothing but the
+/// hover changed).
+#[test]
+fn a_press_on_the_select_all_band_does_not_scrub_the_ruler() {
+    use crate::ui::bench_stance::select_all_band;
+    let bench = src_text("ui/bench_stance.rs");
+    let at = bench.find(r#".id("bench-ruler")"#).expect("no ruler");
+    let listener = &bench[at..at + bench[at..].find(".children(ticks").expect("its ticks")];
+    assert!(
+        listener.contains("bed_w - band") && listener.contains("select_all_band("),
+        "the ruler's scrub takes the select-all band's presses again: {listener}"
+    );
+    assert!(
+        !bench[at..].contains("cx.stop_propagation()"),
+        "a press stopped inside the ruler also swallows the control's own click"
+    );
+    // The rule the listener runs, at the shipped widths: a 850 px bed, `^a`.
+    let band = select_all_band("^a");
+    assert!(band > 30. && band < 70., "the band is not a control's width: {band}");
+    assert!(850. - 4. >= 850. - band, "a press on the control still seeks");
+    assert!(500. < 850. - band, "a press mid-ruler stopped seeking");
+}
+
+/// DESIGN §4/§5: the hero timecode leads the time band and the ledger carries
+/// position. The ruler's left plate was a third resting copy of the same
+/// reading -- it stays only for the state change it belongs to, a live scrub.
+#[test]
+fn the_ruler_plate_shows_the_timecode_only_while_a_scrub_is_live() {
+    let bench = src_text("ui/bench_stance.rs");
+    let at = bench
+        .find(".child(playhead_tc)")
+        .expect("no playhead timecode in the ruler");
+    let before = &bench[..at];
+    let guard = before
+        .rfind(".when(player.scrubbing")
+        .expect("the ruler plate draws its timecode at rest -- the third copy");
+    assert!(
+        before[guard..].matches(".child(").count() <= 2,
+        "the scrubbing guard is not the plate's own: {}",
+        &before[guard..guard + 200]
+    );
+    assert!(
+        bench.contains("let plate_w = if player.scrubbing { PLATE_W } else { 0. };"),
+        "the ticks still lose the plate's width at rest"
+    );
+}
+
+
+/// The band overflowed its own column at 1280x720 (`$EDITH_HITMAP`:
+/// `action.Export x=1113 w=80` with the column ending at x=995, the contact
+/// strip measured `w=0`), so the Export chip was invisible under the dock and
+/// a click on blank dock space at (1130,435) opened the export card. Three
+/// things hold that shut: the row clips itself, the strip keeps a floor, and
+/// the ladder sheds groups above it.
+#[test]
+fn the_time_band_never_paints_outside_its_own_column() {
+    let src = src_text("ui/timeband_stance.rs");
+    let start = src.find(r#".id("stance-time-band-row")"#).expect("the band row");
+    let row = &src[start..start + src[start..].find(".child(hero_timecode(").expect("the timecode")];
+    assert!(
+        row.contains(".overflow_hidden()"),
+        "the band row lets its children paint (and be clicked) under the dock: {row}"
+    );
+    assert!(
+        src.contains(".min_w(px(STRIP_MIN_W))"),
+        "the contact strip is the flex_1 that absorbs the slack; without a floor it measures 0"
+    );
+    assert!(crate::ui::timeband_stance::STRIP_MIN_W >= 120.);
+}
+
+/// DESIGN §7's ladder, one layer per threshold: the four things the band is
+/// *for* -- timecode, cut readout, contact strip, Export -- survive every
+/// rung, and the sheddable groups go in a fixed order (chords, then the
+/// monitoring cluster, then sync/loop, then the range marks), never all at
+/// once. Thresholds are the measured group widths; this pins their order and
+/// the 1280x720 column (939px measured, spine 56 + dock 285) landing on the
+/// marks-only rung, which is what makes Export fit there (it ended at x=991
+/// inside a column ending at 995, against x=1113 under the dock before).
+#[test]
+fn the_band_sheds_one_layer_per_threshold_in_a_fixed_order() {
+    use crate::ui::timeband_stance::band_layers;
+    let ladder = [2000., 1300., 1100., 939., 800., 0.]
+        .map(|w| band_layers(w))
+        .map(|l| (l.chords, l.volume, l.sync, l.marks));
+    assert_eq!(
+        ladder,
+        [
+            (true, true, true, true),
+            (false, true, true, true),
+            (false, false, true, true),
+            (false, false, false, true),
+            (false, false, false, false),
+            (false, false, false, false),
+        ],
+        "the band must drop chords, then the monitoring cluster, then sync/loop, then the marks"
+    );
+    // Monotone: a wider band never shows less than a narrower one.
+    let mut prev = band_layers(0.);
+    for w in (0..2400).step_by(10).map(|w| w as f32) {
+        let now = band_layers(w);
+        for (a, b) in [
+            (prev.chords, now.chords),
+            (prev.volume, now.volume),
+            (prev.sync, now.sync),
+            (prev.marks, now.marks),
+        ] {
+            assert!(b || !a, "layer came back off at {w}px");
+        }
+        prev = now;
+    }
+}
+
+/// Every door in this band is at least `HIT_MIN` wide and tall (WCAG 2.5.8).
+/// The hitmap read `SetIn w=8`, `VolumeDown w=12`, `Loop w=13`, `SetOut w=15`,
+/// `Prev/NextSyncPoint w=16` before this: padding on the shared `ghost`, not a
+/// bigger glyph.
+#[test]
+fn every_ghost_in_the_time_band_carries_a_full_hit_area() {
+    let src = src_text("ui/timeband_stance.rs");
+    let start = src.find("fn ghost(").expect("the band's ghost");
+    let ghost = &src[start..start + src[start..].find(".child(glyph.into())").expect("its glyph")];
+    for needle in [".min_w(px(HIT_MIN))", ".min_h(px(HIT_MIN))"] {
+        assert!(ghost.contains(needle), "the band's ghost lost {needle}: {ghost}");
+    }
+    assert!(HIT_MIN >= 24.);
+}
+
+/// Mute wore `"{volume}%"` as its glyph while the slider beside it drew the
+/// same value: one number, two places, and a toggle with no verb of its own.
+/// The level is a mono readout beside the slider now, once.
+#[test]
+fn the_level_is_written_once_and_mute_wears_a_glyph() {
+    let src = src_text("ui/timeband_stance.rs");
+    assert_eq!(
+        src.matches(r#"player.volume.percent()"#).count(),
+        1,
+        "the volume level must be written in exactly one place in the band"
+    );
+    assert!(
+        src.contains(r#"if player.volume.muted { "◁×" } else { "◁))" }"#),
+        "mute must wear a speaker glyph, struck when muted"
+    );
+    assert!(src.contains("fn volume_readout("), "the level readout is the one place it is written");
+}
+
+/// `Play` and `StepForward` drew the same solid right-triangle: two verbs one
+/// shape, told apart only by their chords. Step wears the frame-step pair.
+#[test]
+fn transport_verbs_differ_by_shape_not_only_by_chord() {
+    let src = src_text("ui/timeband_stance.rs");
+    let glyph = |action: &str| {
+        let at = src.find(&format!("ActionId::{action},")).expect("the call");
+        src[..at].rsplit('"').nth(1).expect("its glyph").to_string()
+    };
+    let shapes = ["Play", "StepBack", "StepForward", "JumpBack", "JumpForward"].map(glyph);
+    let mut seen = shapes.to_vec();
+    seen.sort();
+    seen.dedup();
+    assert_eq!(seen.len(), shapes.len(), "two transport verbs share one glyph: {shapes:?}");
+}
+
+/// DESIGN §6: "the cut readout is the odometer". Keyed off the selection it
+/// read `cut —/—` immediately after a split -- two clips on the bench, the
+/// playhead resting on the new cut, nothing picked. It reads the playhead
+/// now: the cut under it, else the next one ahead, else the selection.
+#[test]
+fn the_cut_readout_counts_from_the_playhead() {
+    use crate::ui::timeband_stance::odometer_cut;
+    let at = |start: u32, len: u32| Clip {
+        fade_in: 0,
+        fade_out: 0,
+        transition_out: 0,
+        start,
+        in_frame: 0,
+        out_frame: len,
+        source: 0,
+        link: None,
+        eq: None,
+        color: None,
+        transform: None,
+        fit: FitPolicy::Fit,
+        speed: Speed::NORMAL,
+    };
+    let lane = [at(0, 30), at(30, 30)];
+    assert_eq!(odometer_cut(&lane, 0), Some(0));
+    assert_eq!(odometer_cut(&lane, 29), Some(0));
+    // The split's own frame: the playhead rests on the SECOND cut's head.
+    assert_eq!(odometer_cut(&lane, 30), Some(1));
+    assert_eq!(odometer_cut(&lane, 59), Some(1));
+    // Past the last cut there is nothing to count -- the selection answers.
+    assert_eq!(odometer_cut(&lane, 60), None);
+    // In a gap: the next cut ahead of the playhead.
+    let gapped = [at(0, 10), at(40, 10)];
+    assert_eq!(odometer_cut(&gapped, 20), Some(1));
+    assert_eq!(odometer_cut(&[], 0), None);
+    assert!(
+        src_text("ui/timeband_stance.rs").contains("odometer_cut(s.lane_clips(lane), frame)"),
+        "the readout must derive its odometer from the playhead"
+    );
+}
+
+/// DESIGN §8's rejected pattern, swept over the source rather than argued
+/// per message: "the room never explains itself in prose ... any new string
+/// over ~4 words that instructs rather than reports state is a defect". The
+/// notices are what the ledger strip paints, and a sentence there is what cut
+/// mid-word in the user's own screenshot (`OPENED ... 1 subtitle track(s) in `).
+///
+/// The scan reads every notice-shaped literal -- one whose first word is a
+/// state word in capitals, which is how every message this window pushes
+/// opens -- and refuses one that is both long (over eight words) and
+/// instructional (an imperative tell). A refusal *claim* may still be long:
+/// those are the allowlist below, each one naming a genuine absent capability,
+/// never a lesson in how to use the room.
+#[test]
+fn no_notice_teaches_the_room_in_prose() {
+    // Long refusal claims that report a capability genuinely absent from this
+    // machine (DESIGN §8, "a refusal string is a claim"), kept whole on
+    // purpose: the remedy is not a chord in this room because the missing
+    // thing is not in this room.
+    const ALLOWED: &[&str] = &["NO FILE CHOOSER"];
+    const TELLS: &[&str] = &[
+        "drag ",
+        "press ",
+        "pick ",
+        "type ",
+        "click ",
+        "to show",
+        "to use",
+        "takes it back",
+        "puts it back",
+        "first",
+        "instead",
+    ];
+    let mut offenders = Vec::new();
+    for path in source_files() {
+        let text = std::fs::read_to_string(&path).expect("a source file");
+        for literal in string_literals(&text) {
+            // A notice opens with its state in capitals -- placeholders in
+            // front of it (`{count} SILENCES CUT`) are stepped over.
+            let head = literal
+                .split_whitespace()
+                .find(|word| !word.starts_with('{'))
+                .unwrap_or("");
+            let shouty = head.len() >= 2
+                && head
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c == '-' || c == ':');
+            if !shouty || ALLOWED.iter().any(|allowed| literal.starts_with(allowed)) {
+                continue;
+            }
+            let long = literal.split_whitespace().count() > 8;
+            if long && TELLS.iter().any(|tell| literal.contains(tell)) {
+                offenders.push(format!("{}: {literal}", path.display()));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "a notice that instructs instead of reporting state (DESIGN §8):\n{}",
+        offenders.join("\n")
+    );
+}
+
+/// Every string literal in `text`, comments dropped first so the prose about
+/// a message is never read as the message.
+fn string_literals(text: &str) -> Vec<String> {
+    let code: String = text
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut out = Vec::new();
+    let mut chars = code.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '"' {
+            continue;
+        }
+        let mut literal = String::new();
+        while let Some(c) = chars.next() {
+            match c {
+                // A line continuation joins the halves of a wrapped message;
+                // every other escape is not a word either way.
+                '\\' => {
+                    if chars.next() == Some('\n') {
+                        while chars.peek() == Some(&' ') {
+                            chars.next();
+                        }
+                    }
+                }
+                '"' => break,
+                _ => literal.push(c),
+            }
+        }
+        out.push(literal);
+    }
+    out
+}
+
+/// The export moment holds the file and the budget; everything a project is
+/// *delivered as* is a settings row now (user: the export card was "too
+/// complicated"). Four rows, and a fifth would be the card growing back --
+/// this is a source scan for the same reason every guard on this page is.
+#[test]
+fn the_export_section_is_four_rows_and_no_fifth() {
+    let source = src_text("ui/settings_stance.rs");
+    let start = source
+        .find("fn export_section(")
+        .expect("the export section");
+    let body = &source[start..];
+    let end = body.find("\n/// The page itself").expect("the page's render fn");
+    let body = &body[..end];
+    let rows = [
+        "settings-export-picture",
+        "settings-export-sound",
+        "settings-export-encoder",
+        "settings-export-range",
+    ];
+    for row in rows {
+        assert!(body.contains(row), "the EXPORT section has no {row} row");
+    }
+    // The Sound row is written twice -- a rated codec's keyed row and an
+    // unrated one's readout, never both at once -- so the count is by label,
+    // not by id.
+    for label in ["\"Picture\"", "\"Sound\"", "\"Encoder\"", "\"Range\""] {
+        assert!(body.contains(label), "the EXPORT section has no {label} row");
+    }
+    let ids = body.match_indices("\"settings-export-").count();
+    assert_eq!(ids, 5, "the EXPORT section grew a row past the four (the two Sound rows are one row's two shapes)");
+    assert!(
+        source.contains("what a delivery is written as"),
+        "the section lost its head"
+    );
+    // Every row wears its chord (DESIGN §4): three keyed rows plus the
+    // range's own marks, which are keymap actions.
+    for chord in ["\"c\"", "\"b\"", "\"e\"", "ActionId::SetIn"] {
+        assert!(body.contains(chord), "an EXPORT row lost its chord {chord}");
+    }
+}
+
+/// `c` walks the nine files in one order -- a codec's two boxes side by side,
+/// the sound-only formats last -- and never stops on a format this machine
+/// cannot write, because [`Player::set_format`] would only refuse it back.
+#[test]
+fn the_picture_row_cycles_codec_and_container_together_and_skips_a_refusal() {
+    use crate::ui::settings_stance::{PICTURE_CYCLE, next_picture, picture_label};
+    assert_eq!(
+        PICTURE_CYCLE,
+        [
+            Format::Mp4,
+            Format::Av1Mp4,
+            Format::Av1,
+            Format::Hevc,
+            Format::HevcMp4,
+            Format::Wav,
+            Format::Flac,
+            Format::Mp3,
+            Format::Ogg,
+        ]
+    );
+    // Nothing refused: the whole ring, wrapping back to the head.
+    let mut at = Format::Mp4;
+    let mut walked = vec![at];
+    for _ in 1..PICTURE_CYCLE.len() {
+        at = next_picture(at, |_| false);
+        walked.push(at);
+    }
+    assert_eq!(walked, PICTURE_CYCLE.to_vec());
+    assert_eq!(next_picture(at, |_| false), Format::Mp4);
+
+    // HEVC unavailable (no plugin): `c` steps over both of its boxes rather
+    // than parking on a pick the setter refuses.
+    let no_hevc = |f: Format| matches!(f, Format::Hevc | Format::HevcMp4);
+    assert_eq!(next_picture(Format::Av1, no_hevc), Format::Wav);
+    // Everything refused: the row keeps what it has instead of cycling to
+    // nothing.
+    assert_eq!(next_picture(Format::Mp4, |_| true), Format::Mp4);
+
+    assert_eq!(picture_label(Format::Mp4), "H.264 · MP4");
+    assert_eq!(picture_label(Format::Av1), "AV1 · MKV");
+    assert_eq!(picture_label(Format::Av1Mp4), "AV1 · MP4");
+    assert_eq!(picture_label(Format::Wav), "WAV");
+}
+
+/// A refused codec is greyed with its reason, never hidden (DESIGN §8), and
+/// the reason is short enough to sit beside a value: six words, the rest of
+/// the sentence still said by the export moment's own banner. The sound row
+/// wears a chord only where its codec has a rate to step.
+#[test]
+fn a_refusal_is_six_words_beside_the_value_and_soundless_codecs_wear_no_chord() {
+    use crate::ui::settings_stance::{encoder_word, short_reason, sound_codec};
+    let long = "HEVC needs the VA-API plugin, which this machine has not built";
+    assert_eq!(short_reason(long), "HEVC needs the VA-API plugin, which");
+    assert!(short_reason(long).split_whitespace().count() <= 6);
+    assert_eq!(short_reason("no encoder here"), "no encoder here");
+
+    for (format, codec, rated) in [
+        (Format::Mp4, "AAC", true),
+        (Format::Av1, "AAC", true),
+        (Format::Mp3, "MP3", true),
+        (Format::Wav, "PCM", false),
+        (Format::Flac, "FLAC", false),
+        (Format::Ogg, "Vorbis", false),
+    ] {
+        assert_eq!(sound_codec(format), (codec, rated), "{format:?}");
+    }
+
+    assert_eq!(encoder_word(EncoderSeat::Auto), "auto");
+    assert_eq!(encoder_word(EncoderSeat::Hardware), "GPU");
+    assert_eq!(encoder_word(EncoderSeat::Software), "software");
+}
+
+/// The one amber line on the page is the AV1-on-the-GPU seat, and it is the
+/// only hue the EXPORT rows introduce -- every other value is an ink.
+#[test]
+fn the_only_hue_in_the_export_section_is_the_av1_gpu_notice() {
+    let source = src_text("ui/settings_stance.rs");
+    let start = source
+        .find("fn export_section(")
+        .expect("the export section");
+    let body = &source[start..];
+    let body = &body[..body.find("\n/// The page itself").expect("the render fn")];
+    assert!(
+        body.contains("NOTICE_LOOK()"),
+        "the AV1-on-the-GPU row lost its amber"
+    );
+    assert_eq!(
+        crate::ui::settings_stance::AV1_GPU_NOTICE,
+        "ignores the budget \u{2014} constant quality"
+    );
+    for hue in ["ACCENT_", "STATUS_", "NOTICE_TELL", "NOTICE_DECIDE"] {
+        assert!(
+            !body.contains(hue),
+            "the EXPORT rows reached for a second hue ({hue})"
+        );
+    }
 }

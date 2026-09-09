@@ -353,7 +353,14 @@ fn source_row(
         // carries no film ink of its own to complement, it is a plain list
         // line, so the general focus/selection ring applies, the same one
         // the bench already uses for the same job.
-        .when(picked, |d| d.border_1().border_color(rgb(INK1())))
+        .border_1()
+        .border_color(match picked {
+            // The ring is always in flow -- transparent at rest, ink1 when
+            // picked -- because a `when(picked, border_1())` added a pixel of
+            // box on selection and shoved every row's text sideways.
+            true => rgb(INK1()).into(),
+            false => gpui::transparent_black(),
+        })
         // Right-click ANYWHERE on the row opens the row's menu -- Add,
         // Remove, Reveal, Properties (DESIGN §9: "verbs of the thing under
         // the cursor"). It used to hang off the 8px ink dot alone, and only
@@ -446,21 +453,21 @@ fn source_row(
                     let style = mono(type_scale::LABEL_ROW_PX, FontWeight::MEDIUM);
                     div()
                         .flex_1()
-                        .min_w(px(0.))
+                        // FAULT: this was `min_w(px(0.))` -- the row's five
+                        // flex_none siblings (usage, Preview, Add ↵, proxy)
+                        // took their full width first and the name, the one
+                        // thing a row is *for*, collapsed to nothing at the
+                        // default dock width: the library read `● V1 A1 · 2
+                        // uses Preview Add ↵ ○` with no filename at all. The
+                        // name is the first line and keeps at least 60% of
+                        // the row; the verbs shrank to glyph ghosts and the
+                        // usage moved down to the metadata line.
+                        .min_w(relative(0.6))
                         .truncate()
                         .font(style.font)
                         .text_size(style.size)
                         .text_color(rgb(INK1()))
                         .child(name)
-                })
-                .child({
-                    let style = mono(type_scale::CHORD_METADATA_MIN_PX, FontWeight::MEDIUM);
-                    div()
-                        .flex_none()
-                        .font(style.font)
-                        .text_size(style.size)
-                        .text_color(rgb(INK3()))
-                        .child(usage)
                 })
                 .when(usable, |d| {
                     d.child({
@@ -490,7 +497,7 @@ fn source_row(
                                     .font(style.font)
                                     .text_size(style.size)
                                     .text_color(rgb(INK2()))
-                                    .child("Preview"),
+                                    .child("▷"),
                             )
                     })
                 })
@@ -544,7 +551,7 @@ fn source_row(
                                     .font(label_style.font)
                                     .text_size(label_style.size)
                                     .text_color(rgb(INK2()))
-                                    .child("Add"),
+                                    .child("+"),
                             )
                             .child(
                                 div()
@@ -612,7 +619,7 @@ fn source_row(
                 .font(style.font)
                 .text_size(style.size)
                 .text_color(rgb(INK3()))
-                .child(under)
+                .child(format!("{usage} · {under}"))
         })
 }
 
@@ -707,7 +714,14 @@ fn subtitle_tab_rows(player: &Player, cx: &mut Context<Player>) -> (usize, Vec<A
                         .pr(px(8.))
                         .py(px(4.))
                         .rounded(px(3.))
-                        .when(picked, |d| d.border_1().border_color(rgb(INK1())))
+                        .border_1()
+                        .border_color(match picked {
+                            // The ring is always in flow -- transparent at rest, ink1 when
+                            // picked -- because a `when(picked, border_1())` added a pixel of
+                            // box on selection and shoved every row's text sideways.
+                            true => rgb(INK1()).into(),
+                            false => gpui::transparent_black(),
+                        })
                         .when(!usable, |d| d.opacity(0.5))
                         .when(usable, |d| {
                             d.cursor_pointer()
@@ -963,7 +977,11 @@ fn sources_tab(player: &Player, window: &mut Window, cx: &mut Context<Player>) -
         .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
             cycle_on_key_down(Surface::Dock)(this, event, window, cx)
         }))
-        .when(focused, |d| d.border_1().border_color(rgb(STROKE_FOCUS())))
+        .border_1()
+        .border_color(match focused {
+            true => rgb(STROKE_FOCUS()).into(),
+            false => gpui::transparent_black(),
+        })
         .flex_1()
         .min_h(px(0.))
         .flex()
@@ -1145,19 +1163,6 @@ fn sources_tab(player: &Player, window: &mut Window, cx: &mut Context<Player>) -
                     }),
                 )),
         )
-        .child({
-            // Metadata, not a row: DESIGN §3's metadata role, and the quietest
-            // text in the dock: ink3, tight leading so it never competes with
-            // the source rows above it.
-            let style = mono(type_scale::CHORD_METADATA_MIN_PX, FontWeight::MEDIUM);
-            div()
-                .flex_none()
-                .line_height(relative(1.25))
-                .font(style.font)
-                .text_size(style.size)
-                .text_color(rgb(INK3()))
-                .child("drag · ↵ add · double-click plays")
-        })
 }
 
 /// The transition a clip carries into its immediate successor, if any -- a
@@ -1285,7 +1290,11 @@ fn clip_tab(
         .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
             cycle_on_key_down(Surface::Inspector)(this, event, window, cx)
         }))
-        .when(focused, |d| d.border_1().border_color(rgb(STROKE_FOCUS())))
+        .border_1()
+        .border_color(match focused {
+            true => rgb(STROKE_FOCUS()).into(),
+            false => gpui::transparent_black(),
+        })
         .flex_1()
         .min_h(px(0.))
         .flex()

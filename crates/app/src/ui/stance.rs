@@ -224,16 +224,58 @@ mod menu_floor_tests {
         let floor = below_picture_floor(f32::from(viewport.height), BENCH_H);
         let (at, room) = menu_floor(point(px(300.), px(20.)), viewport, BENCH_H);
         assert_eq!(f32::from(at.y), floor);
-        // 396px of rows (the charter's measured menu height) does not fit in
-        // the 316px footprint room, so it must be capped to it, not the
-        // window's 720.
-        let list_h = (396f32).min(f32::from(room.height));
+        // 17 rows -- more than the footprint holds -- sized through the real
+        // sizer, so the `MENU_EDGE` margin is in the number the clamp sees.
+        let list_h = crate::oracle::menu_rows_h(17, room);
         assert!(list_h <= f32::from(room.height));
-        let (_, y) = crate::oracle::menu_at(at, viewport, list_h);
+        let h = crate::layout::MENU_PAD * 2. + list_h;
+        let (_, y) = crate::oracle::menu_at(at, viewport, h);
         assert_eq!(
             y, floor,
             "the top edge must not be walked back above the floor"
         );
+    }
+
+    /// Defect 1 as the user met it (`f-clip-menu.png`): a menu opened near the
+    /// right and bottom of a 1280x720 window ran off both edges -- chords cut
+    /// mid-word at the dock seam, rows past the frame. Pure clamp math, both
+    /// window sizes the charter names, and both the floored (clip) menu and
+    /// the unfloored (library) one: whatever the anchor, the whole plate lands
+    /// inside the frame with [`MENU_EDGE`] to spare, and the floored one never
+    /// buys that room off the picture.
+    #[test]
+    fn a_menu_opened_in_the_bottom_right_corner_lands_whole_inside_the_window() {
+        use crate::layout::{MENU_EDGE, MENU_PAD, MENU_W};
+        for viewport in [size(px(1280.), px(720.)), size(px(2560.), px(1440.))] {
+            let (w, v) = (f32::from(viewport.width), f32::from(viewport.height));
+            let floor = below_picture_floor(v, BENCH_H);
+            for rows in [1usize, 5, 16, 40] {
+                for anchor in [
+                    point(px(w - 1.), px(v - 1.)),
+                    point(px(w - 1.), px(0.)),
+                    point(px(0.), px(v - 1.)),
+                ] {
+                    // The clip menu's path: floored below the picture, sized
+                    // against the room that leaves, then clamped.
+                    let (at, room) = menu_floor(anchor, viewport, BENCH_H);
+                    let h = MENU_PAD * 2. + crate::oracle::menu_rows_h(rows, room);
+                    let (x, y) = crate::oracle::menu_at(at, viewport, h);
+                    assert!(x >= MENU_EDGE && x + MENU_W <= w - MENU_EDGE, "x {x} rows {rows}");
+                    assert!(y >= MENU_EDGE && y + h <= v - MENU_EDGE, "y {y} h {h} rows {rows}");
+                    assert!(y >= floor, "y {y} walked above the picture floor {floor}");
+                    // The library menu's path: no floor, hung a row below the
+                    // pointer, same clamp.
+                    let h = MENU_PAD * 2. + crate::oracle::menu_rows_h(rows, viewport);
+                    let (x, y) = crate::oracle::menu_at(
+                        point(anchor.x, anchor.y + px(52.)),
+                        viewport,
+                        h,
+                    );
+                    assert!(x >= MENU_EDGE && x + MENU_W <= w - MENU_EDGE, "lib x {x}");
+                    assert!(y >= MENU_EDGE && y + h <= v - MENU_EDGE, "lib y {y} h {h}");
+                }
+            }
+        }
     }
 }
 
@@ -407,11 +449,11 @@ fn ghost(
         ))
         .text_color(rgb(INK2()))
         .child(glyph.to_string())
-        // The badge is skipped when the stroke IS the glyph: `?` over `?`
-        // drew as two identical rows stacked at the foot of the rail and read
-        // as a duplicated control rather than as one command wearing its own
-        // chord.
-        .children((player.keymap.chord(action) != glyph).then(|| {
+        // Every command wears its chord (DESIGN §4) -- including the one
+        // whose glyph IS its stroke: `?` reads as `?` over a dimmer `?`,
+        // the same glyph-over-chord anatomy every other spine ghost draws,
+        // rather than as the one control on the rail with nothing under it.
+        .child(
             div()
                 .type_style(type_scale::mono(
                     type_scale::CHORD_METADATA_MIN_PX,
@@ -420,8 +462,8 @@ fn ghost(
                 .text_color(rgb(INK3()))
                 // FAULT 1: the badge shows the primary chord, compact --
                 // same rule as every glyph in `spine_stance`.
-                .child(player.keymap.chord(action))
-        }))
+                .child(player.keymap.chord(action)),
+        )
 }
 
 /// The keys overlay (DESIGN §9, §12 step 7): every bound command, sectioned
@@ -460,6 +502,13 @@ fn keys_overlay(player: &Player, bench_h: f32, cx: &mut Context<Player>) -> impl
         .h(px(bench_h + LEDGER_H))
         .bg(rgba(SCRIM()))
         .flex()
+        // The plate's inset lives on the scrim, not on the plate's own
+        // margins: a margin under a fixed `h()` left the list flush with the
+        // window's bottom edge and its last rows cut over the ledger. Padding
+        // here takes the room off the footprint before the plate is measured.
+        .pl(px(12.))
+        .pt(px(8.))
+        .pb(px(8.))
         // Bottom-left, not centred: the `?` control that opens this lives at
         // the foot of the spine ([`spine`]'s last child), and this overlay
         // mounts inside the *centre* column next to it -- anchoring the list
@@ -482,9 +531,10 @@ fn keys_overlay(player: &Player, bench_h: f32, cx: &mut Context<Player>) -> impl
         .child(
             div()
                 .id("stance-keys-list")
-                .ml(px(12.))
-                .mb(px(12.))
-                .h(px((bench_h + LEDGER_H - 24.).max(0.)))
+                // Capped to the bench+ledger footprint less the scrim's own
+                // inset, so the bottom border is on screen and the rows
+                // scroll inside it (DESIGN §9).
+                .h(px((bench_h + LEDGER_H - 16.).max(0.)))
                 .w(px(460.))
                 .overflow_y_scroll()
                 .p(px(10.))
@@ -496,7 +546,27 @@ fn keys_overlay(player: &Player, bench_h: f32, cx: &mut Context<Player>) -> impl
                 .flex()
                 .flex_col()
                 .gap(px(3.))
-                .child(section_head("all commands · hold ? · release to close"))
+                // DESIGN §8, no instructional copy: the heading is the
+                // single noun, and the way out is a chord on the right like
+                // every other row here -- not a sentence that lied anyway
+                // (a click-opened plate does not close on a release).
+                .child(
+                    div()
+                        .flex_none()
+                        .flex()
+                        .justify_between()
+                        .gap(px(12.))
+                        .child(section_head("keys"))
+                        .child(
+                            div()
+                                .type_style(type_scale::mono(
+                                    type_scale::CHORD_METADATA_MIN_PX,
+                                    gpui::FontWeight::MEDIUM,
+                                ))
+                                .text_color(rgb(INK3()))
+                                .child("esc"),
+                        ),
+                )
                 .children(keys_rows().into_iter().map(|row| {
                     match row {
                         KeyRow::Head(category) => div()
@@ -783,13 +853,18 @@ fn ledger(player: &Player, position: f64) -> impl IntoElement {
             div()
                 .flex_1()
                 .min_w(px(0.))
-                .truncate()
+                // Ellipsis, not a bare cut: `.truncate()` stops mid-word with
+                // nothing saying it stopped (user report, `… 1 subtitle track(s)
+                // in `). The name inside the message is elided through its
+                // middle first ([`ledger_line`]) so the state word at the front
+                // is never what the strip drops.
+                .text_ellipsis()
                 .type_style(type_scale::mono(
                     type_scale::CHORD_METADATA_MIN_PX,
                     gpui::FontWeight::MEDIUM,
                 ))
                 .text_color(rgb(action_ink))
-                .child(last_action),
+                .child(ledger_line(&last_action)),
         )
         .children(export.map(|e| {
             div()
@@ -1102,17 +1177,6 @@ pub(crate) fn render(
                 .when(player.settings_open, |el| {
                     el.child(settings_stance::render(player, window_size, cx))
                 })
-                // The two menus (DESIGN §9: "verbs of the thing under the
-                // cursor", plate styling, the same scrim-and-row component
-                // the legacy tree already uses -- `library.rs`'s own doc
-                // comment: "Built like `Player::context_card` ... because it
-                // is the same menu on the other panel") and the open list a
-                // picker sets: none of the three had a home in the stance,
-                // so `overlaid()` refused every key over them for nothing
-                // ever drawn (FAULT 2). `render.rs`'s children order is kept
-                // -- clip menu, then library menu, then the open list last so
-                // it floats over whichever row opened it.
-                .children(player.context_card(window_size, cx))
                 // The export card and its running-progress sheet, mounted
                 // over the whole room exactly as the legacy tree mounts them
                 // (`render.rs`) -- the fix for the shipped "Export does
@@ -1120,7 +1184,6 @@ pub(crate) fn render(
                 // what draws it once open.
                 .children(player.export_card(window_size, cx))
                 .children(player.export_progress_card(cx))
-                .children(player.picker_card(window_size, cx))
                 // A maximized clip param card (EQ/Colour/Transform/Speed/
                 // Silence/Mix/Subtitle style) escapes the dock to mount here
                 // instead, the same window-space `stance-centre` context
@@ -1145,14 +1208,21 @@ pub(crate) fn render(
         )
         .child(divider(Split::Dock, player.split_drag == Some(Split::Dock), cx))
         .child(dock(player, dock_w, window_size, window, cx))
-        // The library row menu mounts on the ROOT, not inside
-        // `stance-centre` like the clip menu beside it: it is opened from a
-        // dock row, so its anchor is a window x past the centre column's own
-        // right edge, and the dock -- painted after the centre -- covered
-        // every pixel of it. That is the whole of the shipped "can not
-        // remove a media from library" defect: the plate was built, placed
-        // and never visible. Mounted here it paints last, over the dock it
-        // belongs to, and its own `menu_floor` window coordinates finally
-        // mean what they say.
+        // All three hanging menus (DESIGN §9: "verbs of the thing under the
+        // cursor") mount on the ROOT, and none of them inside
+        // `stance-centre`. Their anchors are *window* coordinates -- a
+        // `MouseDownEvent::position` -- while an absolutely placed child of
+        // the centre column is laid out from that column's own origin and
+        // ends where it ends: the spine shifted every clip menu right by
+        // `SPINE_W`, and the dock, painted after the centre, covered every
+        // pixel past x = width - dock. That is the shipped "can not remove a
+        // media from library" defect (the library plate was built, placed and
+        // never visible) and the clip menu whose chords were cut off mid-word
+        // at the dock seam. Mounted here they paint last, over the dock they
+        // may overlap, and `menu_floor`/`menu_at`'s window coordinates finally
+        // mean what they say. Order is `render.rs`'s -- clip menu, library
+        // menu, then the open list last so it floats over whichever row set it.
+        .children(player.context_card(window_size, cx))
         .children(player.library_card(window_size, cx))
+        .children(player.picker_card(window_size, cx))
 }

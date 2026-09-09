@@ -180,7 +180,7 @@ impl Player {
                     true => {
                         self.close_session();
                         format!(
-                            "REMOVED {} — the library is empty; import a file to start again",
+                            "REMOVED {} — the library is empty",
                             file_name(path)
                         )
                     }
@@ -194,7 +194,7 @@ impl Player {
                 }
             }
             Some(Err(e)) => format!("NOT REMOVED — {e}"),
-            None => "NO TIMELINE — open a file first".to_string(),
+            None => "NO TIMELINE — no file open".to_string(),
         };
         self.notify_user(text.into());
         cx.notify();
@@ -218,7 +218,7 @@ impl Player {
             return;
         }
         let Some(session) = self.session.as_mut() else {
-            self.notify_user("NO TIMELINE — open a file first".into());
+            self.notify_user("NO TIMELINE — no file open".into());
             return;
         };
         let Some(idx) = session
@@ -732,7 +732,7 @@ impl Player {
             // and the film has a stand-in now.
             Some(Proxy::Ready) if showed_stop => {
                 let text = format!(
-                    "PROXY READY for {} — it finished before the stop; click again to delete it",
+                    "PROXY READY for {} — it finished before the stop",
                     file_name(path)
                 );
                 eprintln!("{text}");
@@ -904,9 +904,9 @@ impl Player {
         let text = match (on, ready, making) {
             (false, ..) => "PROXIES OFF — the films themselves are what play".to_string(),
             (true, 0, 0) => {
-                "PROXIES ON — no film here has one, so the films themselves play".to_string()
+                "PROXIES ON — no film here has one".to_string()
             }
-            (true, 0, n) => format!("PROXIES ON — {n} still being made; the films play until then"),
+            (true, 0, n) => format!("PROXIES ON — {n} still being made"),
             (true, n, 0) => format!("PROXIES ON — cutting on {n}"),
             (true, n, m) => format!("PROXIES ON — cutting on {n}, {m} still being made"),
         };
@@ -951,8 +951,8 @@ impl Player {
             session.set_auto_proxies(on);
         }
         let text = match on {
-            true => "AUTO PROXIES ON — a film that wants a stand-in gets one as it arrives",
-            false => "AUTO PROXIES OFF — no import makes one; Proxies on is what asks for them",
+            true => "AUTO PROXIES ON — every import gets a stand-in",
+            false => "AUTO PROXIES OFF — no import makes one",
         };
         eprintln!("{text}");
         // Kept for the next launch, not only the next project -- a flip made
@@ -1114,7 +1114,7 @@ impl Player {
                     .and_then(|session| subtitle_tail(session, subs))
                     .unwrap_or_default();
                 format!(
-                    "IMPORTED {} to the library — drag it onto a lane to place it{tail}{}",
+                    "IMPORTED {} to the library{tail}{}",
                     file_name(path),
                     audio_import_tail(path, self.has_video(path) && !no_video)
                 )
@@ -1207,7 +1207,7 @@ impl Player {
                 let what = match place {
                     true => format!("OPENED {name}"),
                     false => {
-                        format!("IMPORTED {name} to the library — drag it onto a lane to place it")
+                        format!("IMPORTED {name} to the library")
                     }
                 };
                 let audio = match place {
@@ -1396,7 +1396,7 @@ impl Player {
                 self.keymap.display(ActionId::ToggleSubtitles)
             ),
             Some(Err(e)) => format!("SUBTITLE IMPORT FAILED: {e}"),
-            None => "NO SUBTITLES ADDED — open a file for them to run against first".to_string(),
+            None => "NO SUBTITLES ADDED — no file open".to_string(),
         };
         eprintln!("{text}");
         self.notify_user(text.into());
@@ -1461,7 +1461,7 @@ impl Player {
                 )
             }
             Some(Err(e)) => format!("NO SUBTITLES REMOVED — {e}"),
-            None => "NO SUBTITLES REMOVED — open a file first".to_string(),
+            None => "NO SUBTITLES REMOVED — no file open".to_string(),
         };
         eprintln!("{text}");
         self.notify_user(text.into());
@@ -1587,7 +1587,7 @@ impl Player {
                 format!("SAVED {}", file_name(&self.project_path))
             }
             Some(Err(e)) => format!("SAVE FAILED: {e}"),
-            None => "NOTHING TO SAVE — open a file first".to_string(),
+            None => "NOTHING TO SAVE — no file open".to_string(),
         };
         eprintln!("{text}");
         self.notify_user(text.into());
@@ -1751,22 +1751,14 @@ impl Player {
                 let lane = session.add_lane(kind);
                 self.notify_user(
                     format!(
-                        "{} ADDED — drag {} onto it, {} takes it back",
+                        "{} ADDED · undo {}",
                         lane.label(),
-                        // A subtitle lane takes no clip at all: what lands on it
-                        // is a palette row, so the notice names the panel the
-                        // hand has to go to rather than "a clip", which is the
-                        // one thing that will never work here.
-                        match kind {
-                            LaneKind::Subtitle => "a subtitle from the panel",
-                            _ => "a clip",
-                        },
                         self.keymap.display(ActionId::Undo)
                     )
                     .into(),
                 );
             }
-            None => self.notify_user("NO TRACK ADDED — open a file first".into()),
+            None => self.notify_user("NO TRACK ADDED — no file open".into()),
         }
         cx.notify();
     }
@@ -1809,7 +1801,7 @@ impl Player {
                 )
             }
             Some(Err(e)) => format!("NO TRACK REMOVED — {e}"),
-            None => "NO TRACK REMOVED — open a file first".to_string(),
+            None => "NO TRACK REMOVED — no file open".to_string(),
         };
         self.notify_user(text.into());
         cx.notify();
@@ -1863,7 +1855,7 @@ impl Player {
         }
         self.notify_user(
             format!(
-                "{} IS TRACK {} NOW — {} puts it back",
+                "{} IS TRACK {} NOW · undo {}",
                 moved.label(),
                 to + 1,
                 self.keymap.display(ActionId::Undo)
@@ -1901,7 +1893,7 @@ impl Player {
                                 LaneKind::Subtitle => "subtitle",
                             }
                         ),
-                        false => "NO TRACK REMOVED — open a file first".to_string(),
+                        false => "NO TRACK REMOVED — no file open".to_string(),
                     }
                     .into(),
                 );
