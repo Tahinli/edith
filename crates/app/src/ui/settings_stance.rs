@@ -373,14 +373,25 @@ fn project_section(player: &Player, cx: &mut Context<Player>) -> impl IntoElemen
             None,
             content_ink,
         ))
-        .child(row(
-            "settings-mix",
-            "Mix",
-            "Tracks…",
-            "a fader per track and the limiter over the sum of them",
-            player,
-            cx.listener(|this, _: &ClickEvent, _, cx| this.open_mix(None, cx)),
-        ))
+        // A door row's value is the state behind the door, never the door's
+        // own noun: `Tracks…` read as a cut word and said nothing (user:
+        // "word cut"). No project, no tracks -- the page's one empty state.
+        .child({
+            let (mix_val, mix_ink) = match player.mix_lanes().len() {
+                0 => ("\u{2014}".to_string(), INK4()),
+                1 => ("1 track".to_string(), INK1()),
+                n => (format!("{n} tracks"), INK1()),
+            };
+            row_ink(
+                "settings-mix",
+                "Mix",
+                mix_val,
+                "a fader per track and the limiter over the sum of them",
+                player,
+                cx.listener(|this, _: &ClickEvent, _, cx| this.open_mix(None, cx)),
+                mix_ink,
+            )
+        })
 }
 
 /// EDITOR: this window's own decode/import policy and this person's own
@@ -431,10 +442,16 @@ fn editor_section(player: &Player, cx: &mut Context<Player>) -> impl IntoElement
                 this.open_picker(Pick::Theme, event.position(), cx)
             }),
         ))
+        // The family in force, said (user: "Subtitle font  Font…" -- the
+        // value slot carried the door's noun, elided, never the pick). With
+        // nothing picked the window draws its own, which is one word.
         .child(row(
             "settings-subtitle-style",
             "Subtitle font",
-            "Font…",
+            player
+                .sub_family
+                .clone()
+                .unwrap_or_else(|| "default".to_string()),
             "the cue plate's own font and size -- kept in ~/.config/edith, never in a project",
             player,
             cx.listener(|this, _: &ClickEvent, _, cx| this.open_subtitle_style(cx)),
