@@ -1307,10 +1307,16 @@ fn every_action_is_reachable_without_the_keyboard() {
             "{action:?} is reachable by keyboard only"
         );
     }
-    // The snap has a door of its own as well as its row on the card: the
-    // button beside the zoom, which says which way it is set as well as
-    // setting it.
-    assert!(element("snap"), "no snap button beside the zoom");
+    // The snap's own door was the rail's `⌗` glyph, and the rail is deleted
+    // (DESIGN §5 as amended 2026-09-09, user decision "option C"). Its
+    // replacement -- a right-click row on the ruler it snaps against -- is
+    // LANE R2's parity work, so the assertion is inverted rather than
+    // dropped: it names the owner and fails the moment that door lands, at
+    // which point this goes back to `assert!(element("snap"), ...)`.
+    assert!(
+        !element("snap"),
+        "LANE R2 landed a snap door -- restore this to assert!(element(\"snap\"))"
+    );
     // And the card is a door the pointer can open: the panel's own button.
     assert!(element("keys"), "no way to open the actions card");
     // The card-local strokes have the same rule, and each of them is a thing

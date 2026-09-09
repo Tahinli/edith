@@ -11,7 +11,6 @@ pub mod library;
 pub mod overlays;
 pub mod preview;
 pub mod settings_stance;
-pub mod spine_stance;
 pub mod stance;
 pub mod theme;
 pub mod timeband_stance;

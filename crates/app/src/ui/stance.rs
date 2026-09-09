@@ -12,7 +12,6 @@ use crate::ui::bench_stance;
 use crate::ui::dock_stance;
 use crate::ui::hitmap;
 use crate::ui::settings_stance;
-use crate::ui::spine_stance;
 use crate::ui::timeband_stance;
 use crate::ui::type_scale::{self, Typeset};
 use crate::*;
@@ -118,8 +117,6 @@ impl Player {
     }
 }
 
-/// Left rail, full height (DESIGN §5).
-pub(crate) const SPINE_W: f32 = 56.;
 /// Fixed strip under the screen: timecode, transport, cut readout, contact
 /// strip, Export -- all placeholder at this step. Kept `pub(crate)` for
 /// `layout::split_bounds`'s bench ceiling, the same one-door reason
@@ -422,44 +419,47 @@ fn section_head(label: &str) -> impl IntoElement {
         .child(label.to_uppercase())
 }
 
-/// A ghost command (DESIGN §4): borderless glyph (`ink2`) + dim chord
-/// (`ink3`), read live off the keymap so a rebind can never leave the spine
-/// showing a stroke that no longer fires it.
-fn ghost(
+/// A room verb at the ledger's right end (DESIGN §4, §5 as amended
+/// 2026-09-09 -- user decision "option C"): the name in `ink3`, its chord
+/// beside it, read live off the keymap so a rebind can never leave the
+/// strip showing a stroke that no longer fires it. Hover raises the plate
+/// (`ink2` + `raised`) the same way every other verb in the room does;
+/// active reads `ink1` + fill, the state the deleted rail's glyphs carried.
+fn room_ghost(
     player: &Player,
-    glyph: &str,
+    name: &'static str,
     action: ActionId,
+    active: bool,
     cx: &mut Context<Player>,
 ) -> impl IntoElement {
     div()
-        .id("keys")
+        .id(name)
         .flex_none()
         .flex()
-        .flex_col()
         .items_center()
-        .gap(px(2.))
-        .py(px(6.))
+        .gap(px(4.))
+        .px(px(5.))
+        .py(px(2.))
         .rounded(px(3.))
         .cursor_pointer()
-        .hover(|s| s.bg(rgb(DARK_RAISED())).text_color(rgb(INK1())))
+        .when(active, |d| d.bg(rgb(DARK_RAISED())))
+        .hover(|s| s.bg(rgb(DARK_RAISED())).text_color(rgb(INK2())))
         .tooltip(crate::ui::widgets::action_hover(player, action))
         .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.act(action, window, cx)))
-        .type_style(type_scale::label(
-            type_scale::LABEL_ROW_PX,
+        .type_style(type_scale::mono(
+            type_scale::CHORD_METADATA_MIN_PX,
             gpui::FontWeight::MEDIUM,
         ))
-        .text_color(rgb(INK2()))
-        // The pointer's way to this glyph has to be findable by name like
-        // every other ghost's (`spine_stance`), or a hand -- and the harness
-        // -- can only reach the KEYS tab through its dock tab.
+        .text_color(rgb(if active { INK1() } else { INK3() }))
+        // The pointer's way to this verb has to be findable by name -- with
+        // the rail gone this is the hitmap entry for each of the four, and
+        // for `keys` it is the only `ShowActions` control in the room.
         .children(hitmap::action(action, true))
-        .child(glyph.to_string())
-        // Every command wears its chord (DESIGN §4) -- except the one whose
-        // glyph already IS its stroke: `?` over `?` read as two question
-        // marks on the rail and the user asked why ("why two ? exists").
-        // A badge that only repeats the glyph says nothing, so it is not
-        // drawn; every other ghost still wears its chord under it.
-        .when(player.keymap.chord(action) != glyph, |el| {
+        .child(name)
+        // Every command wears its chord (DESIGN §4) -- except one whose name
+        // already IS its stroke, the `?` over `?` rule the rail's last ghost
+        // was given ("why two ? exists").
+        .when(player.keymap.chord(action) != name, |el| {
             el.child(
                 div()
                     .type_style(type_scale::mono(
@@ -467,36 +467,22 @@ fn ghost(
                         gpui::FontWeight::MEDIUM,
                     ))
                     .text_color(rgb(INK3()))
-                    // FAULT 1: the badge shows the primary chord, compact --
-                    // same rule as every glyph in `spine_stance`.
                     .child(player.keymap.chord(action)),
             )
         })
 }
 
-/// The spine: 56px, left, full height. Frame only -- grouped rows, task
-/// frequency, glyph-over-chord grammar and every click all live in
-/// [`crate::ui::spine_stance`] now (MOCK-SPEC.md "Spine"); this fn keeps
-/// the panel's own surface and the `?` row, which stays part of the frame
-/// since it swings the dock to its KEYS tab right here rather than through
-/// `act`.
-fn spine(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
+/// The separator between two room verbs -- the ledger's own mono middot,
+/// the same one the project identity already reads with.
+fn verb_dot() -> impl IntoElement {
     div()
-        .id("stance-spine")
         .flex_none()
-        .w(px(SPINE_W))
-        .h_full()
-        .bg(rgb(DARK_PANEL()))
-        .border_r_1()
-        .border_color(rgba(DARK_SEAM()))
-        .flex()
-        .flex_col()
-        .items_center()
-        .py(px(8.))
-        .gap(px(4.))
-        .child(section_head("spine"))
-        .child(spine_stance::render(player, cx))
-        .child(ghost(player, "?", ActionId::ShowActions, cx))
+        .type_style(type_scale::mono(
+            type_scale::CHORD_METADATA_MIN_PX,
+            gpui::FontWeight::MEDIUM,
+        ))
+        .text_color(rgb(INK3()))
+        .child("·")
 }
 
 /// The picture region: top of the centre column, takes the remaining space,
@@ -555,7 +541,7 @@ fn screen(
 /// readout, the contact strip, boxed Export at the end (DESIGN §5,
 /// MOCK-SPEC.md "Time band"). Frame only -- every row and the Export chip's
 /// click live in [`crate::ui::timeband_stance`] now, the same split
-/// `spine_stance`/`bench_stance`/`dock_stance` already make for their
+/// `bench_stance`/`dock_stance` already make for their
 /// regions.
 fn time_band(player: &mut Player, position: f64, cx: &mut Context<Player>) -> impl IntoElement {
     // The position comes from `render`, the same one the screen and the ledger
@@ -638,7 +624,7 @@ fn bench(
 
 /// Thin strip at the bottom of the centre column: project identity, last
 /// action, export progress, position. Notices rise from here (DESIGN §5, §8).
-fn ledger(player: &Player, position: f64) -> impl IntoElement {
+fn ledger(player: &Player, position: f64, cx: &mut Context<Player>) -> impl IntoElement {
     let name = match player.project_path.as_os_str().is_empty() {
         true => "untitled".to_string(),
         false => file_name(&player.project_path),
@@ -717,6 +703,51 @@ fn ledger(player: &Player, position: f64) -> impl IntoElement {
                 .text_color(rgb(INK2()))
                 .child(e)
         }))
+        // The room's four verbs (DESIGN §5 as amended 2026-09-09, user
+        // decision "option C"): with the rail deleted, nothing on screen
+        // lists commands -- the KEYS tab is the list, every other verb is a
+        // key or a right-click on the thing -- except these four, which act
+        // on the room itself and so have no thing to be right-clicked on.
+        // They sit at the strip's right end, before the position, each
+        // wearing its chord.
+        .child(
+            div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .child(room_ghost(
+                    player,
+                    "CC",
+                    ActionId::ToggleSubtitles,
+                    player.subs_on,
+                    cx,
+                ))
+                .child(verb_dot())
+                .child(room_ghost(
+                    player,
+                    "settings",
+                    ActionId::Settings,
+                    player.settings_open,
+                    cx,
+                ))
+                .child(verb_dot())
+                .child(room_ghost(
+                    player,
+                    "keys",
+                    ActionId::ShowActions,
+                    player.keys_open,
+                    cx,
+                ))
+                .child(verb_dot())
+                .child(room_ghost(
+                    player,
+                    "full",
+                    ActionId::Fullscreen,
+                    false,
+                    cx,
+                ))
+        )
         .child(
             div()
                 .flex_none()
@@ -786,7 +817,7 @@ fn mouse_exit_listener(cx: &mut Context<Player>) -> impl IntoElement {
     .size(px(0.))
 }
 
-/// The whole stance: spine, screen, time band, bench, ledger, dock, in the
+/// The whole stance: screen, time band, bench, ledger, dock, in the
 /// order DESIGN §5 draws them, over the same key handler the legacy tree
 /// uses (DESIGN §12 step 3): the darkroom draws its own regions but answers
 /// to the one keymap.
@@ -852,7 +883,7 @@ pub(crate) fn render(
             // was clicked into (`dock_stance.rs` sets `dock_filter_edit` on
             // that click regardless of which tree is drawing the row), a
             // letter typed anywhere else in the room keeps meaning whatever
-            // the spine says it means.
+            // the keymap says it means.
             if this.dock_filter_edit {
                 if key == "escape" || key == "enter" {
                     this.dock_filter_edit = false;
@@ -971,8 +1002,8 @@ pub(crate) fn render(
         // hearing it once a `Split::Dock`/`Split::Bench` drag has started.
         // A file dropped from outside the window (gpui's `ExternalPaths`,
         // Wayland's `text/uri-list`) lands on the room itself, not on the
-        // centre column: the dock's Sources panel and the spine are the
-        // centre's flex siblings, so a handler mounted there heard no drop
+        // centre column: the dock's Sources panel is the centre's flex
+        // sibling, so a handler mounted there heard no drop
         // over the library at all -- the shipped "drag and drop import does
         // not work on the library panel" defect. Here it is the one surface
         // under every region, so a drop anywhere in the darkroom is heard.
@@ -995,7 +1026,6 @@ pub(crate) fn render(
         .bg(rgb(DARK_CANVAS()))
         .children(hitmap::frame())
         .child(mouse_exit_listener(cx))
-        .child(spine(player, cx))
         .child(
             div()
                 .id("stance-centre")
@@ -1012,7 +1042,7 @@ pub(crate) fn render(
                 .child(time_band(player, position, cx))
                 .child(divider(Split::Bench, player.split_drag == Some(Split::Bench), cx))
                 .child(bench(player, bench_h, window, cx))
-                .child(ledger(player, position))
+                .child(ledger(player, position, cx))
                 .when(player.settings_open, |el| {
                     el.child(settings_stance::render(player, window_size, cx))
                 })
@@ -1052,8 +1082,9 @@ pub(crate) fn render(
         // `stance-centre`. Their anchors are *window* coordinates -- a
         // `MouseDownEvent::position` -- while an absolutely placed child of
         // the centre column is laid out from that column's own origin and
-        // ends where it ends: the spine shifted every clip menu right by
-        // `SPINE_W`, and the dock, painted after the centre, covered every
+        // ends where it ends: the rail that used to stand left of the centre
+        // shifted every clip menu right by its own 56px, and the dock,
+        // painted after the centre, covered every
         // pixel past x = width - dock. That is the shipped "can not remove a
         // media from library" defect (the library plate was built, placed and
         // never visible) and the clip menu whose chords were cut off mid-word
