@@ -2796,14 +2796,70 @@ fn the_seam_paints_nothing_until_a_pointer_finds_it() {
         "the divider's line is inked at rest: {body}"
     );
     for step in [
-        ".hover(",
+        ".group_hover(",
         "GRAB_W",
+        "BENCH_GRAB_H",
         "STROKE_DIVIDER()",
         "INK3()",
         "border_t_1()",
         "border_l_1()",
     ] {
         assert!(body.contains(step), "the divider is missing {step}");
+    }
+    // The hairline is the *band's* child, not the strip's own border: a line
+    // raised only by the 6 px that already grab the seam is feedback the hand
+    // gets after it no longer needs it (his `bench=207` -- a press with no
+    // drag in it -- beside a `dock=277` he did drag).
+    assert!(
+        body.find(".group(group.clone())").expect("the band's group")
+            < body.find("border_t_1()").expect("the hairline"),
+        "the hairline is painted outside the band: {body}"
+    );
+}
+
+/// The band the hand actually gets, in seam coordinates -- driven at his own
+/// 2560x1440 with his own `bench=207` before this diff: a press answered only
+/// within +/-7 px of the line the eye sees, and the `BENCH` label row under it
+/// -- the visible top edge of the timeline, the thing a hand aims at -- was
+/// silent. The band is hung one row above the [`SPLIT_W`] strip, so its reach
+/// past the line is `grab - 1 - SPLIT_W`.
+#[test]
+fn the_bench_seam_reaches_into_the_row_a_hand_aims_at() {
+    let above = 1.;
+    let reach = |grab: f32| grab - above - crate::layout::SPLIT_W;
+    // Every other seam is unchanged: its neighbour's own first row carries
+    // content (the dock's rows, the legacy toolbar's buttons).
+    assert_eq!(reach(crate::layout::GRAB_W), 7.);
+    // The bench's reaches through the 24 px section head far enough to cover
+    // the label row a hand lands on, and no further than the head itself.
+    let past = reach(crate::layout::BENCH_GRAB_H);
+    assert!(
+        (10. ..=crate::ui::stance::BENCH_CHROME_H).contains(&past),
+        "the bench band reaches {past}px past the seam"
+    );
+}
+
+/// The clamp table, driven: the seam refuses exactly two things, and neither
+/// is anywhere near where a hand drags. Measured live at 2560x1440 --
+/// `bench=105` at the floor, `bench=1164` at the ceiling.
+#[test]
+fn the_bench_seam_stops_at_its_floor_and_its_ceiling() {
+    use crate::{BENCH_MIN_H, Split, split_bounds, split_size};
+    use gpui::{px, size};
+
+    let window = size(px(2560.), px(1440.));
+    let (min, max) = split_bounds(Split::Bench, 2, window, false);
+    assert_eq!(min, BENCH_MIN_H);
+    assert_eq!(
+        max,
+        1440. - crate::ui::stance::TIME_BAND_H - crate::ui::stance::LEDGER_H - 160.
+    );
+    for (asked, want) in [(0., min), (-942., min), (5000., max), (207., 207.)] {
+        assert_eq!(
+            split_size(Split::Bench, Some(asked), 2, window, false),
+            want,
+            "a bench dragged to {asked}"
+        );
     }
 }
 
