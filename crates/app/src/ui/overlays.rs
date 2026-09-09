@@ -298,24 +298,15 @@ impl Player {
                 // The one item that is not about this clip says so, and says it
                 // here rather than in the registry: the stroke is global too,
                 // but its row in the keys menu is not sitting on a clip.
-                // The registry's label is a sentence -- it has to be, the keys
-                // overlay reads the same string -- and a sentence in a 260px
-                // plate row is cut mid-word by the chord column beside it
-                // ("Ungroup the selection (clips anc", "Group the selection
-                // (ctrl-c"). DESIGN §7's rule for the bench applies to a menu
-                // too: labels never truncate into soup. The verb is the head
-                // of the sentence, up to its first parenthesis or em-dash;
-                // the tail is what the row's tooltip carries, so nothing is
-                // lost, it just stops being drawn over the chord.
+                // The registry's label is the verb itself now (cleanse round
+                // 2, `a_label_names_the_verb_in_four_words`): four words at
+                // most, so it fits a 260px plate beside its chord instead of
+                // being cut mid-word ("Ungroup the selection (clips anc").
+                // Nothing is trimmed here any more -- what a parenthesis used
+                // to carry is the refusal string in the column beside it.
                 let full = action.label();
-                let verb = full
-                    .split_once(" (")
-                    .map(|(head, _)| head)
-                    .or_else(|| full.split_once(" — ").map(|(head, _)| head))
-                    .or_else(|| full.split_once(": ").map(|(head, _)| head))
-                    .unwrap_or(full);
                 let label = match action {
-                    ActionId::ToggleMute | ActionId::Paste => format!("{verb} (global)"),
+                    ActionId::ToggleMute | ActionId::Paste => format!("{full} (global)"),
                     // A switch says which way it is set: a row reading "Snap on
                     // / off" beside a chord tells nobody whether snapping is on
                     // right now, which is the one thing the spine's badge did
@@ -323,17 +314,17 @@ impl Player {
                     ActionId::ToggleSnap => {
                         format!("Snap — {}", if self.snap { "on" } else { "off" })
                     }
-                    _ => verb.to_string(),
+                    _ => full.to_string(),
                 };
                 let say: SharedString = full.to_string().into();
                 rows.push(
                     row(rows.len())
-                        // Truncated and shrinkable: a long label ("Transform —
-                        // position, scale, rotation, crop") used to run the
-                        // hint column clean off the fixed-width menu instead
-                        // of sharing the row with it, which is why Transform
-                        // showed no stroke while a short label like Colour's
-                        // did.
+                        // Truncated and shrinkable even so: a long label
+                        // ("Transform — position, scale, rotation, crop")
+                        // used to run the hint column clean off the
+                        // fixed-width menu instead of sharing the row with
+                        // it, which is why Transform showed no stroke while a
+                        // short label like Colour's did.
                         .tooltip(move |_, cx| cx.new(|_| Tip(say.clone())).into())
                         .child(div().min_w(px(0.)).flex_shrink().truncate().child(label))
                         .child(match refusal.why() {

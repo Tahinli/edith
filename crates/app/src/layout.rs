@@ -71,8 +71,8 @@ pub(crate) const RULER_HIT_H: f32 = HIT_MIN;
 /// 360 px tall window. The rows are click targets, so `HIT_MIN` binds them too.
 /// Wider than the export card, and for the same reason that one is wider than
 /// this used to be: at 320 the longest labels ("Remove the last video track (it
-/// must be empty)") ran straight over the stroke printed at the other end of
-/// their row. Every label in the registry fits beside its stroke here, and the
+/// must be empty)", before cleanse round 2 cut every label to its verb) ran
+/// straight over the stroke printed at the other end of their row. Every label in the registry fits beside its stroke here, and the
 /// one that cannot -- a row waiting for a key to be pressed -- truncates rather
 /// than overprinting. Still inside the 640 px floor.
 pub(crate) const KEYS_W: f32 = 480.;
