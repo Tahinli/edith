@@ -648,6 +648,20 @@ impl Player {
             "d" => self.pick_destination(cx),
             "n" => self.edit_budget(),
             "e" | "enter" => self.start_export(cx),
+            // The encode options, on the moment that spends them (user
+            // 2026-09-09: "couldn't find how to change encode options") --
+            // the Settings room's own `c`/`b`/`g` setters, so the two
+            // surfaces can never say different things. `g` and not `e`
+            // because `e` is this moment's Export, and a ghost wears no
+            // shifted letter (DESIGN §4).
+            "c" => self.cycle_export_picture(),
+            "b" => self.cycle_audio_kbps(),
+            "g" => self.cycle_encoder(cx),
+            // corner-cut: the settings door answers a bare `,` as well as the
+            // room's `^,` it wears, because `param_card_key` is handed shift
+            // only -- ceiling: no modifier reaches a card's keys. Upgrade:
+            // thread `Modifiers` through `ui::stance`'s handler.
+            "," => self.open_settings(cx),
             "up" | "right" | "+" | "=" => self.nudge_budget(1, shift),
             "down" | "left" | "-" => self.nudge_budget(-1, shift),
             _ => {}
