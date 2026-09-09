@@ -63,6 +63,25 @@ const TICK_MIN_PX: f64 = 64.;
 const PLATE_W: f32 = 11. * crate::layout::LIST_CHAR_W / type_scale::CHORD_METADATA_MIN_PX
     * type_scale::CHORD_METADATA_MAX_PX
     + 9.;
+/// The reserved right-edge band `bench-select-all` sits in: its own
+/// `right(4.)` offset, the `px(3.)` either side of its text and the `gap(3.)`
+/// between the label and its chord. The band's text width is measured per
+/// render (the chord is keymap-dependent) and added to this.
+pub(crate) const SELECT_ALL_PAD: f32 = 4. + 3. + 3. + 3.;
+/// The width of that band for a given chord: `all`, the chord, and the
+/// padding around them. Read by the tick loop (no label may enter it) and by
+/// the ruler's own scrub listener (no press inside it seeks) -- one rule, so
+/// the two can never disagree about where the control's edge is.
+pub(crate) fn select_all_band(chord: &str) -> f32 {
+    ("all".len() + chord.chars().count()) as f32 * char_w(type_scale::CHORD_METADATA_MIN_PX)
+        + SELECT_ALL_PAD
+}
+/// A mono character's width at `size_px`, from the shared
+/// [`crate::layout::LIST_CHAR_W`] calibration (taken at
+/// [`type_scale::CHORD_METADATA_MIN_PX`]).
+pub(crate) fn char_w(size_px: f32) -> f32 {
+    crate::layout::LIST_CHAR_W / type_scale::CHORD_METADATA_MIN_PX * size_px
+}
 /// The pinned track-head column: wide enough for its lane-specific ghost
 /// verbs and their compact chords without shrinking their pointer targets.
 const HEAD_W: f32 = 72.;
@@ -1278,18 +1297,26 @@ pub(crate) fn render(
     // first tick at or after the bed's left edge to the bed's right edge.
     // Guarded on `pps > 0` -- a zero scale (no session yet) has no interval
     // that ever advances past the bed's own width, which would loop forever.
-    // FAULT 4: the playhead timecode plate is pinned at `left_0`..`PLATE_W`
-    // over the ruler (DESIGN §5), so a tick whose label would land under it
-    // is suppressed here rather than drawn and overlapped -- the plate
-    // already owns that lane.
+    // The ruler's two reserved bands, and no tick label may enter either.
+    // Left: the playhead timecode plate, which now shows only while a scrub
+    // drag is live (the hero timecode leads the time band at rest, DESIGN
+    // §4, and the ledger keeps position, §5 -- a third resting copy is the
+    // crowding) -- at rest the band is zero and the ticks have the width
+    // back. Right: `bench-select-all`, which used to be drawn straight over
+    // the `00:20` label because only the left plate was ever suppressed.
+    let plate_w = if player.scrubbing { PLATE_W } else { 0. };
+    let all_chord = player.keymap.chord(ActionId::SelectAll);
+    let all_w = select_all_band(&all_chord);
     let mut ticks = Vec::new();
     if scale.pps > 0. {
         let interval = tick_interval(scale.pps);
         let mut t = (scale.start / interval).ceil() * interval;
         while scale.px_at(t) <= bed_w {
             let x = scale.px_at(t).max(0.);
-            if x >= PLATE_W {
-                ticks.push((x, tick_mmss(t)));
+            let label = tick_mmss(t);
+            let label_w = label.chars().count() as f32 * char_w(type_scale::FLOOR_PX);
+            if x >= plate_w && x + label_w <= bed_w - all_w {
+                ticks.push((x, label));
             }
             t += interval;
         }
@@ -1331,6 +1358,21 @@ pub(crate) fn render(
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                        // The reserved right-edge band is `bench-select-all`'s,
+                        // not the scrub's: a press there used to select all AND
+                        // seek the playhead under the control (11:12 -> 20:14).
+                        // The guard lives here rather than as a
+                        // `stop_propagation` on the control, because stopping
+                        // the press also swallows the control's own click --
+                        // gpui builds a click out of that same mouse-down.
+                        let bounds = this.ruler.get();
+                        let bed_w = f32::from(bounds.size.width).max(1.);
+                        let band = select_all_band(&this.keymap.chord(ActionId::SelectAll));
+                        if f32::from(crate::timeline_math::px_along(event.position.x, bounds))
+                            >= bed_w - band
+                        {
+                            return;
+                        }
                         this.scrubbing = true;
                         this.scrub_to(event.position.x, true, cx);
                     }),
@@ -1362,11 +1404,15 @@ pub(crate) fn render(
                         .w(px(1.))
                         .bg(rgb(LAMP_WHITE())),
                 )
-                .child(
-                    // The pinned playhead timecode plate, DESIGN §5's own
-                    // "playhead's own timecode in a plate at the left edge" --
-                    // always at `left_0`, never following the scrubbed x, so
-                    // it never overlaps the picture region above it.
+                .when(player.scrubbing, |ruler| {
+                    // The playhead timecode plate, and ONLY while a scrub drag
+                    // is live: a drag is a state change, which is what a plate
+                    // is for. At rest the hero timecode leads the time band
+                    // (DESIGN §4) and the ledger carries position (§5); this
+                    // was the third resting copy of the same reading. Always
+                    // at `left_0`, never following the scrubbed x, so it never
+                    // overlaps the picture region above it.
+                    ruler.child(
                     div()
                         .absolute()
                         .top_0()
@@ -1383,7 +1429,8 @@ pub(crate) fn render(
                         ))
                         .text_color(rgb(INK1()))
                         .child(playhead_tc),
-                )
+                    )
+                })
                 .child(
                     div()
                         .id("bench-select-all")
@@ -1411,7 +1458,7 @@ pub(crate) fn render(
                         ))
                         .text_color(rgb(INK3()))
                         .child("all")
-                        .child(player.keymap.chord(ActionId::SelectAll)),
+                        .child(all_chord),
                 ),
         )
         .child(
