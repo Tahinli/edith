@@ -521,6 +521,47 @@ fn source_row(
         })
 }
 
+/// One entry of the Sources list, planned before anything is drawn: either a
+/// media row or the subtitle group of some file. Plain data so the *order* --
+/// the branchy part -- can be tested without a window.
+#[derive(Debug, PartialEq)]
+pub(crate) enum Slot {
+    /// Index into the media rows.
+    Media(usize),
+    /// Index into the subtitle groups.
+    Subs(usize),
+}
+
+/// Where each subtitle group belongs in the one Sources list: directly under
+/// the source that carries it, never at the end of the list (user 2026-09-10,
+/// "you put a video related subtitle to the end") -- a track that belongs to a
+/// file is that file's subset and reads as one, so it follows the *last* row
+/// naming that file, the way `library_rows` keeps a file's audio streams
+/// together. A standalone `.srt` belongs to nobody and stays a top-level row
+/// in arrival order, after the sources.
+pub(crate) fn source_list_order(media: &[PathBuf], subs: &[PathBuf]) -> Vec<Slot> {
+    let mut slots = Vec::new();
+    for (i, path) in media.iter().enumerate() {
+        slots.push(Slot::Media(i));
+        if media[i + 1..].contains(path) {
+            continue; // a later row still names this file; its subs go under that one
+        }
+        slots.extend(
+            subs.iter()
+                .enumerate()
+                .filter(|(_, sub)| *sub == path)
+                .map(|(j, _)| Slot::Subs(j)),
+        );
+    }
+    slots.extend(
+        subs.iter()
+            .enumerate()
+            .filter(|(_, sub)| !media.contains(sub))
+            .map(|(j, _)| Slot::Subs(j)),
+    );
+    slots
+}
+
 /// Imported subtitle tracks, grouped by their source -- the Text tab's own
 /// rows (DESIGN.md's "text section ... not serving to anything", user
 /// 2026-08-27: relocated off the unconditional spot under the source list
@@ -530,7 +571,11 @@ fn source_row(
 /// hover fill and selection ring -- so Text stops reading as a second
 /// dialect from Media/Audio. Hands back the track count for the tab header's
 /// own count line, same as `rows.len()` does for the other two tabs.
-fn subtitle_tab_rows(player: &Player, cx: &mut Context<Player>) -> (usize, Vec<AnyElement>) {
+fn subtitle_tab_rows(
+    player: &Player,
+    parents: &[PathBuf],
+    cx: &mut Context<Player>,
+) -> (usize, Vec<(PathBuf, usize, AnyElement)>) {
     let mut groups = match player.session.as_ref() {
         Some(session) => subtitle_rows(session.subtitles()),
         None => Vec::new(),
@@ -574,7 +619,13 @@ fn subtitle_tab_rows(player: &Player, cx: &mut Context<Player>) -> (usize, Vec<A
         .into_iter()
         .enumerate()
         .map(|(group_ord, group)| {
-            let folded = player.sub_folded.contains(&group.path);
+            // A source already in the list is this group's parent row: its
+            // tracks hang under it bare, with no `â¸ name 1 track` row of their
+            // own to separate them from it. Past three, the disclosure comes
+            // back -- and arrives shut, so membership of `sub_folded` means
+            // the editor *opened* it there.
+            let nested = parents.contains(&group.path);
+            let group_path = group.path.clone();
             let fold_path = group.path.clone();
             let tint = file_tint(player.sources(), &group.path);
             let track_count = group.rows.len();
@@ -716,19 +767,18 @@ fn subtitle_tab_rows(player: &Player, cx: &mut Context<Player>) -> (usize, Vec<A
                         )
                 })
                 .collect();
-            div()
-                .flex_none()
-                .flex()
-                .flex_col()
-                .gap(px(2.))
-                .child(
-                    div()
+            let has_header = !nested || track_count > 3;
+            let folded = has_header && (nested != player.sub_folded.contains(&group_path));
+            let header = div()
                         .id(("dock-subtitle-group", group_ord))
                         .flex_none()
                         .flex()
                         .items_center()
                         .gap(px(6.))
                         .px(px(8.))
+                        // Stepped in under its parent when it has one, the
+                        // same outline the track rows below it read as.
+                        .when(nested, |d| d.pl(px(22.)))
                         .py(px(4.))
                         .rounded(px(3.))
                         .cursor_pointer()
@@ -791,10 +841,19 @@ fn subtitle_tab_rows(player: &Player, cx: &mut Context<Player>) -> (usize, Vec<A
                                     "{track_count} track{}",
                                     if track_count == 1 { "" } else { "s" }
                                 )),
-                        ),
-                )
-                .when(!folded, |d| d.children(tracks))
-                .into_any_element()
+                        );
+            (
+                group_path,
+                track_count,
+                div()
+                    .flex_none()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .when(has_header, |d| d.child(header))
+                    .when(!folded, |d| d.children(tracks))
+                    .into_any_element(),
+            )
         })
         .collect();
     (count, rows)
@@ -852,7 +911,7 @@ fn sources_tab(
         },
     );
     let filter = player.dock_filter.to_lowercase();
-    let rows: Vec<(Row, usize)> = all_rows
+    let mut rows: Vec<(Row, usize)> = all_rows
         .into_iter()
         .map(|row| {
             let placed = player.row_ctx(&row.path, row.stream).placed;
@@ -865,23 +924,49 @@ fn sources_tab(
                 || ("unused".contains(&filter) && *placed == 0)
         })
         .collect();
-    let mut row_elements: Vec<AnyElement> = rows
-        .iter()
-        .enumerate()
-        .map(|(i, (row, placed))| {
-            let picked = player
-                .selected_asset
-                .as_ref()
-                .is_some_and(|p| *p == (row.path.clone(), row.stream));
-            source_row(player, i, row, *placed, picked, cx).into_any_element()
-        })
-        .collect();
     // The subtitle tracks join the same list rather than hiding behind a tab
     // of their own: a standalone `.srt` is a source in the sense that matters
     // here -- something that came in and can go on a lane -- and the tracks
-    // inside a container stay grouped under the file that carries them.
-    let (_, subtitles) = subtitle_tab_rows(player, cx);
-    row_elements.extend(subtitles);
+    // inside a container are drawn *under* that file's own row
+    // ([`source_list_order`]), not after every other source.
+    let media: Vec<PathBuf> = rows.iter().map(|(row, _)| row.path.clone()).collect();
+    let (_, subtitles) = subtitle_tab_rows(player, &media, cx);
+    let subs: Vec<PathBuf> = subtitles.iter().map(|(path, ..)| path.clone()).collect();
+    // Past three tracks the group under a parent arrives shut, so the count
+    // goes on the parent's own metadata line -- the number stays readable
+    // while the rows it counts are folded away.
+    for (i, (row, _)) in rows.iter_mut().enumerate() {
+        if media[i + 1..].contains(&row.path) {
+            continue;
+        }
+        if let Some((_, n, _)) = subtitles
+            .iter()
+            .find(|(path, n, _)| *path == row.path && *n > 3)
+        {
+            row.detail = join_detail(&row.detail, &format!("{n} subs"));
+        }
+    }
+    let mut subtitles: Vec<Option<AnyElement>> =
+        subtitles.into_iter().map(|(.., el)| Some(el)).collect();
+    let mut row_elements: Vec<AnyElement> = Vec::new();
+    for slot in source_list_order(&media, &subs) {
+        match slot {
+            Slot::Media(i) => {
+                let (row, placed) = &rows[i];
+                let picked = player
+                    .selected_asset
+                    .as_ref()
+                    .is_some_and(|p| *p == (row.path.clone(), row.stream));
+                row_elements
+                    .push(source_row(player, i, row, *placed, picked, cx).into_any_element());
+            }
+            Slot::Subs(j) => {
+                if let Some(el) = subtitles[j].take() {
+                    row_elements.push(el);
+                }
+            }
+        }
+    }
     let filter_text: SharedString = player.dock_filter.clone().into();
     div()
         .id("dock-sources")
