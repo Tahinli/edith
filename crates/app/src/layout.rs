@@ -89,6 +89,13 @@ pub(crate) const EXPORT_KEY_W: f32 = 26.;
 pub(crate) const MENU_W: f32 = 260.;
 pub(crate) const MENU_ROW_H: f32 = HIT_MIN;
 pub(crate) const MENU_PAD: f32 = 6.;
+/// The breathing room a hanging menu keeps against every window edge. Without
+/// it `menu_at`'s clamp let a menu sit flush on the bottom edge -- the last row
+/// touching the frame reads as a list cut off rather than a list that ended,
+/// which is what the user saw at 1280x720 (`f-clip-menu.png`, rows running to
+/// y=720 exactly). Taken out of the room the list may fill as well as off the
+/// clamp, so a floored menu never grows back up over the picture to buy it.
+pub(crate) const MENU_EDGE: f32 = 4.;
 
 /// A cue's text, and the line it sits on. Fixed rather than a share of the
 /// picture: the video region is 108 px tall at the 640x360 floor and a

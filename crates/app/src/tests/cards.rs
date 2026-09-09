@@ -1443,7 +1443,7 @@ fn a_choice_list_offers_every_value_and_fits_the_smallest_window() {
     assert!(tall <= 360., "the list is taller than the floor");
     assert_eq!(
         menu_at(point(px(600.), px(340.)), size(px(640.), px(360.)), tall),
-        (640. - MENU_W, 360. - tall),
+        (640. - crate::layout::MENU_EDGE - MENU_W, 360. - crate::layout::MENU_EDGE - tall),
         "the list would hang off the smallest window"
     );
 }
