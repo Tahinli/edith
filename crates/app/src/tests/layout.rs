@@ -2206,9 +2206,11 @@ fn every_darkroom_menu_sizes_its_list_against_the_floor_room_not_the_raw_viewpor
          to the picture floor (the 'menu in somewhere nonsense' defect)"
     );
     assert!(
-        library.contains("menu_at(menu.at, viewport"),
-        "ui/library.rs no longer anchors its menu to the pointer through \
-         menu_at -- update this guard"
+        library.contains("menu_at(at, viewport, h)")
+            && library.contains("point(menu.at.x, menu.at.y + px(ROW_CLEAR))"),
+        "ui/library.rs no longer anchors its menu to the pointer -- one row \
+         clear of it, so the menu cannot cover the row it names -- through \
+         menu_at; update this guard"
     );
 }
 
