@@ -407,11 +407,11 @@ fn ghost(
         ))
         .text_color(rgb(INK2()))
         .child(glyph.to_string())
-        // The badge is skipped when the stroke IS the glyph: `?` over `?`
-        // drew as two identical rows stacked at the foot of the rail and read
-        // as a duplicated control rather than as one command wearing its own
-        // chord.
-        .children((player.keymap.chord(action) != glyph).then(|| {
+        // Every command wears its chord (DESIGN §4) -- including the one
+        // whose glyph IS its stroke: `?` reads as `?` over a dimmer `?`,
+        // the same glyph-over-chord anatomy every other spine ghost draws,
+        // rather than as the one control on the rail with nothing under it.
+        .child(
             div()
                 .type_style(type_scale::mono(
                     type_scale::CHORD_METADATA_MIN_PX,
@@ -420,8 +420,8 @@ fn ghost(
                 .text_color(rgb(INK3()))
                 // FAULT 1: the badge shows the primary chord, compact --
                 // same rule as every glyph in `spine_stance`.
-                .child(player.keymap.chord(action))
-        }))
+                .child(player.keymap.chord(action)),
+        )
 }
 
 /// The keys overlay (DESIGN §9, §12 step 7): every bound command, sectioned
@@ -460,6 +460,13 @@ fn keys_overlay(player: &Player, bench_h: f32, cx: &mut Context<Player>) -> impl
         .h(px(bench_h + LEDGER_H))
         .bg(rgba(SCRIM()))
         .flex()
+        // The plate's inset lives on the scrim, not on the plate's own
+        // margins: a margin under a fixed `h()` left the list flush with the
+        // window's bottom edge and its last rows cut over the ledger. Padding
+        // here takes the room off the footprint before the plate is measured.
+        .pl(px(12.))
+        .pt(px(8.))
+        .pb(px(8.))
         // Bottom-left, not centred: the `?` control that opens this lives at
         // the foot of the spine ([`spine`]'s last child), and this overlay
         // mounts inside the *centre* column next to it -- anchoring the list
@@ -482,9 +489,10 @@ fn keys_overlay(player: &Player, bench_h: f32, cx: &mut Context<Player>) -> impl
         .child(
             div()
                 .id("stance-keys-list")
-                .ml(px(12.))
-                .mb(px(12.))
-                .h(px((bench_h + LEDGER_H - 24.).max(0.)))
+                // Capped to the bench+ledger footprint less the scrim's own
+                // inset, so the bottom border is on screen and the rows
+                // scroll inside it (DESIGN §9).
+                .h(px((bench_h + LEDGER_H - 16.).max(0.)))
                 .w(px(460.))
                 .overflow_y_scroll()
                 .p(px(10.))
@@ -496,7 +504,27 @@ fn keys_overlay(player: &Player, bench_h: f32, cx: &mut Context<Player>) -> impl
                 .flex()
                 .flex_col()
                 .gap(px(3.))
-                .child(section_head("all commands · hold ? · release to close"))
+                // DESIGN §8, no instructional copy: the heading is the
+                // single noun, and the way out is a chord on the right like
+                // every other row here -- not a sentence that lied anyway
+                // (a click-opened plate does not close on a release).
+                .child(
+                    div()
+                        .flex_none()
+                        .flex()
+                        .justify_between()
+                        .gap(px(12.))
+                        .child(section_head("keys"))
+                        .child(
+                            div()
+                                .type_style(type_scale::mono(
+                                    type_scale::CHORD_METADATA_MIN_PX,
+                                    gpui::FontWeight::MEDIUM,
+                                ))
+                                .text_color(rgb(INK3()))
+                                .child("esc"),
+                        ),
+                )
                 .children(keys_rows().into_iter().map(|row| {
                     match row {
                         KeyRow::Head(category) => div()
