@@ -111,9 +111,10 @@ Fixed geography; nothing moves, nothing occludes the picture:
 │           occluded)             │ Src/ │
 │                                 │ Clip │
 ├─────────────────────────────────┤ KEYS │
-│ TIME BAND: timecode → ghost     │ tabs │
-│  transport → cut readout →      │      │
-│  contact strip → [Export]       │      │
+│ TIME BAND: timecode → |◂ ▶ ▸|   │ tabs │
+│  → cut 14/37 → contact strip    │      │
+│  (with the in/out grips)        │      │
+│  → [Export]                     │      │
 ├─────────────────────────────────┤      │
 │ ruler · lanes  • V1  • A1  • S1  │      │
 ├─────────────────────────────────┤      │
@@ -124,9 +125,20 @@ Fixed geography; nothing moves, nothing occludes the picture:
 
 - **Screen**: the picture. Never covered — not by drawers, notices, drags, or menus. Two-up
   OUT|IN judging renders *in* the screen at rest on a cut.
-- **Time band**: timecode leads; ghost transport; cut readout (`14/37`); the **contact strip**
-  (whole-film motion-trace minimap, `FILM` label, viewport bracket with grip notches — click
-  jumps, drag pans); boxed **Export** at the end.
+- **Time band**: timecode leads; one transport (`|◂ ▶ ▸|` — frame back, play/pause, frame
+  forward); the cut odometer (`14/37`, and the word `roll` only while roll is armed); the
+  **contact strip** (whole-film motion-trace minimap, viewport bracket with grip notches — click
+  jumps, drag scrubs, the bracket's notches pan; the export range's **in/out marks are two `ink1`
+  grips on the strip at their own film positions**, draggable to set the mark, drawn only once a
+  mark exists and taking the pointer within ±6px); boxed **Export** at the end.
+
+**Amendment (2026-09-10), "cleanse round 2"** (user: "seems cool, let's apply"): the band holds
+five things and nothing else. The shuttle pair (`◀◀ ▶▶`), home/end, the sync points, the loop
+toggle, the monitoring cluster (mute, level slider, percent), the `I O ×` marks trio and `Save`
+all left it — each keeps its chord and its KEYS-tab row, the ruler menu keeps the verbs that act
+on the ruler, the marks became the strip's grips, and the ledger already says `saved`/`unsaved ·
+^s`. The picture's `scale 0.59` corner readout is deleted with them: fit is `^0`, and the number
+was a state nobody acts on.
 - **Bench**: the ruler row, then lanes. Clip anatomy = ink spine (3px left edge) + real
   thumbnails/waveform in the source's ink + name plate + splice gaps in lamp white. A lane head
   is a source dot and the lane's name (`• V1`, 60px) and nothing else; the name plate carries
