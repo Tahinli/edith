@@ -2739,3 +2739,59 @@ fn the_bench_answers_a_wheel_notch_anywhere_over_it() {
         "the ruler answers the wheel on its own again -- one notch, two scrolls"
     );
 }
+
+/// The way back from a layout dragged somewhere unusable: a double press on
+/// the seam forgets the size, and the region is the window's own share again
+/// -- the *same* share an untouched window gives it, not a second default
+/// kept beside the first ([`Splits::clear`]).
+#[test]
+fn a_double_pressed_divider_forgets_the_size_it_was_dragged_to() {
+    use crate::layout::{Split, Splits, split_size};
+    use gpui::{px, size};
+
+    let window = size(px(1280.), px(720.));
+    let mut splits = Splits::default();
+    for split in Split::PERSISTED {
+        let default = split_size(split, None, 2, window, false);
+        // A hand takes the seam somewhere else...
+        splits.set(split, split_size(split, Some(300.), 2, window, false));
+        assert_ne!(
+            splits.get(split),
+            None,
+            "{split:?} kept nothing of the drag"
+        );
+        // ...and the double press puts it back where an untouched window
+        // would have drawn it.
+        splits.clear(split);
+        assert_eq!(splits.get(split), None, "{split:?} still holds a size");
+        assert_eq!(
+            split_size(split, splits.get(split), 2, window, false),
+            default,
+            "{split:?} came back to something other than its own share"
+        );
+    }
+}
+
+/// The seam is a ghost (DESIGN §11.2): 6 px of hit area with *nothing* painted
+/// at rest, one hairline of dim ink under the pointer, the same line one step
+/// brighter while it is held. The scan is the guard because the failure it
+/// catches -- a `bg` on the strip, which is what the divider shipped with --
+/// draws a 6 px band of colour down the room at rest and reads as the chrome
+/// the user called crowded.
+#[test]
+fn the_seam_paints_nothing_until_a_pointer_finds_it() {
+    let src = src_text("interact.rs");
+    let start = src.find("pub(crate) fn divider(").expect("the divider");
+    let body = &src[start..start + src[start..].find("\n}\n").expect("its end")];
+    assert!(
+        !body.contains(".bg("),
+        "the divider fills its strip at rest: {body}"
+    );
+    assert!(
+        body.contains("gpui::transparent_black()"),
+        "the divider's line is inked at rest: {body}"
+    );
+    for step in [".hover(", "STROKE_DIVIDER()", "INK3()", "border_t_1()", "border_l_1()"] {
+        assert!(body.contains(step), "the divider is missing {step}");
+    }
+}
