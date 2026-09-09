@@ -238,20 +238,52 @@ pub(crate) fn drag_scrim(cx: &mut Context<Player>) -> Div {
 /// where the pointer stays, and a divider whose own listeners tracked it would
 /// stop following the hand on the first move. `stop_propagation` so the press
 /// never reaches the region under it -- a seam over the timeline must not scrub.
-pub(crate) fn divider(split: Split, cx: &mut Context<Player>) -> Div {
+///
+/// Drawn to the ghost grammar (DESIGN §11.2): nothing at rest -- a room whose
+/// every seam is inked is the "crowded" the user named -- then one hairline of
+/// dim ink under the pointer, and the same line one step brighter while the
+/// hand is actually holding it. The 6 px strip is the *hit* area throughout;
+/// only its 1 px edge is ever painted. `held` is the seam this window is
+/// dragging right now ([`Player::split_drag`]), which the pointer leaves on the
+/// first move -- so the lit line has to come from the model, not from `hover`.
+///
+/// A double press resets the seam to the window's own share
+/// ([`Splits::clear`]): the cheap way back from a layout dragged somewhere
+/// unusable, and the one every editor's dividers answer to.
+pub(crate) fn divider(split: Split, held: bool, cx: &mut Context<Player>) -> Div {
     let across = matches!(split, Split::Timeline | Split::Bench);
     div()
         .flex_none()
-        .when(across, |d| d.h(px(SPLIT_W)).w_full().cursor_row_resize())
-        .when(!across, |d| d.w(px(SPLIT_W)).h_full().cursor_col_resize())
-        .bg(rgb(STROKE_DIVIDER()))
+        .when(across, |d| {
+            d.h(px(SPLIT_W)).w_full().cursor_row_resize().border_t_1()
+        })
+        .when(!across, |d| {
+            d.w(px(SPLIT_W)).h_full().cursor_col_resize().border_l_1()
+        })
+        .border_color(match held {
+            true => gpui::Hsla::from(rgb(INK3())),
+            false => gpui::transparent_black(),
+        })
         // Lit under the pointer: the second half of "this can be dragged", said
         // before the button goes down rather than after.
-        .hover(|s| s.bg(rgb(ACCENT_PRIMARY())))
+        .when(!held, |d| {
+            d.hover(|s| s.border_color(rgb(STROKE_DIVIDER())))
+        })
         .on_mouse_down(
             MouseButton::Left,
-            cx.listener(move |this, _: &MouseDownEvent, _, cx| {
-                this.split_drag = Some(split);
+            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                match event.click_count >= 2 {
+                    // The reset is written where a release would have written
+                    // the drag, the same small round trip: a seam put back by
+                    // hand must not come back on the next launch.
+                    true => {
+                        this.split_drag = None;
+                        this.splits.clear(split);
+                        crate::layout::save_stance_splits(&this.splits);
+                    }
+                    false => this.split_drag = Some(split),
+                }
+                cx.notify();
                 cx.stop_propagation();
             }),
         )

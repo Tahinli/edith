@@ -1085,7 +1085,7 @@ pub(crate) fn render(
                 }))
                 .child(screen(player, position, window, cx))
                 .child(time_band(player, position, cx))
-                .child(divider(Split::Bench, cx))
+                .child(divider(Split::Bench, player.split_drag == Some(Split::Bench), cx))
                 .child(bench(player, bench_h, window, cx))
                 .child(ledger(player, position))
                 .when(player.keys_open, |el| {
@@ -1135,7 +1135,7 @@ pub(crate) fn render(
                         .children(player.subtitle_style_card(window_size, cx))
                 }),
         )
-        .child(divider(Split::Dock, cx))
+        .child(divider(Split::Dock, player.split_drag == Some(Split::Dock), cx))
         .child(dock(player, dock_w, window_size, window, cx))
         // The library row menu mounts on the ROOT, not inside
         // `stance-centre` like the clip menu beside it: it is opened from a
