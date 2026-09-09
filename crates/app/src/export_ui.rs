@@ -47,7 +47,10 @@ pub(crate) fn sample_rate_choices(current: Option<u32>) -> Vec<ChoiceRow> {
     let mut rows = vec![(
         Choice::SampleRate(None),
         "Source".into(),
-        "the first audio source's own rate".into(),
+        // A state word, the resolution list's rule: the six-word phrase this
+        // row wore ran past `MENU_W` and was cut mid-word like the size
+        // list's was. Nothing is resampled -- that is what the row means.
+        "unchanged".into(),
         current.is_none(),
     )];
     rows.extend(SAMPLE_RATES.into_iter().map(|rate| {
@@ -338,9 +341,11 @@ pub(crate) fn resolution_choices(current: (u32, u32), native: (u32, u32)) -> Vec
                 Choice::Size(w, h),
                 format!("{h}p").into(),
                 match (w, h) == native {
-                    // Short enough to sit beside the label inside `MENU_W`:
-                    // the longer phrase lost its last word to the truncation.
-                    true => format!("{w}x{h} · the media's own"),
+                    // A state word, not prose (DESIGN §8): "· the media's own"
+                    // lost its last word to `MENU_W` on the row a user read
+                    // ("word cut"). `source` is the word the sample-rate list
+                    // already says the same fact in.
+                    true => format!("{w}x{h} source"),
                     false => format!("{w}x{h}"),
                 }
                 .into(),
