@@ -374,6 +374,12 @@ pub(crate) fn enable_lane(action: ActionId, lane: Lane, ctx: Ctx) -> Enable {
 /// second row arguing about the same act.
 pub(crate) fn lane_items(lane: Lane) -> Vec<ActionId> {
     let mut items = HEAD_ADDS.to_vec();
+    // The verbs that used to hang off the head itself (cleanse round 2): the
+    // head is a dot and a name now, and this menu is where the pointer reaches
+    // its mix -- an audio lane's alone, the way `enable_lane` reads it.
+    if lane.kind == LaneKind::Audio {
+        items.push(ActionId::Mix);
+    }
     items.push(match lane.kind {
         LaneKind::Video => ActionId::RemoveVideoLane,
         LaneKind::Audio => ActionId::RemoveAudioLane,
