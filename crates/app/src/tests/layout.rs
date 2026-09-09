@@ -3456,19 +3456,32 @@ fn the_only_hue_in_the_export_section_is_the_av1_gpu_notice() {
 /// `.tooltip` is a glyph the user cannot name.
 ///
 /// A scan and not a render: this crate has no gpui window in its tests, so
-/// the function body is the finest grain available. One control may emit two
-/// hitmap ids (a row and the selection inside it), which is what
-/// `DOUBLE_NAMED` allows for, by name and with its reason.
+/// the text is the finest grain available. Each emitter must claim a
+/// `.tooltip(` of *its own* within [`REACH`] lines -- one to one, nearest
+/// first. Counting them per function instead let an unrelated plate (the
+/// empty-dock hint) pay for a control that had none: `dock.sort.cycle` sat
+/// bare under a green gate until this pairing was written.
+///
+/// Controls outside the hitmap are outside this gate by charter. Named for
+/// the record, since each is a control the pointer can press: a card's own
+/// picker rows (colour/transform/mix/subtitle/silence bands, the speed
+/// chips) and the two menus' rows, all of which already read as
+/// `<label> <value-or-chord>` on the row itself -- a plate would repeat the
+/// row it hangs off, which is DESIGN §8's prose rule the other way round.
 #[test]
 fn every_hitmap_control_wears_a_hover_line() {
-    // (file, fn, ids beyond the first that name the SAME control)
-    const DOUBLE_NAMED: &[(&str, &str, usize)] = &[(
-        "dock_stance.rs",
-        "subtitle_tab_rows",
-        // `subtitle.N.M.row` and `subtitle.N.M.select` are one row: the
-        // second id is the harness's aim point for picking it.
-        1,
-    )];
+    /// How far from a control's `hitmap::` line its plate may be attached.
+    /// A builder chain runs long here (the contact strip's tooltip sits 65
+    /// lines above its emitter), so the reach is generous; what it buys is
+    /// that a plate can be spent only once.
+    const REACH: usize = 80;
+    // Ids that name a control a *previous* emitter in the same chain already
+    // plated -- the second id is the harness's aim point, not a second
+    // control -- with the reason each is exempt.
+    const DOUBLE_NAMED: &[&str] = &[
+        // `subtitle.N.M.row` and `subtitle.N.M.select` are one row.
+        ".select\")",
+    ];
     let mut controls = 0;
     let mut naked = Vec::new();
     for path in source_files() {
@@ -3481,53 +3494,33 @@ fn every_hitmap_control_wears_a_hover_line() {
             .and_then(|n| n.to_str())
             .expect("a file name")
             .to_string();
-        let mut at = 0;
-        while let Some(found) = text[at..].find("fn ") {
-            let start = at + found;
-            at = start + 3;
-            let name: String = text[at..]
-                .chars()
-                .take_while(|c| c.is_alphanumeric() || *c == '_')
+        let lines: Vec<&str> = text.lines().collect();
+        let mut tips: Vec<(usize, bool)> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.contains(".tooltip("))
+            .map(|(i, _)| (i, false))
+            .collect();
+        for (i, line) in lines.iter().enumerate() {
+            let emitter = ["hitmap::control(", "hitmap::dynamic(", "hitmap::action("]
+                .iter()
+                .any(|needle| line.contains(needle));
+            if !emitter {
+                continue;
+            }
+            // The id a `dynamic` builds sits a line or three below its call.
+            let head = lines[i..(i + 6).min(lines.len())].join("\n");
+            if DOUBLE_NAMED.iter().any(|id| head.contains(id)) {
+                continue;
+            }
+            controls += 1;
+            let mut free: Vec<usize> = (0..tips.len())
+                .filter(|n| !tips[*n].1 && tips[*n].0.abs_diff(i) <= REACH)
                 .collect();
-            if name.is_empty() {
-                continue;
-            }
-            let Some(open) = text[at..].find('{').map(|i| at + i) else {
-                continue;
-            };
-            let mut depth = 0usize;
-            let mut end = text.len();
-            for (i, c) in text[open..].char_indices() {
-                match c {
-                    '{' => depth += 1,
-                    '}' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            end = open + i;
-                            break;
-                        }
-                    }
-                    _ => (),
-                }
-            }
-            let body = &text[start..end];
-            let emitters = ["hitmap::control(", "hitmap::dynamic(", "hitmap::action("]
-                .iter()
-                .map(|needle| body.matches(needle).count())
-                .sum::<usize>();
-            if emitters == 0 {
-                continue;
-            }
-            controls += emitters;
-            let allowed = DOUBLE_NAMED
-                .iter()
-                .find(|(f, n, _)| *f == file && *n == name)
-                .map_or(0, |(_, _, extra)| *extra);
-            let tips = body.matches(".tooltip(").count();
-            if tips + allowed < emitters {
-                naked.push(format!(
-                    "{file}::{name} -- {emitters} hitmap controls, {tips} tooltips"
-                ));
+            free.sort_by_key(|n| tips[*n].0.abs_diff(i));
+            match free.first() {
+                Some(n) => tips[*n].1 = true,
+                None => naked.push(format!("{file}:{}: {}", i + 1, line.trim())),
             }
         }
     }
@@ -3537,8 +3530,9 @@ fn every_hitmap_control_wears_a_hover_line() {
     );
     assert!(
         naked.is_empty(),
-        "controls with no hover line (attach `widgets::tip_hover`/`action_hover` \
-         in the shared constructor): {naked:#?}"
+        "controls with no hover line of their own (attach \
+         `widgets::tip_hover`/`action_hover` in the chain that emits the \
+         hitmap id): {naked:#?}"
     );
 }
 
