@@ -209,6 +209,45 @@ fn dark_step_glyph(
         .child(dark_row_value(if plus { "+" } else { "−" }))
 }
 
+/// One segment of the export moment's plan line (row 3): the thing it says
+/// *is* the button that changes it, so `H.264 \u{b7} MP4` is pressed to walk the
+/// files and wears `c` beside it exactly as the Settings row does (user
+/// 2026-09-09: "couldn't find how to change encode options, simplifying
+/// doesn't mean getting rid of advanced settings"). A ghost (DESIGN \u{a7}4) at a
+/// readout's size: `ink3` at rest so the line stays as quiet as the one it
+/// replaced, `ink2` and one fill step on hover, the chord in `ink4` beside it.
+fn moment_segment(
+    id: &'static str,
+    text: impl Into<SharedString>,
+    chord: impl Into<SharedString>,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let text: SharedString = text.into();
+    let hitmap = hitmap::enabled().then(|| {
+        let label = text.clone();
+        hitmap::dynamic(move || (format!("card.{id}"), label.to_string()), true)
+    });
+    div()
+        .id(id)
+        .flex_none()
+        .flex()
+        .items_baseline()
+        .gap(px(5.))
+        .px(px(4.))
+        .rounded(px(3.))
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(DARK_RAISED())).text_color(rgb(INK2())))
+        .on_click(on_click)
+        .children(hitmap.flatten())
+        .type_style(type_scale::mono(
+            type_scale::CHORD_METADATA_MIN_PX,
+            gpui::FontWeight::MEDIUM,
+        ))
+        .text_color(rgb(INK3()))
+        .child(text)
+        .child(div().flex_none().text_color(rgb(INK4())).child(chord.into()))
+}
+
 fn dark_ghost_button(
     id: impl Into<gpui::ElementId>,
     text: impl Into<SharedString>,
@@ -323,7 +362,33 @@ impl Player {
                 timecode(f64::from(end) / self.fps, self.fps),
             )
         });
-        let plan = plan_line(self.format, audio, marks.as_deref(), hardware);
+        // Row 3's segments are the Settings room's own EXPORT rows worn as
+        // ghosts on the line that used to only *report* them -- the same
+        // setters, so both surfaces can never disagree.
+        // What the engine says the sound *will* be ("AAC 256 kbps", or "AAC
+        // copy" where the source's own stream is carried through): a rate
+        // nobody is choosing wears no chord, the Settings row's own rule for
+        // a codec with no rate to pick.
+        let (codec, rated) = crate::ui::settings_stance::sound_codec(self.format);
+        let sound_label = match audio.is_empty() {
+            true => codec.to_string(),
+            false => audio.to_string(),
+        };
+        let sound_keyed = rated && !audio.contains("copy");
+        // `auto` is a promise until the probe answers; once it has, the seat
+        // says what it resolved to rather than the word nobody picked.
+        let seat = self.encoder_seat();
+        let seat_label = match seat {
+            EncoderSeat::Auto => format!(
+                "auto \u{2192} {}",
+                match hardware {
+                    true => "GPU",
+                    false => "SW",
+                }
+            ),
+            _ => crate::ui::settings_stance::encoder_word(seat).to_string(),
+        };
+        let range = range_word(marks.as_deref(), self.format.has_video());
         // The refusal the button used to carry, said before it is pressed and
         // in the readout's own place: a few words and the chord that fixes it,
         // never the sentence the old card wrapped over three lines.
@@ -530,17 +595,82 @@ impl Player {
                 div()
                     .flex_1()
                     .min_w(px(0.))
-                    .truncate()
-                    .type_style(type_scale::mono(
-                        type_scale::CHORD_METADATA_MIN_PX,
-                        gpui::FontWeight::MEDIUM,
-                    ))
-                    .text_color(rgb(match blocked.is_some() {
-                        true => STATUS_WARNING(),
-                        false => INK4(),
+                    .flex()
+                    .items_baseline()
+                    .gap(px(6.))
+                    .children(self.format.has_video().then(|| {
+                        moment_segment(
+                            "moment-picture",
+                            crate::ui::settings_stance::picture_label(self.format),
+                            "c",
+                            cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.cycle_export_picture();
+                                cx.notify();
+                            }),
+                        )
                     }))
-                    .child(blocked.clone().unwrap_or(plan)),
+                    .children(sound_keyed.then(|| {
+                        moment_segment(
+                            "moment-sound",
+                            sound_label.clone(),
+                            "b",
+                            cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.cycle_audio_kbps();
+                                cx.notify();
+                            }),
+                        )
+                    }))
+                    // A codec with no rate to pick is a readout, not a button
+                    // that would do nothing when pressed -- the Settings row's
+                    // own rule.
+                    .children((!sound_keyed).then(|| {
+                        div()
+                            .flex_none()
+                            .type_style(type_scale::mono(
+                                type_scale::CHORD_METADATA_MIN_PX,
+                                gpui::FontWeight::MEDIUM,
+                            ))
+                            .text_color(rgb(INK4()))
+                            .child(sound_label.clone())
+                    }))
+                    .children(self.format.has_video().then(|| {
+                        moment_segment(
+                            "moment-encoder",
+                            seat_label.clone(),
+                            "g",
+                            cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.cycle_encoder(cx);
+                            }),
+                        )
+                    }))
+                    // The range is set on the timeline with the marks
+                    // themselves, so here it is what the file will hold --
+                    // or, where the press would be refused, the refusal in
+                    // its place (DESIGN \u{a7}8: said before it is pressed).
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
+                            .type_style(type_scale::mono(
+                                type_scale::CHORD_METADATA_MIN_PX,
+                                gpui::FontWeight::MEDIUM,
+                            ))
+                            .text_color(rgb(match blocked.is_some() {
+                                true => STATUS_WARNING(),
+                                false => INK4(),
+                            }))
+                            .child(blocked.clone().unwrap_or(range)),
+                    ),
             )
+            // The door to everything else this file could be written as: the
+            // room's own settings chord, on the moment that needed it.
+            .child(moment_segment(
+                "moment-settings",
+                "settings",
+                self.keymap.chord(ActionId::Settings),
+                cx.listener(|this, _: &ClickEvent, _, cx| this.open_settings(cx)),
+            ))
             .child(
                 div()
                     .id("export-confirm")
