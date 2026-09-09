@@ -195,14 +195,32 @@ fn dock_tab(
         .pb(px(6.))
         .when(active, |d| d.border_t_1().border_color(rgb(INK1())))
         .cursor_pointer()
-        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
             // The keys list is body state, not a tab (user 2026-09-09:
             // "remove keys section from here since we also have it next to
             // ledger") -- picking either tab is also the way out of it, and
             // the pair itself (`dock_src_active`) is what the file keeps.
             this.keys_open = false;
-            this.dock_src_active = label_text == "SOURCES";
-            save(this.dock_src_active);
+            let surface = match label_text == "SOURCES" {
+                true => Surface::Dock,
+                false => Surface::Inspector,
+            };
+            // Same dead-handle class as `keys_tab`'s: the tab being left
+            // takes its `FocusHandle`'s element out of the tree with it, so a
+            // ring that was on that handle has to move with the tab or the
+            // keyboard goes silent. Only when the ring is actually in the
+            // dock -- a tab picked while the bench (or nothing) has focus
+            // does not steal it.
+            let in_ring = window
+                .focused(cx)
+                .is_some_and(|f| f == this.focus_dock || f == this.focus_inspector);
+            match in_ring {
+                true => this.focus_surface(surface, window, cx),
+                false => {
+                    this.dock_src_active = label_text == "SOURCES";
+                    save(this.dock_src_active);
+                }
+            }
             cx.notify();
         }))
         .tooltip(crate::ui::widgets::tip_hover(&format!("Show {}", label_text.to_lowercase()), "", None))
@@ -1441,7 +1459,20 @@ fn clip_tab(
 /// An action the room would refuse right now greys to `ink4`, the same ink a
 /// refused verb wears (DESIGN §8) -- never hidden: the list is the full truth
 /// about the keyboard, including the strokes that would answer `No` today.
-fn keys_tab(player: &Player) -> impl IntoElement {
+fn keys_tab(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
+    // The surface this body is standing in for. `keys_tab` replaces whichever
+    // tab was mounted, and gpui dispatches a key only along the *rendered*
+    // focus node's ancestors: a `FocusHandle` whose element left the tree
+    // falls back to the window's own root node, which the room's handler
+    // (`ui::stance::render`'s div) is not -- so every key dies until the next
+    // click. Mounting the same handle here is what keeps `?` able to close
+    // the list it just opened (measured 2026-09-09: second `?` and `space`
+    // reached no listener at all).
+    let surface = match player.dock_src_active {
+        true => Surface::Dock,
+        false => Surface::Inspector,
+    };
+    let focus = player.focus_handle(surface).clone();
     let row_label = label(type_scale::CHORD_METADATA_MIN_PX, FontWeight::MEDIUM);
     let row_chord = mono(type_scale::CHORD_METADATA_MIN_PX, FontWeight::MEDIUM);
     let pair = move |text: String, chord: String, ink: u32| {
@@ -1477,6 +1508,10 @@ fn keys_tab(player: &Player) -> impl IntoElement {
     };
     div()
         .id("dock-keys-rows")
+        .track_focus(&focus)
+        .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+            cycle_on_key_down(surface)(this, event, window, cx)
+        }))
         .flex_1()
         .min_h(px(0.))
         .flex()
@@ -1551,7 +1586,7 @@ pub(crate) fn render(
                 .child(dock_tab("dock-tab-clip", "CLIP", !src_active && !keys, cx)),
         )
         .child(match (keys, src_active) {
-            (true, _) => keys_tab(player).into_any_element(),
+            (true, _) => keys_tab(player, cx).into_any_element(),
             (false, true) => sources_tab(player, window, cx).into_any_element(),
             (false, false) => clip_tab(player, width, window_size, window, cx).into_any_element(),
         })
