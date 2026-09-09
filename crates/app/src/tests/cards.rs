@@ -2006,3 +2006,32 @@ fn toggle_proxy_wakes_the_asked_phase_it_stops() {
         "a stop asked during Asked no longer sets the flag the header read polls"
     );
 }
+
+/// A wheel notch on the budget must not re-ask the seat probe. The probe opens
+/// a real VA-API encoder (ten opens for ten notches before this, 5-32 ms of GPU
+/// work each, against the player's own decoder) and its answer -- GPU seat or
+/// software, copy or encode -- does not depend on the bitrate at all. So the
+/// settings it is keyed on carry no budget, and the budget still reaches the
+/// export itself, which is the one place it changes a file.
+#[test]
+fn the_seat_probe_is_not_keyed_on_the_budget() {
+    let seat = EncoderSeat::default();
+    let asked = crate::probe_settings(Format::Mp4, DEFAULT_AUDIO_KBPS, seat);
+    assert_eq!(asked.bitrate, None, "no budget is in the probe's question");
+    // What still *is* a new question: the format the file is written in.
+    assert_ne!(
+        asked,
+        crate::probe_settings(Format::Av1, DEFAULT_AUDIO_KBPS, seat),
+        "a format change must re-probe"
+    );
+    let cache = fn_body("cache_export_seat");
+    assert!(
+        cache.contains("probe_settings(") && !cache.contains("budget_bps()"),
+        "the seat cache is keyed on the budget again"
+    );
+    // ...and the number the wheel moves is still what the export is given.
+    assert!(
+        fn_body("start_export").contains("self.budget_bps()"),
+        "the export no longer writes at the budget on the row"
+    );
+}
