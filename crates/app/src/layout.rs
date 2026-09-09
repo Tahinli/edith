@@ -320,19 +320,14 @@ pub(crate) const SPLIT_W: f32 = 6.;
 /// the strip's far side), not the six transparent pixels in front of it.
 pub(crate) const GRAB_W: f32 = 14.;
 
-/// The bench seam's own band, deeper than [`GRAB_W`] because it may be: what
-/// lies under the seam is `ui::stance::bench`'s own section head -- 24 px of
-/// border, padding and the word "bench", with nothing in it to press -- so the
-/// band reaches down through it instead of stopping 7 px past the line. Driven
-/// at 2560x1440 against his own `bench=207`: with the 14 px band the seam
-/// answered a press only within +/-7 px of the line the eye sees and was silent
-/// on the `BENCH` label row below it, which is the visible top edge of the
-/// timeline and so the thing a hand aims at ("library resizes but timeline
-/// doesn't" -- his real `stance-splits` holds `dock=277`, a dragged dock, beside
-/// a `bench=207` that is a press with no drag in it). 20 px hung one row above
-/// the strip covers the line, the six pixels in front of it and the whole head
-/// row: `-1 .. +19` of strip, `-7 .. +13` of the seam.
-pub(crate) const BENCH_GRAB_H: f32 = 20.;
+/// The bench seam's own band. It used to be deeper than [`GRAB_W`] because
+/// what lay under the seam was `ui::stance::bench`'s own section head -- 24 px
+/// with nothing in it to press, so the band reached down through it. That head
+/// is gone (cleanse round 2): the ruler row is the bench's top edge now, and
+/// the ruler *is* pressable (it scrubs), so a band reaching into it would take
+/// presses meant for the film. Back to every other seam's reach: `-1 .. +13`
+/// of strip, `-7 .. +7` of the seam.
+pub(crate) const BENCH_GRAB_H: f32 = GRAB_W;
 
 /// The most of the window one side column may be dragged to. A third each, so
 /// the picture keeps the middle at every size -- the rule [`library_w`] and

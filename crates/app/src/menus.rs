@@ -260,7 +260,11 @@ pub(crate) const MENU_ITEMS: [ActionId; 16] = [
 /// undo pair, which is the one thing every editor expects on empty canvas.
 /// Not a junk drawer (§9): nothing here acts on a clip, and everything here
 /// acts on the thing the pointer is over.
-pub(crate) const BENCH_ITEMS: [ActionId; 10] = [
+pub(crate) const BENCH_ITEMS: [ActionId; 11] = [
+    // The `all` control left the ruler's right edge (cleanse round 2): this
+    // row is where the pointer reaches "select everything" now, and `^a`
+    // still fires it.
+    ActionId::SelectAll,
     ActionId::WalkCutPrev,
     ActionId::WalkCutNext,
     ActionId::WalkCutPrev10,
