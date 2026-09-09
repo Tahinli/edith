@@ -3401,6 +3401,25 @@ fn one_name_per_source_one_stem_helper_and_one_save_door() {
         stance.contains(r#"room_ghost(player, "unsaved", ActionId::Save"#),
         "the ledger's unsaved state is not Save's door -- it is a word again"
     );
+    // The close request is intercepted and routed through the predicate, and
+    // the plate it raises is answered: this repo can build no window in a
+    // test ([`Player`] needs a `TestAppContext`), so the wiring itself is
+    // what is guarded -- the hook, the rule it asks, and the three answers.
+    let main = src_text("main.rs");
+    assert!(
+        main.contains("on_window_should_close") && main.contains("close_needs_answer()"),
+        "alt+F4 closes the window without asking about unsaved work"
+    );
+    assert!(
+        stance.contains("if this.quit_ask {")
+            && stance.contains("this.save_project(cx);")
+            && stance.contains("window.remove_window()"),
+        "the unsaved plate is up with no key answering it"
+    );
+    assert!(
+        stance.contains("UNSAVED — save ↵ · discard d · stay esc"),
+        "the decision plate speaks prose instead of state + verb·chord"
+    );
     assert!(
         !src_text("ui/timeband_stance.rs").contains("ActionId::Save"),
         "Save has two doors: the ledger's state word and the time band's ghost"

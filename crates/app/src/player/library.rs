@@ -1561,6 +1561,29 @@ impl Player {
         cx.notify();
     }
 
+    /// Whether a close has to be answered instead of obeyed: the timeline
+    /// holds at least one clip and the project file does not hold the latest
+    /// edit -- the same `autosave_dirty` the ledger's `unsaved` ghost reads,
+    /// so what the strip says and what the close asks can never disagree.
+    /// An empty timeline, or a saved one, closes the way it always did.
+    pub(crate) fn close_needs_answer(&self) -> bool {
+        let clips = self.session.as_ref().map_or(0, |session| {
+            session
+                .lanes()
+                .into_iter()
+                .map(|lane| session.lane_clips(lane).len())
+                .sum()
+        });
+        Self::close_asks(clips, self.autosave_dirty)
+    }
+
+    /// The close question as a value: clips on the timeline and an edit the
+    /// file does not have. Split out of [`Player::close_needs_answer`] so the
+    /// rule can be read and tested without a window or a session.
+    pub(crate) fn close_asks(clips: usize, dirty: bool) -> bool {
+        clips > 0 && dirty
+    }
+
     /// Writes the timeline back to its project file. Overwrites silently, like
     /// an export: the path was chosen once and the notice is the confirmation.
     pub(crate) fn save_project(&mut self, cx: &mut Context<Self>) {
@@ -1906,6 +1929,23 @@ impl Player {
 #[cfg(test)]
 mod autosave_tests {
     use super::*;
+
+    /// The three cases the user named: an empty timeline closes, a saved one
+    /// closes, and only work that is both there and unsaved asks first --
+    /// the rule the window's close request routes through.
+    #[test]
+    fn only_unsaved_clips_ask_before_the_window_closes() {
+        assert!(!Player::close_asks(0, false));
+        assert!(
+            !Player::close_asks(0, true),
+            "an empty timeline has nothing to lose"
+        );
+        assert!(
+            !Player::close_asks(3, false),
+            "saved work closes without a question"
+        );
+        assert!(Player::close_asks(1, true));
+    }
 
     /// The three answers [`Player::recovery_offer`] gives, off nothing but a
     /// project file and a sidecar's mtimes: younger sidecar offers it, an

@@ -463,6 +463,13 @@ struct Player {
     /// `project_path` is never touched by either path, only a manual save
     /// writes the real file.
     recovery_sidecar: Option<PathBuf>,
+    /// Whether the unsaved-work question is on screen: raised by the window's
+    /// own close request when [`Player::close_needs_answer`] says the timeline
+    /// holds work the project file does not (user 2026-09-10, "if timeline is
+    /// not empty and user does alt+f4 or exit somehow, ask user to save").
+    /// While it is up it owns the keyboard -- three answers and nothing else
+    /// ([`ui::stance`]'s root `on_key_down`).
+    quit_ask: bool,
     /// Whether `project_path` names a file this window itself put there --
     /// loaded from a `.edith` ([`Player::install_project`]) or written by a
     /// manual save ([`Player::save_project`]) -- rather than one merely
@@ -952,6 +959,7 @@ fn main() {
                     autosave_last_edit: None,
                     autosave_last_run: None,
                     recovery_sidecar: None,
+                    quit_ask: false,
                     autosave_armed: false,
                     keymap: keymap.clone(),
                     keys_open: false,
@@ -1042,6 +1050,23 @@ fn main() {
                 // Nothing else takes focus, and without it the key listener
                 // above is never reached.
                 window.focus(&player.read(cx).focus);
+                // The compositor's close request -- alt+F4, the titlebar's
+                // button, `swaymsg kill`, a session logout -- is the one door
+                // out of this window (there is no Quit action and nothing in
+                // the tree calls `cx.quit()`). Answering `false` keeps the
+                // window up, which is what turns "closing" into a question
+                // when the timeline holds work no file has.
+                let asking = player.clone();
+                window.on_window_should_close(cx, move |_, cx| {
+                    asking.update(cx, |player, cx| {
+                        if !player.close_needs_answer() {
+                            return true;
+                        }
+                        player.quit_ask = true;
+                        cx.notify();
+                        false
+                    })
+                });
                 player.update(cx, |player, cx| player.start_autosave(cx));
                 player
             },
