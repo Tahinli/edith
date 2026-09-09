@@ -634,7 +634,7 @@ fn export_section(player: &Player, cx: &mut Context<Player>) -> impl IntoElement
             "Encoder",
             encoder_word(seat),
             "which encoder writes the picture: the GPU where this machine has a seat, or the CPU",
-            "e",
+            "g",
             av1_gpu.then(|| (AV1_GPU_NOTICE.into(), NOTICE_LOOK())),
             player,
             cx.listener(|this, _: &ClickEvent, _, cx| {
