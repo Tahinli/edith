@@ -47,6 +47,44 @@ fn glyph(
     player: &Player,
     cx: &mut Context<Player>,
 ) -> impl IntoElement + use<> {
+    glyph_sized(false, id, glyph, action, active, quiet, player, cx)
+}
+
+/// The paired half of [`glyph`]: same control, one step down the §3 scale
+/// (13px, the chord size) and 1px of side padding instead of 3. Two
+/// full-size halves plus their padding measured 66px against a 56px rail
+/// and laid out at negative x -- `‹10` was cut at the window's own left
+/// edge (hitmap `action.WalkCutPrev10 x=-5 w=31`). Subtraction, not a wider
+/// spine: the pair now fits inside the column with room on both sides.
+fn small(
+    id: &'static str,
+    glyph: &'static str,
+    action: ActionId,
+    active: bool,
+    quiet: bool,
+    player: &Player,
+    cx: &mut Context<Player>,
+) -> impl IntoElement + use<> {
+    glyph_sized(true, id, glyph, action, active, quiet, player, cx)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn glyph_sized(
+    paired: bool,
+    id: &'static str,
+    glyph: &'static str,
+    action: ActionId,
+    active: bool,
+    quiet: bool,
+    player: &Player,
+    cx: &mut Context<Player>,
+) -> impl IntoElement + use<> {
+    let size = if paired {
+        type_scale::CHORD_METADATA_MIN_PX
+    } else {
+        type_scale::LABEL_ROW_PX
+    };
+    let pad = if paired { 1. } else { 3. };
     let enabled = player.enable(action, None);
     // The badge shows the primary chord only (FAULT 1: a chord badge is a
     // compact token, not a sentence); the tooltip keeps every stroke an
@@ -67,7 +105,7 @@ fn glyph(
         .flex_col()
         .items_center()
         .gap(px(1.))
-        .px(px(3.))
+        .px(px(pad))
         .py(px(1.))
         .rounded(px(3.))
         .when(active, |d| d.bg(rgb(DARK_RAISED())))
@@ -88,10 +126,7 @@ fn glyph(
                 .line_height(relative(1.05))
                 // FAULT 1: the glyph is the loudest thing in its row -- BOLD,
                 // not the MEDIUM weight the chord beneath it also wears.
-                .type_style(type_scale::label(
-                    type_scale::LABEL_ROW_PX,
-                    gpui::FontWeight::BOLD,
-                ))
+                .type_style(type_scale::label(size, gpui::FontWeight::BOLD))
                 .text_color(rgb(if active {
                     INK1()
                 } else if quiet {
@@ -132,7 +167,7 @@ fn trim_control(active: bool, player: &Player, cx: &mut Context<Player>) -> impl
         div()
             .id(id)
             .flex_none()
-            .px(px(2.))
+            .px(px(1.))
             .rounded(px(3.))
             .tooltip(move |_, cx| cx.new(|_| Tip(say.clone())).into())
             .when(!on, |d| d.opacity(0.4).cursor_not_allowed())
@@ -147,8 +182,9 @@ fn trim_control(active: bool, player: &Player, cx: &mut Context<Player>) -> impl
             .child(
                 div()
                     .line_height(relative(1.05))
+                    // Paired, so the same step down the scale `small` takes.
                     .type_style(type_scale::label(
-                        type_scale::LABEL_ROW_PX,
+                        type_scale::CHORD_METADATA_MIN_PX,
                         gpui::FontWeight::BOLD,
                     ))
                     .text_color(rgb(if active { INK1() } else { INK2() }))
@@ -213,11 +249,10 @@ fn pair(left: impl IntoElement, right: impl IntoElement) -> impl IntoElement {
         .w_full()
         .items_center()
         .justify_center()
-        // 4px, not 6: two two-glyph halves plus their own padding used to
-        // measure wider than the 56px rail and bled past its left edge
-        // (measured at 1280x720: the `AP`/`FS` row started at x=0, outside
-        // the spine's own surface).
-        .gap(px(4.))
+        // 3px, and both halves come from `small` (13px, 1px padding): two
+        // full-size halves plus 4px measured 66px against the 56px rail and
+        // laid out at negative x (hitmap `action.AddVideoLane x=-2 w=28`).
+        .gap(px(3.))
         .child(left)
         .child(right)
 }
@@ -271,16 +306,16 @@ pub(crate) fn render(player: &Player, cx: &mut Context<Player>) -> impl IntoElem
             cx,
         ))
         .child(pair(
-            glyph("spine-undo", "↺", ActionId::Undo, false, false, player, cx),
+            small("spine-undo", "↺", ActionId::Undo, false, false, player, cx),
             // Redo had a legacy toolbar button (`toolbar.rs:347`) but no
             // darkroom home -- Undo got a glyph here and Redo did not.
             // Same row, same door (`this.act`), the pair anatomy the
             // cut-prev/cut-next row below already uses.
-            glyph("spine-redo", "⟳", ActionId::Redo, false, false, player, cx),
+            small("spine-redo", "⟳", ActionId::Redo, false, false, player, cx),
         ))
         .child(group_head("cut"))
         .child(pair(
-            glyph(
+            small(
                 "spine-cut-prev",
                 "‹",
                 ActionId::WalkCutPrev,
@@ -289,7 +324,7 @@ pub(crate) fn render(player: &Player, cx: &mut Context<Player>) -> impl IntoElem
                 player,
                 cx,
             ),
-            glyph(
+            small(
                 "spine-cut-next",
                 "›",
                 ActionId::WalkCutNext,
@@ -312,7 +347,7 @@ pub(crate) fn render(player: &Player, cx: &mut Context<Player>) -> impl IntoElem
                 .items_center()
                 .gap(px(1.))
                 .child(pair(
-                    glyph(
+                    small(
                         "spine-cut-prev-ten",
                         "‹10",
                         ActionId::WalkCutPrev10,
@@ -321,7 +356,7 @@ pub(crate) fn render(player: &Player, cx: &mut Context<Player>) -> impl IntoElem
                         player,
                         cx,
                     ),
-                    glyph(
+                    small(
                         "spine-cut-next-ten",
                         "10›",
                         ActionId::WalkCutNext10,
@@ -336,7 +371,7 @@ pub(crate) fn render(player: &Player, cx: &mut Context<Player>) -> impl IntoElem
                     // Trim-to-playhead (debt #42): the keyboard's own version
                     // of the pointer's drag-to-a-spot trim, beside the nudge
                     // pair it shares its primitive with.
-                    glyph(
+                    small(
                         "spine-trim-in-playhead",
                         "[▮",
                         ActionId::TrimInToPlayhead,
@@ -345,7 +380,7 @@ pub(crate) fn render(player: &Player, cx: &mut Context<Player>) -> impl IntoElem
                         player,
                         cx,
                     ),
-                    glyph(
+                    small(
                         "spine-trim-out-playhead",
                         "▮]",
                         ActionId::TrimOutToPlayhead,
@@ -379,7 +414,7 @@ pub(crate) fn render(player: &Player, cx: &mut Context<Player>) -> impl IntoElem
                 .items_center()
                 .gap(px(1.))
                 .child(pair(
-                    glyph(
+                    small(
                         "spine-zoom-out",
                         "−",
                         ActionId::ZoomOut,
@@ -388,7 +423,7 @@ pub(crate) fn render(player: &Player, cx: &mut Context<Player>) -> impl IntoElem
                         player,
                         cx,
                     ),
-                    glyph(
+                    small(
                         "spine-zoom-in",
                         "+",
                         ActionId::ZoomIn,
@@ -431,7 +466,7 @@ pub(crate) fn render(player: &Player, cx: &mut Context<Player>) -> impl IntoElem
                 .items_center()
                 .gap(px(1.))
                 .child(pair(
-                    glyph(
+                    small(
                         "spine-add-video",
                         "+V",
                         ActionId::AddVideoLane,
@@ -440,7 +475,7 @@ pub(crate) fn render(player: &Player, cx: &mut Context<Player>) -> impl IntoElem
                         player,
                         cx,
                     ),
-                    glyph(
+                    small(
                         "spine-add-audio",
                         "+A",
                         ActionId::AddAudioLane,
@@ -457,7 +492,7 @@ pub(crate) fn render(player: &Player, cx: &mut Context<Player>) -> impl IntoElem
                 // beside "Add files" (`dock_stance`), where an editor
                 // already goes to bring a file into the room.
                 .child(pair(
-                    glyph(
+                    small(
                         "spine-add-subtitle",
                         "+S",
                         ActionId::AddSubtitleLane,
@@ -466,7 +501,7 @@ pub(crate) fn render(player: &Player, cx: &mut Context<Player>) -> impl IntoElem
                         player,
                         cx,
                     ),
-                    glyph(
+                    small(
                         "spine-remove-subtitle",
                         "−S",
                         ActionId::RemoveSubtitleLane,
@@ -500,7 +535,7 @@ pub(crate) fn render(player: &Player, cx: &mut Context<Player>) -> impl IntoElem
                 .items_center()
                 .gap(px(1.))
                 .child(pair(
-                    glyph(
+                    small(
                         "spine-settings",
                         "St",
                         ActionId::Settings,
@@ -509,7 +544,7 @@ pub(crate) fn render(player: &Player, cx: &mut Context<Player>) -> impl IntoElem
                         player,
                         cx,
                     ),
-                    glyph(
+                    small(
                         "spine-screenshot",
                         "Sh",
                         ActionId::Screenshot,

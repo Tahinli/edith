@@ -2894,3 +2894,83 @@ fn a_dock_ring_never_moves_what_it_rings() {
         "a dock ring lost its at-rest transparent border"
     );
 }
+
+/// The spine is 56px and every pair must fit inside it. Measured at
+/// 1280x720 the full-size halves did not: hitmap `action.WalkCutPrev10
+/// x=-5 w=31`, `action.AddVideoLane x=-2 w=28` -- the `‹10` glyph was cut
+/// at the window's own left edge. Fixed by subtraction (13px + 1px padding
+/// for the paired halves, 3px row gap), so this scan is what keeps a new
+/// pair from being written at the full row size again.
+#[test]
+fn every_paired_spine_glyph_is_drawn_at_the_narrow_size() {
+    let src = src_text("ui/spine_stance.rs");
+    // Inside every `pair(...)` call, both halves come from `small`.
+    let mut rest = src.as_str();
+    let mut pairs = 0;
+    while let Some(at) = rest.find("pair(") {
+        let after = &rest[at..];
+        // The definition and the doc comments are not call sites.
+        if rest[..at].ends_with("fn ") || rest[..at].ends_with('`') {
+            rest = &after[5..];
+            continue;
+        }
+        let mut depth = 0i32;
+        let mut end = after.len();
+        for (i, c) in after.char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let body = &after[..end];
+        assert!(
+            !body.contains("glyph("),
+            "a spine pair draws a full-size glyph, which lays out past the \
+             56px rail: {}",
+            &body[..body.len().min(120)]
+        );
+        pairs += 1;
+        rest = &after[end..];
+    }
+    assert!(pairs >= 8, "the spine's pairs went missing ({pairs} found)");
+    // And `small` is the narrow one: one step down the §3 scale, 1px sides.
+    assert!(
+        src.contains("type_scale::CHORD_METADATA_MIN_PX")
+            && src.contains("let pad = if paired { 1. } else { 3. };"),
+        "the paired size/padding subtraction is gone from spine_stance"
+    );
+    assert!(
+        src.contains(".gap(px(3.))\n        .child(left)"),
+        "the pair row's own gap grew again"
+    );
+}
+
+/// DESIGN §8 (no instructional copy) and §9: the keys plate's heading is one
+/// noun, its way out is a chord like every other row, and its bottom edge is
+/// inside the window -- the shipped plate said `ALL COMMANDS · HOLD ? ·
+/// RELEASE TO CLOSE` while sitting there latched after a click, with its last
+/// rows cut off below y=720.
+#[test]
+fn the_keys_plate_says_one_noun_and_ends_inside_the_window() {
+    let src = src_text("ui/stance.rs");
+    let lower = src.to_lowercase();
+    assert!(
+        !lower.contains("hold ? · release to close") && !lower.contains("all commands"),
+        "the keys plate still tells the hand what to do"
+    );
+    assert!(
+        src.contains("section_head(\"keys\")") && src.contains(".child(\"esc\")"),
+        "the keys plate lost its noun or its escape chord"
+    );
+    assert!(
+        src.contains(".h(px((bench_h + LEDGER_H - 16.).max(0.)))"),
+        "the keys plate is no longer capped inside the bench+ledger footprint"
+    );
+}
