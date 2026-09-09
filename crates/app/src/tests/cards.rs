@@ -1083,7 +1083,9 @@ fn row_three_wears_the_encode_options_and_the_door_to_the_rest() {
     // the ink4 line the plan used to be.
     let seg = cards
         .find("fn moment_segment(")
-        .map(|at| &cards[at..at + 1200])
+        // Wide enough for the atom's whole chain, plate included -- the
+        // hover line pushed the ink pair past the old 1200-char window.
+        .map(|at| &cards[at..at + 1900])
         .expect("the segment atom");
     assert!(seg.contains("INK3()") && seg.contains("INK4()"));
     assert!(seg.contains("DARK_RAISED()"), "a segment does not answer hover");

@@ -3478,3 +3478,110 @@ fn the_only_hue_in_the_export_section_is_the_av1_gpu_notice() {
         );
     }
 }
+
+/// Every control the hitmap names wears a hover line (the user, 2026-09-09,
+/// over a screenshot of the time band: "each and every button needs hover
+/// over information ... I don't know some of them"). The hitmap already
+/// carries the pair a plate needs -- an id and a label -- so the sweep walks
+/// the same emitters: a builder chain that records a control and never calls
+/// `.tooltip` is a glyph the user cannot name.
+///
+/// A scan and not a render: this crate has no gpui window in its tests, so
+/// the text is the finest grain available. Each emitter must claim a
+/// `.tooltip(` of *its own* within [`REACH`] lines -- one to one, nearest
+/// first. Counting them per function instead let an unrelated plate (the
+/// empty-dock hint) pay for a control that had none: `dock.sort.cycle` sat
+/// bare under a green gate until this pairing was written.
+///
+/// Controls outside the hitmap are outside this gate by charter. Named for
+/// the record, since each is a control the pointer can press: a card's own
+/// picker rows (colour/transform/mix/subtitle/silence bands, the speed
+/// chips) and the two menus' rows, all of which already read as
+/// `<label> <value-or-chord>` on the row itself -- a plate would repeat the
+/// row it hangs off, which is DESIGN §8's prose rule the other way round.
+#[test]
+fn every_hitmap_control_wears_a_hover_line() {
+    /// How far from a control's `hitmap::` line its plate may be attached.
+    /// A builder chain runs long here (the contact strip's tooltip sits 65
+    /// lines above its emitter), so the reach is generous; what it buys is
+    /// that a plate can be spent only once.
+    const REACH: usize = 80;
+    // Ids that name a control a *previous* emitter in the same chain already
+    // plated -- the second id is the harness's aim point, not a second
+    // control -- with the reason each is exempt.
+    const DOUBLE_NAMED: &[&str] = &[
+        // `subtitle.N.M.row` and `subtitle.N.M.select` are one row.
+        ".select\")",
+    ];
+    let mut controls = 0;
+    let mut naked = Vec::new();
+    for path in source_files() {
+        let text = std::fs::read_to_string(&path).expect("a source file");
+        if !text.contains("hitmap::") {
+            continue;
+        }
+        let file = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("a file name")
+            .to_string();
+        let lines: Vec<&str> = text.lines().collect();
+        let mut tips: Vec<(usize, bool)> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.contains(".tooltip("))
+            .map(|(i, _)| (i, false))
+            .collect();
+        for (i, line) in lines.iter().enumerate() {
+            let emitter = ["hitmap::control(", "hitmap::dynamic(", "hitmap::action("]
+                .iter()
+                .any(|needle| line.contains(needle));
+            if !emitter {
+                continue;
+            }
+            // The id a `dynamic` builds sits a line or three below its call.
+            let head = lines[i..(i + 6).min(lines.len())].join("\n");
+            if DOUBLE_NAMED.iter().any(|id| head.contains(id)) {
+                continue;
+            }
+            controls += 1;
+            let mut free: Vec<usize> = (0..tips.len())
+                .filter(|n| !tips[*n].1 && tips[*n].0.abs_diff(i) <= REACH)
+                .collect();
+            free.sort_by_key(|n| tips[*n].0.abs_diff(i));
+            match free.first() {
+                Some(n) => tips[*n].1 = true,
+                None => naked.push(format!("{file}:{}: {}", i + 1, line.trim())),
+            }
+        }
+    }
+    assert!(
+        controls >= 40,
+        "the hover sweep found only {controls} controls -- it has gone blind"
+    );
+    assert!(
+        naked.is_empty(),
+        "controls with no hover line of their own (attach \
+         `widgets::tip_hover`/`action_hover` in the chain that emits the \
+         hitmap id): {naked:#?}"
+    );
+}
+
+/// The one hover shape for the whole room: `<name> · <chord>`, and a control
+/// the state refuses says why instead of naming a stroke that will not fire
+/// (DESIGN §4/§8 -- a tooltip is not a sentence).
+#[test]
+fn a_hover_line_is_a_name_and_a_chord() {
+    use crate::ui::widgets::tip_line;
+    assert_eq!(
+        tip_line("One frame forward", "right", None),
+        "One frame forward · right"
+    );
+    assert_eq!(
+        tip_line("Split", "s", Some("nothing selected")),
+        "Split · nothing selected"
+    );
+    // `Keymap::chord`'s unbound badge is not a stroke.
+    assert_eq!(tip_line("Add files", "--", None), "Add files");
+    assert_eq!(tip_line("Source", "", None), "Source");
+}

@@ -121,6 +121,7 @@ fn dark_card_head(
                     .into()
                 })
                 .child(if max { "▣ m" } else { "⤢ m" })
+                .tooltip(crate::ui::widgets::overlay_tip_hover("Toggle card size", "", None))
                 .children(hitmap::control("card.maximize", "Toggle card size", true))
         }))
         .child(
@@ -205,6 +206,11 @@ fn dark_step_glyph(
         .cursor_pointer()
         .hover(|s| s.bg(rgb(DARK_RAISED())))
         .on_click(on_click)
+        .tooltip(crate::ui::widgets::overlay_tip_hover(
+            if plus { "Step up" } else { "Step down" },
+            "",
+            None,
+        ))
         .children(hitmap.flatten())
         .child(dark_row_value(if plus { "+" } else { "−" }))
 }
@@ -223,6 +229,16 @@ fn moment_segment(
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     let text: SharedString = text.into();
+    let chord: SharedString = chord.into();
+    // The segment reads its *value* ("H.264 \u{b7} MP4"); the plate has to say
+    // what pressing it does. Keyed off the id, so the next segment cannot
+    // ship without one -- the sweep in `tests::layout` holds it to that.
+    let name = match id {
+        "moment-picture" => "Change the picture format",
+        "moment-sound" => "Change the sound rate",
+        "moment-encoder" => "Change the encoder seat",
+        _ => "Open the export settings",
+    };
     let hitmap = hitmap::enabled().then(|| {
         let label = text.clone();
         hitmap::dynamic(move || (format!("card.{id}"), label.to_string()), true)
@@ -238,6 +254,7 @@ fn moment_segment(
         .cursor_pointer()
         .hover(|s| s.bg(rgb(DARK_RAISED())).text_color(rgb(INK2())))
         .on_click(on_click)
+        .tooltip(crate::ui::widgets::overlay_tip_hover(name, &chord, None))
         .children(hitmap.flatten())
         .type_style(type_scale::mono(
             type_scale::CHORD_METADATA_MIN_PX,
@@ -245,7 +262,7 @@ fn moment_segment(
         ))
         .text_color(rgb(INK3()))
         .child(text)
-        .child(div().flex_none().text_color(rgb(INK4())).child(chord.into()))
+        .child(div().flex_none().text_color(rgb(INK4())).child(chord))
 }
 
 fn dark_ghost_button(
@@ -275,6 +292,7 @@ fn dark_ghost_button(
         .cursor_pointer()
         .hover(|s| s.bg(rgb(DARK_RAISED())))
         .on_click(on_click)
+        .tooltip(crate::ui::widgets::overlay_tip_hover(&text, chord, None))
         .children(hitmap.flatten())
         .child(
             div()
