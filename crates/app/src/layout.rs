@@ -295,8 +295,10 @@ pub(crate) const SPLIT_W: f32 = 6.;
 /// have -- the lead's own press one row into the bench missed the seam by 5 px
 /// and focused the bench instead ("panes should be enlargable and shrinkable",
 /// of panes that already resized). 12 px is the ±6 px of aim every editor's
-/// dividers allow.
-pub(crate) const GRAB_W: f32 = 12.;
+/// dividers allow, and it is hung one row above the strip rather than centred
+/// on it: what a hand aims at is the line it can see (the panel's own edge at
+/// the strip's far side), not the six transparent pixels in front of it.
+pub(crate) const GRAB_W: f32 = 14.;
 
 /// The most of the window one side column may be dragged to. A third each, so
 /// the picture keeps the middle at every size -- the rule [`library_w`] and

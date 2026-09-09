@@ -248,7 +248,9 @@ pub(crate) fn drag_scrim(cx: &mut Context<Player>) -> Div {
 /// first move -- so the lit line has to come from the model, not from `hover`.
 ///
 /// What the *hand* aims at is wider than what the eye is given: the press and
-/// the resize cursor live on a [`GRAB_W`] band centred on the strip, mounted
+/// the resize cursor live on a [`GRAB_W`] band centred on the *line the eye
+/// sees* -- one row above the strip, so it reaches past the panel edge the
+/// strip stands in front of rather than being centred on the strip -- mounted
 /// absolutely so it overlays its neighbours instead of pushing them (the strip
 /// keeps its [`SPLIT_W`] of layout, and `layout::split_drag_size` keeps
 /// answering in strip coordinates). A 6 px target missed by 5 px is a resize
@@ -285,14 +287,14 @@ pub(crate) fn divider(split: Split, held: bool, cx: &mut Context<Player>) -> Div
                 .when(across, |d| {
                     d.left_0()
                         .right_0()
-                        .top(px((SPLIT_W - GRAB_W) / 2.))
+                        .top(px(-1.))
                         .h(px(GRAB_W))
                         .cursor_row_resize()
                 })
                 .when(!across, |d| {
                     d.top_0()
                         .bottom_0()
-                        .left(px((SPLIT_W - GRAB_W) / 2.))
+                        .left(px(-1.))
                         .w(px(GRAB_W))
                         .cursor_col_resize()
                 })
