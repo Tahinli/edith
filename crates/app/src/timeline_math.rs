@@ -659,10 +659,10 @@ pub(crate) fn lane_refuses(path: &Path, lane: Lane, has_video: bool) -> Option<S
     let label = lane.label();
     match lane.kind {
         LaneKind::Video if !has_video => Some(format!(
-            "NOT ON {label} — {name} has no picture; drop it on an audio lane"
+            "NOT ON {label} — {name} has no picture"
         )),
         LaneKind::Audio if engine::is_image(path) => Some(format!(
-            "NOT ON {label} — {name} is a still image; drop it on a video lane"
+            "NOT ON {label} — {name} is a still image"
         )),
         // A subtitle lane holds words and no media at all: the refusal is here
         // rather than at the engine's door so the shadow is tinted red on the

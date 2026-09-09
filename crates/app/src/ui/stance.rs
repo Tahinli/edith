@@ -783,13 +783,18 @@ fn ledger(player: &Player, position: f64) -> impl IntoElement {
             div()
                 .flex_1()
                 .min_w(px(0.))
-                .truncate()
+                // Ellipsis, not a bare cut: `.truncate()` stops mid-word with
+                // nothing saying it stopped (user report, `… 1 subtitle track(s)
+                // in `). The name inside the message is elided through its
+                // middle first ([`ledger_line`]) so the state word at the front
+                // is never what the strip drops.
+                .text_ellipsis()
                 .type_style(type_scale::mono(
                     type_scale::CHORD_METADATA_MIN_PX,
                     gpui::FontWeight::MEDIUM,
                 ))
                 .text_color(rgb(action_ink))
-                .child(last_action),
+                .child(ledger_line(&last_action)),
         )
         .children(export.map(|e| {
             div()
