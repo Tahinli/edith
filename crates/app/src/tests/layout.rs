@@ -3708,3 +3708,35 @@ fn a_hover_line_is_a_name_and_a_chord() {
     assert_eq!(tip_line("Add files", "--", None), "Add files");
     assert_eq!(tip_line("Source", "", None), "Source");
 }
+
+/// A region is a place, not a control: none of the region roots paints a
+/// border because it holds focus (user 2026-09-10, "clicking through
+/// timeline draws a white overlay around the timeline"; DESIGN §4's ring
+/// line is about the *selected thing*). Focus routing itself is untouched.
+#[test]
+fn no_region_root_wears_a_focus_ring() {
+    let stance = src_text("ui/stance.rs");
+    let bench = src_text("ui/bench_stance.rs");
+    let band = src_text("ui/timeband_stance.rs");
+    for (name, text) in [
+        ("stance.rs", &stance),
+        ("bench_stance.rs", &bench),
+        ("timeband_stance.rs", &band),
+    ] {
+        for line in text.lines() {
+            let code = line.trim_start();
+            if code.starts_with("//") {
+                continue;
+            }
+            assert!(
+                !(code.contains("is_focused(") || code.contains("when(focused"))
+                    || !code.contains("border"),
+                "{name} still paints a focus-conditional border: {code}"
+            );
+            assert!(
+                !code.contains("STROKE_FOCUS"),
+                "{name} paints the focus stroke on a region: {code}"
+            );
+        }
+    }
+}

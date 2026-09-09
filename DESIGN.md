@@ -98,7 +98,7 @@ align.
   the room.
 - Radii: 0 for lanes/clips/room chrome · 2px plates · 3px verbs/controls · 4–6px floating
   (menus, sheets). No pills, no circles except source dots.
-- Hover never adds hue. Focus/selection ring = 1px `ink1` (lamp-adjacent, not colored).
+- Hover never adds hue. Selection ring = 1px `ink1` on the selected thing (lamp-adjacent, not colored); regions never draw a focus ring (user 2026-09-10).
 
 ## 5. The stance — layout
 

@@ -16,8 +16,8 @@ use crate::ui::timeband_stance;
 use crate::ui::type_scale::{self, Typeset};
 use crate::*;
 
-/// Keyboard focus v1: the three regions Tab/Shift-Tab cycle a painted ring
-/// through -- the bench, the dock's Sources tab (library) and the dock's
+/// Keyboard focus v1: the three regions Tab/Shift-Tab cycle focus through
+/// (no ring is painted for it any more, user 2026-09-10) -- the bench, the dock's Sources tab (library) and the dock's
 /// Clip tab (inspector), the darkroom's own stand-ins for "timeline",
 /// "library" and "inspector" (there is no separate inspector *region* in
 /// this tree -- MOCK-SPEC's Clip tab, `dock_stance::clip_tab`, is it).
@@ -675,10 +675,9 @@ fn time_band(player: &mut Player, position: f64, cx: &mut Context<Player>) -> im
 fn bench(
     player: &mut Player,
     bench_h: f32,
-    window: &mut Window,
+    _window: &mut Window,
     cx: &mut Context<Player>,
 ) -> impl IntoElement {
-    let focused = player.focus_bench.is_focused(window);
     div()
         .id("stance-bench")
         .track_focus(&player.focus_bench)
@@ -716,12 +715,11 @@ fn bench(
         .bg(rgb(DARK_CANVAS()))
         .border_t_1()
         .border_color(rgba(DARK_SEAM()))
-        // The ring (DESIGN §4's "1px, lamp-adjacent" convention -- the same
-        // `.border_1().border_color(...)` a picked bench clip already uses):
-        // painted on this outer frame, never on a row, and only while this
-        // surface itself -- not a picked clip inside it -- holds the focus
-        // ring Tab/Shift-Tab moves ([`next_surface`]).
-        .when(focused, |d| d.border_1().border_color(rgb(STROKE_FOCUS())))
+        // No ring: a region is never outlined for holding focus (user
+        // 2026-09-10, "clicking through timeline draws a white overlay
+        // around the timeline"). Focus routing is untouched -- Tab/Shift-Tab
+        // still land here ([`next_surface`]) -- and the only ring left in
+        // the bench is the selection one a picked clip draws (DESIGN §2/§4).
         .flex()
         .flex_col()
         .px(px(12.))
