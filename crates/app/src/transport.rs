@@ -77,12 +77,6 @@ impl Volume {
         f32::from(self.steps) / f32::from(Self::MAX_STEPS)
     }
 
-    /// The level as a whole number, for the button's fixed rect: muting swaps
-    /// the glyph beside it, never the width of the box.
-    pub(crate) fn percent(self) -> u32 {
-        u32::from(self.steps) * 100 / u32::from(Self::MAX_STEPS)
-    }
-
     /// What the button read before the mute state became a glyph and a colour
     /// ([`Player::toolbar`]): the guards still hold the wording to it, so it
     /// sits with them rather than in the binary.

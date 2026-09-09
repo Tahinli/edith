@@ -60,7 +60,11 @@ pub(crate) const LIBRARY_MIN_W: f32 = 120.;
 pub(crate) const LIBRARY_MAX_W: f32 = 220.;
 pub(crate) const CONTROL_H: f32 = 28.;
 /// The volume slider beside its button: a hundred steps across it, so a pixel
-/// is finer than a step and the drag reads as continuous.
+/// is finer than a step and the drag reads as continuous. Cleanse round 2
+/// (2026-09-10) took that slider out of the time band, so the width is only
+/// the drag-math guard's own bar now -- it sits with the tests, like
+/// [`Volume::label`], rather than in the binary.
+#[cfg(test)]
 pub(crate) const VOLUME_W: f32 = 110.;
 pub(crate) const RULER_HIT_H: f32 = HIT_MIN;
 /// The keybindings card: a row per action, a title and a status line, inside a

@@ -1,6 +1,7 @@
 //! The time band's own content (MOCK-SPEC.md "Time band", DESIGN.md §5):
-//! hero timecode, ghost transport, cut readout, the contact strip (whole-film
-//! minimap) and the boxed Export chip. `stance.rs::time_band()`'s frame draws
+//! hero timecode, one three-glyph transport, the cut odometer, the contact
+//! strip (whole-film minimap, carrying the export range's two mark grips)
+//! and the boxed Export chip. `stance.rs::time_band()`'s frame draws
 //! the strip; this module owns what fills it, the same split
 //! `dock_stance.rs`/`bench_stance.rs` already make for their regions.
 //!
@@ -23,6 +24,10 @@ thread_local! {
     // fold both into `Player` once `main.rs` is free again.
     static STRIP_BOUNDS: Rc<Cell<Bounds<Pixels>>> = Rc::new(Cell::new(Bounds::default()));
     static PAN_ANCHOR: Cell<Option<f32>> = Cell::new(None);
+    /// Which export mark a live drag on the strip is moving (the grips of
+    /// `mark_grip` below), `None` when no mark drag is up. Same transient
+    /// shape as `PAN_ANCHOR` above, and the same ceiling.
+    static MARK_DRAG: Cell<Option<ActionId>> = const { Cell::new(None) };
     /// The band row's own measured width, read by the frame after the one
     /// that took it (`width_probe` asks for that frame whenever it changes).
     /// This is what the degradation ladder below keys off: the band cannot
@@ -58,45 +63,38 @@ fn width_probe(into: Rc<Cell<Pixels>>) -> impl IntoElement {
 }
 
 /// Which layers of the band are still drawn at a given column width
-/// (DESIGN §7's ladder, one layer per threshold, never all at once).
+/// (DESIGN §7's ladder). Cleanse round 2 (2026-09-10) left the band five
+/// things -- timecode, the three transport glyphs, the odometer, the strip
+/// and the Export chip -- and only one of them has anything left to shed.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct BandLayers {
     /// Chord badges under the transport glyphs.
     pub(crate) chords: bool,
-    /// The audio-monitoring cluster (mute, -/+, slider, level readout).
-    pub(crate) volume: bool,
-    /// The sync-point pair and the loop toggle.
-    pub(crate) sync: bool,
-    /// The export-range marks (I / O / x).
-    pub(crate) marks: bool,
 }
 
-/// The ladder itself. Every threshold is a MEASURED number: the band drawn
-/// whole at 2560x1440 (`$EDITH_HITMAP`) reads 1246px of fixed groups beside a
-/// 974px strip, and the same band at 1280x720 (chords off) reads each glyph's
-/// door at its `HIT_MIN` floor. Fixed width + `STRIP_MIN_W`, rounded up to the
-/// next 10px, is what each rung costs:
+/// The ladder itself, now two rungs. Every threshold is a MEASURED number,
+/// taken off `$EDITH_HITMAP` in the harness: the row's own content box (what
+/// `width_probe` reads -- the band's column less its 12px padding either
+/// side) holds 454px of fixed groups beside the strip that absorbs the rest,
+/// and the same band with the chords dropped holds 419px (each glyph's door
+/// falls back to its `HIT_MIN` floor, so the chord row costs 35px of width
+/// and 22px of height). Fixed width + `STRIP_MIN_W`, rounded up to the next
+/// 10px, is what each rung costs:
 ///
 /// | drawn                                        | fixed | needs  |
 /// |----------------------------------------------|-------|--------|
-/// | everything, chords under every glyph         | 1246  | 1370px |
-/// | chords dropped (-97px, doors keep `HIT_MIN`) | 1149  | 1270px |
-/// | + monitoring cluster dropped (-256px)        |  893  | 1020px |
-/// | + sync pair and loop dropped (-102px)        |  791  |  920px |
-/// | + range marks dropped (-92px): the floor     |  699  |  820px |
+/// | chords under every glyph                     |  454  |  580px |
+/// | chords dropped (-35px, doors keep `HIT_MIN`) |  419  |  540px |
 ///
-/// The four things the band is *for* -- timecode, cut readout, contact strip
-/// (>=`STRIP_MIN_W`, the flex_1 that absorbs the slack) and the Export chip --
-/// are on every rung; below the floor's own 820px there is nothing left to
-/// shed and `overflow_hidden` is what keeps the rest inside the column.
-/// There is no zoom group in this band (the charter's rung 2): the monitoring
-/// cluster is the band's equivalent extra and takes its place.
+/// The five things the band is *for* are on every rung; below the floor's
+/// own 540px there is nothing left to shed and `overflow_hidden` is what
+/// keeps the rest inside the column. Everything the older four-rung ladder
+/// used to drop -- the monitoring cluster, the sync pair and loop, the
+/// `I O ×` marks -- left the band entirely in cleanse round 2, so the rungs
+/// that shed them went with them.
 pub(crate) fn band_layers(band_w: f32) -> BandLayers {
     BandLayers {
-        chords: band_w >= 1370.,
-        volume: band_w >= 1270.,
-        sync: band_w >= 1020.,
-        marks: band_w >= 920.,
+        chords: band_w >= 580.,
     }
 }
 
@@ -277,48 +275,15 @@ fn cut_readout(player: &Player, position: f64) -> impl IntoElement {
                 .child(sep())
                 .child(val(format!("in {in_d}")))
         })
-        .child(sep())
-        .child(
-            div()
-                .text_color(rgb(if roll_on { INK1() } else { INK4() }))
-                .child("roll"),
-        )
+        // Cleanse round 2: the word `roll` sat in the band dim at all times,
+        // naming a mode that is off. The STATE stays -- when roll is armed
+        // the word is there in `ink1` -- but at rest the odometer reads
+        // `cut 14/37` and nothing else.
+        .when(roll_on, |el| {
+            el.child(sep())
+                .child(div().text_color(rgb(INK1())).child("roll"))
+        })
 }
-/// Export-range marks belong beside the cut readout they constrain (DESIGN §9):
-/// each is a direct mouse door to the same action its chord asks for.
-fn range_marks(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
-    div()
-        .id("stance-range-marks")
-        .flex_none()
-        .flex()
-        .items_center()
-        .gap(px(4.))
-        .child(ghost(
-            "stance-mark-in",
-            player,
-            "I",
-            ActionId::SetIn,
-            false,
-            cx,
-        ))
-        .child(ghost(
-            "stance-mark-out",
-            player,
-            "O",
-            ActionId::SetOut,
-            false,
-            cx,
-        ))
-        .child(ghost(
-            "stance-clear-range",
-            player,
-            "×",
-            ActionId::ClearRange,
-            false,
-            cx,
-        ))
-}
-
 /// The contact strip (MOCK-SPEC "Contact strip"): the whole-film minimap
 /// filling the band's remaining width, with a 1px viewport bracket marking
 /// where the bench's own window sits. Click jumps the playhead; drag pans
@@ -404,10 +369,6 @@ fn contact_strip(player: &Player, position: f64, cx: &mut Context<Player>) -> im
         .min_w(px(STRIP_MIN_W))
         .h(px(28.))
         .cursor_pointer()
-        .tooltip(|_, cx| {
-            cx.new(|_| Tip("Contact strip — drag scrubs the playhead, click jumps; drag the bracket's grips to pan the bench".into()))
-                .into()
-        })
         // Division of the plain drag (MOCK-SPEC "Contact strip", task's own
         // instruction to decide honestly): a person reaches for this strip to
         // move through the FILM far more often than to slide the bench's own
@@ -434,6 +395,44 @@ fn contact_strip(player: &Player, position: f64, cx: &mut Context<Player>) -> im
             move |this, event: &MouseMoveEvent, _, cx| {
                 if event.pressed_button != Some(MouseButton::Left) {
                     PAN_ANCHOR.with(|a| a.set(None));
+                    MARK_DRAG.with(|m| m.set(None));
+                    return;
+                }
+                // A mark grip is under the hand: the drag sets that mark
+                // instead of scrubbing or panning (the grip's own press
+                // armed this and stopped propagation, so this branch is the
+                // only thing a mark drag does).
+                if let Some(action) = MARK_DRAG.with(Cell::get) {
+                    let duration = this.drawn_duration();
+                    if duration > 0. {
+                        let frac = frac_along(event.position.x, bounds.get());
+                        let at = (f64::from(frac) * duration * this.active_fps()).max(0.).round()
+                            as u32;
+                        let (lo, hi) = this.range.unwrap_or((at, at));
+                        let (a, b) = if action == ActionId::SetIn {
+                            (at, hi)
+                        } else {
+                            (lo, at)
+                        };
+                        // Dragged past its partner, the mark under the hand
+                        // becomes the OTHER mark (`ordered_range` is what
+                        // keeps the pair legal, and `i`/`o` swap the same
+                        // way). Without this flip a live drag re-orders on
+                        // every move event and both ticks walk along with
+                        // the pointer, which is what the first harness run
+                        // caught.
+                        if crate::player::actions::ordered_range(a, b) != (a, b) {
+                            MARK_DRAG.with(|m| {
+                                m.set(Some(if action == ActionId::SetIn {
+                                    ActionId::SetOut
+                                } else {
+                                    ActionId::SetIn
+                                }))
+                            });
+                        }
+                        this.range = Some(crate::player::actions::ordered_range(a, b));
+                    }
+                    cx.notify();
                     return;
                 }
                 match PAN_ANCHOR.with(Cell::get) {
@@ -467,8 +466,18 @@ fn contact_strip(player: &Player, position: f64, cx: &mut Context<Player>) -> im
         }))
         .on_mouse_up(
             MouseButton::Left,
-            cx.listener(|_, _, _, _| PAN_ANCHOR.with(|a| a.set(None))),
+            cx.listener(|_, _, _, _| {
+                PAN_ANCHOR.with(|a| a.set(None));
+                MARK_DRAG.with(|m| m.set(None));
+            }),
         )
+        // The plate sits beside the id it names: the mark-drag branch above
+        // pushed the two more than `every_hitmap_control_wears_a_hover_line`
+        // reaches when this hung at the top of the chain.
+        .tooltip(|_, cx| {
+            cx.new(|_| Tip("Contact strip — drag scrubs the playhead, click jumps; drag the bracket's grips to pan the bench".into()))
+                .into()
+        })
         .children(hitmap::control("timeline.contact-strip", "Timeline contact strip", true))
         .child(bounds_probe(strip_bounds))
         // Baseline: a quiet hairline under the real traces below it, so an
@@ -525,6 +534,28 @@ fn contact_strip(player: &Player, position: f64, cx: &mut Context<Player>) -> im
                 .child(grip("stance-strip-grip-rt", false, true))
                 .child(grip("stance-strip-grip-rb", false, false)),
         )
+        // The export range's own two grips (DESIGN §5 as amended
+        // 2026-09-10): the `I O ×` trio left the band, so the marks live on
+        // the film itself. Nothing is drawn until a mark exists.
+        .when_some(
+            player.range.filter(|_| duration > 0.),
+            |el, (in_f, out_f)| {
+                el.child(mark_grip(
+                    player,
+                    "stance-strip-mark-in",
+                    frac(in_f),
+                    "Mark in",
+                    ActionId::SetIn,
+                ))
+                .child(mark_grip(
+                    player,
+                    "stance-strip-mark-out",
+                    frac(out_f),
+                    "Mark out",
+                    ActionId::SetOut,
+                ))
+            },
+        )
         // The lamp-white playhead marker: this is what turns the strip from
         // a trace into a slider with a handle (task's own wording) -- the
         // one 1px line on the whole band that names *this* film moment,
@@ -543,6 +574,43 @@ fn contact_strip(player: &Player, position: f64, cx: &mut Context<Player>) -> im
             )
         })
 }
+
+/// One export-range mark, drawn on the contact strip at its own film
+/// position: an `ink1` tick beside the bracket's lamp-white playhead, with a
+/// ±6px door around it that takes precedence over the strip's own
+/// click-jump/drag-scrub (`stop_propagation` on its press, the same split
+/// [`grip`] below makes for the bench-window pan). Dragging it sets that
+/// mark; `i`, `o` and `^u` are unchanged.
+fn mark_grip(
+    player: &Player,
+    id: &'static str,
+    frac: f32,
+    name: &'static str,
+    action: ActionId,
+) -> impl IntoElement {
+    let chord = player.keymap.chord(action);
+    div()
+        .id(id)
+        .absolute()
+        .left(relative(frac))
+        .top_0()
+        .h_full()
+        .ml(px(-MARK_GRAB))
+        .w(px(MARK_GRAB * 2. + 1.))
+        .flex()
+        .justify_center()
+        .cursor_col_resize()
+        .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, _, cx| {
+            MARK_DRAG.with(|m| m.set(Some(action)));
+            cx.stop_propagation();
+        })
+        .tooltip(crate::ui::widgets::tip_hover(name, &chord, None))
+        .children(hitmap::action(action, player.enable(action, None).yes()))
+        .child(div().w(px(1.)).h_full().bg(rgb(INK1())))
+}
+
+/// How far either side of a mark tick the hand still grabs it.
+const MARK_GRAB: f32 = 6.;
 
 /// One grip notch on the viewport bracket (MOCK-SPEC "grip notches"): the
 /// only part of the contact strip that pans the bench window rather than
@@ -641,67 +709,6 @@ fn export_chip(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
         )
 }
 
-/// The monitoring level's continuous pointer door. It shares the Player's
-/// measured bar and root drag plumbing with the legacy slider, but keeps the
-/// Darkroom's achromatic track and ink ladder.
-fn volume_slider(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
-    let volume = player.volume;
-    let enabled = player.enable(ActionId::ToggleMute, None).yes();
-    div()
-        .id("stance-tb-volume-bar")
-        .relative()
-        .flex_none()
-        .w(px(VOLUME_W))
-        .h(px(CONTROL_H))
-        .flex()
-        .items_center()
-        .tooltip(|_, cx| {
-            cx.new(|_| Tip("Volume — drag to set the level; the button mutes".into()))
-                .into()
-        })
-        .when(!enabled, |d| d.opacity(0.4).cursor_not_allowed())
-        .when(enabled, |d| {
-            d.cursor_pointer()
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                        this.volume_dragging = true;
-                        this.drag_volume(event.position.x, cx);
-                    }),
-                )
-                .child(bounds_probe(player.volume_bar.clone()))
-        })
-        .children(hitmap::control("timeline.volume", "Volume", enabled))
-        .child(
-            div()
-                .w_full()
-                .h(px(4.))
-                .rounded(px(2.))
-                .bg(rgb(DARK_RAISED()))
-                .child(
-                    div()
-                        .h_full()
-                        .w(relative(volume.along()))
-                        .rounded(px(2.))
-                        .bg(rgb(if volume.muted { INK3() } else { INK2() })),
-                ),
-        )
-}
-
-/// The level, written once (DESIGN 3: a number about a level is mono). It
-/// sits beside the slider that sets it -- the slider's fill and this readout
-/// are one truth in two forms, where the mute button used to wear a third.
-fn volume_readout(player: &Player) -> impl IntoElement {
-    let style = mono(type_scale::CHORD_METADATA_MAX_PX, FontWeight::MEDIUM);
-    div()
-        .flex_none()
-        .w(px(34.))
-        .font(style.font)
-        .text_size(style.size)
-        .text_color(rgb(if player.volume.muted { INK3() } else { INK2() }))
-        .child(format!("{}%", player.volume.percent()))
-}
-
 /// The whole band, left to right per MOCK-SPEC: hero timecode, ghost
 /// transport, cut readout, the contact strip filling the rest, the Export
 /// chip at the end.
@@ -739,20 +746,12 @@ pub(crate) fn render(
         // The most-read element anchors its region (DESIGN §5): the
         // timecode leads.
         .child(hero_timecode(&tc))
-        // FAULT 2, the J/K/L question: MOCK-SPEC reads this row's chords as
-        // `J`/`spc`/`L`, which DESIGN §6 names as the shuttle. No shuttle
-        // action exists anywhere in this codebase (grepped -- `keymap.rs`,
-        // `player/actions.rs`, the engine: nothing), and `j`/`k`/`l` are
-        // already bound to Speed/Color/Lift (`keymap.rs`'s Clip-verb group),
-        // not to this row -- rebinding them here would silently steal those,
-        // and `keymap.rs` is not this task's file to make that call in. So
-        // the glyphs below stay wired to what actually exists and already
-        // fires correctly (`JumpBack`/`Play`/`JumpForward`, real one-second
-        // stepping): each badge now reads that action's own compact chord
-        // (`^←`/`spc`/`^→`) instead of the mismatched mock label, which is
-        // what keeps glyph, badge and action honestly in agreement per this
-        // task's own rule -- the mock's `J`/`L` reading stays unimplemented
-        // and is named here rather than faked.
+        // Cleanse round 2 (2026-09-10): one transport, three glyphs. The
+        // shuttle pair (`◀◀ ▶▶`), the home/end pair, the sync points, the
+        // loop toggle, the monitoring cluster, the `I O ×` marks and Save
+        // all left the band -- each keeps its chord, its KEYS-tab row and
+        // (where it has one) its right-click home, and the marks became the
+        // contact strip's own two grips.
         .child(
             div()
                 .flex_none()
@@ -760,10 +759,10 @@ pub(crate) fn render(
                 .items_center()
                 .gap(px(10.))
                 .child(ghost(
-                    "stance-tb-jumpback",
+                    "stance-tb-step-back",
                     player,
-                    "◀◀",
-                    ActionId::JumpBack,
+                    "|◂",
+                    ActionId::StepBack,
                     false,
                     cx,
                 ))
@@ -780,132 +779,15 @@ pub(crate) fn render(
                     cx,
                 ))
                 .child(ghost(
-                    "stance-tb-jumpforward",
-                    player,
-                    "▶▶",
-                    ActionId::JumpForward,
-                    false,
-                    cx,
-                ))
-                .child(ghost(
-                    "stance-tb-step-back",
-                    player,
-                    "|◂",
-                    ActionId::StepBack,
-                    false,
-                    cx,
-                ))
-                .child(ghost(
                     "stance-tb-step-forward",
                     player,
                     "▸|",
                     ActionId::StepForward,
                     false,
                     cx,
-                ))
-                .child(ghost(
-                    "stance-tb-start",
-                    player,
-                    "↤",
-                    ActionId::GoStart,
-                    false,
-                    cx,
-                ))
-                .child(ghost(
-                    "stance-tb-end",
-                    player,
-                    "↦",
-                    ActionId::GoEnd,
-                    false,
-                    cx,
-                ))
-                .when(layers.sync, |el| {
-                    el.child(ghost(
-                        "stance-tb-sync-prev",
-                        player,
-                        "‹|",
-                        ActionId::PrevSyncPoint,
-                        false,
-                        cx,
-                    ))
-                    .child(ghost(
-                        "stance-tb-sync-next",
-                        player,
-                        "|›",
-                        ActionId::NextSyncPoint,
-                        false,
-                        cx,
-                    ))
-                })
-                // Loop (homeless per this task's audit): the playback-loop
-                // toggle -- burst-use during editing per the charter's own
-                // classification -- earns the transport cluster it plays
-                // alongside, not the CUT group's `LoopTrim` two files over
-                // (a different verb already drawn on the spine, "↻" taken).
-                // "∞" reads as "keeps going" without borrowing that glyph.
-                .when(layers.sync, |el| {
-                    el.child(ghost(
-                        "stance-tb-loop",
-                        player,
-                        "∞",
-                        ActionId::Loop,
-                        player.loop_on,
-                        cx,
-                    ))
-                }),
-        )
-        // The audio-monitoring cluster (homeless per this task's audit):
-        // ToggleMute/VolumeUp/VolumeDown, burst-use per the charter, placed
-        // beside the transport it plays with rather than the spine (the
-        // rail is already tightened, and this is a play-time concern, same
-        // land as J/spc/L above it). The level itself is the mute button's
-        // own label (legacy `toolbar.rs`'s own convention: an "×" prefix
-        // marks muted rather than a second colour), so one click toggles
-        // mute and the two ghosts flanking it nudge the level -- three
-        // homeless actions sharing one cluster rather than three unrelated
-        // rows.
-        .when(layers.volume, |el| el.child(
-            div()
-                .flex_none()
-                .flex()
-                .items_center()
-                .gap(px(6.))
-                .child(ghost(
-                    "stance-tb-vol-down",
-                    player,
-                    "−",
-                    ActionId::VolumeDown,
-                    false,
-                    cx,
-                ))
-                // The level is NOT this button's label any more: the slider
-                // beside it already draws the same number as a fill and
-                // `volume_readout` writes it once, so wearing it here made
-                // mute a ghost with no glyph of its own (a percentage is not
-                // a verb). Speaker, struck when muted -- typographic, the
-                // same hand-drawn grammar as the glyphs around it.
-                .child(ghost(
-                    "stance-tb-mute",
-                    player,
-                    if player.volume.muted { "◁×" } else { "◁))" },
-                    ActionId::ToggleMute,
-                    player.volume.muted,
-                    cx,
-                ))
-                .child(volume_slider(player, cx))
-                .child(volume_readout(player))
-                .child(ghost(
-                    "stance-tb-vol-up",
-                    player,
-                    "+",
-                    ActionId::VolumeUp,
-                    false,
-                    cx,
                 )),
-        ))
-        .when(layers.marks, |el| el.child(range_marks(player, cx)))
+        )
         .child(cut_readout(player, position))
         .child(contact_strip(player, position, cx))
         .child(export_chip(player, cx))
 }
-
