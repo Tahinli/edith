@@ -368,6 +368,7 @@ impl Player {
                         }
                         cx.notify();
                     }))
+                    .tooltip(crate::ui::widgets::tip_hover("Properties", "", None))
                     .children(hitmap::control("menu.properties", "Properties", true))
                     .child("Properties")
                     // No stroke reaches this one, and a blank column would read
@@ -470,6 +471,7 @@ impl Player {
             .enumerate()
             .map(|(n, (choice, label, detail, picked))| {
                 let hitmap_label = label.clone();
+                let row_tip = label.clone();
                 let hitmap_id = match theme_picker {
                     true => format!("theme.{n}.row"),
                     false => format!("picker.choice.{n}"),
@@ -547,6 +549,7 @@ impl Player {
                     .on_click(
                         cx.listener(move |this, _: &ClickEvent, _, cx| this.choose(choice, cx)),
                     )
+                    .tooltip(crate::ui::widgets::overlay_tip_hover(&row_tip, "", None))
                     .children(hitmap::dynamic(
                         move || (hitmap_id, hitmap_label.to_string()),
                         true,

@@ -122,6 +122,59 @@ pub(crate) fn dissolve_glyph() -> impl IntoElement {
     .size_full()
 }
 
+/// The hover line every control in the room wears (the user, 2026-09-09:
+/// "each and every button gets hover over information" -- he could not name
+/// the band's own glyphs). One shape, built from the same pair the hitmap
+/// already names the control by: `<name> · <chord>`, DESIGN §4's "every
+/// command wears its chord" and §8's no-prose rule -- never a sentence. A
+/// control the current state refuses says *why* in the chord's place: naming
+/// a stroke that will not fire is the lie §4 forbids.
+pub(crate) fn tip_line(name: &str, chord: &str, why: Option<&str>) -> SharedString {
+    match why {
+        Some(why) => format!("{name} · {why}"),
+        // `Keymap::chord`'s own "unbound" badge: a glyph with no stroke says
+        // its name and stops, rather than wearing `--` as if that were one.
+        None if chord.is_empty() || chord == "--" => name.to_string(),
+        None => format!("{name} · {chord}"),
+    }
+    .into()
+}
+
+/// [`tip_line`] in the shape gpui's `.tooltip` takes. Every shared control
+/// constructor attaches this rather than building its own plate, which is
+/// what keeps the next control from shipping without a hover line.
+pub(crate) fn tip_hover(
+    name: &str,
+    chord: &str,
+    why: Option<&str>,
+) -> impl Fn(&mut Window, &mut App) -> gpui::AnyView + use<> {
+    let say = tip_line(name, chord, why);
+    move |_, cx| cx.new(|_| Tip(say.clone())).into()
+}
+
+/// [`tip_hover`] for a control drawn *on* a card or a menu, where an
+/// ordinary [`Tip`] stands aside (`OVERLAID`) and would show nothing.
+pub(crate) fn overlay_tip_hover(
+    name: &str,
+    chord: &str,
+    why: Option<&str>,
+) -> impl Fn(&mut Window, &mut App) -> gpui::AnyView + use<> {
+    let say = tip_line(name, chord, why);
+    move |_, cx| cx.new(|_| OverlayTip(say.clone())).into()
+}
+
+/// [`tip_hover`] for a control that dispatches an action: the name and the
+/// stroke are read live off the keymap and the enable state, so a rebind or
+/// a refusal can never leave a stale plate under the pointer.
+pub(crate) fn action_hover(
+    player: &Player,
+    action: ActionId,
+) -> impl Fn(&mut Window, &mut App) -> gpui::AnyView + use<> {
+    let enabled = player.enable(action, None);
+    let chord = player.keymap.chord(action);
+    tip_hover(action.label(), &chord, enabled.why())
+}
+
 /// A toolbar button: its glyph, its name, and its key on hover. `id` only buys
 /// `on_click` and the tooltip -- it is still not focusable, so the root's own
 /// key listener keeps working after a press, and the click lands on mouse-up
@@ -146,7 +199,7 @@ pub(crate) fn control(
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     let label = label.into();
-    let tip: SharedString = format!("{label} — {shortcut}").into();
+    let tip = tip_line(&label, &shortcut, None);
     div()
         .id(id)
         .flex_none()
