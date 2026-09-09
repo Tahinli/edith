@@ -1367,7 +1367,6 @@ fn every_action_is_reachable_without_the_keyboard() {
 #[test]
 fn every_card_closes_without_the_keyboard() {
     for card in [
-        "keys_overlay",
         "export_card",
         "eq_card",
         "color_card",

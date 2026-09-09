@@ -2954,29 +2954,60 @@ fn every_paired_spine_glyph_is_drawn_at_the_narrow_size() {
     );
 }
 
-/// DESIGN §8 (no instructional copy) and §9: the keys plate's heading is one
-/// noun, its way out is a chord like every other row, and its bottom edge is
-/// inside the window -- the shipped plate said `ALL COMMANDS · HOLD ? ·
-/// RELEASE TO CLOSE` while sitting there latched after a click, with its last
-/// rows cut off below y=720.
+/// DESIGN §9 as amended 2026-09-09: the keys list is the dock's third tab,
+/// not a plate over the bench. The overlay the user asked about ("clicking
+/// them opens a menu ... probably location problem") is gone with its scrim,
+/// the tab strip lists all three tabs, and the rows still come off
+/// `keys_rows` with the refused ones greyed rather than hidden (§8).
 #[test]
-fn the_keys_plate_says_one_noun_and_ends_inside_the_window() {
-    let src = src_text("ui/stance.rs");
-    let lower = src.to_lowercase();
+fn the_keys_list_is_a_dock_tab_and_the_plate_is_gone() {
+    let stance = src_text("ui/stance.rs");
     assert!(
-        !lower.contains("hold ? · release to close") && !lower.contains("all commands"),
-        "the keys plate still tells the hand what to do"
+        !stance.contains("keys_overlay") && !stance.contains("stance-keys-overlay"),
+        "the keys plate is still mounted over the bench"
+    );
+    let dock = src_text("ui/dock_stance.rs");
+    for (id, label) in [
+        ("dock-tab-src", "SOURCES"),
+        ("dock-tab-clip", "CLIP"),
+        ("dock-tab-keys", "KEYS"),
+    ] {
+        assert!(
+            dock.contains(&format!("dock_tab(\"{id}\", \"{label}\"")),
+            "the dock's tab strip lost {label}"
+        );
+    }
+    assert!(
+        dock.contains("fn keys_tab(") && dock.contains("keys_rows()"),
+        "the KEYS tab draws something other than the action registry"
     );
     assert!(
-        src.contains("section_head(\"keys\")") && src.contains(".child(\"esc\")"),
-        "the keys plate lost its noun or its escape chord"
+        dock.contains("Enable::Yes => INK2(),") && dock.contains("_ => INK4(),"),
+        "a refused action's row no longer greys to ink4 (DESIGN §8)"
     );
     assert!(
-        src.contains(".h(px((bench_h + LEDGER_H - 16.).max(0.)))"),
-        "the keys plate is no longer capped inside the bench+ledger footprint"
+        dock[dock.find("fn keys_tab(").unwrap()..].contains(".overflow_y_scroll()"),
+        "the KEYS tab does not scroll like its neighbours"
+    );
+    // The Sources filter box belongs to Sources: it is built inside
+    // `sources_tab`, never in the shared frame `render` draws.
+    let frame = &dock[dock.find("pub(crate) fn render(").unwrap()..];
+    assert!(
+        !frame.contains("dock-filter"),
+        "the Sources filter box leaked into the shared dock frame"
     );
 }
 
+/// The user's screenshot: the spine ended with `?` over `?`. A ghost whose
+/// primary chord IS its glyph wears no badge; every other one still does.
+#[test]
+fn the_spine_question_mark_wears_no_second_question_mark() {
+    let src = src_text("ui/stance.rs");
+    assert!(
+        src.contains(".when(player.keymap.chord(action) != glyph, |el| {"),
+        "the spine ghost draws its chord badge even when the badge repeats the glyph"
+    );
+}
 
 /// The ruler's right edge was soup: `bench-select-all` sits `right(4.)` over
 /// the tick band while tick suppression only guarded the LEFT plate, so the
