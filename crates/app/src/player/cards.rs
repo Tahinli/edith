@@ -1325,8 +1325,11 @@ impl Player {
     /// a keystroke reach `enable()`/`act()` and be answered -- Yes, or a
     /// spoken `No` -- instead of being swallowed before either is asked.
     pub(crate) fn card_open(&self) -> bool {
-        self.keys_open
-            || self.settings_open
+        // Not `keys_open`: since 2026-09-09 that is the dock's KEYS *tab*
+        // showing, a region like any other, not a surface sitting on the
+        // keyboard -- every stroke still means what the spine says it means
+        // while the list is up.
+        self.settings_open
             || self.export_open
             || self.eq_open.is_some()
             || self.color_open.is_some()

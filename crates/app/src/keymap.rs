@@ -1175,9 +1175,9 @@ impl Keymap {
                 // key stays the one people look for -- the modifier is what
                 // makes it an intention ([`crate::cancels_export`]).
                 b(ActionId::CancelExport, "escape", true),
-                // The help key (DESIGN.md §9): held, it opens the keys
-                // overlay; released, it closes -- the room's own `on_key_up`
-                // (`ui/stance.rs`) is what makes that a hold and not a latch.
+                // The help key (DESIGN.md §9, amended 2026-09-09): it swings
+                // the dock to its KEYS tab, and a second press (or `escape`)
+                // swings it back -- a toggle, not a hold, not a modal.
                 // Its own key, not `shift+/`: gpui reports a shifted symbol as
                 // the glyph itself, so `"?"` is what a stroke of it reports.
                 b(ActionId::ShowActions, "?", false),

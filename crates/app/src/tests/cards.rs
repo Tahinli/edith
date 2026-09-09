@@ -85,15 +85,13 @@ fn every_modal_field_has_a_mounted_surface_somewhere_in_the_darkroom() {
     );
     // The mounted-surface function each field's own card draws, by the
     // convention the param cards already follow (`x_open` -> `x_card(` --
-    // `Player::eq_card`/`color_card`/... in `ui/cards.rs`). `keys_open` and
-    // `export_open`/`exporting` don't follow that convention (the keys
-    // overlay isn't a "card", export pairs with the running-export sheet),
-    // so they're named explicitly. Anything else unmapped panics loudly --
+    // `Player::eq_card`/`color_card`/... in `ui/cards.rs`).
+    // `export_open`/`exporting` don't follow that convention (export pairs
+    // with the running-export sheet), so they're named explicitly. Anything else unmapped panics loudly --
     // the point is that a ninth card has to earn a line here, not just a
     // mount, or this test cannot see it.
     let mount_for = |field: &str| -> &'static str {
         match field {
-            "keys_open" => "keys_overlay(",
             "export_open" => "export_card(",
             "exporting" => "export_progress_card(",
             "eq_open" => "eq_card(",

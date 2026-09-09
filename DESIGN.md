@@ -223,7 +223,22 @@ string over ~4 words that instructs rather than reports state is a defect.
   control it already has no visual presence beside (marks and clipboard on the time band's cut
   readout row; lift/detach/group/regroup as bench lane-head ghosts; fit/resolution/zoom on the
   screen's own corner; subtitle/silence/project verbs into the dock next to the tab they already
-  belong to) — at which point the plate deletes and `?` held becomes pure dim, no list.
+  belong to) — at which point the list deletes and `?` becomes pure dim, no list.
+
+  **Amendment (2026-09-09), explicit per this section's own rule:** the plate is deleted. The
+  user asked why the spine ended in `?` over `?` and said of the plate it opened "it's not good,
+  I mean probably location problem" — a surface that appears out of nowhere over the bench, holds
+  the keyboard, and covers work. The list is now the **dock's third tab, `KEYS`, beside SOURCES
+  and CLIP**: stable geography, occluding nothing, scrolling like its neighbours, with the same
+  registry-driven rows (`keys_rows`, section head per `keymap::Category`, label left, mono chord
+  `ink3` right) and no heading prose, since the tab strip itself is the way back. An action the
+  room would refuse right now greys to `ink4` like any refused verb (§8) rather than vanishing.
+  `?` swings the dock to that tab and a second `?` (or `escape`, or a press on another tab)
+  swings it back — a toggle, not a hold and not a modal: nothing about the KEYS tab owns the
+  keyboard, so the film keeps playing and every other stroke keeps meaning what the spine says it
+  means. The spine's `?` glyph wears no chord badge, because its chord *is* its glyph. The
+  ceiling above is unchanged: the 56 homeless actions still owe a geographic home, and this tab
+  is what they read from until they get one.
 
 ## 10. The joy layer
 

@@ -257,9 +257,10 @@ impl Player {
         cx.notify();
     }
 
-    /// The actions card, from its key, from the panel button, or from its own
-    /// row: open, scrolled to the top -- a card that opens where the last
-    /// look left it would hide most of the list for a reason nobody remembers.
+    /// The keys list, from its key, from the spine's `?`, from the dock's own
+    /// KEYS tab or from a menu row: the dock swings to that tab, scrolled to
+    /// the top -- a list that opens where the last look left it would hide
+    /// most of itself for a reason nobody remembers.
     pub(crate) fn show_actions(&mut self, cx: &mut Context<Self>) {
         self.keys_open = true;
         self.scroll_keys(None);
@@ -445,7 +446,7 @@ impl Player {
         // below, which otherwise repeats nothing.
         if self.budget_edit.is_some() {
             Repeat::Card
-        } else if self.keys_open || self.export_open || self.exporting().is_some() {
+        } else if self.export_open || self.exporting().is_some() {
             Repeat::Nothing
         } else if self.eq_open.is_some()
             || self.color_open.is_some()
