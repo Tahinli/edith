@@ -442,6 +442,7 @@ fn ghost(
         .rounded(px(3.))
         .cursor_pointer()
         .hover(|s| s.bg(rgb(DARK_RAISED())).text_color(rgb(INK1())))
+        .tooltip(crate::ui::widgets::action_hover(player, action))
         .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.act(action, window, cx)))
         .type_style(type_scale::label(
             type_scale::LABEL_ROW_PX,

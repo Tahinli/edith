@@ -91,11 +91,10 @@ fn glyph_sized(
     // action answers to, and the keys overlay ([`crate::ui::stance`]) is
     // still where the full truth lives.
     let full = player.keymap.display(action);
-    let say: SharedString = match enabled.why() {
-        Some(why) => format!("{full} — {why}"),
-        None => format!("{full} — {}", action.label()),
-    }
-    .into();
+    // The room's one hover shape (`widgets::tip_line`): the name first, then
+    // the strokes -- `display`'s every stroke here rather than the compact
+    // badge, since the spine's glyph is already showing the compact one.
+    let say = crate::ui::widgets::tip_line(action.label(), &full, enabled.why());
     let compact = player.keymap.chord(action);
     let on = enabled.yes();
     div()
@@ -158,11 +157,7 @@ fn trim_control(active: bool, player: &Player, cx: &mut Context<Player>) -> impl
     let half = |id: &'static str, txt: &'static str, action: ActionId, cx: &mut Context<Player>| {
         let enabled = player.enable(action, None);
         let full = player.keymap.display(action);
-        let say: SharedString = match enabled.why() {
-            Some(why) => format!("{full} — {why}"),
-            None => format!("{full} — {}", action.label()),
-        }
-        .into();
+        let say = crate::ui::widgets::tip_line(action.label(), &full, enabled.why());
         let on = enabled.yes();
         div()
             .id(id)

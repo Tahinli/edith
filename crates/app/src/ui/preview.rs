@@ -49,6 +49,7 @@ impl Player {
                         .cursor_pointer()
                         .hover(|s| s.bg(rgb(DARK_RAISED())))
                         .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.close_preview(cx)))
+                        .tooltip(crate::ui::widgets::tip_hover("Stop preview", "esc", None))
                         .children(hitmap::control("preview.stop", "Stop preview", true))
                         .child(div().text_color(rgb(INK2())).child("Stop"))
                         .child(

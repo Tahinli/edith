@@ -121,6 +121,7 @@ fn dark_card_head(
                     .into()
                 })
                 .child(if max { "▣ m" } else { "⤢ m" })
+                .tooltip(crate::ui::widgets::overlay_tip_hover("Toggle card size", "", None))
                 .children(hitmap::control("card.maximize", "Toggle card size", true))
         }))
         .child(
@@ -205,6 +206,11 @@ fn dark_step_glyph(
         .cursor_pointer()
         .hover(|s| s.bg(rgb(DARK_RAISED())))
         .on_click(on_click)
+        .tooltip(crate::ui::widgets::overlay_tip_hover(
+            if plus { "Step up" } else { "Step down" },
+            "",
+            None,
+        ))
         .children(hitmap.flatten())
         .child(dark_row_value(if plus { "+" } else { "−" }))
 }
@@ -236,6 +242,7 @@ fn dark_ghost_button(
         .cursor_pointer()
         .hover(|s| s.bg(rgb(DARK_RAISED())))
         .on_click(on_click)
+        .tooltip(crate::ui::widgets::overlay_tip_hover(&text, chord, None))
         .children(hitmap.flatten())
         .child(
             div()
