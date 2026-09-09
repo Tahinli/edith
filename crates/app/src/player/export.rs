@@ -351,12 +351,7 @@ impl Player {
         let Some(session) = &self.session else {
             return;
         };
-        let settings = export_settings(
-            self.budget_bps(),
-            self.format,
-            self.audio_kbps,
-            self.encoder_seat(),
-        );
+        let settings = probe_settings(self.format, self.audio_kbps, self.encoder_seat());
         if !self.export_open {
             return;
         }
