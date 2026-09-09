@@ -448,6 +448,10 @@ fn ghost(
             gpui::FontWeight::MEDIUM,
         ))
         .text_color(rgb(INK2()))
+        // The pointer's way to this glyph has to be findable by name like
+        // every other ghost's (`spine_stance`), or a hand -- and the harness
+        // -- can only reach the KEYS tab through its dock tab.
+        .children(hitmap::action(action, true))
         .child(glyph.to_string())
         // Every command wears its chord (DESIGN §4) -- except the one whose
         // glyph already IS its stroke: `?` over `?` read as two question
