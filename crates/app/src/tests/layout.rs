@@ -1292,6 +1292,97 @@ fn the_darkroom_subtitle_palette_drags_tracks_to_subtitle_lanes() {
     );
 }
 
+/// A file's subtitle tracks are that file's subset and are listed as one:
+/// directly under the row that names it, never after every unrelated file
+/// (user 2026-09-10, screenshot -- two screen recordings sat between a film
+/// and its own subtitle group). A `.srt` nobody carries stays top-level, in
+/// arrival order, at the end.
+#[test]
+fn a_file_subtitle_group_follows_its_own_row() {
+    use crate::ui::dock_stance::{Slot, source_list_order};
+    let film = PathBuf::from("/films/a.mkv");
+    let other = PathBuf::from("/rec/b.mp4");
+    let loose = PathBuf::from("/subs/late.srt");
+    assert_eq!(
+        source_list_order(
+            &[film.clone(), other.clone()],
+            &[film.clone(), loose.clone()]
+        ),
+        [Slot::Media(0), Slot::Subs(0), Slot::Media(1), Slot::Subs(1)],
+        "the film's own tracks must sit between it and the next file"
+    );
+    // A file with several audio streams has several rows; the tracks follow
+    // the last of them, so the file's own rows stay together.
+    assert_eq!(
+        source_list_order(
+            &[film.clone(), other.clone(), film.clone()],
+            &[film.clone()]
+        ),
+        [Slot::Media(0), Slot::Media(1), Slot::Media(2), Slot::Subs(0)],
+    );
+    // Nobody's `.srt`: still a top-level row, still last.
+    assert_eq!(
+        source_list_order(&[other], &[loose]),
+        [Slot::Media(0), Slot::Subs(0)],
+    );
+}
+
+/// ...and the Sources list is *built* through that ordering rather than by
+/// appending the subtitle groups after the media rows, which is what put a
+/// film's own tracks at the end of the list.
+#[test]
+fn the_sources_list_is_built_through_the_ordering() {
+    let dock = src_text("ui/dock_stance.rs");
+    let tab = &dock[dock.find("fn sources_tab").expect("no sources tab")..];
+    assert!(
+        tab.contains("source_list_order(&media, &subs)"),
+        "the Sources list no longer goes through source_list_order"
+    );
+    assert!(
+        !tab.contains("row_elements.extend(subtitles)"),
+        "the subtitle groups are appended after every source again"
+    );
+    // A parent already in the list gets the tracks bare, under it.
+    let palette = &dock[dock.find("fn subtitle_tab_rows").expect("no subtitle rows")..];
+    assert!(
+        palette.contains("let nested = parents.contains(&group.path)")
+            && palette.contains("let has_header = !nested || track_count > 3"),
+        "a group under its own parent still draws a group row"
+    );
+}
+
+/// Two files whose rows read the same word are told apart on the metadata
+/// line -- the folder, or `#n` when the folder is shared too.
+#[test]
+fn same_named_files_are_told_apart_on_the_metadata_line() {
+    let three: Vec<Source> = ["/a/rec.mp4", "/b/rec.mp4", "/a/solo.mp4"]
+        .into_iter()
+        .map(|path| Source {
+            path: PathBuf::from(path),
+            audio_stream: 0,
+        })
+        .collect();
+    let rows = library_rows(&three, &HashMap::new(), &HashMap::new(), None, |_| 90);
+    assert_eq!(
+        rows.iter().map(|row| row.detail.as_str()).collect::<Vec<_>>(),
+        ["a", "b", ""],
+        "twins say which folder they came out of"
+    );
+    let twins: Vec<Source> = ["/a/rec.mp4", "/a/rec.mkv"]
+        .into_iter()
+        .map(|path| Source {
+            path: PathBuf::from(path),
+            audio_stream: 0,
+        })
+        .collect();
+    let rows = library_rows(&twins, &HashMap::new(), &HashMap::new(), None, |_| 90);
+    assert_eq!(
+        rows.iter().map(|row| row.detail.as_str()).collect::<Vec<_>>(),
+        ["#1", "#2"],
+        "one folder, one stem: arrival order tells them apart"
+    );
+}
+
 /// A subtitle group's header in the Text tab must not vanish on a short
 /// window: `subtitle_tab_rows` draws one per group unconditionally -- there
 /// is no viewport-height gate on it at all any more, so the list under it
@@ -3903,6 +3994,70 @@ fn no_region_root_wears_a_focus_ring() {
     }
 }
 
+
+/// The user could not find the three columns (2026-09-10: "I couldn't realize
+/// them when I look at"), because their heads were 12px `ink3` -- the room's
+/// quietest type -- with a prose tail running on after each one. DESIGN §3's
+/// new line: a room/column head is 15px Archivo 700 `ink1`, and the prose is a
+/// hover plate (DESIGN §8), never ambient text on the head itself.
+#[test]
+fn the_settings_columns_wear_room_heads_not_section_heads() {
+    let source = src_text("ui/settings_stance.rs");
+    let start = source.find("fn room_head(").expect("the room head");
+    let body = &source[start..source[start..].find("\n}\n").unwrap() + start];
+    for needle in [
+        "type_scale::LABEL_ROW_PX",
+        "FontWeight::BOLD",
+        "rgb(INK1())",
+        ".tooltip(",
+        ".pb(px(12.))",
+    ] {
+        assert!(body.contains(needle), "a room head lost {needle}");
+    }
+    assert!(
+        !body.contains("INK3()") && !body.contains("type_scale::head()"),
+        "the room heads fell back to the 12px in-list section head"
+    );
+    // Each column head is one word, and its prose lives on the plate.
+    for head in ["\"PROJECT\"", "\"EDITOR\"", "\"EXPORT\""] {
+        assert!(source.contains(head), "the settings room lost its {head} head");
+    }
+    for run_on in ["PROJECT \u{b7}", "EDITOR \u{b7}", "EXPORT \u{b7}"] {
+        assert!(
+            !source.contains(run_on),
+            "a settings head grew its prose tail back: {run_on}"
+        );
+    }
+}
+
+/// The Picture row said every refused format's reason after its value
+/// (`H.264 no picture -- an mp4 would \u{b7} AV1 no picture -- ...`; the user
+/// called it "funny"). A row says its own pick: one value, and a refusal only
+/// when *that* pick is the refused one.
+#[test]
+fn the_picture_row_tail_is_the_current_format_alone() {
+    let source = src_text("ui/settings_stance.rs");
+    let start = source.find("fn export_section(").expect("the export section");
+    let body = &source[start..];
+    let body = &body[..body.find("\n/// The page itself").expect("the page's render fn")];
+    assert!(
+        !body.contains("PICTURE_CYCLE"),
+        "the Picture row walks the whole cycle to build its tail again"
+    );
+    assert!(
+        !body.contains(".join("),
+        "an EXPORT row concatenates a list into one row's tail again"
+    );
+    assert!(
+        body.contains("format_refusal(session, format)"),
+        "the Picture row's refusal is no longer asked about the current format"
+    );
+    // Six words at most, and the value greys with the refusal it carries.
+    assert!(
+        body.contains("short_reason(&why)") && body.contains("picture_ink"),
+        "the Picture row lost its short reason or its greyed value"
+    );
+}
 
 /// The monitoring level's home. Cleanse round 2 took the mute button, the
 /// `- +` pair and the slider off the time band on the promise that the level
