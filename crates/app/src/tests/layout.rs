@@ -2795,3 +2795,22 @@ fn the_seam_paints_nothing_until_a_pointer_finds_it() {
         assert!(body.contains(step), "the divider is missing {step}");
     }
 }
+
+/// DESIGN §7: "lanes scroll behind the pinned ruler and track heads" -- pinned
+/// means pinned. A clip that starts left of the view sits at a negative `left`
+/// inside its bed, and with no clip mask gpui paints it (and its hitbox) over
+/// the 72 px head column, so V1/A1 and their verbs disappear under the first
+/// take as soon as the bench is wheeled past frame 0. The mask belongs on the
+/// bed itself so a half-scrolled clip still drags on the half that shows.
+#[test]
+fn the_lane_bed_clips_its_clips_at_the_pinned_heads() {
+    let src = src_text("ui/bench_stance.rs");
+    let start = src.find(r#".id(("bench-bed""#).expect("the bed");
+    let bed =
+        &src[start..start + src[start..].find(".bg(rgb(DARK_CANVAS()))").expect("its fill")];
+    assert!(
+        bed.contains(".overflow_hidden()"),
+        "the bed lets its clips paint outside itself, straight over the \
+         pinned lane heads: {bed}"
+    );
+}

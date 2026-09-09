@@ -1039,6 +1039,17 @@ fn lane_row(
                 .flex_1()
                 .min_w(px(0.))
                 .h_full()
+                // DESIGN Â§7: the lanes scroll BEHIND the pinned heads. A
+                // clip whose start is left of the view sits at a negative
+                // `left`, and without a clip mask gpui paints it -- and its
+                // hitbox -- straight over the 72px head column, so V1/A1 and
+                // their verbs vanish under it. The mask cuts painting and
+                // hit-testing at the bed's own edges together, so the visible
+                // half of a half-scrolled clip still drags and trims and the
+                // hidden half answers nothing. Menus, drag previews and
+                // tooltips are unaffected: they render at the window root
+                // (`ui/overlays.rs`, gpui's `active_drag`), not in here.
+                .overflow_hidden()
                 .bg(rgb(DARK_CANVAS()))
                 // The seam is drawn as an absolute overlay rather than a
                 // layout `border_l_1`: a border eats a pixel out of the
