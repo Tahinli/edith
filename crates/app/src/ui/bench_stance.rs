@@ -328,7 +328,19 @@ fn clip_box(
             },
             {
                 let ghost = ghost.clone();
-                move |_, _, _, cx| cx.new(|_| Tip(ghost.clone()))
+                let me = cx.entity();
+                move |_, _, _, cx| {
+                    // A fresh gesture inherits nothing: `Player::drag_lane`
+                    // and `Player::drag_x` are the *last live sample* of the
+                    // drag being made, and a drag whose first sample lands
+                    // outside every row would otherwise be let go onto the
+                    // lane the previous one ended over.
+                    me.update(cx, |this, _| {
+                        this.drag_lane = None;
+                        this.drag_x = None;
+                    });
+                    cx.new(|_| Tip(ghost.clone()))
+                }
             },
         )
         .tooltip(crate::ui::widgets::tip_hover("Clip", "drag to move", None))
@@ -717,7 +729,19 @@ fn sub_box(
             },
             {
                 let ghost = ghost.clone();
-                move |_, _, _, cx| cx.new(|_| Tip(ghost.clone()))
+                let me = cx.entity();
+                move |_, _, _, cx| {
+                    // A fresh gesture inherits nothing: `Player::drag_lane`
+                    // and `Player::drag_x` are the *last live sample* of the
+                    // drag being made, and a drag whose first sample lands
+                    // outside every row would otherwise be let go onto the
+                    // lane the previous one ended over.
+                    me.update(cx, |this, _| {
+                        this.drag_lane = None;
+                        this.drag_x = None;
+                    });
+                    cx.new(|_| Tip(ghost.clone()))
+                }
             },
         )
         .tooltip(crate::ui::widgets::tip_hover("Subtitle", "drag to move", None))
@@ -892,7 +916,7 @@ fn lane_row(
         // pointer actually being inside this *row's* bounds, since
         // `on_drag_move` fires on every painted element of the drag's
         // type, not just the one under the pointer. The row and not the
-        // bed: the head column is 72px of this lane too, and a clip
+        // bed: the head column is `HEAD_W` px of this lane too, and a clip
         // dragged out over it is aiming at frame 0 -- the drop it used to
         // fall through (nothing under the pointer answered `ClipDrag`) is
         // the "I have to be pixel perfect to snap to 0" complaint.
@@ -905,6 +929,11 @@ fn lane_row(
                 }
                 let path = event.drag(cx).0.clone();
                 this.drag_x = Some(event.event.position.x);
+                // The row the catch-all release below aims at. A file's own
+                // kind is not known until the engine has placed it, so the
+                // last row hovered is the answer and `Player::insert_source`
+                // words the refusal if it cannot hold this file.
+                this.drag_lane = Some(lane);
                 this.drag_alt = event.event.modifiers.alt;
                 this.preview_ghost_asset(&path, lane, event.event.position.x, cx);
             }),
@@ -956,6 +985,7 @@ fn lane_row(
                 }
                 let drag = *event.drag(cx);
                 this.drag_x = Some(event.event.position.x);
+                this.drag_lane = held_lane(this.drag_lane, lane, drag.lane);
                 this.drag_alt = event.event.modifiers.alt;
                 this.preview_ghost_sub(&drag, lane, event.event.position.x, cx);
             }),
@@ -976,6 +1006,7 @@ fn lane_row(
                 }
                 let track = event.drag(cx).0;
                 this.drag_x = Some(event.event.position.x);
+                this.drag_lane = Some(lane);
                 this.drag_alt = event.event.modifiers.alt;
                 this.preview_ghost_pick(track, lane, event.event.position.x, cx);
             }),
@@ -1096,7 +1127,7 @@ fn lane_row(
                 // DESIGN Â§7: the lanes scroll BEHIND the pinned heads. A
                 // clip whose start is left of the view sits at a negative
                 // `left`, and without a clip mask gpui paints it -- and its
-                // hitbox -- straight over the 72px head column, so V1/A1 and
+                // hitbox -- straight over the `HEAD_W` px head column, so V1/A1 and
                 // their verbs vanish under it. The mask cuts painting and
                 // hit-testing at the bed's own edges together, so the visible
                 // half of a half-scrolled clip still drags and trims and the
@@ -1320,6 +1351,46 @@ pub(crate) fn render(
                 .unwrap_or_else(|| window.mouse_position().x);
             this.drag_alt = window.modifiers().alt;
             this.move_clip(drag.lane, idx, lane, x, cx);
+        }))
+        // The same catch-all for the other three things a hand can be holding
+        // over the bench -- a library row, a caption already down, a palette
+        // row. Each lands on the lane its last live sample was over, through
+        // the very door that row's own release uses, so the engine words the
+        // refusal when that lane cannot hold it. Without these, letting one go
+        // off the rows reached nothing at all.
+        .on_drop(cx.listener(move |this, drag: &AssetDrag, window, cx| {
+            let Some(lane) = this.drag_lane else {
+                return;
+            };
+            let x = this
+                .drag_x
+                .take()
+                .unwrap_or_else(|| window.mouse_position().x);
+            this.drag_alt = window.modifiers().alt;
+            let at = this.place_frame(x).0;
+            this.insert_source(&drag.0.clone(), drag.1, Some(lane), Some(at), cx);
+        }))
+        .on_drop(cx.listener(move |this, drag: &SubDrag, window, cx| {
+            let Some(lane) = this.drag_lane else {
+                return;
+            };
+            let x = this
+                .drag_x
+                .take()
+                .unwrap_or_else(|| window.mouse_position().x);
+            this.drag_alt = window.modifiers().alt;
+            this.move_sub(drag, lane, x, cx);
+        }))
+        .on_drop(cx.listener(move |this, drag: &SubPick, window, cx| {
+            let Some(lane) = this.drag_lane else {
+                return;
+            };
+            let x = this
+                .drag_x
+                .take()
+                .unwrap_or_else(|| window.mouse_position().x);
+            this.drag_alt = window.modifiers().alt;
+            this.place_sub(drag.0, lane, x, cx);
         }))
         .child(
             // Pinned ruler: click/drag to seek (reuses `Player::scrub_to`,

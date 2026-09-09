@@ -661,20 +661,33 @@ pub(crate) fn landing(
     snap_cue(on, under.saturating_sub(grab), len, tol, marks)
 }
 
-/// Whether a clip `len` frames long landing at `start` would sit on top of one
-/// of `others` -- `(start, end)` of every clip already on the lane it is being
-/// let go over, less the ones travelling with it. The engine refuses such a
-/// drop ([`Project::move_selection`]'s `move_room`), so the shadow is drawn as
-/// refused rather than promising a landing the release will not make: a drag
-/// that ends in nothing at all is what an editor reads as a broken timeline.
+/// Where a clip `len` frames long, let go over *another* lane with its head
+/// asked at `at`, really comes to rest -- `None` when the engine refuses the
+/// drop outright. A mirror of [`Project::move_room`]: the release is refused
+/// only when the asked head sits *inside* a take already there (a clamp has no
+/// answer for that), or when the gap it names is narrower than the clip;
+/// otherwise the head is clamped into that gap exactly as a same-lane move is
+/// ([`gap_clamp`]). `others` is `(start, end)` of every clip already on the
+/// destination lane, less the ones travelling with this one.
 ///
-/// Touching is not overlapping -- a clip laid exactly against the take in front
-/// of it is the whole point of the magnet.
-pub(crate) fn collides(start: u32, len: u32, others: &[(u32, u32)]) -> bool {
-    let end = start.saturating_add(len);
-    others
-        .iter()
-        .any(|&(other_start, other_end)| start < other_end && other_start < end)
+/// The shadow reads this, so a landing the release *will* make is never drawn
+/// as refused -- a whole-span overlap test refuses far more than the engine
+/// does, and a shadow that lies about a refusal reads as a broken timeline.
+pub(crate) fn cross_room(at: u32, len: u32, others: &[(u32, u32)]) -> Option<u32> {
+    let (mut lo, mut hi) = (0, u32::MAX);
+    for &(other_start, other_end) in others {
+        if other_start <= at && at < other_end {
+            return None;
+        }
+        match other_end <= at {
+            true => lo = lo.max(other_end),
+            false => hi = hi.min(other_start),
+        }
+    }
+    match hi - lo < len {
+        true => None,
+        false => Some(at.clamp(lo, hi - len)),
+    }
 }
 
 /// Where a clip staying on its own lane really comes to rest: `want`, clamped
@@ -929,17 +942,20 @@ mod drop_landing_tests {
         assert_eq!(gap_clamp(500, 100, 9_000, &[]), 9_000);
     }
 
-    /// The refused state the shadow draws: a head let go on top of a take
-    /// already on the lane, which the engine changes nothing for. Laid exactly
-    /// against one -- what the magnet is for -- is not a collision.
+    /// The cross-lane shadow's rule, mirroring the engine: refused only when
+    /// the asked head is inside a take or the gap is too narrow, and otherwise
+    /// clamped into the gap rather than refused. The middle case is the
+    /// verifier's repro -- an obstacle at (360, 420), a 90-frame clip asked at
+    /// 315, which the engine lands at 270.
     #[test]
-    fn a_landing_on_top_of_a_take_previews_as_refused() {
-        let others = [(100, 200), (400, 500)];
-        assert!(collides(150, 50, &others), "inside the first take");
-        assert!(collides(90, 50, &others), "its head laps the first take");
-        assert!(collides(50, 400, &others), "long enough to swallow both");
-        assert!(!collides(50, 50, &others), "tail meets the head exactly");
-        assert!(!collides(200, 200, &others), "the gap holds it exactly");
-        assert!(!collides(500, 10, &others), "past the last take");
+    fn a_cross_lane_landing_clamps_into_the_gap_the_engine_leaves() {
+        let others = [(360, 420)];
+        assert_eq!(cross_room(315, 90, &others), Some(270), "clamped, not refused");
+        assert_eq!(cross_room(380, 90, &others), None, "head inside the take");
+        assert_eq!(cross_room(100, 90, &others), Some(100), "room to spare");
+        let tight = [(0, 100), (150, 300)];
+        assert_eq!(cross_room(120, 90, &tight), None, "the gap is 50 frames wide");
+        assert_eq!(cross_room(120, 50, &tight), Some(100), "and holds a 50-frame clip");
+        assert_eq!(cross_room(500, 90, &[]), Some(500), "an empty lane takes it as asked");
     }
 }

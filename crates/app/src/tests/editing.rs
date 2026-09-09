@@ -1672,7 +1672,10 @@ fn a_row_dropped_on_the_open_bed_lands_under_the_pointer() {
     let clips = [session.lane_clips(Lane::V1), session.lane_clips(Lane::A1)];
     let marks = snap_marks(&clips, None, None, frame_at(session.now(), fps), None);
     let under = frame_at(scale.time_at(px_along(px(212.), bed)), fps);
-    let (at, cue) = landing(under, 0, 0, true, scale.snap_frames(fps), &marks);
+    // The drop's own magnet, not the trims' finer one -- `Player::place_frame`
+    // ships `drop_snap_frames`, and a test computing with `snap_frames` stops
+    // mirroring production the moment the two differ.
+    let (at, cue) = landing(under, 0, 0, true, scale.drop_snap_frames(fps), &marks);
     assert_eq!((at, cue), (300, None), "the pointer is on frame 300");
 
     // ...and what the release does with it: the frame back through the same

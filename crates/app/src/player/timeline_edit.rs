@@ -399,6 +399,10 @@ impl Player {
                     self.selected.clear();
                 }
                 self.reset_after_reseek();
+                // The strip names the edit that just happened: a move that
+                // lands silently leaves the last word (`SPLIT`) standing, and
+                // an editor reads that as the drag having done nothing.
+                self.notify_user("MOVED".into());
             }
             // The three ways a drag is refused, told apart by what the
             // front-end already knows: a lane's kind, and where the clip was.
@@ -431,6 +435,9 @@ impl Player {
                 .into(),
             ),
         }
+        // The gesture is over: the lane it ended over is nobody's answer any
+        // more (`Player::drag_lane`, read by `bench-content`'s catch-all).
+        self.drag_lane = None;
         cx.notify();
     }
 
@@ -802,7 +809,7 @@ impl Player {
     /// Where a clip let go at window `x` over lane `to` wants its head: the
     /// frame under the pointer, less however far into the box the hand grabbed
     /// it (so the clip does not jump under the pointer), pulled onto a
-    /// neighbouring edge when it lands within [`SNAP_PX`] of one. `None` when
+    /// neighbouring edge when it lands within [`Player::drop_snap_frames`] of one. `None` when
     /// there is no such clip to move. The engine has the last word on where it
     /// may actually go -- this is the ask, not the answer.
     ///
@@ -912,13 +919,17 @@ impl Player {
         // Staying on its own lane, the engine clamps the travel into the gap
         // the clip sits in rather than refusing it, so the shadow rests where
         // the release will: flush against the take it was dragged into. Landing
-        // on *another* lane it is refused outright when a take is already
-        // there, and the shadow says so before the hand lets go -- never a
-        // silent no-op.
+        // on *another* lane it clamps too ([`cross_room`], the engine's own
+        // `move_room` rule) and refuses only a head let go *inside* a take or a
+        // gap too narrow to hold the clip -- the shadow says so before the hand
+        // lets go, and never claims a refusal the release would not make.
         let len = drag.clip.frames();
         let (start, refused) = match to == drag.lane {
             true => (gap_clamp(drag.clip.start, len, start, &neighbours), false),
-            false => (start, collides(start, len, &neighbours)),
+            false => match cross_room(start, len, &neighbours) {
+                Some(landed) => (landed, false),
+                None => (start, true),
+            },
         };
         let anchor = Ghost {
             lane: to,
@@ -1178,9 +1189,6 @@ impl Player {
         }
     }
 
-    /// [`SNAP_PX`] in timeline frames at the scale the bed is drawn at: the bed's
-    /// own width drops out of it, since a pixel is now worth the same stretch of
-    /// timeline wherever the view sits.
     /// Whether the magnet is on for the gesture happening *now*: the switch
     /// ([`Player::snap`]) unless `alt` is held ([`Player::drag_alt`]), which
     /// turns it off for this drag or trim alone -- the temporary override
@@ -1192,6 +1200,10 @@ impl Player {
         snap_live(self.snap, self.drag_alt)
     }
 
+    /// [`SNAP_PX`] in timeline frames at the scale the bed is drawn at: the
+    /// bed's own width drops out of it, since a pixel is now worth the same
+    /// stretch of timeline wherever the view sits. The edge trims' magnet --
+    /// a drop asks [`Player::drop_snap_frames`].
     pub(crate) fn snap_frames(&self) -> u32 {
         self.scale.snap_frames(self.fps)
     }
