@@ -244,22 +244,22 @@ impl ActionId {
     pub fn label(self) -> &'static str {
         match self {
             ActionId::Play => "Play / Pause",
-            ActionId::Loop => "Loop the playhead's end",
+            ActionId::Loop => "Loop playback",
             ActionId::StepBack => "One frame back",
             ActionId::StepForward => "One frame forward",
             ActionId::JumpBack => "One second back",
             ActionId::JumpForward => "One second forward",
-            ActionId::GoStart => "Go to the start",
-            ActionId::GoEnd => "Go to the last frame",
-            ActionId::PrevSyncPoint => "Previous sync point (a cut here is copied, not re-encoded)",
-            ActionId::NextSyncPoint => "Next sync point (a cut here is copied, not re-encoded)",
-            ActionId::WalkCutNext => "Walk to the next cut",
-            ActionId::WalkCutPrev => "Walk to the previous cut",
-            ActionId::WalkCutNext10 => "Walk ten cuts forward",
-            ActionId::WalkCutPrev10 => "Walk ten cuts back",
-            ActionId::SetIn => "Mark in (export range)",
-            ActionId::SetOut => "Mark out (export range)",
-            ActionId::ClearRange => "Clear the export range",
+            ActionId::GoStart => "Go to start",
+            ActionId::GoEnd => "Go to end",
+            ActionId::PrevSyncPoint => "Previous sync point",
+            ActionId::NextSyncPoint => "Next sync point",
+            ActionId::WalkCutNext => "Next cut",
+            ActionId::WalkCutPrev => "Previous cut",
+            ActionId::WalkCutNext10 => "Forward ten cuts",
+            ActionId::WalkCutPrev10 => "Back ten cuts",
+            ActionId::SetIn => "Mark in",
+            ActionId::SetOut => "Mark out",
+            ActionId::ClearRange => "Clear range",
             ActionId::Export => "Export",
             ActionId::Save => "Save",
             ActionId::Copy => "Copy",
@@ -269,59 +269,59 @@ impl ActionId {
             // Neither half's action: it takes the *pair* apart, and the menu
             // that offers it hangs on whichever half was right-clicked -- worded
             // from the picture's side it read as a video item on an audio clip.
-            ActionId::Detach => "Ungroup the selection (clips and captions)",
-            ActionId::Group => "Group the selection (ctrl-click the clips first)",
-            ActionId::Select => "Select the clip under the playhead (again for the next lane)",
-            ActionId::SelectNext => "Select the next clip in the lane",
-            ActionId::SelectPrev => "Select the previous clip in the lane",
-            ActionId::SelectAll => "Select everything (every clip and caption)",
-            ActionId::Deselect => "Clear the selection",
+            ActionId::Detach => "Ungroup",
+            ActionId::Group => "Group",
+            ActionId::Select => "Select clip at playhead",
+            ActionId::SelectNext => "Select next clip",
+            ActionId::SelectPrev => "Select previous clip",
+            ActionId::SelectAll => "Select all",
+            ActionId::Deselect => "Deselect",
             ActionId::Delete => "Delete",
-            ActionId::Lift => "Lift (leave a gap)",
+            ActionId::Lift => "Lift",
             ActionId::Color => "Colour…",
-            ActionId::Transform => "Transform — position, scale, rotation, crop",
-            ActionId::Fit => "Fit policy: fit → fill → stretch → centre",
-            ActionId::Resolution => "Project resolution: source → 2160p → 1080p → 720p → 480p",
-            ActionId::ZoomIn => "Zoom in on the timeline (around the playhead)",
-            ActionId::ZoomOut => "Zoom out of the timeline",
-            ActionId::ZoomFit => "Fit the whole timeline on screen",
+            ActionId::Transform => "Transform…",
+            ActionId::Fit => "Fit policy",
+            ActionId::Resolution => "Project resolution",
+            ActionId::ZoomIn => "Zoom in",
+            ActionId::ZoomOut => "Zoom out",
+            ActionId::ZoomFit => "Fit timeline",
             ActionId::Undo => "Undo",
             ActionId::Redo => "Redo",
-            ActionId::AddVideoLane => "Add a video track",
-            ActionId::AddAudioLane => "Add an audio track",
-            ActionId::RemoveVideoLane => "Remove the last video track (it must be empty)",
-            ActionId::RemoveAudioLane => "Remove the last audio track (it must be empty)",
-            ActionId::AddSubtitleLane => "Add a subtitle track",
-            ActionId::RemoveSubtitleLane => "Remove the last subtitle track (it must be empty)",
-            ActionId::ImportSubtitles => "Add subtitles from a file…",
+            ActionId::AddVideoLane => "Add video track",
+            ActionId::AddAudioLane => "Add audio track",
+            ActionId::RemoveVideoLane => "Remove video track",
+            ActionId::RemoveAudioLane => "Remove audio track",
+            ActionId::AddSubtitleLane => "Add subtitle track",
+            ActionId::RemoveSubtitleLane => "Remove subtitle track",
+            ActionId::ImportSubtitles => "Add subtitles…",
             ActionId::AddFiles => "Add files…",
-            ActionId::PasteFilePath => "Paste path (import the file it names)",
+            ActionId::PasteFilePath => "Paste path",
             ActionId::ToggleMute => "Mute / Unmute",
             ActionId::VolumeUp => "Volume up",
             ActionId::VolumeDown => "Volume down",
             ActionId::Equalizer => "Equalizer",
-            ActionId::Speed => "Speed (tape)…",
-            ActionId::Silence => "Silences: cut or speed up…",
-            ActionId::Crossfade => "Crossfade into the next clip",
-            ActionId::TrimIn => "Trim the subject cut's in point",
-            ActionId::TrimOut => "Trim the subject cut's out point",
-            ActionId::LoopTrim => "Loop-trim the subject cut",
-            ActionId::TrimInToPlayhead => "Trim the subject cut's in point to the playhead",
-            ActionId::TrimOutToPlayhead => "Trim the subject cut's out point to the playhead",
-            ActionId::Dissolve => "Dissolve into the next clip",
-            ActionId::Mix => "Mix: track volumes and the limiter…",
-            ActionId::ToggleSnap => "Snap on / off (edges, the playhead, the start)",
-            ActionId::ToggleSubtitles => "Subtitles on / off over the picture",
-            ActionId::ToggleProxies => "Proxies on / off for the picture",
-            ActionId::ToggleAutoProxies => "Make proxies on import: on / off",
-            ActionId::Theme => "Theme: the window's colours…",
-            ActionId::Fullscreen => "Fullscreen on / off",
+            ActionId::Speed => "Speed…",
+            ActionId::Silence => "Silences…",
+            ActionId::Crossfade => "Crossfade to next",
+            ActionId::TrimIn => "Trim in",
+            ActionId::TrimOut => "Trim out",
+            ActionId::LoopTrim => "Loop-trim",
+            ActionId::TrimInToPlayhead => "Trim in to playhead",
+            ActionId::TrimOutToPlayhead => "Trim out to playhead",
+            ActionId::Dissolve => "Dissolve to next",
+            ActionId::Mix => "Mix…",
+            ActionId::ToggleSnap => "Snap",
+            ActionId::ToggleSubtitles => "Subtitles",
+            ActionId::ToggleProxies => "Proxies",
+            ActionId::ToggleAutoProxies => "Proxies on import",
+            ActionId::Theme => "Theme…",
+            ActionId::Fullscreen => "Fullscreen",
             ActionId::CancelExport => "Cancel export",
-            ActionId::ShowActions => "All actions and their keys…",
-            ActionId::Screenshot => "Save the frame on screen as a PNG",
-            ActionId::SubtitleStyle => "Subtitle style: font and size…",
-            ActionId::Settings => "Settings: project and editor…",
-            ActionId::FocusPanels => "Move keyboard focus between panels",
+            ActionId::ShowActions => "All actions…",
+            ActionId::Screenshot => "Save frame as PNG",
+            ActionId::SubtitleStyle => "Subtitle style…",
+            ActionId::Settings => "Settings…",
+            ActionId::FocusPanels => "Focus panels",
         }
     }
 
@@ -1679,6 +1679,28 @@ mod tests {
         assert_eq!(k.display(ActionId::ShowActions), "?");
         assert_eq!(k.display(ActionId::ToggleSubtitles), "t");
         assert_eq!(k.display(ActionId::ZoomIn), "ctrl+=");
+    }
+
+    /// DESIGN §8: a label names the verb. Prose truncates -- the KEYS list
+    /// ellipsises it, a menu row's fixed plate cuts it mid-word, a hover plate
+    /// the same -- so four words is the whole budget, and what a parenthesis
+    /// used to carry (why an action refuses) lives in the refusal string the
+    /// oracle and the engine already word.
+    #[test]
+    fn a_label_names_the_verb_in_four_words() {
+        let mut seen: Vec<&'static str> = Vec::new();
+        for action in ActionId::ALL {
+            let label = action.label();
+            let words = label.split_whitespace().count();
+            assert!(words <= 4, "{action:?}: {words} words -- {label:?}");
+            assert!(!label.contains('('), "{action:?}: a parenthesis -- {label:?}");
+            assert!(
+                !label.to_lowercase().starts_with("the "),
+                "{action:?}: leads with an article -- {label:?}"
+            );
+            assert!(!seen.contains(&label), "two actions both named {label:?}");
+            seen.push(label);
+        }
     }
 
     /// [`Keymap::chord`] is the badge's one token, not [`Keymap::display`]'s

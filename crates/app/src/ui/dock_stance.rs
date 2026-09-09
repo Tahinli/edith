@@ -1265,11 +1265,14 @@ fn keys_tab(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
             .gap(px(12.))
             .child(
                 div()
-                    // The label gives way, never the chord: a long parenthetical
-                    // ("Previous sync point (a cut here is copied...)") pushed
-                    // the chord column clean off the dock's right edge until
-                    // this row took `min_w(0)` + ellipsis, the same shape a
-                    // source row's name already uses.
+                    // The label gives way, never the chord: a long
+                    // parenthetical ("Previous sync point (a cut here is
+                    // copied...)") pushed the chord column clean off the
+                    // dock's right edge until this row took `min_w(0)` +
+                    // ellipsis, the same shape a source row's name already
+                    // uses. The labels are four words at most since cleanse
+                    // round 2, so nothing reaches the ellipsis; it stays for
+                    // the row that is waiting for a key.
                     .flex_1()
                     .min_w(px(0.))
                     .truncate()

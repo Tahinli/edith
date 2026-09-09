@@ -2591,11 +2591,11 @@ fn every_action_has_a_darkroom_widget_home_or_explicit_owner() {
     ];
     /// `ActionId::Loop` is a prefix of `ActionId::LoopTrim`, and the keys
     /// menu's own label arm (`ActionId::ToggleMute | ActionId::Paste =>
-    /// format!("{verb} (global)")`) shapes a string rather than opening a
+    /// format!("{full} (global)")`) shapes a string rather than opening a
     /// door -- neither is a widget home, so neither counts as a mention.
     fn mentions(text: &str, name: &str) -> bool {
         text.lines()
-            .filter(|l| !l.contains("=> format!(\"{verb} (global)\")"))
+            .filter(|l| !l.contains("=> format!(\"{full} (global)\")"))
             .any(|line| {
                 line.match_indices(&format!("ActionId::{name}")).any(|(i, m)| {
                     !line[i + m.len()..]
