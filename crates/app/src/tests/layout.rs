@@ -2694,3 +2694,48 @@ fn an_external_file_drop_is_heard_by_the_whole_room_and_imports() {
         "the dock answers an external file drag with nothing: {dock}"
     );
 }
+
+/// The wheel is the bench's, not a clip's: the user rolled it over the bench
+/// and nothing moved unless the pointer happened to sit on a track, because
+/// the only listeners were one per bed and one on the ruler strip. The row's
+/// listener now sits on the whole row (head column included) and stops there,
+/// and `bench-content` answers everything else -- the strip left of the ruler,
+/// the ruler itself, the gaps between rows, the space below the last track.
+/// Exactly two listeners, so no strip answers one notch twice.
+#[test]
+fn the_bench_answers_a_wheel_notch_anywhere_over_it() {
+    let bench = src_text("ui/bench_stance.rs");
+    assert_eq!(
+        bench.matches(".on_scroll_wheel(").count(),
+        2,
+        "the bench has a wheel listener per region again -- a notch would be answered twice"
+    );
+    let row = bench
+        .find(".id((\"bench-lane\", lane.ord")
+        .expect("no lane row");
+    let bed = bench.find(".id((\"bench-bed\"").expect("no lane bed");
+    let row_wheel = bench[row..bed]
+        .find(".on_scroll_wheel(")
+        .map(|at| &bench[row + at..bed])
+        .expect("the lane row does not answer the wheel -- only its bed does");
+    assert!(
+        row_wheel[..200].contains("cx.stop_propagation();")
+            && row_wheel[..200].contains("this.timeline_wheel(event, cx)"),
+        "the row's wheel lost the mapping or its stop: {}",
+        &row_wheel[..200]
+    );
+    let content = bench.find(".id(\"bench-content\")").expect("no bench content");
+    let content_wheel = bench[content..]
+        .find(".on_scroll_wheel(")
+        .expect("the bench container does not answer the wheel");
+    assert!(
+        content_wheel < 700 && bench[content..].contains("this.timeline_wheel(event, cx)"),
+        "the container's wheel listener is not on the container itself"
+    );
+    let ruler = bench.find(".id(\"bench-ruler\")").expect("no ruler");
+    let lanes = bench.find(".id(\"bench-lanes\")").expect("no lane column");
+    assert!(
+        !bench[ruler..lanes].contains(".on_scroll_wheel("),
+        "the ruler answers the wheel on its own again -- one notch, two scrolls"
+    );
+}
