@@ -663,6 +663,21 @@ pub(crate) fn export_settings(
     }
 }
 
+/// The same settings with the budget taken out -- what the seat probe is asked
+/// and keyed on ([`crate::Player::cache_export_seat`]). A bitrate does not
+/// decide whether this machine has a VA-API seat or whether the picture's
+/// packets can be copied; leaving it in the key meant every wheel notch on the
+/// budget row invalidated the answer and opened a real VA-API encoder to ask it
+/// again -- measured at ten opens for ten notches, 5-32 ms of GPU work each,
+/// against the player's own decoder, which is the "freezes a little" this row
+/// was reported for.
+pub(crate) fn probe_settings(format: Format, audio_kbps: u32, seat: EncoderSeat) -> ExportSettings {
+    ExportSettings {
+        bitrate: None,
+        ..export_settings(0, format, audio_kbps, seat)
+    }
+}
+
 /// The budget's bounds, the engine's own (`engine::export`'s `MIN_BITRATE`
 /// and `MAX_EXPLICIT_BITRATE`): a number outside them would be written as a
 /// different one, so the lever and the field clamp to exactly these.
@@ -724,32 +739,15 @@ pub(crate) fn parse_budget(text: &str, seconds: f64, audio_bps: u64) -> Option<u
 /// The faintest line on the moment: what the export resolved to on its own --
 /// the codec, the sound, whether it is the whole film or the marked span, and
 /// which seat writes the picture. A readout, never a control: everything in it
-/// is set in Settings now.
-pub(crate) fn plan_line(
-    format: Format,
-    audio: &str,
-    marks: Option<&str>,
-    hardware: bool,
-) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    if format.has_video() {
-        parts.push(format_label(format).to_string());
-    }
-    if !audio.is_empty() {
-        parts.push(audio.to_string());
-    }
-    parts.push(match (marks, format.has_video()) {
+/// The span an export writes, in the words row 3 says it in: the marked
+/// range where there is one, the whole timeline otherwise -- and "sound only"
+/// for a file that carries no picture at all.
+pub(crate) fn range_word(marks: Option<&str>, has_video: bool) -> String {
+    match (marks, has_video) {
         (Some(marks), _) => format!("marks {marks}"),
         (None, true) => "whole film".to_string(),
         (None, false) => "sound only".to_string(),
-    });
-    if format.has_video() {
-        parts.push(match hardware {
-            true => "GPU".to_string(),
-            false => "SW".to_string(),
-        });
     }
-    parts.join(" · ")
 }
 
 /// A clip's share of the lane. A timeline with no length reads as one full-width

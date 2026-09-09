@@ -690,18 +690,14 @@ fn the_budget_row_states_the_size_before_it_is_written() {
     assert_eq!(rate_label(6_000_000), "6.0");
     assert_eq!(rate_label(6_500_000), "6.5");
     assert_eq!(rate_label(BPS_MIN), "1.0");
-    // The faintest line: what resolved, never a control -- and it says the
-    // marked span where there is one rather than "whole film".
-    let line = plan_line(Format::Mp4, "AAC 256 kbps", None, true);
-    assert_eq!(line, "H.264 · AAC 256 kbps · whole film · GPU");
-    assert!(plan_line(Format::Mp4, "AAC", None, false).ends_with("SW"));
-    assert!(
-        plan_line(Format::Mp4, "AAC", Some("00:00:04:00–00:00:12:00"), true)
-            .contains("marks 00:00:04:00–00:00:12:00")
+    // Row 3's range readout: the marked span where there is one, and a
+    // sound-only file names no film to take a range from.
+    assert_eq!(range_word(None, true), "whole film");
+    assert_eq!(range_word(None, false), "sound only");
+    assert_eq!(
+        range_word(Some("00:00:04:00\u{2013}00:00:12:00"), true),
+        "marks 00:00:04:00\u{2013}00:00:12:00"
     );
-    // A sound-only export names no picture codec and no seat to write it on.
-    let sound = plan_line(Format::Flac, "FLAC", None, true);
-    assert_eq!(sound, "FLAC · sound only");
 }
 
 /// Which cue is on screen when: the whole of what the overlay decides, and

@@ -1047,9 +1047,69 @@ fn a_chord_the_export_moment_answers_never_reaches_the_room() {
     assert!(typing.contains("self.budget_edit = None"), "esc leaves the field");
     assert!(closed.contains("self.close_card()"), "then esc closes the moment");
     // Its chords, all of them consumed here rather than by the keymap.
-    for chord in ["\"d\"", "\"n\"", "\"e\"", "\"enter\"", "\"up\"", "\"down\""] {
+    for chord in [
+        "\"d\"", "\"n\"", "\"e\"", "\"enter\"", "\"up\"", "\"down\"", "\"c\"", "\"b\"", "\"g\"",
+        "\",\"",
+    ] {
         assert!(closed.contains(chord), "{chord} is not the moment's own");
     }
+}
+
+/// The user could not find the encode options from the moment that spends
+/// them ("simplifying doesn't mean getting rid of advanced settings"): row 3
+/// now *is* the options -- three ghost segments carrying the Settings room's
+/// own setters, plus the door to the rest of that room.
+#[test]
+fn row_three_wears_the_encode_options_and_the_door_to_the_rest() {
+    let cards = src_text("ui/cards.rs");
+    let start = cards.find("fn export_card(").expect("the moment");
+    let body = &cards[start..start + cards[start..].find("\n    /// ").unwrap_or(cards.len() - start)];
+    // A segment is the setter it names, not a readout of it.
+    for (id, chord, setter) in [
+        ("moment-picture", "\"c\"", "cycle_export_picture"),
+        ("moment-sound", "\"b\"", "cycle_audio_kbps"),
+        ("moment-encoder", "\"g\"", "cycle_encoder"),
+    ] {
+        assert!(body.contains(id), "row 3 lost its {id} segment");
+        assert!(body.contains(chord), "the {id} segment wears no chord");
+        assert!(body.contains(setter), "the {id} segment changes nothing");
+    }
+    // The door, wearing the room's own chord rather than a hand-typed one.
+    assert!(body.contains("moment-settings"), "row 3 has no settings door");
+    assert!(
+        body.contains("self.keymap.chord(ActionId::Settings)"),
+        "the door's chord is not read from the keymap"
+    );
+    assert!(body.contains("open_settings"), "the door opens nothing");
+    // Quiet, and a control: ink3 with the chord in ink4 (DESIGN §4), never
+    // the ink4 line the plan used to be.
+    let seg = cards
+        .find("fn moment_segment(")
+        .map(|at| &cards[at..at + 1200])
+        .expect("the segment atom");
+    assert!(seg.contains("INK3()") && seg.contains("INK4()"));
+    assert!(seg.contains("DARK_RAISED()"), "a segment does not answer hover");
+}
+
+/// One chord per thing, said the same on both surfaces: the moment's segments
+/// and the Settings room's EXPORT rows drive the same setters, so a chord that
+/// drifted on one of them would teach the user a key the other refuses.
+#[test]
+fn the_moment_and_the_settings_room_wear_the_same_export_chords() {
+    let settings = src_text("ui/settings_stance.rs");
+    let moment = src_text("ui/cards.rs");
+    let player = src_text("player/cards.rs");
+    let handler = fn_body("export_moment_key");
+    for chord in ["\"c\"", "\"b\"", "\"g\""] {
+        assert!(settings.contains(chord), "the EXPORT rows lost {chord}");
+        assert!(moment.contains(chord), "row 3 lost {chord}");
+        assert!(handler.contains(chord), "the moment answers no {chord}");
+        assert!(player.contains(chord), "the settings page answers no {chord}");
+    }
+    // `e` stays the Export press: the encoder seat took `g` rather than a
+    // shifted letter, which no ghost wears.
+    assert!(handler.contains("\"e\" | \"enter\" => self.start_export"));
+    assert!(!settings.contains("\n            \"e\","), "the Encoder row took `e` back");
 }
 
 /// The Sound row: what it offers, and that the pick travels to the engine
@@ -2004,5 +2064,34 @@ fn toggle_proxy_wakes_the_asked_phase_it_stops() {
     assert!(
         asked_arm.contains("cancel.store(true"),
         "a stop asked during Asked no longer sets the flag the header read polls"
+    );
+}
+
+/// A wheel notch on the budget must not re-ask the seat probe. The probe opens
+/// a real VA-API encoder (ten opens for ten notches before this, 5-32 ms of GPU
+/// work each, against the player's own decoder) and its answer -- GPU seat or
+/// software, copy or encode -- does not depend on the bitrate at all. So the
+/// settings it is keyed on carry no budget, and the budget still reaches the
+/// export itself, which is the one place it changes a file.
+#[test]
+fn the_seat_probe_is_not_keyed_on_the_budget() {
+    let seat = EncoderSeat::default();
+    let asked = crate::probe_settings(Format::Mp4, DEFAULT_AUDIO_KBPS, seat);
+    assert_eq!(asked.bitrate, None, "no budget is in the probe's question");
+    // What still *is* a new question: the format the file is written in.
+    assert_ne!(
+        asked,
+        crate::probe_settings(Format::Av1, DEFAULT_AUDIO_KBPS, seat),
+        "a format change must re-probe"
+    );
+    let cache = fn_body("cache_export_seat");
+    assert!(
+        cache.contains("probe_settings(") && !cache.contains("budget_bps()"),
+        "the seat cache is keyed on the budget again"
+    );
+    // ...and the number the wheel moves is still what the export is given.
+    assert!(
+        fn_body("start_export").contains("self.budget_bps()"),
+        "the export no longer writes at the budget on the row"
     );
 }

@@ -27,7 +27,7 @@ use super::{
     export_settings, format_refusal, fps_choices, fps_label, frac_along, frac_down,
     frame_at, frame_rate_ladder, histogram, inserted_band, is_project, keymap, keys_rows, lanes_h,
     marked, menu_at, menu_items, menu_rows_h, next_container, normalise, nothing_to_play,
-    notice_tone, panel_h, parse_budget, plan_line, project_path, proxies_to_start, push_notice, px_below, retarget,
+    notice_tone, panel_h, parse_budget, project_path, range_word, proxies_to_start, push_notice, px_below, retarget,
     row_enable, row_items, scrub_due, secs_label, should_resync, silence_rate, size_label,
     rate_label, snap_cue, snap_marks, snapped, source_tint, span_partner, speed_at, sub_pick_after_removal,
     subtitle_plan, timecode, timeline_fixed_h, tip_may_paint,

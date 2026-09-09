@@ -1824,7 +1824,7 @@ impl Player {
             return true;
         }
         // The settings page's EXPORT rows: `c` steps the file, `b` the rate
-        // its sound is coded at and `e` the encoder seat. Card-local like the
+        // its sound is coded at and `g` the encoder seat. Card-local like the
         // colour and transform branches above -- and only these three, so
         // escape still closes the page and every other key falls through to
         // the room.
@@ -1832,7 +1832,7 @@ impl Player {
             match key {
                 "c" => self.cycle_export_picture(),
                 "b" => self.cycle_audio_kbps(),
-                "e" => self.cycle_encoder(cx),
+                "g" => self.cycle_encoder(cx),
                 _ => return false,
             }
             return true;
