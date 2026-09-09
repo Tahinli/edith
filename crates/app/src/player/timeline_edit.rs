@@ -751,7 +751,7 @@ impl Player {
             self.frame_under(x),
             self.grab,
             sub.frames,
-            self.snap,
+            self.snap_live(),
             self.drop_snap_frames(),
             &marks,
         )
@@ -824,7 +824,7 @@ impl Player {
             self.frame_under(x),
             self.grab,
             clip.frames(),
-            self.snap,
+            self.snap_live(),
             self.drop_snap_frames(),
             &marks,
         ))
@@ -841,7 +841,7 @@ impl Player {
             self.frame_under(x),
             0,
             0,
-            self.snap,
+            self.snap_live(),
             self.drop_snap_frames(),
             &marks,
         )
@@ -1052,7 +1052,7 @@ impl Player {
     /// Where a gesture at `raw` lands and the mark that pulled it there, with
     /// the switch honoured: snapping off, nothing moves and no line is drawn.
     pub(crate) fn snap_to(&self, raw: u32, len: u32, marks: &[u32]) -> (u32, Option<u32>) {
-        snap_cue(self.snap, raw, len, self.snap_frames(), marks)
+        snap_cue(self.snap_live(), raw, len, self.snap_frames(), marks)
     }
 
     /// Every timeline frame that is a *source* sync point: each clip's own
@@ -1148,6 +1148,17 @@ impl Player {
     /// [`SNAP_PX`] in timeline frames at the scale the bed is drawn at: the bed's
     /// own width drops out of it, since a pixel is now worth the same stretch of
     /// timeline wherever the view sits.
+    /// Whether the magnet is on for the gesture happening *now*: the switch
+    /// ([`Player::snap`]) unless `alt` is held ([`Player::drag_alt`]), which
+    /// turns it off for this drag or trim alone -- the temporary override
+    /// Resolve, Premiere and Final Cut all put on the same key. The switch is
+    /// not touched, so the stroke that follows the drag finds it where it was.
+    /// Every landing on this timeline asks it, so the shadow, the line and the
+    /// drop can never disagree about whether a magnet was on.
+    pub(crate) fn snap_live(&self) -> bool {
+        snap_live(self.snap, self.drag_alt)
+    }
+
     pub(crate) fn snap_frames(&self) -> u32 {
         self.scale.snap_frames(self.fps)
     }
@@ -2005,7 +2016,10 @@ impl Player {
         // outside the window, still owing its one edit.
         if self.trim.is_some() {
             match event.pressed_button {
-                Some(MouseButton::Left) => self.trim_to(event.position.x, cx),
+                Some(MouseButton::Left) => {
+                    self.drag_alt = event.modifiers.alt;
+                    self.trim_to(event.position.x, cx);
+                }
                 _ => self.commit_trim(cx),
             }
             return;
@@ -2131,6 +2145,7 @@ impl Player {
         if self.trim.is_some() {
             // The release lands exactly, then the gesture is
             // written once -- one edit, one undo step.
+            self.drag_alt = event.modifiers.alt;
             self.trim_to(event.position.x, cx);
             self.commit_trim(cx);
             return;

@@ -626,6 +626,15 @@ pub(crate) fn snap_cue(
     (start, mark)
 }
 
+/// Whether the magnet is on for the gesture in flight: the switch, unless
+/// `alt` is held -- the temporary override Resolve, Premiere and Final Cut all
+/// put on that key, off for this one drag and leaving the switch where the hand
+/// left it. [`Player::snap_live`]'s whole rule, here so it can be read without
+/// a window.
+pub(crate) fn snap_live(on: bool, alt: bool) -> bool {
+    on && !alt
+}
+
 /// Where a drag lands and the mark that pulled it there: the frame under the
 /// pointer, less however far into the box the hand grabbed it (so a clip travels
 /// with the pointer rather than jumping its head under it), snapped by
@@ -722,5 +731,80 @@ mod drop_landing_tests {
         let marks = snap_marks(&[&[]], None, None, 500);
         assert!(marks.contains(&500));
         assert_eq!(snapped(493, 0, 10, &marks), 500);
+    }
+
+    /// The user's own repro: a clip dragged left through the lane-head column
+    /// -- window x *left of the bed* -- lands on frame 0 rather than nowhere.
+    /// Two clamps do it, and both are on the path the bench now takes for a
+    /// drop over the head ([`Player::frame_under`]): [`px_along`] pins an x
+    /// before the bed's left edge to 0 px, [`Scale::time_at`] pins the moment
+    /// to 0 s, and the grab offset comes off with a saturating subtraction, so
+    /// even a clip held by its tail cannot ask for a negative frame.
+    #[test]
+    fn a_drag_out_over_the_lane_head_lands_on_frame_0() {
+        let bed = Bounds {
+            origin: point(px(100.), px(0.)),
+            size: size(px(900.), px(60.)),
+        };
+        let scale = Scale::default();
+        // 40 px into the head column, and off the window entirely.
+        for x in [px(60.), px(-400.)] {
+            assert_eq!(px_along(x, bed), 0.);
+            let under = frame_at(scale.time_at(px_along(x, bed)), 25.);
+            assert_eq!(under, 0);
+            // Grabbed 30 frames into the box: still frame 0, never a refusal.
+            assert_eq!(landing(under, 30, 50, true, 10, &[0, 300]), (0, Some(0)));
+        }
+    }
+
+    /// Both edges of the clip in the hand are candidates and the nearest one
+    /// wins: a tail 2 frames short of a neighbour's head beats a head 8 frames
+    /// from the timeline's start.
+    #[test]
+    fn the_nearer_of_the_two_edges_wins() {
+        let marks = [0, 300, 500];
+        // len 292: the tail wants 300 (2 away), the head 0 (8 away).
+        // The tail already sits exactly on 300, so the head is left alone.
+        assert_eq!(snapped(8, 292, 10, &marks), 8);
+        assert_eq!(snapped(6, 292, 10, &marks), 8, "tail meets 300, head stays");
+    }
+
+    /// The threshold is a distance on *screen*: the same 10 px of aim at two
+    /// zooms is a different number of frames, which is what makes the magnet
+    /// feel identical zoomed in and zoomed out ([`Scale::drop_snap_frames`]).
+    /// Outside it the drag follows the pointer exactly.
+    #[test]
+    fn the_threshold_is_ten_pixels_at_any_zoom() {
+        let fps = 25.;
+        for pps in [50., 400.] {
+            let scale = Scale { pps, start: 0. };
+            let tol = scale.drop_snap_frames(fps);
+            // 10 px worth of frames, and one frame more than that is not near.
+            let near = (DROP_SNAP_PX / pps * fps) as u32;
+            assert_eq!(tol, near);
+            assert_eq!(snapped(500 + tol, 0, tol, &[500]), 500);
+            assert_eq!(
+                snapped(500 + tol + 1, 0, tol, &[500]),
+                500 + tol + 1,
+                "past the window the pointer is obeyed exactly"
+            );
+        }
+    }
+
+    /// `alt` held turns the magnet off for the gesture and nothing else: the
+    /// same raw ask, no line, and [`Player::snap`] itself untouched.
+    #[test]
+    fn alt_turns_the_magnet_off_for_this_drag_only() {
+        let on = true;
+        assert!(snap_live(on, false));
+        assert!(!snap_live(on, true));
+        let marks = [0, 300];
+        assert_eq!(
+            snap_cue(snap_live(on, true), 297, 0, 10, &marks),
+            (297, None)
+        );
+        assert_eq!(snap_cue(snap_live(on, false), 297, 0, 10, &marks), (300, Some(300)));
+        // The switch off stays off however the modifier is held.
+        assert!(!snap_live(false, false));
     }
 }
