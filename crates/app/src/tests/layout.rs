@@ -3188,6 +3188,49 @@ fn select_all_left_the_ruler_for_the_rulers_own_menu() {
     );
 }
 
+/// The rest of cleanse round 2's bench + ledger, which is all about *one*
+/// saying per thing: the head is a dot and a name (its verbs left, checked
+/// above), a source's name is drawn once per source -- the audio half of a
+/// linked insert has no plate, because the picture plate directly above it
+/// and the shared dot already say whose it is -- names lose their extension
+/// through one helper, and the ledger's state word is Save's only door now
+/// (the time band's parking-spot ghost, filed there because the ledger was a
+/// concurrent builder's file, is deleted).
+#[test]
+fn one_name_per_source_one_stem_helper_and_one_save_door() {
+    let bench = src_text("ui/bench_stance.rs");
+    assert!(
+        bench.contains(".filter(|_| !(audio && clip.link.is_some()))"),
+        "the audio half of a linked insert wears a second name plate again"
+    );
+    assert!(
+        bench.contains("stem(&s.path)") && !bench.contains("file_name(&s.path)"),
+        "a name plate shows the file's extension again"
+    );
+    let stance = src_text("ui/stance.rs");
+    assert!(
+        stance.contains("stem(&player.project_path)"),
+        "the ledger shows the project's extension again"
+    );
+    assert!(
+        stance.contains(r#"room_ghost(player, "unsaved", ActionId::Save"#),
+        "the ledger's unsaved state is not Save's door -- it is a word again"
+    );
+    assert!(
+        !src_text("ui/timeband_stance.rs").contains("ActionId::Save"),
+        "Save has two doors: the ledger's state word and the time band's ghost"
+    );
+    // The helper itself, since three surfaces read one file's name through
+    // it: a plain name loses its extension, a name with none is itself, and
+    // a path with no name at all still reads as something.
+    use crate::files::{file_name, stem};
+    use std::path::Path;
+    assert_eq!(stem(Path::new("/x/he_is_not_the_only_one.mp4")), "he_is_not_the_only_one");
+    assert_eq!(stem(Path::new("/x/untitled")), "untitled");
+    assert_eq!(stem(Path::new("/x/a.b.edith")), "a.b");
+    assert_eq!(stem(Path::new("/")), file_name(Path::new("/")));
+}
+
 /// DESIGN §4/§5: the hero timecode leads the time band and the ledger carries
 /// position. The ruler's left plate was a third resting copy of the same
 /// reading -- it stays only for the state change it belongs to, a live scrub.

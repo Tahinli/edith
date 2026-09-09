@@ -151,7 +151,9 @@ ruler answers presses itself), and the ledger's first word is the project. `all 
 ruler's right edge for the ruler's own right-click menu; the lane head's `≋` mix and `×` remove
 leave the head for the head's own right-click menu, where they still act on the lane that was
 clicked. Every one of them keeps its chord and its KEYS row: nothing lost a door, each one moved
-to the thing it acts on, which is the "option C" rule below applied a second time.
+to the thing it acts on, which is the "option C" rule below applied a second time. Save moves
+the same way: the time band's ghost — parked there only because the ledger was another
+builder's file at the time — is deleted, and the ledger's own state word is its door.
 
 **Amendment (2026-09-09), user decision "option C":** there is no rail. The 56px spine — every
 command as a ghost glyph + chord down the left edge — is deleted, and the picture, time band,

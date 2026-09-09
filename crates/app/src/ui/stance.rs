@@ -767,7 +767,8 @@ fn ledger(player: &Player, position: f64, cx: &mut Context<Player>) -> impl Into
                 .child(identity),
         )
         // Saved is a state and reads as one; unsaved is a thing to *do*, and
-        // this is Save's home now that the time band no longer carries it
+        // this is Save's home; the time band's parking-spot ghost, filed there only
+        // because the ledger was a concurrent builder's file, is deleted
         // (cleanse round 2) -- the same room-verb ghost the four verbs at the
         // strip's other end are built from, so its chord, its hover plate and
         // its hitmap door all come from one place.

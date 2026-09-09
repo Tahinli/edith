@@ -147,8 +147,8 @@ pub(crate) fn is_project(path: &std::path::Path) -> bool {
 
 /// A path's name without its extension, for every surface that shows what a
 /// file *is* rather than what it is stored as (cleanse round 2: the bench's
-/// name plates, the ledger's project identity, the dock's rows). One place,
-/// so those three can never come to disagree about the same file's name.
+/// name plates and the ledger's project identity). One place, so the two can
+/// never come to disagree about the same file's name.
 pub(crate) fn stem(path: &std::path::Path) -> String {
     path.file_stem().map_or_else(
         || file_name(path),

@@ -906,50 +906,6 @@ pub(crate) fn render(
         .when(layers.marks, |el| el.child(range_marks(player, cx)))
         .child(cut_readout(player, position))
         .child(contact_strip(player, position, cx))
-        .child(save_verb(player, cx))
         .child(export_chip(player, cx))
 }
 
-/// `Save` (homeless per this task's audit): not boxed -- DESIGN §4 reserves
-/// the room's one border for the commit-class Export beside it -- but filed
-/// right next to it anyway. `keymap.rs`'s own `Category::File` already
-/// files Save beside Export and Screenshot on the strength of what each one
-/// writes, and the ledger this task named as Save's natural home
-/// (`name.edith · saved`/`unsaved`) lives in `stance.rs`, a concurrent
-/// builder's file this task does not touch -- so the verb lands here
-/// instead, a ghost sharing the export chip's own end-of-band land rather
-/// than competing with the ledger strip below it for the same state.
-fn save_verb(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
-    let label_style = label(type_scale::LABEL_ROW_PX, FontWeight::MEDIUM);
-    let chord_style = mono(type_scale::CHORD_METADATA_MIN_PX, FontWeight::MEDIUM);
-    div()
-        .id("stance-tb-save")
-        .flex_none()
-        .flex()
-        .items_center()
-        .gap(px(4.))
-        .cursor_pointer()
-        .hover(|s| s.text_color(rgb(INK1())))
-        .text_color(rgb(INK2()))
-        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-            this.act(ActionId::Save, window, cx);
-        }))
-        .tooltip(crate::ui::widgets::action_hover(player, ActionId::Save))
-        .children(hitmap::action(
-            ActionId::Save,
-            player.enable(ActionId::Save, None).yes(),
-        ))
-        .child(
-            div()
-                .font(label_style.font)
-                .text_size(label_style.size)
-                .child("Save"),
-        )
-        .child(
-            div()
-                .font(chord_style.font)
-                .text_size(chord_style.size)
-                .text_color(rgb(INK3()))
-                .child(player.keymap.chord(ActionId::Save)),
-        )
-}
