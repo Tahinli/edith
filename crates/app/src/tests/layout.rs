@@ -1599,17 +1599,30 @@ fn darkroom_lane_header_verbs_are_targeted_and_visible() {
         Enable::Hidden(_)
     ));
 
+    // The head itself carries a dot, a name and -- on a subtitle lane -- its
+    // eye, and nothing else (cleanse round 2). Its mix and its remove are rows
+    // in its own right-click menu instead, and they still reach the lane the
+    // hand named rather than the last of the kind a bare stroke walks to:
+    // `overlays.rs` routes those rows through the same `act_lane` door the
+    // head's buttons used.
     let bench = src_text("ui/bench_stance.rs");
-    for door in [
-        "\"bench-mix-lane\"",
-        "\"bench-show-sub-lane\"",
-        "\"bench-remove-lane\"",
-        "this.act_lane(ActionId::Mix, lane, cx)",
-        "this.show_sub_lane(lane, cx)",
-        "this.act_lane(action, lane, cx)",
-    ] {
+    for gone in ["\"bench-mix-lane\"", "\"bench-remove-lane\"", "lane.{}.remove"] {
+        assert!(!bench.contains(gone), "the lane head still wears {gone}");
+    }
+    for door in ["\"bench-show-sub-lane\"", "this.show_sub_lane(lane, cx)"] {
         assert!(bench.contains(door), "lane header lost {door}");
     }
+    assert!(
+        lane_items(Lane::A1).contains(&ActionId::Mix)
+            && lane_items(Lane::A1).contains(&ActionId::RemoveAudioLane)
+            && lane_items(Lane::V1).contains(&ActionId::RemoveVideoLane)
+            && !lane_items(Lane::V1).contains(&ActionId::Mix),
+        "a head verb left the head with no row in the head's own menu"
+    );
+    assert!(
+        src_text("ui/overlays.rs").contains("this.act_lane(action, menu.lane, cx)"),
+        "the head menu lane verbs no longer act on the lane that was clicked"
+    );
     let time_band = src_text("ui/timeband_stance.rs");
     for door in [
         "fn volume_slider(",
@@ -1854,18 +1867,17 @@ fn the_whole_bench_stack_fits_its_own_floor_with_the_ledger_seam_clear() {
     use crate::BENCH_MIN_H;
     use crate::ui::bench_stance::{LANE_MIN_H, ROW_GAP, RULER_H};
     use crate::ui::stance::BENCH_CHROME_H;
-    use crate::ui::type_scale::SECTION_HEAD_PX;
 
     const BENCH_BORDER_T: f32 = 1.;
     const BENCH_PY_TOP: f32 = 4.;
-    let section_head_line_h = (SECTION_HEAD_PX * 1.618_034).round();
-    let real_chrome = BENCH_BORDER_T + BENCH_PY_TOP + section_head_line_h;
+    // No section head any more (cleanse round 2): the border and the padding
+    // are the whole of what `stance::bench` draws above the ruler.
+    let real_chrome = BENCH_BORDER_T + BENCH_PY_TOP;
     assert_eq!(
         BENCH_CHROME_H, real_chrome,
         "BENCH_CHROME_H ({BENCH_CHROME_H}) does not match what `stance::bench` \
          actually draws above the content ({real_chrome}px: {BENCH_BORDER_T}px \
-         border + {BENCH_PY_TOP}px padding + {section_head_line_h}px label line \
-         box) -- bench_stance::render gets handed the wrong box_h and lays its \
+         border + {BENCH_PY_TOP}px padding) -- bench_stance::render gets handed the wrong box_h and lays its \
          rows out past its own real space"
     );
 
@@ -2626,9 +2638,7 @@ fn hitmap_names_every_darkroom_pointer_entry_surface() {
         "clip.{}.{}.{}.trim-{}",
         "clip.{}.{}.{}.dissolve",
         "lane.{}.reorder",
-        "lane.{}.mix",
         "lane.{}.eye",
-        "lane.{}.remove",
     ] {
         assert!(
             bench.contains(needle),
@@ -2854,27 +2864,23 @@ fn the_seam_paints_nothing_until_a_pointer_finds_it() {
     );
 }
 
-/// The band the hand actually gets, in seam coordinates -- driven at his own
-/// 2560x1440 with his own `bench=207` before this diff: a press answered only
-/// within +/-7 px of the line the eye sees, and the `BENCH` label row under it
-/// -- the visible top edge of the timeline, the thing a hand aims at -- was
-/// silent. The band is hung one row above the [`SPLIT_W`] strip, so its reach
-/// past the line is `grab - 1 - SPLIT_W`.
+/// The band the hand actually gets, in seam coordinates. It once reached 13px
+/// past the line to cover the `BENCH` label row a hand aimed at; that row is
+/// gone (cleanse round 2) and the ruler under the seam answers presses of its
+/// own (it scrubs), so the bench seam takes every other seam's reach and no
+/// more -- a deeper band would eat scrubs at the film's own top edge.
 #[test]
-fn the_bench_seam_reaches_into_the_row_a_hand_aims_at() {
+fn the_bench_seam_reaches_no_further_than_every_other_seam() {
     let above = 1.;
     let reach = |grab: f32| grab - above - crate::layout::SPLIT_W;
-    // Every other seam is unchanged: its neighbour's own first row carries
-    // content (the dock's rows, the legacy toolbar's buttons).
     assert_eq!(reach(crate::layout::GRAB_W), 7.);
-    // The bench's reaches through the 24 px section head far enough to cover
-    // the label row a hand lands on, and no further than the head itself.
-    let past = reach(crate::layout::BENCH_GRAB_H);
-    assert!(
-        (10. ..=crate::ui::stance::BENCH_CHROME_H).contains(&past),
-        "the bench band reaches {past}px past the seam"
+    assert_eq!(
+        reach(crate::layout::BENCH_GRAB_H),
+        7.,
+        "the bench band reaches past the ruler row, which answers presses itself"
     );
 }
+
 
 /// The clamp table, driven: the seam refuses exactly two things, and neither
 /// is anywhere near where a hand drags. Measured live at 2560x1440 --
@@ -3156,60 +3162,30 @@ fn the_ledger_carries_the_rooms_four_verbs_and_no_rail_remains() {
     );
 }
 
-/// The ruler's right edge was soup: `bench-select-all` sits `right(4.)` over
-/// the tick band while tick suppression only guarded the LEFT plate, so the
-/// `00:20` label drew straight under the `all` chord. The control's band is
-/// reserved now -- a label whose right edge would enter it is dropped, the
-/// mirror of the left rule.
+/// The `all` control left the ruler (cleanse round 2, DESIGN §5): the ruler
+/// row is the bench's own top edge and carries ticks and the playhead alone.
+/// Every removed control keeps a door -- `^a` still fires it, and the ruler's
+/// own right-click menu ([`BENCH_ITEMS`]) is where the pointer reaches it --
+/// so this checks the control is gone AND that the row exists, not just the
+/// deletion.
 #[test]
-fn the_ruler_reserves_a_band_for_its_select_all_control() {
-    use crate::ui::bench_stance::{SELECT_ALL_PAD, char_w};
-    use crate::ui::type_scale::{CHORD_METADATA_MIN_PX, FLOOR_PX};
+fn select_all_left_the_ruler_for_the_rulers_own_menu() {
+    use crate::ActionId;
+    use crate::menus::BENCH_ITEMS;
     let bench = src_text("ui/bench_stance.rs");
+    for gone in ["bench-select-all", "select_all_band", "SELECT_ALL_PAD"] {
+        assert!(!bench.contains(gone), "the ruler still carries {gone}");
+    }
     assert!(
-        bench.contains("x + label_w <= bed_w - all_w"),
-        "the tick loop no longer keeps the select-all band clear"
+        BENCH_ITEMS.contains(&ActionId::SelectAll),
+        "`all` left the ruler with no menu row behind it"
     );
-    // The rule itself, with the shipped widths: `all` + `^a` at the chord
-    // size, a `00:20` label at the floor size, a 850 px bed.
-    let all_w = ("all".len() + "^a".len()) as f32 * char_w(CHORD_METADATA_MIN_PX) + SELECT_ALL_PAD;
-    let label_w = "00:20".len() as f32 * char_w(FLOOR_PX);
-    let clear = |x: f32| x + label_w <= 850. - all_w;
-    assert!(!clear(820.), "a tick at the right edge still draws under `all`");
+    // And the band it reserved is the ticks' again: nothing subtracts a
+    // control's width from the bed's right edge any more.
     assert!(
-        !clear(850. - all_w - label_w + 1.),
-        "the band's own edge leaks"
+        bench.contains("if x >= plate_w && x + label_w <= bed_w {"),
+        "the tick loop still keeps a band clear for a control that is gone"
     );
-    assert!(clear(700.), "the rule eats ticks that clear the band");
-}
-
-/// Clicking `all` selected all AND scrubbed: the control lives inside
-/// `bench-ruler`, whose `on_mouse_down` seeks, and the press reached it (the
-/// playhead jumped 00:00:11:12 -> 00:00:20:14). The scrub refuses the
-/// control's reserved band now -- a `stop_propagation` on the control is what
-/// this looks like at first and it does NOT work: gpui builds the control's
-/// own click out of that same mouse-down, so stopping it drops the selection
-/// (measured live, run 20260909-174243-jZzccm/after-all.png: nothing but the
-/// hover changed).
-#[test]
-fn a_press_on_the_select_all_band_does_not_scrub_the_ruler() {
-    use crate::ui::bench_stance::select_all_band;
-    let bench = src_text("ui/bench_stance.rs");
-    let at = bench.find(r#".id("bench-ruler")"#).expect("no ruler");
-    let listener = &bench[at..at + bench[at..].find(".children(ticks").expect("its ticks")];
-    assert!(
-        listener.contains("bed_w - band") && listener.contains("select_all_band("),
-        "the ruler's scrub takes the select-all band's presses again: {listener}"
-    );
-    assert!(
-        !bench[at..].contains("cx.stop_propagation()"),
-        "a press stopped inside the ruler also swallows the control's own click"
-    );
-    // The rule the listener runs, at the shipped widths: a 850 px bed, `^a`.
-    let band = select_all_band("^a");
-    assert!(band > 30. && band < 70., "the band is not a control's width: {band}");
-    assert!(850. - 4. >= 850. - band, "a press on the control still seeks");
-    assert!(500. < 850. - band, "a press mid-ruler stopped seeking");
 }
 
 /// DESIGN §4/§5: the hero timecode leads the time band and the ledger carries
@@ -3745,7 +3721,7 @@ fn every_hitmap_control_wears_a_hover_line() {
         }
     }
     assert!(
-        controls >= 40,
+        controls >= 38,
         "the hover sweep found only {controls} controls -- it has gone blind"
     );
     assert!(
