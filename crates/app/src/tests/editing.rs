@@ -285,7 +285,7 @@ fn a_caption_is_deleted_by_the_same_row_and_stroke_every_box_is() {
         "the one thing a placed caption could always be asked to do",
     );
     // The clip rows are refusals of *kind* on a caption, so the menu leaves
-    // them out rather than drawing "click a clip first" over a clicked box.
+    // them out rather than drawing "nothing selected" over a clicked box.
     for clip_only in [ActionId::Copy, ActionId::Lift, ActionId::Equalizer] {
         assert_eq!(
             enable(clip_only, cap),
@@ -564,7 +564,7 @@ fn group_is_live_over_a_multi_selection_and_words_a_repeated_lane() {
     };
     assert_eq!(
         enable(ActionId::Group, twice),
-        Enable::No("a group is one clip per lane: keep one pick per track")
+        Enable::No("a lane is picked twice")
     );
     // One pick and none at all: the partner hunt and its own refusal, which
     // the player words rather than the oracle.
@@ -683,7 +683,7 @@ fn the_clip_menu_dims_what_the_playhead_is_not_on_and_stays_in_the_window() {
     assert!(!offered(&slow, v1, ActionId::Cut, 35));
     assert_eq!(
         on(&slow, v1, ActionId::Cut, 35).why(),
-        Some("this speed holds one frame here — step to the next"),
+        Some("this speed holds one frame here"),
     );
     assert_eq!(
         on(&slow, v1, ActionId::Cut, 30).why(),
@@ -904,7 +904,7 @@ fn the_clip_menu_dims_what_the_playhead_is_not_on_and_stays_in_the_window() {
                 ..live
             }
         ),
-        Enable::No("put a clip on a lane first")
+        Enable::No("the timeline is empty")
     );
     // The magnet and the monitoring level are the editor's own and answer
     // with no timeline at all -- the keyboard always fired them there, and

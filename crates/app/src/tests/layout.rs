@@ -3305,12 +3305,13 @@ fn the_cut_readout_counts_from_the_playhead() {
 /// notices are what the ledger strip paints, and a sentence there is what cut
 /// mid-word in the user's own screenshot (`OPENED ... 1 subtitle track(s) in `).
 ///
-/// The scan reads every notice-shaped literal -- one whose first word is a
-/// state word in capitals, which is how every message this window pushes
-/// opens -- and refuses one that is both long (over eight words) and
-/// instructional (an imperative tell). A refusal *claim* may still be long:
-/// those are the allowlist below, each one naming a genuine absent capability,
-/// never a lesson in how to use the room.
+/// The scan reads every literal handed to a notice constructor, found by its
+/// *call site* and not by its shape: the head of a composed refusal is the
+/// verb's own label ("Delete — click a clip first", seen live 2026-09-09), so
+/// a caps-headed filter walked past every one of them. Any imperative tell in
+/// such a literal is a defect at any length. A refusal *claim* may still be
+/// long: those are the allowlist below, each one naming a genuine absent
+/// capability, never a lesson in how to use the room.
 #[test]
 fn no_notice_teaches_the_room_in_prose() {
     // Long refusal claims that report a capability genuinely absent from this
@@ -3328,28 +3329,17 @@ fn no_notice_teaches_the_room_in_prose() {
         "to use",
         "takes it back",
         "puts it back",
-        "first",
-        "instead",
+        " first",
     ];
     let mut offenders = Vec::new();
     for path in source_files() {
         let text = std::fs::read_to_string(&path).expect("a source file");
-        for literal in string_literals(&text) {
-            // A notice opens with its state in capitals -- placeholders in
-            // front of it (`{count} SILENCES CUT`) are stepped over.
-            let head = literal
-                .split_whitespace()
-                .find(|word| !word.starts_with('{'))
-                .unwrap_or("");
-            let shouty = head.len() >= 2
-                && head
-                    .chars()
-                    .all(|c| c.is_ascii_uppercase() || c == '-' || c == ':');
-            if !shouty || ALLOWED.iter().any(|allowed| literal.starts_with(allowed)) {
+        for literal in notice_literals(&text) {
+            if ALLOWED.iter().any(|allowed| literal.contains(allowed)) {
                 continue;
             }
-            let long = literal.split_whitespace().count() > 8;
-            if long && TELLS.iter().any(|tell| literal.contains(tell)) {
+            let lower = literal.to_lowercase();
+            if TELLS.iter().any(|tell| lower.contains(tell)) {
                 offenders.push(format!("{}: {literal}", path.display()));
             }
         }
@@ -3359,6 +3349,56 @@ fn no_notice_teaches_the_room_in_prose() {
         "a notice that instructs instead of reporting state (DESIGN §8):\n{}",
         offenders.join("\n")
     );
+}
+
+/// Every string literal that reaches the user as a notice: the arguments of
+/// the doors a message comes through -- the queue's own two, and the oracle's
+/// refusal words, which the dispatch pastes behind an action label
+/// ([`crate::player::actions`]). Reading the call site rather than the string
+/// is the point: a message's case says nothing about whether it teaches.
+fn notice_literals(text: &str) -> Vec<String> {
+    const CALLS: &[&str] = &[
+        "notify_user(",
+        "push_notice(",
+        "Enable::No(",
+        "Enable::Hidden(",
+    ];
+    let code: String = text
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut out = Vec::new();
+    for call in CALLS {
+        for (at, _) in code.match_indices(call) {
+            let open = at + call.len();
+            // The call's own argument list, to its matching paren: a literal
+            // written two lines below the opening one is still this call's.
+            let mut depth = 1usize;
+            let mut in_string = false;
+            let mut escaped = false;
+            let mut end = open;
+            for (offset, c) in code[open..].char_indices() {
+                end = open + offset;
+                match (in_string, c) {
+                    (true, '\\') => escaped = !escaped,
+                    (true, '"') if !escaped => in_string = false,
+                    (true, _) => escaped = false,
+                    (false, '"') => in_string = true,
+                    (false, '(') => depth += 1,
+                    (false, ')') => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            out.extend(string_literals(&code[open..end]));
+        }
+    }
+    out
 }
 
 /// Every string literal in `text`, comments dropped first so the prose about

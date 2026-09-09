@@ -20,7 +20,7 @@ impl Player {
             // A state refusal is spoken: the thing exists and cannot happen
             // *now*, which is exactly what a silent key press fails to say.
             Enable::No(why) => {
-                self.notify_user(format!("{} — {why}", action.label()).into());
+                self.notify_user(format!("{} — {why}", action.label().to_uppercase()).into());
                 cx.notify();
                 return;
             }
@@ -216,7 +216,7 @@ impl Player {
         match enable_lane(action, lane, self.ctx(None)) {
             Enable::Yes => {}
             Enable::No(why) => {
-                self.notify_user(format!("{} — {why}", action.label()).into());
+                self.notify_user(format!("{} — {why}", action.label().to_uppercase()).into());
                 cx.notify();
                 return;
             }

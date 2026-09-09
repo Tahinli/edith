@@ -505,7 +505,7 @@ impl Player {
     pub(crate) fn apply_encoder(&mut self, seat: EncoderSeat, cx: &mut Context<Self>) {
         if let Some(session) = &mut self.session {
             session.set_encoder_seat(seat);
-            self.notify_user(format!("Encoder: {}", encoder_label(seat)).into());
+            self.notify_user(format!("ENCODER: {}", encoder_label(seat)).into());
         }
         cx.notify();
     }
