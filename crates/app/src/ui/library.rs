@@ -4,6 +4,18 @@ use crate::ui::type_scale::Typeset;
 use crate::ui::widgets::*;
 use crate::*;
 
+/// How far below the pointer a library menu hangs so it clears the row it was
+/// opened on: a source row is two lines (`dock_stance::source_row` -- `py(4.)`
+/// twice, a `gap(2.)` and two ~20px line boxes), and the pointer may land on
+/// its very first pixel.
+///
+/// corner-cut: a constant rather than the row's measured bottom, which the
+/// `on_mouse_down` listener that sets `LibraryMenu::at` has no access to. The
+/// ceiling is a row that grows a third line -- the menu would then start
+/// inside it. Upgrade path: carry the row's `Bounds` bottom in `LibraryMenu`
+/// via a `canvas`/`prepaint` probe in `source_row` and hang the menu off that.
+const ROW_CLEAR: f32 = 52.;
+
 impl Player {
     /// The menu a right-click on a library row opens: what can be done with the
     /// *file* rather than with a clip of it, and a turn-over side saying what
@@ -161,14 +173,29 @@ impl Player {
                 );
             }
         }
-        // Placed at the pointer, clamped only to the window's own bounds --
-        // standard context-menu behavior. Unlike the clip menu, this menu
-        // mounts on the root over the dock (no picture behind it to protect),
-        // so it does not go through `menu_floor`'s picture-floor clamp; doing
-        // so pulled a right-click high in the dock down to the picture floor,
-        // teleporting the menu away from the pointer that opened it.
+        // Hung BELOW the row it is about, not on the pointer: opened at the
+        // pointer it covered the very row it names (`k-lib-menu.png` -- the
+        // source row vanished under its own menu), and a menu that hides its
+        // subject is DESIGN §11.6's occlusion rule broken on the other panel.
+        // `menu_at` then does the rest -- left-aligned to the pointer, pulled
+        // back inside all four window edges, and flipped up above the row
+        // where the dock has no room below. Unlike the clip menu it does not
+        // go through `menu_floor`'s picture-floor clamp: it mounts over the
+        // dock, which has no picture behind it, and clamping there pulled a
+        // right-click high in the dock down to the picture floor, teleporting
+        // the menu away from the pointer that opened it.
         let list_h = menu_rows_h(rows.len(), viewport);
-        let (x, y) = menu_at(menu.at, viewport, MENU_PAD * 2. + list_h);
+        let h = MENU_PAD * 2. + list_h;
+        let below = point(menu.at.x, menu.at.y + px(ROW_CLEAR));
+        // Above the row instead when the plate would not fit whole below it:
+        // `menu_at`'s own clamp would otherwise slide it back up *over* the
+        // row, which is the thing this placement exists to prevent.
+        let at = if f32::from(below.y) + h + MENU_EDGE > f32::from(viewport.height) {
+            point(menu.at.x, px((f32::from(menu.at.y) - h).max(0.)))
+        } else {
+            below
+        };
+        let (x, y) = menu_at(at, viewport, h);
         let full: SharedString = path.display().to_string().into();
         Some(
             scrim()

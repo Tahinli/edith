@@ -110,8 +110,9 @@ pub(crate) enum Choice {
 pub(crate) type ChoiceRow = (Choice, SharedString, SharedString, bool);
 
 /// What a library row's menu offers, in the order it lists them. Unlike the clip
-/// menu's items none of these is a stroke -- there is no keyboard way to a row --
-/// so the label and the hint are written here rather than read off the keymap.
+/// menu's items only one of these ([`RowItem::Add`]) is a stroke, and that one
+/// is not a bindable [`ActionId`] but `ui/stance.rs`'s own `enter` branch, so
+/// the label and the chord are written here rather than read off the keymap.
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum RowItem {
     Add,
@@ -140,29 +141,34 @@ impl RowItem {
         match self {
             Self::Add => "Add at playhead",
             Self::Remove => "Remove from library",
-            // Same label as the plain remove: only ever one of the two is on
-            // the plate (the oracle hides the other), so what differs is the
-            // consequence, and the consequence belongs in the hint column
-            // where every other row states its own. The long dashed title
-            // truncated its own hint at `MENU_W`.
-            Self::RemoveWithClips => "Remove from library",
+            // The consequence is in the label now rather than in the hint
+            // column beside a label identical to the plain remove's: that
+            // column carries chords ([`RowItem::hint`]), and a destructive
+            // verb whose difference from the row above it lived in dim grey
+            // prose is a verb that reads as the same verb. It fits `MENU_W`
+            // whole exactly because nothing is printed to its right.
+            Self::RemoveWithClips => "Remove with its clips",
             Self::Reveal => "Reveal in files",
             Self::Properties => "Properties",
         }
     }
 
-    /// The dim right-hand column, where the clip menu prints the stroke: what
-    /// the item will do to the timeline, so nothing here is a surprise.
+    /// The dim right-hand column: the *stroke* that does the same thing, the
+    /// one thing DESIGN §4 puts there ("every command wears its chord"), and
+    /// nothing at all where no stroke reaches the verb.
+    ///
+    /// It used to carry a prose gloss on every row -- a phrase about the whole
+    /// file, one about the desktop's file browser, one about clips -- which is
+    /// §8's instructional copy sitting in the column the sibling clip menu
+    /// spends on chords, and which the user read as the crowding it is. The
+    /// only row a stroke reaches is the add (`ui/stance.rs`'s `enter` branch,
+    /// live while a dock row is picked); its own row in the dock already wears
+    /// the same `↵`. A refusal still prints here in place of the chord
+    /// (`oracle::row_enable`) -- that is state, not instruction.
     pub(crate) fn hint(self) -> &'static str {
         match self {
-            // Short enough to sit beside its label inside `MENU_W`, the clip
-            // menu's rule for a refusal: this column truncates, and a hint cut
-            // off mid-word says less than a shorter one.
-            Self::Add => "the whole file",
-            Self::Remove => "nothing plays it",
-            Self::RemoveWithClips => "clips too",
-            Self::Reveal => "file manager",
-            Self::Properties => "…",
+            Self::Add => "↵",
+            Self::Remove | Self::RemoveWithClips | Self::Reveal | Self::Properties => "",
         }
     }
 }

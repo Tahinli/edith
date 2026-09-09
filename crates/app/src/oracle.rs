@@ -451,18 +451,22 @@ pub(crate) fn row_items(ctx: RowCtx) -> Vec<RowItem> {
 /// How tall a menu's list may draw: the whole of it where the window has room,
 /// and what the window has where it has not -- only then does the list scroll.
 /// A cap fixed at twelve rows put the last items behind a scroll on a window
-/// with room to spare, which reads as a menu cut off by the bottom edge.
+/// with room to spare, which reads as a menu cut off by the bottom edge. Both
+/// [`MENU_EDGE`] margins come off the room first, so the plate `menu_at` places
+/// from this always fits between them whatever the anchor.
 pub(crate) fn menu_rows_h(rows: usize, viewport: Size<Pixels>) -> f32 {
-    let room = f32::from(viewport.height) - MENU_PAD * 2.;
+    let room = f32::from(viewport.height) - MENU_PAD * 2. - MENU_EDGE * 2.;
     (rows as f32 * MENU_ROW_H).min(room.max(MENU_ROW_H))
 }
 
 /// Where the menu actually hangs: at the pointer, pulled back inside the window
 /// when it would not fit -- an item off the bottom edge is an item nobody can
-/// click. Never negative, so a window smaller than the menu loses the bottom of
-/// it rather than the top, where the items are.
+/// click. All four edges, [`MENU_EDGE`] clear of each: a plate flush on the
+/// frame reads as a list that was cut, not one that ended. Never past the top
+/// or left edge, so a window smaller than the menu loses the bottom of it
+/// rather than the top, where the items are.
 pub(crate) fn menu_at(at: Point<Pixels>, viewport: Size<Pixels>, height: f32) -> (f32, f32) {
-    let fit = |v: f32, size: f32, room: f32| v.min(room - size).max(0.);
+    let fit = |v: f32, size: f32, room: f32| v.min(room - MENU_EDGE - size).max(MENU_EDGE);
     (
         fit(f32::from(at.x), MENU_W, f32::from(viewport.width)),
         fit(f32::from(at.y), height, f32::from(viewport.height)),
