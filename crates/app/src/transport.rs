@@ -77,12 +77,19 @@ impl Volume {
         f32::from(self.steps) / f32::from(Self::MAX_STEPS)
     }
 
+    /// The level as a number to read out, 0..=100 -- what the settings page's
+    /// Level row says (`100%`), the one place the level is written since the
+    /// time band lost its slider.
+    pub(crate) fn percent(self) -> u32 {
+        u32::from(self.steps) * 100 / u32::from(Self::MAX_STEPS)
+    }
+
     /// What the button read before the mute state became a glyph and a colour
     /// ([`Player::toolbar`]): the guards still hold the wording to it, so it
     /// sits with them rather than in the binary.
     #[cfg(test)]
     pub(crate) fn label(self) -> String {
-        let percent = u32::from(self.steps) * 100 / u32::from(Self::MAX_STEPS);
+        let percent = self.percent();
         if self.muted {
             format!("Muted {percent}%")
         } else {

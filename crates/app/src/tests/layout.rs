@@ -2565,18 +2565,6 @@ fn every_action_has_a_darkroom_widget_home_or_explicit_owner() {
             "KEYS tab + key: the loop toggle left the band in cleanse round 2",
         ),
         (
-            ActionId::ToggleMute,
-            "KEYS tab + key: the monitoring cluster left the band in cleanse round 2",
-        ),
-        (
-            ActionId::VolumeUp,
-            "KEYS tab + key: the monitoring cluster left the band in cleanse round 2",
-        ),
-        (
-            ActionId::VolumeDown,
-            "KEYS tab + key: the monitoring cluster left the band in cleanse round 2",
-        ),
-        (
             ActionId::ClearRange,
             "KEYS tab + key: `I O ×` left the band in cleanse round 2 -- in and out \
              became the contact strip's own grips, and clearing both at once is \
@@ -3913,4 +3901,104 @@ fn no_region_root_wears_a_focus_ring() {
             );
         }
     }
+}
+
+
+/// The monitoring level's home. Cleanse round 2 took the mute button, the
+/// `- +` pair and the slider off the time band on the promise that the level
+/// "lives in Settings" (DESIGN 5) -- a promise nothing kept until this row,
+/// which is why the volume trio sat in
+/// [`every_action_has_a_darkroom_widget_home_or_explicit_owner`]'s exemption
+/// list. A source scan, like every other guard on this page: the EDITOR
+/// section carries the row, the row wears the mute chord (`m`), and the wheel
+/// over it moves the level through the very actions the keys do -- no second
+/// setter, no slider growing back.
+#[test]
+fn the_editor_section_owns_the_monitoring_level_row() {
+    let source = src_text("ui/settings_stance.rs");
+    let editor_start = source
+        .find("fn editor_section(")
+        .expect("the editor section");
+    let render_start = source
+        .find("pub(crate) fn render(")
+        .expect("the page's render fn");
+    let editor_body = &source[editor_start..render_start];
+    for needle in [
+        "\"settings-level\"",
+        "\"Level\"",
+        "ActionId::ToggleMute",
+        "ActionId::VolumeUp",
+        "ActionId::VolumeDown",
+        ".on_scroll_wheel(",
+    ] {
+        assert!(
+            editor_body.contains(needle),
+            "the EDITOR section's Level row is missing {needle}"
+        );
+    }
+    // The chord the row draws is the keymap's own, so the badge reads `m`
+    // wherever this test's reader looks for it.
+    assert_eq!(
+        crate::keymap::Keymap::defaults().chord(crate::ActionId::ToggleMute),
+        "m",
+        "the mute chord moved -- the Level row's badge is no longer `m`"
+    );
+    // Muted reads as a word in the quieter ink, never as `0%`: the level is
+    // what unmuting comes back to and the row must not lie about it.
+    assert!(
+        editor_body.contains("\"muted\".to_string()"),
+        "the Level row must say `muted` rather than a number when silenced"
+    );
+    // A readout, not a widget: the slider stayed dead (DESIGN 5).
+    assert!(
+        !editor_body.contains("volume_bar") && !editor_body.contains("drag_volume"),
+        "the level slider grew back in Settings"
+    );
+    // The page counts as a card ([`Player::card_open`]), so the darkroom's
+    // modal guard eats every stroke this branch does not answer: without
+    // these three arms the row wears a chord that does nothing while the page
+    // is the visible thing on screen (what the first harness run showed).
+    let cards = src_text("player/cards.rs");
+    let branch_start = cards
+        .find("if self.settings_open {")
+        .expect("the settings key branch");
+    let branch = &cards[branch_start..(branch_start + 1600).min(cards.len())];
+    for arm in ["\"m\" =>", "\"=\" =>", "\"-\" =>"] {
+        assert!(
+            branch.contains(arm),
+            "the settings key branch does not answer {arm} -- the Level row's \
+             chord is swallowed by the modal guard while the page is up"
+        );
+    }
+}
+
+/// The wheel's own arithmetic: one notch is one key press (5%), and the count
+/// stops at both ends rather than wrapping silence into full volume -- the
+/// saturating pair [`Volume::step`] is written for. Pure, so it runs without
+/// a window.
+#[test]
+fn the_level_wheel_steps_five_percent_and_clamps_at_both_ends() {
+    use crate::transport::Volume;
+    let mut volume = Volume::default();
+    assert_eq!(volume.percent(), 100);
+    for expected in [95, 90, 85, 80] {
+        volume.step(false);
+        assert_eq!(volume.percent(), expected, "a notch down is 5%");
+    }
+    for _ in 0..40 {
+        volume.step(false);
+    }
+    assert_eq!(volume.percent(), 0, "the level floors at silence");
+    volume.step(false);
+    assert_eq!(volume.percent(), 0, "a notch below silence is silence");
+    for _ in 0..40 {
+        volume.step(true);
+    }
+    assert_eq!(volume.percent(), 100, "the level ceilings at full");
+    volume.step(true);
+    assert_eq!(volume.percent(), 100, "a notch above full is full");
+    // Turning it down while muted is not what makes sound come out.
+    volume.muted = true;
+    volume.step(false);
+    assert!(volume.muted && volume.percent() == 95);
 }
