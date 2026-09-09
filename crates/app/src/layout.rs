@@ -373,14 +373,26 @@ impl Splits {
         }
     }
 
+    /// Forgets a seam's dragged size, which is exactly what
+    /// [`split_size`] reads as "the window's own share answers again" --
+    /// the double-click reset, one field rather than a second table of
+    /// defaults that could disagree with the one already there.
+    pub(crate) fn clear(&mut self, split: Split) {
+        *self.slot(split) = None;
+    }
+
     pub(crate) fn set(&mut self, split: Split, size: f32) {
-        *match split {
+        *self.slot(split) = Some(size);
+    }
+
+    fn slot(&mut self, split: Split) -> &mut Option<f32> {
+        match split {
             Split::Library => &mut self.library,
             Split::Inspector => &mut self.inspector,
             Split::Timeline => &mut self.timeline,
             Split::Dock => &mut self.dock,
             Split::Bench => &mut self.bench,
-        } = Some(size);
+        }
     }
 }
 
