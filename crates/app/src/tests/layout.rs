@@ -2724,7 +2724,9 @@ fn the_bench_answers_a_wheel_notch_anywhere_over_it() {
         "the row's wheel lost the mapping or its stop: {}",
         &row_wheel[..200]
     );
-    let content = bench.find(".id(\"bench-content\")").expect("no bench content");
+    let content = bench
+        .find(".id(\"bench-content\")")
+        .expect("no bench content");
     let content_wheel = bench[content..]
         .find(".on_scroll_wheel(")
         .expect("the bench container does not answer the wheel");
@@ -2791,7 +2793,14 @@ fn the_seam_paints_nothing_until_a_pointer_finds_it() {
         body.contains("gpui::transparent_black()"),
         "the divider's line is inked at rest: {body}"
     );
-    for step in [".hover(", "STROKE_DIVIDER()", "INK3()", "border_t_1()", "border_l_1()"] {
+    for step in [
+        ".hover(",
+        "GRAB_W",
+        "STROKE_DIVIDER()",
+        "INK3()",
+        "border_t_1()",
+        "border_l_1()",
+    ] {
         assert!(body.contains(step), "the divider is missing {step}");
     }
 }
