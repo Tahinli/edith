@@ -3847,12 +3847,13 @@ fn every_hitmap_control_wears_a_hover_line() {
             }
         }
     }
-    // The floor moved 40 -> 35 with cleanse round 2 (2026-09-10): the dock
+    // The floor moved 40 -> 34 with cleanse round 2 (2026-09-10): the band lost its
+    // shuttle/marks/monitoring cluster, the bench its head verbs and `all`, and the dock
     // gave up five named controls in one diff (the three sub-tabs, the sort
     // cycle, the row's preview and stand-in ghosts, against one Add row kept)
     // and a floor above the true count is a red gate, not a blindness check.
     assert!(
-        controls >= 35,
+        controls >= 34,
         "the hover sweep found only {controls} controls -- it has gone blind"
     );
     assert!(
