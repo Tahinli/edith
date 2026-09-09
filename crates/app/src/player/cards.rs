@@ -1836,6 +1836,17 @@ impl Player {
                 "c" => self.cycle_export_picture(),
                 "b" => self.cycle_audio_kbps(),
                 "g" => self.cycle_encoder(cx),
+                // The Level row's own three, and they have to be *here*:
+                // this page counts as a card in [`Self::card_open`], so a
+                // stroke that falls through this branch is swallowed by the
+                // darkroom's modal guard rather than reaching the keymap --
+                // `m` did nothing at all with the page up (caught in the
+                // harness, not by a guard). Same setter the keymap's
+                // [`ActionId::ToggleMute`]/`VolumeUp`/`VolumeDown` call, so
+                // the row cannot drift from the chord it wears.
+                "m" => self.set_volume(|volume| volume.muted = !volume.muted, cx),
+                "=" => self.set_volume(|volume| volume.step(true), cx),
+                "-" => self.set_volume(|volume| volume.step(false), cx),
                 _ => return false,
             }
             return true;
