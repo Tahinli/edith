@@ -406,6 +406,59 @@ fn editor_section(player: &Player, cx: &mut Context<Player>) -> impl IntoElement
         .flex_col()
         .gap(px(2.))
         .child(section_head("EDITOR · this machine, this window"))
+        // The monitoring level, which lost its slider when the time band was
+        // cleansed (DESIGN §5 -- "the level lives in Settings"). A readout and
+        // not a widget: the number is spent rarely, so the wheel over the row
+        // moves it and `m` silences it, exactly what the keys already do
+        // ([`ActionId::VolumeUp`]/[`ActionId::VolumeDown`] reach the same
+        // setter while this page is up, since the settings key branch passes
+        // every stroke but its own three through to the keymap). Session-only:
+        // nothing in ~/.config/edith holds a level, and a muted window that
+        // stayed muted across a launch is a bug report, not a preference.
+        .child(
+            div()
+                .id("settings-level-wheel")
+                .flex_none()
+                .on_scroll_wheel(cx.listener(
+                    |this, event: &ScrollWheelEvent, window, cx| {
+                        let by = wheel_delta(event);
+                        if by == 0. {
+                            return;
+                        }
+                        // One notch is one press: the wheel lands on the same
+                        // 5% grid the keys do, never a second finer one.
+                        this.act(
+                            if by > 0. {
+                                ActionId::VolumeUp
+                            } else {
+                                ActionId::VolumeDown
+                            },
+                            window,
+                            cx,
+                        );
+                        cx.stop_propagation();
+                    },
+                ))
+                .child(row_full(
+                    "settings-level",
+                    "Level",
+                    match player.volume.muted {
+                        true => "muted".to_string(),
+                        false => format!("{}%", player.volume.percent()),
+                    },
+                    "Monitoring level -- the wheel over this row moves it 5% at a time; kept for this window, never written into a project",
+                    Some(player.keymap.chord(ActionId::ToggleMute).into()),
+                    None,
+                    player,
+                    cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.set_volume(|volume| volume.muted = !volume.muted, cx)
+                    }),
+                    match player.volume.muted {
+                        true => INK3(),
+                        false => INK1(),
+                    },
+                )),
+        )
         .child(row_keyed(
             "settings-proxies",
             "Proxies",
