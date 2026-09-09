@@ -1,7 +1,7 @@
 //! The bars and the floating cards that are not inspector sections.
 
 use crate::ui::hitmap;
-use crate::ui::stance::menu_floor;
+use crate::ui::stance::{menu_above, menu_floor, picture_bottom};
 use crate::ui::type_scale::{self, Typeset};
 use crate::ui::widgets::*;
 use crate::*;
@@ -420,9 +420,17 @@ impl Player {
         // footprint (`room`), not the whole window, so a menu taller than
         // the footprint scrolls inside its own plate instead of walking its
         // clamped top edge back up over the picture ([`menu_floor`]).
-        let (at, room) = menu_floor(menu.at, viewport, self.split_px(Split::Bench, viewport));
+        // ...and that floor is the picture's painted edge, so the black bars
+        // of a letterboxed film are room the menu may use (R4).
+        let (at, room, floor) = menu_floor(
+            menu.at,
+            viewport,
+            self.split_px(Split::Bench, viewport),
+            picture_bottom(self),
+        );
         let list_h = menu_rows_h(rows.len(), room);
-        let (x, y) = menu_at(at, viewport, MENU_PAD * 2. + list_h);
+        let h = MENU_PAD * 2. + list_h;
+        let (x, y) = menu_at(menu_above(at, viewport, floor, h), viewport, h);
         let full: SharedString = source
             .map(|source| source.path.display().to_string())
             .unwrap_or_default()
@@ -592,9 +600,15 @@ impl Player {
             .collect();
         // The window's own room, and the list scrolls only where the window has
         // none -- the clip menu's rule, one function for both.
-        let (at, room) = menu_floor(picker.at, viewport, self.split_px(Split::Bench, viewport));
+        let (at, room, floor) = menu_floor(
+            picker.at,
+            viewport,
+            self.split_px(Split::Bench, viewport),
+            picture_bottom(self),
+        );
         let list_h = menu_rows_h(rows.len(), room);
-        let (x, y) = menu_at(at, viewport, MENU_PAD * 2. + list_h);
+        let h = MENU_PAD * 2. + list_h;
+        let (x, y) = menu_at(menu_above(at, viewport, floor, h), viewport, h);
         Some(
             scrim()
                 // Click away closes it, either button, swallowed so nothing

@@ -193,15 +193,47 @@ pub(crate) fn maximized_card_top(viewport_h: f32, bench_h: f32) -> f32 {
 /// room *below the floor* instead means it never needs more than that room,
 /// so `menu_at` never has a reason to walk it back up; a list still taller
 /// than the room scrolls inside its own plate, same as the keys overlay.
+///
+/// The floor is the picture's own *painted* bottom edge
+/// ([`picture_bottom`]) when a frame is up, not the screen region's: the
+/// region letterboxes, and a black bar is not picture. With his 3840x1608
+/// film in a 2560x1440 window that edge sits ~170px above the region's own
+/// bottom, which is two more row slots the menu no longer has to scroll
+/// through. Nothing is shown (safelight, empty room, before the first
+/// paint) -> the region's bottom, unchanged. Returned alongside the anchor
+/// so the caller can flip the plate *above* its pointer without a second
+/// copy of this arithmetic.
 pub(crate) fn menu_floor(
     at: Point<Pixels>,
     viewport: Size<Pixels>,
     bench_h: f32,
-) -> (Point<Pixels>, Size<Pixels>) {
-    let floor = below_picture_floor(f32::from(viewport.height), bench_h);
+    picture_bottom: Option<f32>,
+) -> (Point<Pixels>, Size<Pixels>, f32) {
+    let region = below_picture_floor(f32::from(viewport.height), bench_h);
+    let floor = picture_bottom.unwrap_or(region).clamp(0., region);
     let at = point(at.x, px(f32::from(at.y).max(floor)));
     let room = size(viewport.width, px(f32::from(viewport.height) - floor));
-    (at, room)
+    (at, room, floor)
+}
+
+/// The plate's top edge, flipped to sit *above* the pointer when the room
+/// below it does not hold the whole list -- `library.rs` already places its
+/// menu this way for the same reason, and every row above the fold is a row
+/// nobody has to wheel to. Never above `floor`: a menu that gained rows by
+/// climbing over the picture is the occlusion this file exists to prevent
+/// (DESIGN §5, §11 check 6). `room` from [`menu_floor`] already sizes the
+/// list to fit between `floor` and the window's bottom edge, so the clamped
+/// flip always fits.
+pub(crate) fn menu_above(
+    at: Point<Pixels>,
+    viewport: Size<Pixels>,
+    floor: f32,
+    h: f32,
+) -> Point<Pixels> {
+    if f32::from(at.y) + h + MENU_EDGE <= f32::from(viewport.height) {
+        return at;
+    }
+    point(at.x, px((f32::from(at.y) - h).max(floor)))
 }
 
 #[cfg(test)]
@@ -219,7 +251,7 @@ mod menu_floor_tests {
     fn a_menu_taller_than_the_footprint_stays_pinned_to_the_floor_not_walked_back_over_it() {
         let viewport = size(px(1280.), px(720.));
         let floor = below_picture_floor(f32::from(viewport.height), BENCH_H);
-        let (at, room) = menu_floor(point(px(300.), px(20.)), viewport, BENCH_H);
+        let (at, room, _) = menu_floor(point(px(300.), px(20.)), viewport, BENCH_H, None);
         assert_eq!(f32::from(at.y), floor);
         // 17 rows -- more than the footprint holds -- sized through the real
         // sizer, so the `MENU_EDGE` margin is in the number the clamp sees.
@@ -254,12 +286,22 @@ mod menu_floor_tests {
                 ] {
                     // The clip menu's path: floored below the picture, sized
                     // against the room that leaves, then clamped.
-                    let (at, room) = menu_floor(anchor, viewport, BENCH_H);
-                    let h = MENU_PAD * 2. + crate::oracle::menu_rows_h(rows, room);
-                    let (x, y) = crate::oracle::menu_at(at, viewport, h);
-                    assert!(x >= MENU_EDGE && x + MENU_W <= w - MENU_EDGE, "x {x} rows {rows}");
-                    assert!(y >= MENU_EDGE && y + h <= v - MENU_EDGE, "y {y} h {h} rows {rows}");
-                    assert!(y >= floor, "y {y} walked above the picture floor {floor}");
+                    // Both the picture floors a menu can get: the region's
+                    // own bottom (nothing shown) and a letterboxed film's
+                    // painted edge, 120px above it.
+                    for pic in [None, Some(floor - 120.)] {
+                        let (at, room, f) = menu_floor(anchor, viewport, BENCH_H, pic);
+                        let h = MENU_PAD * 2. + crate::oracle::menu_rows_h(rows, room);
+                        // Through the flip: the placement the app actually uses.
+                        let at = menu_above(at, viewport, f, h);
+                        let (x, y) = crate::oracle::menu_at(at, viewport, h);
+                        assert!(y >= f, "y {y} walked above the menu floor {f}");
+                        assert!(x >= MENU_EDGE && x + MENU_W <= w - MENU_EDGE, "x {x} rows {rows}");
+                        assert!(
+                            y >= MENU_EDGE && y + h <= v - MENU_EDGE,
+                            "y {y} h {h} rows {rows}"
+                        );
+                    }
                     // The library menu's path: no floor, hung a row below the
                     // pointer, same clamp.
                     let h = MENU_PAD * 2. + crate::oracle::menu_rows_h(rows, viewport);
@@ -273,6 +315,47 @@ mod menu_floor_tests {
                 }
             }
         }
+    }
+
+    /// The floor the charter names (R4): a wide film letterboxed into a tall
+    /// region stops being picture well above that region's bottom, and the
+    /// menu may have that black. His 3840x1608 film fit into the real
+    /// 2560x1440 darkroom's picture box (2224x1129) lands 931px tall -- a
+    /// 99px bar top and bottom -- so the floor rises 99px, two more row
+    /// slots. A 4:3 source in a 4:3 box has no bar at all and the floor stays
+    /// the region's own bottom.
+    #[test]
+    fn the_menu_floor_is_the_picture_s_painted_edge_not_the_region_s() {
+        let native = |w, h| size(gpui::DevicePixels(w), gpui::DevicePixels(h));
+        let box_of = |w: f32, h: f32| Bounds {
+            origin: point(px(0.), px(88.)),
+            size: size(px(w), px(h)),
+        };
+        // Wide film, tall box: bars top and bottom, so the edge rises.
+        let wide = fitted_bottom(box_of(2224., 1129.), native(3840, 1608)).unwrap();
+        let painted_h = 2224. * 1608. / 3840.;
+        let want = 88. + (1129. - painted_h) / 2. + painted_h;
+        assert!(
+            (wide - want).abs() < 1.,
+            "wide film's painted bottom {wide}, wanted {want}"
+        );
+        assert!(88. + 1129. - wide > 90., "the bar the menu gains is real");
+        // Same ratio as its box: no bar, the edge IS the box's bottom.
+        let square = fitted_bottom(box_of(800., 600.), native(1600, 1200)).unwrap();
+        assert!((square - 688.).abs() < 0.01, "4:3 in a 4:3 box: {square}");
+        // Nothing measured yet reads as no floor, never a NaN one.
+        assert_eq!(fitted_bottom(box_of(0., 0.), native(1600, 1200)), None);
+
+        // And the floor menu_floor hands the sizer follows it: the wide film
+        // buys the menu rows, the region's bottom is still the ceiling on it.
+        let viewport = size(px(2560.), px(1440.));
+        let region = below_picture_floor(1440., BENCH_H);
+        let (_, room, floor) = menu_floor(point(px(10.), px(10.)), viewport, BENCH_H, Some(wide));
+        assert_eq!(floor, wide);
+        assert!(f32::from(room.height) > 1440. - region);
+        // A bogus reading below the bench never lets a menu climb: clamped.
+        let (_, _, floor) = menu_floor(point(px(10.), px(10.)), viewport, BENCH_H, Some(9999.));
+        assert_eq!(floor, region);
     }
 }
 
@@ -341,6 +424,31 @@ fn fit_scale(bounds: Bounds<Pixels>, native: gpui::Size<gpui::DevicePixels>) -> 
     }
     let fitted = gpui::ObjectFit::Contain.get_bounds(bounds, native);
     Some(f32::from(fitted.size.width) / native.width.0 as f32)
+}
+
+/// The pure half of [`picture_bottom`]: the bottom edge of the `Contain`
+/// fit of `native` into `bounds` -- gpui's own `get_bounds`, the same call
+/// [`letterboxed_image`] paints through, so this is the frame's real edge
+/// and not aspect math reimplemented here.
+fn fitted_bottom(bounds: Bounds<Pixels>, native: gpui::Size<gpui::DevicePixels>) -> Option<f32> {
+    if bounds.size.width <= px(0.)
+        || bounds.size.height <= px(0.)
+        || native.width.0 <= 0
+        || native.height.0 <= 0
+    {
+        return None;
+    }
+    let fitted = gpui::ObjectFit::Contain.get_bounds(bounds, native);
+    Some(f32::from(fitted.origin.y + fitted.size.height))
+}
+
+/// Where the picture actually stops being picture: the letterboxed frame's
+/// bottom edge in window coordinates, read off the last frame's measured box
+/// ([`PICTURE_BOUNDS`]). `None` with nothing shown or before the first paint
+/// measured anything -- [`menu_floor`] falls back to the region's bottom.
+pub(crate) fn picture_bottom(player: &Player) -> Option<f32> {
+    let image = player.image.clone()?;
+    fitted_bottom(PICTURE_BOUNDS.with(Rc::clone).get(), image.size(0))
 }
 
 /// The picture's own fit factor against its native size, read off the last
