@@ -136,15 +136,12 @@ pub(crate) const LEDGER_H: f32 = 28.;
 /// role [`BENCH_H`] plays for the bench.
 pub(crate) const DOCK_W: f32 = 280.;
 /// What [`bench`] spends above `bench_stance::render`'s own content: the
-/// `bench` div's own `.border_t_1()` (1px) + its `py(4.)` top padding +
-/// the section head's real line box -- `type_scale::head()` sizes text at
-/// `SECTION_HEAD_PX` (12) but never calls `.line_height()`, so gpui's
-/// default `TextStyle::line_height` (the golden ratio, `gpui::phi()` ==
-/// `1.618034`, not 1x the font size) is what it actually draws:
-/// `round(12. * 1.618034)` = `round(19.416408)` = `19`.
-/// `1 + 4 + 19` = `24`. Named and `pub(crate)` rather than an inline
-/// subtraction, so `layout::BENCH_MIN_H` can derive from the real chrome.
-pub(crate) const BENCH_CHROME_H: f32 = 24.;
+/// `bench` div's own `.border_t_1()` (1px) + its `py(4.)` top padding, and
+/// nothing else since the `BENCH` section head went (cleanse round 2 -- the
+/// ruler row starts the region and the geography says what it is). `1 + 4`
+/// = `5`. Named and `pub(crate)` rather than an inline subtraction, so
+/// `layout::BENCH_MIN_H` can derive from the real chrome.
+pub(crate) const BENCH_CHROME_H: f32 = 5.;
 
 /// The lowest a menu's top edge may sit and still land inside the
 /// bench/ledger/dock footprint below the screen (DESIGN §5, §9, §11 check 6):
@@ -436,16 +433,6 @@ pub(crate) fn picture_bottom(player: &Player) -> Option<f32> {
     fitted_bottom(PICTURE_BOUNDS.with(Rc::clone).get(), image.size(0))
 }
 
-/// A section head, uppercase, `ink3` -- DESIGN §3's scale for the label
-/// that names a region before anything else lives in it.
-fn section_head(label: &str) -> impl IntoElement {
-    div()
-        .flex_none()
-        .type_style(type_scale::head())
-        .text_color(rgb(INK3()))
-        .child(label.to_uppercase())
-}
-
 /// A room verb at the ledger's right end (DESIGN §4, §5 as amended
 /// 2026-09-09 -- user decision "option C"): the name in `ink3`, its chord
 /// beside it, read live off the keymap so a rebind can never leave the
@@ -630,7 +617,6 @@ fn bench(
         .flex_col()
         .px(px(12.))
         .py(px(4.))
-        .child(section_head("bench"))
         .child(bench_stance::render(player, bench_h - BENCH_CHROME_H, cx))
 }
 
@@ -639,16 +625,14 @@ fn bench(
 fn ledger(player: &Player, position: f64, cx: &mut Context<Player>) -> impl IntoElement {
     let name = match player.project_path.as_os_str().is_empty() {
         true => "untitled".to_string(),
-        false => file_name(&player.project_path),
+        false => stem(&player.project_path),
     };
-    let identity = format!(
-        "{name} · {}",
-        if player.autosave_dirty {
-            "unsaved"
-        } else {
-            "saved"
-        }
-    );
+    // The project's own name, extension dropped (`files::stem`, the bench's
+    // plates read with the same helper) and the middot the state word hangs
+    // off -- the word itself is a child of its own, because when the project
+    // is unsaved it is not a word but Save's door (below).
+    let identity = format!("{name} ·");
+    let dirty = player.autosave_dirty;
     let last_action = player.notices.back().cloned().unwrap_or_else(|| "—".into());
     // With the floating plate gone (user 2026-08-27, "we also have notifier
     // at the ledger section"), this strip is the one notice surface left --
@@ -676,7 +660,6 @@ fn ledger(player: &Player, position: f64, cx: &mut Context<Player>) -> impl Into
         .items_center()
         .gap(px(14.))
         .px(px(12.))
-        .child(section_head("ledger"))
         // MOCK-SPEC.md "Ledger": "All mono" -- project identity, last
         // action, export progress and position are all what the film/project
         // says, not the room's own voice.
@@ -689,6 +672,24 @@ fn ledger(player: &Player, position: f64, cx: &mut Context<Player>) -> impl Into
                 .text_color(rgb(INK1()))
                 .child(identity),
         )
+        // Saved is a state and reads as one; unsaved is a thing to *do*, and
+        // this is Save's home; the time band's parking-spot ghost, filed there only
+        // because the ledger was a concurrent builder's file, is deleted
+        // (cleanse round 2) -- the same room-verb ghost the four verbs at the
+        // strip's other end are built from, so its chord, its hover plate and
+        // its hitmap door all come from one place.
+        .child(match dirty {
+            true => room_ghost(player, "unsaved", ActionId::Save, false, cx).into_any_element(),
+            false => div()
+                .flex_none()
+                .type_style(type_scale::mono(
+                    type_scale::CHORD_METADATA_MIN_PX,
+                    gpui::FontWeight::MEDIUM,
+                ))
+                .text_color(rgb(INK1()))
+                .child("saved")
+                .into_any_element(),
+        })
         .child(
             div()
                 .flex_1()

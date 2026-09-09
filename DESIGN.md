@@ -116,10 +116,10 @@ Fixed geography; nothing moves, nothing occludes the picture:
 │  (with the in/out grips)        │      │
 │  → [Export]                     │      │
 ├─────────────────────────────────┤      │
-│ BENCH (lanes V/A/S)             │      │
+│ ruler · lanes  • V1  • A1  • S1  │      │
 ├─────────────────────────────────┤      │
-│ LEDGER (project · state · room  │      │
-│  verbs · position)              │      │
+│ name · saved | last action |    │      │
+│  room verbs · position          │      │
 └─────────────────────────────────┴──────┘
 ```
 
@@ -139,15 +139,22 @@ all left it — each keeps its chord and its KEYS-tab row, the ruler menu keeps 
 on the ruler, the marks became the strip's grips, and the ledger already says `saved`/`unsaved ·
 ^s`. The picture's `scale 0.59` corner readout is deleted with them: fit is `^0`, and the number
 was a state nobody acts on.
-- **Bench**: lanes. Clip anatomy = ink spine (3px left edge) + real thumbnails/waveform in the
-  source's ink + name plate + splice gaps in lamp white.
-- **Ledger**: project identity (`name.edith · saved`), last action, export progress, and at the
+- **Bench**: the ruler row, then lanes. Clip anatomy = ink spine (3px left edge) + real
+  thumbnails/waveform in the source's ink + name plate + splice gaps in lamp white. A lane head
+  is a source dot and the lane's name (`• V1`, 60px) and nothing else; the name plate carries
+  the file's name without its extension (`files::stem`), and only once per source — the audio
+  half of a linked insert has no plate, because the picture plate directly above it and the
+  shared dot already say whose it is.
+- **Ledger**: project identity (`name · saved`, extension dropped), last action, export
+  progress, and at the
   right end, before the position: the **room verbs** as ghosts (`CC t · settings ^, · keys ? ·
   full f11`) — the four commands that act on the room itself and so have no thing under the
   cursor to be right-clicked on. `ink3` + chord, hover raises to `ink2` with the room's own
   plate, `CC` reads `ink1` + fill while subtitles are shown. State lives here, notices rise
-  from here.
-- **Dock** (right, the only side panel): SOURCES tab, CLIP tab, KEYS tab.
+  from here. When the project is unsaved the state word is not a word but a door:
+  `unsaved ^s`, the same room-verb ghost, and clicking it saves — this is Save's home.
+- **Dock** (right, the only side panel): SOURCES tab and CLIP tab; the keys list is dock-body
+  state behind `?` / the ledger's `keys ?`, not a tab (user 2026-09-09).
   **Cleanse round 2 (2026-09-10):** SOURCES is a filter and *one* list. The filter is the glass
   alone (`⌕`, no placeholder word); the list holds every source together — picture, sound and
   subtitle tracks — in arrival order, with no `Media / Audio / Text` sub-tabs, no sort row, no
@@ -160,6 +167,17 @@ was a state nobody acts on.
   their KEYS rows and the dock's own right-click menu. Empty list: the one noun `none`.
   CLIP tab: the per-clip verbs (Speed / Colour / Transform / EQ / Silence / Mix / Fit) as plain
   ghost rows — label + chord, no head styling — over the param rows they open.
+
+**Amendment (2026-09-10), "cleanse round 2":** the `BENCH` and `LEDGER` section heads are
+deleted — the geography says what a region is, and a label above it is a second saying. The
+ruler row is the bench's own top edge (the seam's grab band no longer reaches past it, since the
+ruler answers presses itself), and the ledger's first word is the project. `all ^a` leaves the
+ruler's right edge for the ruler's own right-click menu; the lane head's `≋` mix and `×` remove
+leave the head for the head's own right-click menu, where they still act on the lane that was
+clicked. Every one of them keeps its chord and its KEYS row: nothing lost a door, each one moved
+to the thing it acts on, which is the "option C" rule below applied a second time. Save moves
+the same way: the time band's ghost — parked there only because the ledger was another
+builder's file at the time — is deleted, and the ledger's own state word is its door.
 
 **Amendment (2026-09-09), user decision "option C":** there is no rail. The 56px spine — every
 command as a ghost glyph + chord down the left edge — is deleted, and the picture, time band,

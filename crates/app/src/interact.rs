@@ -258,20 +258,20 @@ pub(crate) fn drag_scrim(cx: &mut Context<Player>) -> Div {
 /// 2026-09-09: "panes should be enlargable and shrinkable" -- they already
 /// were). The hairline is painted *by the band*, not by the strip, so the
 /// whole band lights it: a line raised only by the pixels that already grab
-/// the seam tells a hand nothing. The bench's band is deeper still
-/// ([`BENCH_GRAB_H`]) -- the row under its seam is the bench's own section
-/// head, and that is where a hand aiming at "the top of the timeline" lands.
+/// the seam tells a hand nothing. The bench's band ([`BENCH_GRAB_H`]) is every
+/// other seam's reach: the section head under it is gone (cleanse round 2) and
+/// the ruler that starts the bench now answers presses itself, so a deeper
+/// band would eat scrubs at the film's own top edge.
 ///
 /// A double press resets the seam to the window's own share
 /// ([`Splits::clear`]): the cheap way back from a layout dragged somewhere
 /// unusable, and the one every editor's dividers answer to.
 pub(crate) fn divider(split: Split, held: bool, cx: &mut Context<Player>) -> Div {
     let across = matches!(split, Split::Timeline | Split::Bench);
-    // A row seam parts the picture from a panel whose own first row is its
-    // section head -- empty land -- so the bench's band reaches down through
-    // it ([`BENCH_GRAB_H`]). Every other seam keeps [`GRAB_W`]: the dock's
-    // neighbour is a list whose rows start at its very edge, and the legacy
-    // timeline's is the edit toolbar's buttons.
+    // Named per seam anyway ([`BENCH_GRAB_H`] is [`GRAB_W`] since the bench
+    // lost its section head): every neighbour's first row carries content the
+    // hand may want instead -- the bench's ruler scrubs, the dock's rows start
+    // at its very edge, the legacy timeline's are the edit toolbar's buttons.
     let grab = match split {
         Split::Bench => BENCH_GRAB_H,
         _ => GRAB_W,

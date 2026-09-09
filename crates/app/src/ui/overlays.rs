@@ -376,6 +376,21 @@ impl Player {
                                                 event.position(),
                                                 cx,
                                             );
+                                        } else if matches!(menu.on, MenuOn::Head)
+                                            && matches!(
+                                                action,
+                                                ActionId::Mix
+                                                    | ActionId::RemoveVideoLane
+                                                    | ActionId::RemoveAudioLane
+                                            )
+                                        {
+                                            // The head's own verbs, which left the
+                                            // head itself for this menu (cleanse
+                                            // round 2): they act on the lane the
+                                            // hand named, the way the head's
+                                            // buttons did, not on the last of the
+                                            // kind the bare stroke reaches.
+                                            this.act_lane(action, menu.lane, cx);
                                         } else {
                                             this.act(action, window, cx);
                                         }

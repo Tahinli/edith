@@ -63,28 +63,16 @@ const TICK_MIN_PX: f64 = 64.;
 const PLATE_W: f32 = 11. * crate::layout::LIST_CHAR_W / type_scale::CHORD_METADATA_MIN_PX
     * type_scale::CHORD_METADATA_MAX_PX
     + 9.;
-/// The reserved right-edge band `bench-select-all` sits in: its own
-/// `right(4.)` offset, the `px(3.)` either side of its text and the `gap(3.)`
-/// between the label and its chord. The band's text width is measured per
-/// render (the chord is keymap-dependent) and added to this.
-pub(crate) const SELECT_ALL_PAD: f32 = 4. + 3. + 3. + 3.;
-/// The width of that band for a given chord: `all`, the chord, and the
-/// padding around them. Read by the tick loop (no label may enter it) and by
-/// the ruler's own scrub listener (no press inside it seeks) -- one rule, so
-/// the two can never disagree about where the control's edge is.
-pub(crate) fn select_all_band(chord: &str) -> f32 {
-    ("all".len() + chord.chars().count()) as f32 * char_w(type_scale::CHORD_METADATA_MIN_PX)
-        + SELECT_ALL_PAD
-}
 /// A mono character's width at `size_px`, from the shared
 /// [`crate::layout::LIST_CHAR_W`] calibration (taken at
 /// [`type_scale::CHORD_METADATA_MIN_PX`]).
 pub(crate) fn char_w(size_px: f32) -> f32 {
     crate::layout::LIST_CHAR_W / type_scale::CHORD_METADATA_MIN_PX * size_px
 }
-/// The pinned track-head column: wide enough for its lane-specific ghost
-/// verbs and their compact chords without shrinking their pointer targets.
-const HEAD_W: f32 = 72.;
+/// The pinned track-head column: the source dot and the lane's name, and
+/// nothing else since the head's verbs moved into its own menu (cleanse
+/// round 2) -- the pixels it gave up are the bed's now.
+const HEAD_W: f32 = 60.;
 pub(crate) const ROW_GAP: f32 = 2.;
 /// DESIGN §7: lanes compress evenly up to this many rows before the column
 /// scrolls behind the pinned ruler and heads instead of compressing further.
@@ -220,8 +208,14 @@ fn clip_box(
     let on = marked((lane, idx), clip.link, picks, pick_links);
     let t = tier(span);
     let source = player.sources().get(clip.source);
-    let label = source.map(|s| file_name(&s.path));
     let audio = lane.kind == LaneKind::Audio;
+    // The name, extension dropped (`files::stem`, the ledger's and the dock's
+    // helper too) -- and only once per source: the audio half of a linked
+    // insert carries no plate at all, because the picture plate directly above
+    // it and the shared source dot already say whose it is (cleanse round 2).
+    let label = source
+        .filter(|_| !(audio && clip.link.is_some()))
+        .map(|s| stem(&s.path));
     let fade_in = player.shown_fade_in(lane, idx, clip);
     let fade_out = player.shown_fade_out(lane, idx, clip);
     let dissolves = lane.kind == LaneKind::Video
@@ -847,12 +841,7 @@ fn lane_row(
         .first()
         .map_or_else(INK4, |clip| source_tint(clip.source));
     let head_ghost: SharedString = lane.label().into();
-    let gain_db = player
-        .session
-        .as_ref()
-        .map_or(0., |session| session.lane_gain_db(lane));
     let shown = player.sub_lane_on(lane);
-    let chord_style = type_scale::mono(type_scale::CHORD_METADATA_MIN_PX, gpui::FontWeight::MEDIUM);
     let drop = player
         .lane_drop
         .filter(|drop| drop.lane == lane && cx.has_active_drag());
@@ -930,56 +919,30 @@ fn lane_row(
                     div()
                         .flex()
                         .items_center()
-                        .gap(px(2.))
-                        // MOCK-SPEC.md "Bench": "V1, A1 in mono".
-                        .type_style(type_scale::mono(
-                            type_scale::CHORD_METADATA_MIN_PX,
-                            gpui::FontWeight::MEDIUM,
-                        ))
-                        .text_color(rgb(INK2()))
-                        .child(lane.label())
-                        .when(lane.kind == LaneKind::Audio, |d| {
-                            d.child(
-                                div()
-                                    .id(("bench-mix-lane", lane.ord))
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(1.))
-                                    .rounded(px(3.))
-                                    .px(px(2.))
-                                    .cursor_pointer()
-                                    .hover(|s| s.bg(rgb(DARK_RAISED())).text_color(rgb(INK1())))
-                                    .tooltip(move |_, cx| {
-                                        cx.new(|_| {
-                                            Tip(format!(
-                                                "{} {gain_db:+.0} dB — mix this lane",
-                                                lane.label()
-                                            )
-                                            .into())
-                                        })
-                                        .into()
-                                    })
-                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                        this.act_lane(ActionId::Mix, lane, cx);
-                                    }))
-                                    .children(hitmap::dynamic(
-                                        move || {
-                                            (
-                                                format!("lane.{}.mix", lane.label()),
-                                                format!("Mix {}", lane.label()),
-                                            )
-                                        },
-                                        true,
-                                    ))
-                                    .child("≋")
-                                    .child(
-                                        div()
-                                            .type_style(chord_style.clone())
-                                            .text_color(rgb(INK3()))
-                                            .child(player.keymap.chord(ActionId::Mix)),
-                                    ),
-                            )
-                        })
+                        .gap(px(5.))
+                        // The head is the source dot and the lane's name, and
+                        // nothing else (DESIGN §5, cleanse round 2): the verbs
+                        // it used to wear -- mix, remove -- are rows in its own
+                        // right-click menu (`oracle::lane_items`) and keep
+                        // their chords there.
+                        .child(
+                            div()
+                                .flex_none()
+                                .w(px(LANE_DOT_D))
+                                .h(px(LANE_DOT_D))
+                                .rounded(px(LANE_DOT_D / 2.))
+                                .bg(rgb(dot)),
+                        )
+                        .child(
+                            div()
+                                // MOCK-SPEC.md "Bench": "V1, A1 in mono".
+                                .type_style(type_scale::mono(
+                                    type_scale::CHORD_METADATA_MIN_PX,
+                                    gpui::FontWeight::MEDIUM,
+                                ))
+                                .text_color(rgb(INK2()))
+                                .child(lane.label()),
+                        )
                         .when(lane.kind == LaneKind::Subtitle, |d| {
                             d.child(
                                 div()
@@ -1014,62 +977,7 @@ fn lane_row(
                                     ))
                                     .child("◉"),
                             )
-                        })
-                        .when(lane.kind != LaneKind::Subtitle, |d| {
-                            let action = match lane.kind {
-                                LaneKind::Video => ActionId::RemoveVideoLane,
-                                LaneKind::Audio => ActionId::RemoveAudioLane,
-                                LaneKind::Subtitle => unreachable!(),
-                            };
-                            d.child(
-                                div()
-                                    .id(("bench-remove-lane", lane.ord * 10 + lane.kind as usize))
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(1.))
-                                    .rounded(px(3.))
-                                    .px(px(2.))
-                                    .cursor_pointer()
-                                    .hover(|s| s.bg(rgb(DARK_RAISED())).text_color(rgb(INK1())))
-                                    .tooltip(move |_, cx| {
-                                        cx.new(|_| {
-                                            Tip(format!(
-                                                "Remove {} — it must be empty first",
-                                                lane.label()
-                                            )
-                                            .into())
-                                        })
-                                        .into()
-                                    })
-                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                        this.act_lane(action, lane, cx);
-                                    }))
-                                    .children(hitmap::dynamic(
-                                        move || {
-                                            (
-                                                format!("lane.{}.remove", lane.label()),
-                                                format!("Remove {}", lane.label()),
-                                            )
-                                        },
-                                        player.enable(action, None).yes(),
-                                    ))
-                                    .child("×")
-                                    .child(
-                                        div()
-                                            .type_style(chord_style)
-                                            .text_color(rgb(INK3()))
-                                            .child(player.keymap.chord(action)),
-                                    ),
-                            )
                         }),
-                )
-                .child(
-                    div()
-                        .flex_none()
-                        .w(px(LANE_DOT_D))
-                        .h(px(LANE_DOT_D))
-                        .rounded(px(LANE_DOT_D / 2.))
-                        .bg(rgb(dot)),
                 ),
         )
         .child(
@@ -1313,16 +1221,6 @@ pub(crate) fn render(
         .map_or_else(|| vec![Lane::V1, Lane::A1], PlaybackSession::lanes);
     let position = player.active_session().map_or(0., PlaybackSession::now);
     let scale = player.scale;
-    let select_all = player.enable(ActionId::SelectAll, None);
-    let select_all_tip: SharedString = match select_all.why() {
-        Some(why) => format!("{} — {why}", player.keymap.display(ActionId::SelectAll)),
-        None => format!(
-            "{} — {}",
-            player.keymap.display(ActionId::SelectAll),
-            ActionId::SelectAll.label()
-        ),
-    }
-    .into();
     let bed_w = f32::from(player.ruler.get().size.width).max(1.);
     let filled = scale.px_at(position).clamp(0., bed_w);
     let (picks, pick_links) = player.marks();
@@ -1336,16 +1234,13 @@ pub(crate) fn render(
     // first tick at or after the bed's left edge to the bed's right edge.
     // Guarded on `pps > 0` -- a zero scale (no session yet) has no interval
     // that ever advances past the bed's own width, which would loop forever.
-    // The ruler's two reserved bands, and no tick label may enter either.
-    // Left: the playhead timecode plate, which now shows only while a scrub
+    // The ruler's one reserved band, which no tick label may enter: the
+    // playhead timecode plate, which now shows only while a scrub
     // drag is live (the hero timecode leads the time band at rest, DESIGN
     // §4, and the ledger keeps position, §5 -- a third resting copy is the
     // crowding) -- at rest the band is zero and the ticks have the width
-    // back. Right: `bench-select-all`, which used to be drawn straight over
-    // the `00:20` label because only the left plate was ever suppressed.
+    // back.
     let plate_w = if player.scrubbing { PLATE_W } else { 0. };
-    let all_chord = player.keymap.chord(ActionId::SelectAll);
-    let all_w = select_all_band(&all_chord);
     let mut ticks = Vec::new();
     if scale.pps > 0. {
         let interval = tick_interval(scale.pps);
@@ -1354,7 +1249,7 @@ pub(crate) fn render(
             let x = scale.px_at(t).max(0.);
             let label = tick_mmss(t);
             let label_w = label.chars().count() as f32 * char_w(type_scale::FLOOR_PX);
-            if x >= plate_w && x + label_w <= bed_w - all_w {
+            if x >= plate_w && x + label_w <= bed_w {
                 ticks.push((x, label));
             }
             t += interval;
@@ -1397,21 +1292,6 @@ pub(crate) fn render(
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                        // The reserved right-edge band is `bench-select-all`'s,
-                        // not the scrub's: a press there used to select all AND
-                        // seek the playhead under the control (11:12 -> 20:14).
-                        // The guard lives here rather than as a
-                        // `stop_propagation` on the control, because stopping
-                        // the press also swallows the control's own click --
-                        // gpui builds a click out of that same mouse-down.
-                        let bounds = this.ruler.get();
-                        let bed_w = f32::from(bounds.size.width).max(1.);
-                        let band = select_all_band(&this.keymap.chord(ActionId::SelectAll));
-                        if f32::from(crate::timeline_math::px_along(event.position.x, bounds))
-                            >= bed_w - band
-                        {
-                            return;
-                        }
                         this.scrubbing = true;
                         this.scrub_to(event.position.x, true, cx);
                     }),
@@ -1479,35 +1359,7 @@ pub(crate) fn render(
                         .child(playhead_tc),
                     )
                 })
-                .child(
-                    div()
-                        .id("bench-select-all")
-                        .absolute()
-                        .right(px(4.))
-                        .top_0()
-                        .h_full()
-                        .flex()
-                        .items_center()
-                        .gap(px(3.))
-                        .px(px(3.))
-                        .rounded(px(2.))
-                        .tooltip(move |_, cx| cx.new(|_| Tip(select_all_tip.clone())).into())
-                        .when(!select_all.yes(), |d| d.opacity(0.4).cursor_not_allowed())
-                        .when(select_all.yes(), |d| {
-                            d.cursor_pointer()
-                                .hover(|s| s.bg(rgb(DARK_RAISED())).text_color(rgb(INK1())))
-                                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                                    this.act(ActionId::SelectAll, window, cx)
-                                }))
-                        })
-                        .type_style(type_scale::mono(
-                            type_scale::CHORD_METADATA_MIN_PX,
-                            gpui::FontWeight::MEDIUM,
-                        ))
-                        .text_color(rgb(INK3()))
-                        .child("all")
-                        .child(all_chord),
-                ),
+
         )
         .child(
             div()
