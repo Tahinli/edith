@@ -539,36 +539,22 @@ struct Player {
     /// time -- opening either closes the other, since both are the whole window
     /// and two stacked scrims say nothing about which one is listening.
     export_open: bool,
-    /// How the card lays its rows out, and where the formats this program
-    /// cannot write are said. Two shapes of the same card, kept behind `g` and
-    /// `r` so the choice between them can be made by looking at both rather
-    /// than by argument: sections with headers against one flat list, and a
-    /// collapsed "cannot write" footer against a dimmed row each. The defaults
-    /// are grouped and collapsed -- the five dead rows used to eat the fold.
-    /// Not persisted: this is a look, not a setting.
-    export_grouped: bool,
-    export_refusals_inline: bool,
-    /// Whether the card's Advanced pane -- codec, container, quality,
-    /// sound, encoder, subtitles, this machine -- is open under the primary
-    /// pane's destination and preset rows. Closed by default: most exports
-    /// are one of the bundled presets, and the fifteen-odd rows under them
-    /// are what a person who is not one of those goes looking for, kept
-    /// behind one row rather than eaten by the fold. Not persisted, like the
-    /// two switches above it -- this is a look, not a setting.
-    export_advanced_open: bool,
-    /// Which quality row the card has picked, and the megabits typed against
-    /// the custom one. Kept across closes, so a second export offers what the
-    /// first one chose.
-    quality: Quality,
-    custom_mbps: u32,
-    /// The custom row's number *while it is being typed*, or `None` when nobody
-    /// is typing one. A field with a caret in it and not a key capture: digits
-    /// used to change the bitrate from anywhere in the card, with no caret to
-    /// say where they were landing and nothing to look at before the number
-    /// took effect. Nothing in this card takes gpui focus (the root keeps the
-    /// keyboard), so the field is a modal state on the player exactly as a
-    /// waiting rebind row is, and the root's handler is what types into it.
-    mbps_edit: Option<NumberEdit>,
+    /// The export budget, in bits per second -- the moment's one number, and
+    /// the only thing the encoder actually takes. Zero means nobody has
+    /// chosen: the lever then reads the engine's own automatic figure for
+    /// this picture ([`Player::budget_bps`]), which is what keeps it off the
+    /// "0 Mbps" the old `custom_mbps: 0` default put on screen.
+    custom_bps: u64,
+    /// The budget *while it is being typed*, or `None` when nobody is typing.
+    /// Free text and not digits: `850k`, `6.5M`, `6.5` and `1.2G` are all
+    /// ways of saying one budget ([`parse_budget`]). Nothing on this surface
+    /// takes gpui focus (the root keeps the keyboard), so the field is a
+    /// modal state on the player and the root's handler types into it.
+    budget_edit: Option<String>,
+    /// The budget track's box, recorded at prepaint -- [`Self::color_bars`]'
+    /// own reason: a mouse listener is handed the window position only, and
+    /// [`frac_along`] is what turns it into a rate.
+    budget_bar: Rc<Cell<Bounds<Pixels>>>,
     /// The Clip tab's transition duration row, the same way (DEBT #111):
     /// the anchor clip's frame count while it is being typed, `None` when
     /// nobody is. Opened on the row's own click, closed on the same field's
@@ -978,9 +964,6 @@ fn main() {
                     lanes_scroll: ScrollHandle::new(),
                     eq_scroll: ScrollHandle::new(),
                     export_open: false,
-                    export_grouped: true,
-                    export_refusals_inline: false,
-                    export_advanced_open: false,
                     eq_open: None,
                     card_maximized: ui::dock_stance::load_maximized(),
                     // Replaced by the clip's own curve the moment the card
@@ -1030,14 +1013,12 @@ fn main() {
                     // Empty until the first frame is pumped, which draws as a
                     // flat line rather than as a shape nothing measured.
                     histogram: [[0; HIST_BINS]; 3],
-                    // What an export is until someone says otherwise: the Web
-                    // bundle, so `ExportPreset::from_state` opens on a real
-                    // preset rather than a `Custom` nobody picked -- `Auto`
-                    // paired with `Format::default()`'s MP4 matched no bundle
-                    // at all.
-                    quality: Quality::Medium,
-                    custom_mbps: 0,
-                    mbps_edit: None,
+                    // Nobody has chosen a budget yet, which is not the same
+                    // as a budget of nothing: the lever opens on the engine's
+                    // own automatic figure for the picture that is open.
+                    custom_bps: 0,
+                    budget_edit: None,
+                    budget_bar: Rc::default(),
                     transition_edit: None,
                     // ...and the rate the sound has always been written at.
                     audio_kbps: DEFAULT_AUDIO_KBPS,

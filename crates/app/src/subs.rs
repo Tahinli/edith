@@ -426,6 +426,7 @@ pub(crate) fn subtitle_detail(track: &engine::subtitle::SubtitleTrack) -> String
 /// string verbatim, would say it correctly meanwhile. Upgrade path: reasons out
 /// of `planned_subtitles` as data rather than as one sentence, which is an
 /// engine change.
+#[allow(dead_code)] // read by `Player::subtitle_line`, which Settings shows
 pub(crate) fn subtitle_plan(
     plan: String,
     tracks: &[engine::subtitle::SubtitleTrack],

@@ -609,10 +609,6 @@ fn every_codec_row_is_offered_or_says_why_not() {
             // Every box on one row is the same codec, so the quality rows
             // do not change meaning when the container does.
             assert!(row.iter().all(|f| f.has_video() == first.has_video()));
-            assert!(
-                row.iter()
-                    .all(|f| bitrate_refusal(*f) == bitrate_refusal(first))
-            );
         }
     }
     // No two rows share a key, and none of them is a stroke the card already
@@ -651,78 +647,10 @@ fn every_codec_row_is_offered_or_says_why_not() {
         detail.contains("rusty_vorbis"),
         "the row names the encoder like every other live one: {detail}"
     );
-    // Both AV1 boxes say they carry sound: the file used to be picture only,
-    // and a line that still said so would be the lie a user plays the file
-    // to find out about. HEVC says intra-only before anyone waits on one --
-    // a file several times the size, which the disk would otherwise say.
-    for format in [Format::Av1, Format::Av1Mp4] {
-        assert!(format_line(format).starts_with("AV1 · "));
-    }
-    for format in [Format::Hevc, Format::HevcMp4] {
-        assert!(format_line(format).starts_with("HEVC intra · "));
-    }
-    // The head names the box every format goes in, which is what the
-    // destination is then named after.
-    for format in [
-        Format::Mp4,
-        Format::Av1,
-        Format::Av1Mp4,
-        Format::Hevc,
-        Format::HevcMp4,
-    ] {
-        assert!(
-            format_line(format).contains(&format.ext().to_uppercase()),
-            "{format:?}: {}",
-            format_line(format)
-        );
-    }
-    // ...and it stays inside the one line the card budgets for it: the
-    // longest of them, with every field after it, against the 76 characters
-    // that fit at `EXPORT_W`.
-    let longest = summary_head(
-        Format::Hevc,
-        Some(((1920, 1080), 23.976)),
-        "AAC · SW encode (rusty_aac)",
-    );
-    assert!(
-        longest.chars().count() <= 76,
-        "{longest} is {} long",
-        longest.chars().count()
-    );
     assert!(
         FORMATS
             .into_iter()
             .any(|(row, _, _, detail)| row.contains(&Format::Hevc) && detail.contains("intra"))
-    );
-    // Only a picture encoder is given a bitrate, and the quality rows dim
-    // with the reason for every format that is not one.
-    for format in [
-        Format::Mp4,
-        Format::Av1,
-        Format::Av1Mp4,
-        Format::Hevc,
-        Format::HevcMp4,
-    ] {
-        assert!(
-            format.has_video() && bitrate_refusal(format).is_none(),
-            "{format:?}"
-        );
-    }
-    for format in [Format::Wav, Format::Flac, Format::Mp3] {
-        assert!(!format.has_video());
-        assert!(
-            bitrate_refusal(format).is_some(),
-            "{format:?} dims silently"
-        );
-    }
-    assert!(bitrate_refusal(Format::Wav).unwrap().contains("lossless"));
-    // MP3 has a rate and it is the *Sound* row's: the quality rows are the
-    // picture's, and this refusal used to claim a fixed 256 kbps that the
-    // Sound row can now change under it.
-    assert!(bitrate_refusal(Format::Mp3).unwrap().contains("Sound row"));
-    assert!(
-        !format_line(Format::Mp3).contains("256"),
-        "the summary states a rate the Sound row can change under it"
     );
     // The destination follows the format and keeps the stem, mp4 included.
     assert_eq!(
@@ -733,79 +661,47 @@ fn every_codec_row_is_offered_or_says_why_not() {
         retarget(std::path::Path::new("/a/take.export.wav"), Format::Mp4),
         std::path::Path::new("/a/take.export.mp4")
     );
-    assert!(format_line(Format::Flac).contains("lossless"));
 }
 
-/// The one line the card is answerable for: what it says is on screen before
-/// the button is pressed, and every field of it is one `ffprobe` reads back
-/// off the file that comes out.
+/// What the budget row says about the file before it is written: the size a
+/// rate makes over a span, in the unit the row states it in.
 #[test]
-fn the_summary_states_the_file_before_it_is_written() {
-    let head = summary_head(Format::Mp4, Some(((1920, 1080), 30.)), "AAC copy");
-    for field in ["H.264", "MP4", "1920x1080", "30 fps", "AAC copy"] {
-        assert!(head.contains(field), "{field} missing from {head}");
-    }
+fn the_budget_row_states_the_size_before_it_is_written() {
     // The rate as a person writes it, and the ratio one spelled out rather
     // than rounded to a rate nothing is written at.
     assert_eq!(fps_label(30.), "30");
     assert_eq!(fps_label(24000. / 1001.), "23.976");
     assert_eq!(fps_label(29.97002997), "29.97");
-    // A format with no picture states no size and no rate it does not write.
-    let audio = summary_head(Format::Wav, Some(((1920, 1080), 30.)), "PCM · SW (hound)");
+    // 6 Mbps over a minute is 45 MB -- and the sound rides in the same
+    // number, because it is in the same file.
+    assert_eq!(estimated_bytes(6_000_000, 60.), 45_000_000);
+    assert_eq!(estimated_bytes(6_000_000 + 256_000, 60.), 46_920_000);
+    assert_eq!(estimated_bytes(2_000_000, 90.), 22_500_000);
+    // Nothing to write is nothing to estimate, and never a negative span.
+    assert_eq!(estimated_bytes(6_000_000, 0.), 0);
+    assert_eq!(estimated_bytes(6_000_000, -3.), 0);
+    // Whole megabytes under a gigabyte, two decimals over it: the estimate
+    // is an "≈" and a tenth of a megabyte is precision it does not have.
+    assert_eq!(size_label(45_000_000), "45 MB");
+    assert_eq!(size_label(999_999_999), "1000 MB");
+    assert_eq!(size_label(1_000_000_000), "1.00 GB");
+    assert_eq!(size_label(1_240_000_000), "1.24 GB");
+    // The lever's own readout, one decimal, in the unit it is moved in.
+    assert_eq!(rate_label(6_000_000), "6.0");
+    assert_eq!(rate_label(6_500_000), "6.5");
+    assert_eq!(rate_label(BPS_MIN), "1.0");
+    // The faintest line: what resolved, never a control -- and it says the
+    // marked span where there is one rather than "whole film".
+    let line = plan_line(Format::Mp4, "AAC 256 kbps", None, true);
+    assert_eq!(line, "H.264 · AAC 256 kbps · whole film · GPU");
+    assert!(plan_line(Format::Mp4, "AAC", None, false).ends_with("SW"));
     assert!(
-        !audio.contains("1920x1080") && !audio.contains("fps"),
-        "{audio}"
+        plan_line(Format::Mp4, "AAC", Some("00:00:04:00–00:00:12:00"), true)
+            .contains("marks 00:00:04:00–00:00:12:00")
     );
-    assert!(audio.contains("PCM · SW (hound)"));
-    // ...and one with no sound on the timeline says that, rather than
-    // leaving the field out and reading as a file with sound in it.
-    assert!(
-        summary_head(Format::Mp4, Some(((640, 360), 25.)), "no sound to write")
-            .contains("no sound to write")
-    );
-    // The tail: where it lands, about how big, and what will encode it --
-    // never a guessed seat, and no seat at all for a format with no picture.
-    let tail = summary_tail(
-        Path::new("/a/take.export.mp4"),
-        Some(45_000_000),
-        Some("VA-API"),
-        true,
-    );
-    assert!(tail.starts_with("take.export.mp4"), "{tail}");
-    assert!(
-        tail.contains("≈ 45 MB") && tail.contains("VA-API"),
-        "{tail}"
-    );
-    assert!(summary_tail(Path::new("/a/x.mp4"), None, None, true).contains("encoder …"));
-    assert!(!summary_tail(Path::new("/a/x.wav"), None, None, false).contains("encoder"));
-    assert!(!summary_tail(Path::new("/a/x.wav"), None, None, false).contains("MB"));
-    // 6 Mbps over a minute is 45 MB. `Auto` has no figure to estimate from
-    // and an empty timeline no length: neither invents one.
-    assert_eq!(estimated_bytes(Some(6_000_000), 60.), Some(45_000_000));
-    assert_eq!(estimated_bytes(Some(2_000_000), 90.), Some(22_500_000));
-    assert_eq!(estimated_bytes(None, 60.), None);
-    assert_eq!(estimated_bytes(Some(6_000_000), 0.), None);
-    assert_eq!(estimated_bytes(Some(0), 60.), None);
-    // ...and a short one is not nothing. Three seconds at the floor
-    // bitrate is 375 kB, which used to round to the "≈ 0 MB" this line
-    // exists to never say -- the shortest export a frame can make is
-    // still a real file with a real size.
-    let short = estimated_bytes(Some(1_000_000), 3.).expect("a rate and a length");
-    assert_eq!(size_label(short), "375 kB");
-    let frame = summary_tail(
-        Path::new("/a/x.mp4"),
-        estimated_bytes(Some(1_000_000), 1. / 60.),
-        None,
-        true,
-    );
-    assert!(
-        frame.contains("≈ 2 kB") && !frame.contains("0 MB") && !frame.contains("0 kB"),
-        "{frame}"
-    );
-    // The boundary reads in the unit that can state it, either side.
-    assert_eq!(size_label(999_600), "1 MB");
-    assert_eq!(size_label(499_000), "499 kB");
-    assert_eq!(size_label(1), "1 kB");
+    // A sound-only export names no picture codec and no seat to write it on.
+    let sound = plan_line(Format::Flac, "FLAC", None, true);
+    assert_eq!(sound, "FLAC · sound only");
 }
 
 /// Which cue is on screen when: the whole of what the overlay decides, and

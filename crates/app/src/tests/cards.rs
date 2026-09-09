@@ -875,83 +875,167 @@ fn the_volume_stops_at_both_ends() {
 }
 
 #[test]
-fn a_quality_row_is_the_bitrate_it_promises() {
-    // Auto is the one row that says nothing: the exporter derives it, and
-    // a number typed against the custom row must not leak into it.
-    let mp4 = Format::Mp4;
-    assert_eq!(
-        export_settings(Quality::Auto, 7, mp4, DEFAULT_AUDIO_KBPS, EncoderSeat::Auto).bitrate,
-        None
-    );
-    assert_eq!(
-        export_settings(Quality::Low, 0, mp4, DEFAULT_AUDIO_KBPS, EncoderSeat::Auto).bitrate,
-        Some(2_000_000)
-    );
-    assert_eq!(
-        export_settings(
-            Quality::Medium,
-            0,
-            mp4,
-            DEFAULT_AUDIO_KBPS,
-            EncoderSeat::Auto
-        )
-        .bitrate,
-        Some(6_000_000)
-    );
-    assert_eq!(
-        export_settings(Quality::High, 0, mp4, DEFAULT_AUDIO_KBPS, EncoderSeat::Auto).bitrate,
-        Some(12_000_000)
-    );
-    // Megabits as typed, and as the row says it back.
-    assert_eq!(
-        export_settings(
-            Quality::Custom,
-            7,
-            mp4,
-            DEFAULT_AUDIO_KBPS,
-            EncoderSeat::Auto
-        )
-        .bitrate,
-        Some(7_000_000)
-    );
-    assert_eq!(Quality::Low.detail(0), "2 Mbps");
-    // The picked format travels, or the card's rows would be a picture of a
+fn the_budget_is_the_one_number_the_engine_gets() {
+    // One explicit rate, always: the Auto/Low/Medium/High/Exact ladder is
+    // gone, so there is nothing left that sends `None` and lets the encoder
+    // pick a figure the row never showed.
+    let settings = export_settings(6_500_000, Format::Mp4, DEFAULT_AUDIO_KBPS, EncoderSeat::Auto);
+    assert_eq!(settings.bitrate, Some(6_500_000));
+    assert!(!settings.exact, "the copy path is off this surface");
+    assert_eq!(settings.audio_kbps, Some(DEFAULT_AUDIO_KBPS));
+    assert_eq!(settings.seat, EncoderSeat::Auto);
+    // The picked format travels, or the moment would be a picture of a
     // choice the engine never hears about.
     for format in [Format::Mp4, Format::Wav, Format::Flac] {
         assert_eq!(
-            export_settings(
-                Quality::Auto,
-                0,
-                format,
-                DEFAULT_AUDIO_KBPS,
-                EncoderSeat::Auto
-            )
-            .format,
+            export_settings(BPS_MIN, format, DEFAULT_AUDIO_KBPS, EncoderSeat::Auto).format,
             format
         );
     }
-    // Every fixed row sits inside the engine's clamp
-    // (`MAX_EXPLICIT_BITRATE`), so no row can promise a bitrate the exporter
-    // silently changes -- the ceiling row included, which is the one a
-    // raised cap could have walked out past.
-    for quality in Quality::ALL {
-        let settings = export_settings(
-            quality,
-            MBPS_MAX,
-            mp4,
-            DEFAULT_AUDIO_KBPS,
-            EncoderSeat::Auto,
-        );
-        if let Some(bitrate) = settings.bitrate {
-            assert!(
-                (u64::from(MBPS_MIN) * 1_000_000..=u64::from(MBPS_MAX) * 1_000_000)
-                    .contains(&bitrate),
-                "{quality:?} outside the engine clamp"
-            );
+    // The lever's bounds are the engine's own (`MIN_BITRATE`,
+    // `MAX_EXPLICIT_BITRATE`), so no reachable number is silently rewritten.
+    assert_eq!(BPS_MIN, 1_000_000);
+    assert_eq!(BPS_MAX, 50_000_000);
+    // The default the lever opens on is the engine's automatic figure for
+    // the picture that is open -- never the 0 Mbps the old `custom_mbps: 0`
+    // put on screen.
+    assert_eq!(auto_bps(1920, 1080, 30.), 6_220_800);
+    assert!(auto_bps(320, 240, 30.) >= BPS_MIN, "a tiny picture floors");
+    assert!(auto_bps(7680, 4320, 60.) <= 20_000_000, "and a huge one caps");
+    for bps in [auto_bps(1920, 1080, 30.), auto_bps(320, 240, 24.)] {
+        assert!((BPS_MIN..=BPS_MAX).contains(&bps));
+    }
+}
+
+#[test]
+fn a_budget_is_said_four_ways_and_lands_inside_the_engines_range() {
+    // A minute of film with 256 kbps of sound under it: the span and the
+    // sound are what a *size* has to be converted through.
+    let (seconds, audio) = (60., 256_000);
+    // A rate in its own units, and a bare number in the row's (Mbps).
+    assert_eq!(parse_budget("6.5M", seconds, audio), Some(6_500_000));
+    assert_eq!(parse_budget("6.5", seconds, audio), Some(6_500_000));
+    assert_eq!(parse_budget("6.5 mbps", seconds, audio), Some(6_500_000));
+    assert_eq!(parse_budget("12M", seconds, audio), Some(12_000_000));
+    // 850 kbps is under the engine's floor, so it lands *on* the floor --
+    // clamped, and shown clamped in the same keystroke.
+    assert_eq!(parse_budget("850k", seconds, audio), Some(BPS_MIN));
+    assert_eq!(parse_budget("2500k", seconds, audio), Some(2_500_000));
+    // `G` is a target file size: 1.2 GB over a minute is 160 Mbit/s of file,
+    // less the sound -- past the ceiling, so the ceiling is what is written.
+    assert_eq!(parse_budget("1.2G", seconds, audio), Some(BPS_MAX));
+    // ...and over an hour of film the same size is a rate that fits: the
+    // sound's own bits come out of it, which is why it is not 2.67 Mbps.
+    let hour = parse_budget("1.2G", 3600., audio).expect("a size over an hour");
+    assert_eq!(hour, (1.2e9 * 8. / 3600.) as u64 - audio);
+    // A size with no film to spread it over is not a rate.
+    assert_eq!(parse_budget("1.2G", 0., audio), None);
+    // Everything else is refused rather than guessed at, and the field stays
+    // open on it.
+    for text in ["", "  ", "abc", "-4", "0", "M", "6.5.5"] {
+        assert_eq!(parse_budget(text, seconds, audio), None, "{text}");
+    }
+    // Whatever is typed, what comes out is inside the engine's clamp.
+    for text in ["1k", "999G", "50M", "51M", "0.5"] {
+        if let Some(bps) = parse_budget(text, seconds, audio) {
+            assert!((BPS_MIN..=BPS_MAX).contains(&bps), "{text} -> {bps}");
         }
-        // The seat travels exactly as it was picked, and an unpicked project
-        // exports on the seat this machine has.
-        assert_eq!(settings.seat, EncoderSeat::Auto);
+    }
+}
+
+#[test]
+fn the_budget_lever_steps_by_a_tenth_and_a_whole_megabit() {
+    // A notch is 0.1 Mbps and a notch with shift is 1 -- the readout has one
+    // decimal, so the fine step is the smallest move it can show.
+    assert_eq!(BPS_FINE, 100_000);
+    assert_eq!(BPS_COARSE, 1_000_000);
+    assert_eq!(rate_label(6_000_000 + BPS_FINE), "6.1");
+    assert_eq!(rate_label(6_000_000 + BPS_COARSE), "7.0");
+    // Fifty notches of the coarse step crosses the whole range, which is
+    // what a wheel is for; the fine one would take five hundred.
+    assert_eq!((BPS_MAX - BPS_MIN) / BPS_COARSE, 49);
+    // The step arithmetic itself, as `Player::nudge_budget` does it: a
+    // saturating walk that stops at both ends rather than wrapping.
+    let step = |at: u64, steps: i32, coarse: bool| {
+        let by = i64::from(steps) * if coarse { BPS_COARSE } else { BPS_FINE } as i64;
+        ((at as i64 + by).max(0) as u64).clamp(BPS_MIN, BPS_MAX)
+    };
+    assert_eq!(step(6_000_000, 5, false), 6_500_000);
+    assert_eq!(step(6_000_000, -1, true), 5_000_000);
+    assert_eq!(step(BPS_MIN, -9, true), BPS_MIN, "the floor holds");
+    assert_eq!(step(BPS_MAX, 9, true), BPS_MAX, "and so does the ceiling");
+}
+
+/// The moment itself, read off its own source: three rows, no scrolling
+/// list, no second pane, and exactly one boxed chip in the room (DESIGN §4).
+/// A source scan, like the stance guards above it -- this binary has no
+/// `TestAppContext` to render a card and measure it.
+#[test]
+fn the_export_moment_is_three_rows_one_chip_and_no_list() {
+    let body = fn_body("export_card");
+    assert!(
+        !body.contains("overflow_y_scroll"),
+        "the export moment scrolls again -- it is three rows and a fixed height"
+    );
+    assert_eq!(
+        body.matches(".border_1()").count(),
+        2,
+        "one border for the plate and one for the chip: §4's single boxed chip"
+    );
+    for gone in ["Advanced", "preset", "Quality", "Subtitles", "GPU: ", "Built in"] {
+        assert!(!body.contains(gone), "the old card's {gone} is still here");
+    }
+    // Its three rows, each reachable by pointer as well as by chord.
+    for id in ["destination", "budget", "budget-track", "export-confirm"] {
+        assert!(body.contains(&format!("\"{id}\"")), "{id} is on no row");
+    }
+    // 200px, and it fits the smallest window this editor draws with the
+    // room's own chrome above and below it.
+    assert_eq!(EXPORT_MOMENT_H, 200.);
+    assert!(EXPORT_MOMENT_H + crate::ui::stance::TIME_BAND_H + CONTROL_H <= 360.);
+    // The clickable rows are `HIT_MIN` tall (WCAG 2.5.8) -- the track is
+    // drawn 1px and grabbed a whole row.
+    assert!(KEYS_ROW_H >= HIT_MIN);
+}
+
+/// The shipped defect: a chord the export surface answers (`n`) also reached
+/// the room's keymap under it and toggled the timeline snap. The fix is that
+/// the moment owns the keyboard while it is up -- every stroke is consumed,
+/// and escape retreats one step at a time (the field, then the moment).
+#[test]
+fn a_chord_the_export_moment_answers_never_reaches_the_room() {
+    // The leak was real: `n` is the room's own snap chord.
+    let keymap = keymap::Keymap::defaults();
+    assert_eq!(keymap.display(keymap::ActionId::ToggleSnap), "n");
+    // One door, and it is asked *before* the stance's modal guard.
+    let cards = src_text("player/cards.rs");
+    assert!(
+        cards.contains("if self.export_moment_key(key, shift, cx)"),
+        "param_card_key no longer routes the moment's own strokes"
+    );
+    let body = fn_body("export_moment_key");
+    let (guard, rest) = body
+        .split_once("return false;")
+        .expect("the one early out is `the moment is not open`");
+    assert!(
+        guard.contains("!self.export_open"),
+        "the only way out of this handler must be that no moment is up"
+    );
+    assert!(
+        !rest.contains("return false"),
+        "a stroke fell through to the room's keymap again -- that is the `n` \
+         toggling snap defect"
+    );
+    // Escape retreats one step at a time (DESIGN.md:146): the field is
+    // closed inside the typing branch, the moment only once it is shut.
+    let (typing, closed) = rest
+        .split_once("return true;")
+        .expect("the typing branch returns before the chords below it");
+    assert!(typing.contains("self.budget_edit = None"), "esc leaves the field");
+    assert!(closed.contains("self.close_card()"), "then esc closes the moment");
+    // Its chords, all of them consumed here rather than by the keymap.
+    for chord in ["\"d\"", "\"n\"", "\"e\"", "\"enter\"", "\"up\"", "\"down\""] {
+        assert!(closed.contains(chord), "{chord} is not the moment's own");
     }
 }
 
@@ -972,7 +1056,7 @@ fn the_sound_row_carries_its_rate_into_both_kinds_of_file() {
     for format in [Format::Mp4, Format::Av1, Format::Hevc, Format::Mp3] {
         for kbps in AUDIO_KBPS {
             assert_eq!(
-                export_settings(Quality::Auto, 0, format, kbps, EncoderSeat::Auto).audio_kbps,
+                export_settings(BPS_MIN, format, kbps, EncoderSeat::Auto).audio_kbps,
                 Some(kbps),
                 "{format:?} at {kbps} kbps"
             );
@@ -992,105 +1076,6 @@ fn the_sound_row_carries_its_rate_into_both_kinds_of_file() {
     }
     // A rate no row holds marks none of them, rather than the wrong one.
     assert!(audio_rate_choices(7).iter().all(|(.., picked)| !picked));
-}
-
-/// The shape [`NumberEdit`] is opened in for a bitrate: `(value, MBPS_MIN,
-/// MBPS_MAX, MBPS_DIGITS, "Mbps")`, same as `Player::edit_mbps`.
-fn mbps_edit(value: u32) -> NumberEdit {
-    NumberEdit::new(value, MBPS_MIN, MBPS_MAX, MBPS_DIGITS, "Mbps")
-}
-
-#[test]
-fn a_typed_bitrate_is_a_field_and_not_a_key_capture() {
-    // It opens on the number in force, so backspace edits that number
-    // rather than the field starting empty over a bitrate still being used.
-    let mut edit = mbps_edit(12);
-    assert_eq!(edit.text, "12");
-    edit.backspace();
-    edit.digit(8);
-    assert_eq!(edit.text, "18");
-    assert_eq!(edit.commit(), Some(18));
-    // A card nobody has typed a number into opens empty: zero is not a
-    // bitrate anyone chose.
-    assert_eq!(mbps_edit(0).text, "");
-
-    // Out of range is refused *in words* and the digits stay put: clamping
-    // 55 to 50 would write a bitrate the user never typed.
-    let mut edit = mbps_edit(0);
-    for digit in [5, 5] {
-        edit.digit(digit);
-    }
-    assert_eq!(edit.commit(), None);
-    assert_eq!(edit.text, "55", "a refusal keeps what was typed");
-    let refusal = edit.refusal.clone().expect("a refusal says why");
-    assert!(refusal.contains(&MBPS_MAX.to_string()), "{refusal}");
-    assert!(edit.detail().starts_with("55▏"), "{}", edit.detail());
-    assert!(edit.detail().contains(&refusal));
-    // And is fixable in place, which is the whole point of a field.
-    edit.backspace();
-    assert_eq!(edit.refusal, None, "the reason went with the digit");
-    assert_eq!(edit.commit(), Some(5));
-
-    // Empty, zero, and past the digit cap: each its own reason, none of
-    // them silent -- asserted on the widget itself, the door the card uses.
-    let mut edit = mbps_edit(0);
-    assert_eq!(edit.commit(), None, "empty is not a number");
-    let mut edit = mbps_edit(0);
-    edit.digit(0);
-    assert_eq!(edit.commit(), None);
-    assert!(
-        edit.refusal
-            .clone()
-            .expect("zero says why")
-            .contains("0 is not a value")
-    );
-    assert_eq!(mbps_edit(MBPS_MIN).commit(), Some(MBPS_MIN));
-    assert_eq!(mbps_edit(MBPS_MAX).commit(), Some(MBPS_MAX));
-    let mut edit = mbps_edit(0);
-    for digit in [5, 1] {
-        edit.digit(digit);
-    }
-    assert_eq!(edit.commit(), None, "51 is past the ceiling");
-    let mut edit = mbps_edit(0);
-    for digit in [9, 9, 9, 9] {
-        edit.digit(digit);
-    }
-    assert_eq!(edit.text, "999", "the cap holds");
-    assert!(edit.refusal.is_some(), "and says it is holding");
-    // Never past what a u64 bitrate can be built from -- the committed
-    // number is the only one that reaches the engine, and it is bounded.
-    assert!(u64::from(MBPS_MAX) * 1_000_000 < u64::from(u32::MAX));
-    assert_eq!(MBPS_DIGITS, 3);
-
-    // The arrows step inside the range and stop at both ends: a walk
-    // through the legal numbers, never a way out of them.
-    let mut edit = mbps_edit(0);
-    edit.step(1);
-    assert_eq!(edit.text, MBPS_MIN.to_string(), "empty starts at the floor");
-    edit.step(-1);
-    assert_eq!(edit.text, MBPS_MIN.to_string());
-    let mut edit = mbps_edit(MBPS_MAX);
-    edit.step(1);
-    assert_eq!(edit.text, MBPS_MAX.to_string());
-    edit.step(-1);
-    assert_eq!(edit.text, (MBPS_MAX - 1).to_string());
-    // A step past a refused number clears the refusal with it.
-    let mut edit = mbps_edit(0);
-    edit.digit(5);
-    edit.digit(5);
-    assert_eq!(edit.commit(), None);
-    edit.step(-1);
-    assert_eq!(edit.refusal, None);
-    assert_eq!(edit.text, MBPS_MAX.to_string(), "back inside the range");
-
-    // The hint the field shows when there is nothing to refuse names both
-    // ways out of it.
-    let detail = mbps_edit(6).detail();
-    assert!(
-        detail.contains("enter") && detail.contains("esc"),
-        "{detail}"
-    );
-    assert!(detail.starts_with("6▏"), "{detail}");
 }
 
 /// DEBT #111: the transition duration row's field is the same [`NumberEdit`]
@@ -1505,78 +1490,6 @@ fn the_sample_rate_list_marks_source_with_nothing_picked() {
     assert!(picked[2].3);
 }
 
-#[test]
-fn the_export_card_fits_the_smallest_window() {
-    // Same 640x360 floor the keybindings card is measured against: the
-    // capped row list, the two summary lines and the confirm button, under
-    // a title and a status line.
-    let title = 17.;
-    let status = 28.;
-    // The head is one line of 11 px at this width -- every field of it,
-    // worst case, is 71 characters against the 76 that fit. The tail is
-    // budgeted for two: the destination's name is the user's and a long one
-    // wraps.
-    let summary = 15. + 30.;
-    // Six children in the column, so five gaps.
-    let gaps = 5. * 2.;
-    let padding = 24.;
-    assert_eq!(
-        (17. + 28. + 15. + 30. + CONTROL_H + 4. + 10. + 24.),
-        title + status + summary + CONTROL_H + 4. + gaps + padding
-    );
-    assert!(
-        (17. + 28. + 15. + 30. + CONTROL_H + 4. + 10. + 24.) + (8. * KEYS_ROW_H) <= 360.,
-        "card too tall"
-    );
-    // The list grows with a window that has the room -- and never shrinks
-    // below the cap that made the floor fit, whatever arithmetic the window
-    // hands it.
-    let cap = |h: f32| {
-        (h - (17. + 28. + 15. + 30. + CONTROL_H + 4. + 10. + 24.) - 24.).max(8. * KEYS_ROW_H)
-    };
-    assert_eq!(cap(360.), (8. * KEYS_ROW_H));
-    assert_eq!(cap(0.), (8. * KEYS_ROW_H));
-    assert!(cap(720.) > (8. * KEYS_ROW_H));
-    assert!((17. + 28. + 15. + 30. + CONTROL_H + 4. + 10. + 24.) + cap(720.) <= 720.);
-    // ...and inside the 640 px floor with the scrim showing either side.
-    assert!(EXPORT_W + 2. * 12. <= 640.);
-    // The cap is only honest if enough of the list is on screen to read as
-    // one -- and the whole format section is: its header and every codec
-    // row, so nothing that is picked *first* is behind a scroll.
-    let codecs = FORMATS.iter().filter(|(row, ..)| !row.is_empty()).count();
-    assert!((8. * KEYS_ROW_H) / KEYS_ROW_H >= 1. + codecs as f32);
-    // Clickable rows, so WCAG 2.5.8 binds them as it binds the panel's --
-    // and the bitrate steppers are `HIT_MIN` squares sitting inside a row,
-    // which only fits while the row is at least as tall as one.
-    assert!(KEYS_ROW_H >= HIT_MIN);
-    assert!(CONTROL_H >= HIT_MIN);
-    // The dimmed text on the card -- every refusal, every detail, every key
-    // in its column -- is body text on `BG_RAISED` and WCAG 1.4.3 binds it.
-    // A dimmed row is drawn in this ink rather than at an opacity, which is
-    // what a refusal used to be readable through.
-    // Every palette, not the one in force: a family is picked at runtime
-    // now (`ui::theme`), so a floor met by one of them and missed by the
-    // other is a window somebody is looking at.
-    for id in crate::ui::theme::PaletteId::ALL {
-        let p = id.palette();
-        assert!(
-            contrast(p.FG_SECONDARY, p.BG_RAISED) >= 4.5,
-            "{id:?}: refusal ink {:.2}",
-            contrast(p.FG_SECONDARY, p.BG_RAISED)
-        );
-        // ...and on the picked row, where the highlight is the accent at
-        // surface brightness. Both inks clear 4.5:1 on it now -- the row still
-        // lifts its key and detail to `FG_PRIMARY`, as emphasis rather than as
-        // the rescue it used to be.
-        assert!(contrast(p.FG_PRIMARY, p.BG_SELECTED) >= 4.5, "{id:?}");
-        assert!(
-            contrast(p.FG_SECONDARY, p.BG_SELECTED) >= 4.5,
-            "{id:?}: refusal ink on the picked row {:.2}",
-            contrast(p.FG_SECONDARY, p.BG_SELECTED)
-        );
-    }
-}
-
 /// The progress line's two clocks, driven the way a repaint drives them:
 /// steady work, a stall where hardware hands over to software, then steady
 /// work again. The estimate may not whipsaw, may not vanish once it has
@@ -1680,85 +1593,6 @@ fn the_export_estimate_answers_a_bar_that_went_backwards_with_a_guess() {
             "{left:?} would be printed as a clock"
         );
     }
-}
-
-/// The primary pane's own round trip: every bundle's format-and-quality lands
-/// back on the preset that named it, so the row a person picked is the row
-/// the card shows picked. `Custom` is the one preset `bundle` names nothing
-/// for, and the one every pair outside the other four's must fall back to.
-#[test]
-fn every_preset_bundle_round_trips_through_from_state() {
-    for preset in ExportPreset::ALL {
-        match preset.bundle() {
-            Some((format, quality)) => {
-                assert_eq!(ExportPreset::from_state(format, quality), preset);
-            }
-            None => assert_eq!(preset, ExportPreset::Custom),
-        }
-    }
-    // A pair no bundle names -- the launch default before this batch's fix --
-    // reads as `Custom`, not as whichever preset happens to be first.
-    assert_eq!(
-        ExportPreset::from_state(Format::Mp4, Quality::Auto),
-        ExportPreset::Custom
-    );
-    // Master's bundle is HEVC/High, not H.264: an intra-only master is the one
-    // that keeps its own "for re-editing later" detail true.
-    assert_eq!(
-        ExportPreset::Master.bundle(),
-        Some((Format::HevcMp4, Quality::High))
-    );
-}
-
-/// The primary pane's own refusal: a bundle whose format this timeline cannot
-/// write reads exactly as a codec row does -- the reason in place of the
-/// detail, and no format-and-quality pair to land wrong once a click on a
-/// dimmed row is ignored.
-#[test]
-fn a_preset_over_a_picture_this_timeline_has_none_of_carries_the_codec_refusal() {
-    let mut session = PlaybackSession::open(asset("test_tone.mp3")).expect("a song is a timeline");
-    session.set_gain(0.0);
-    let path = session.sources()[0].path.clone();
-    session.seek(1.0);
-    session
-        .place_stream_at(1.0, &path, 0, Some(Lane::A1))
-        .expect("its own file is on this timeline");
-    assert!(session.lane_clips(Lane::V1).is_empty(), "still no picture");
-
-    for preset in [ExportPreset::Web, ExportPreset::Small, ExportPreset::Master] {
-        let (format, _) = preset.bundle().expect("a real bundle");
-        assert!(
-            format_refusal(&session, format).is_some(),
-            "{preset:?}'s bundle is a picture format this audio-only timeline must refuse"
-        );
-    }
-    // Audio only's bundle is FLAC, which has no picture to refuse.
-    let (audio_format, _) = ExportPreset::AudioOnly.bundle().expect("a real bundle");
-    assert_eq!(format_refusal(&session, audio_format), None);
-}
-
-/// Picking Exact must derive the container from the source's own codec
-/// rather than leave whatever format was already picked -- an HEVC or AV1
-/// source lands on its own copy-capable Matroska format, and a source Exact
-/// has no copy path for at all (h264) leaves `exact_format` with nothing to
-/// set, so the row's own [`exact_refusal`] is what a click on it would see.
-#[test]
-fn exact_derives_its_format_from_the_source_codec() {
-    let hevc = PlaybackSession::open(asset("test_hevc.mkv")).expect("an hevc fixture");
-    assert_eq!(crate::exact_format(&hevc), Some(Format::Hevc));
-
-    let av1 = PlaybackSession::open(asset("test_av1.mkv")).expect("an av1 fixture");
-    assert_eq!(crate::exact_format(&av1), Some(Format::Av1));
-
-    let h264 = PlaybackSession::open(asset("test_h264.mkv")).expect("an h264 fixture");
-    assert_eq!(h264.export_snapshot().1.codec, engine::demux::Codec::H264);
-    assert_eq!(crate::exact_format(&h264), None);
-    // No copy path for h264 at any format -- the row's own refusal is what a
-    // click on Exact would still show, since `exact_format` sets nothing and
-    // the format is left at whatever it already was (Mp4's own refusal, or
-    // Hevc's if the pane was left there from an earlier pick).
-    assert!(crate::exact_refusal(&h264, Format::Mp4, Quality::Exact).is_some());
-    assert!(crate::exact_refusal(&h264, Format::Hevc, Quality::Exact).is_some());
 }
 
 /// The stacking-scrims bug: opening the speed card while the colour card was

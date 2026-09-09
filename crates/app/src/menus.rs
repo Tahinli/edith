@@ -70,6 +70,7 @@ pub(crate) enum Pick {
     Fit(Lane, usize),
     /// What the export's *sound* is coded at. Opened from the card's Sound row,
     /// which is the only place it means anything.
+    #[allow(dead_code)] // opened from Settings now
     AudioRate,
     /// Which HDR-to-SDR rendition the project is watched and exported in
     /// ([`engine::tonemap::Preset`]). Opened from the panel, beside the two
@@ -82,6 +83,7 @@ pub(crate) enum Pick {
     /// Which encoder an export writes the picture with
     /// ([`engine::export::EncoderSeat`]). Opened from the card's Encoder row,
     /// which is the only place it means anything.
+    #[allow(dead_code)] // opened from Settings now
     Encoder,
 }
 

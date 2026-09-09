@@ -78,10 +78,14 @@ pub(crate) const KEYS_ROW_H: f32 = HIT_MIN;
 /// the whole file. At `KEYS_W` every one of those wrapped to two lines, which is
 /// the card the user called unfriendly. Still inside the 640 px floor with the
 /// scrim showing either side of it.
+/// The export moment's height (the approved artboard's 200px): three rows,
+/// never a scroll -- the card it replaced grew a capped, scrolling list.
+pub(crate) const EXPORT_MOMENT_H: f32 = 200.;
+
 pub(crate) const EXPORT_W: f32 = 420.;
-/// The column the key of a row is printed in, wide enough for `0–9`: every row
-/// in the export card says what picks it, so the card is drivable by keyboard
-/// without a legend to memorise.
+
+/// The column a key is printed in, wide enough for `0-9` -- the width the
+/// subtitle plan line is still measured against ([`SUB_PLAN_CHARS`]).
 pub(crate) const EXPORT_KEY_W: f32 = 26.;
 /// The menu a right-click on a clip opens: wide enough for the longest label
 /// beside the stroke that does the same thing, with the click targets `HIT_MIN`
@@ -128,6 +132,7 @@ pub(crate) const LIST_CHAR_W: f32 = 6.;
 /// in front of the value. Not a track count -- what walks the Destination row
 /// off the bottom of the card is the *wrapping*, and thirty-five one-word
 /// labels wrap less than three long ones.
+#[allow(dead_code)] // the subtitle plan line lives in Settings now
 pub(crate) const SUB_PLAN_CHARS: usize = (3.
     * (EXPORT_W - 12. - 12. - (10. + 8. + EXPORT_KEY_W + 8. + 9. * LIST_CHAR_W))
     / LIST_CHAR_W) as usize;
