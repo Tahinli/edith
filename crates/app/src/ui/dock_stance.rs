@@ -1085,6 +1085,7 @@ fn sources_tab(player: &Player, window: &mut Window, cx: &mut Context<Player>) -
                     .text_color(rgb(INK2()))
                     .cursor_pointer()
                     .hover(|s| s.bg(rgb(DARK_RAISED())).text_color(rgb(INK1())))
+                    .tooltip(crate::ui::widgets::tip_hover("Sort sources", "click to cycle", None))
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                         this.dock_sort = this.dock_sort.next();
                         cx.notify();
