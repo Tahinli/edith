@@ -1311,13 +1311,14 @@ fn every_action_is_reachable_without_the_keyboard() {
     }
     // The snap's own door was the rail's `⌗` glyph, and the rail is deleted
     // (DESIGN §5 as amended 2026-09-09, user decision "option C"). Its
-    // replacement -- a right-click row on the ruler it snaps against -- is
-    // LANE R2's parity work, so the assertion is inverted rather than
-    // dropped: it names the owner and fails the moment that door lands, at
-    // which point this goes back to `assert!(element("snap"), ...)`.
+    // replacement landed with the ruler's right-click menu ([`BENCH_ITEMS`]),
+    // which carries the snap with its state in the label. A menu row wears a
+    // *generated* hitmap id (`menu.{action:?}`, overlays.rs), so the door is
+    // asserted on the list the row is built from rather than on a literal id
+    // no source file spells any more.
     assert!(
-        !element("snap"),
-        "LANE R2 landed a snap door -- restore this to assert!(element(\"snap\"))"
+        BENCH_ITEMS.contains(&ActionId::ToggleSnap),
+        "no pointer door for the snap"
     );
     // And the card is a door the pointer can open: the panel's own button.
     assert!(element("keys"), "no way to open the actions card");

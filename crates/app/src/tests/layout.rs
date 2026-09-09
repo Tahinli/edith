@@ -2471,111 +2471,16 @@ fn every_action_has_a_darkroom_widget_home_or_explicit_owner() {
              accelerator for cycling that existing selection, not a new door -- legacy had no \
              toolbar button for it either",
         ),
-        // The rail's own eighteen. Deleting the spine (DESIGN §5 as amended
-        // 2026-09-09, user decision "option C") took the only pointer door
-        // each of these had; LANE R2's right-click parity is what gives them
-        // a new one, on the thing each acts on. The staleness check below
-        // deletes the exemption the moment that lands, so this cannot become
-        // a permanent hole.
-        (
-            ActionId::Undo,
-            "the 56px rail these stood on is deleted (DESIGN §5, 2026-09-09, user \"option C\"); \
-             LANE R2 owns the right-click row on the thing each acts on",
-        ),
-        (
-            ActionId::Redo,
-            "the 56px rail these stood on is deleted (DESIGN §5, 2026-09-09, user \"option C\"); \
-             LANE R2 owns the right-click row on the thing each acts on",
-        ),
-        (
-            ActionId::WalkCutPrev,
-            "the 56px rail these stood on is deleted (DESIGN §5, 2026-09-09, user \"option C\"); \
-             LANE R2 owns the right-click row on the thing each acts on",
-        ),
-        (
-            ActionId::WalkCutNext,
-            "the 56px rail these stood on is deleted (DESIGN §5, 2026-09-09, user \"option C\"); \
-             LANE R2 owns the right-click row on the thing each acts on",
-        ),
-        (
-            ActionId::WalkCutNext10,
-            "the 56px rail these stood on is deleted (DESIGN §5, 2026-09-09, user \"option C\"); \
-             LANE R2 owns the right-click row on the thing each acts on",
-        ),
-        (
-            ActionId::WalkCutPrev10,
-            "the 56px rail these stood on is deleted (DESIGN §5, 2026-09-09, user \"option C\"); \
-             LANE R2 owns the right-click row on the thing each acts on",
-        ),
-        (
-            ActionId::TrimIn,
-            "the 56px rail these stood on is deleted (DESIGN §5, 2026-09-09, user \"option C\"); \
-             LANE R2 owns the right-click row on the thing each acts on",
-        ),
-        (
-            ActionId::TrimOut,
-            "the 56px rail these stood on is deleted (DESIGN §5, 2026-09-09, user \"option C\"); \
-             LANE R2 owns the right-click row on the thing each acts on",
-        ),
-        (
-            ActionId::TrimInToPlayhead,
-            "the 56px rail these stood on is deleted (DESIGN §5, 2026-09-09, user \"option C\"); \
-             LANE R2 owns the right-click row on the thing each acts on",
-        ),
-        (
-            ActionId::TrimOutToPlayhead,
-            "the 56px rail these stood on is deleted (DESIGN §5, 2026-09-09, user \"option C\"); \
-             LANE R2 owns the right-click row on the thing each acts on",
-        ),
-        (
-            ActionId::LoopTrim,
-            "the 56px rail these stood on is deleted (DESIGN §5, 2026-09-09, user \"option C\"); \
-             LANE R2 owns the right-click row on the thing each acts on",
-        ),
-        (
-            ActionId::ZoomIn,
-            "the 56px rail these stood on is deleted (DESIGN §5, 2026-09-09, user \"option C\"); \
-             LANE R2 owns the right-click row on the thing each acts on",
-        ),
-        (
-            ActionId::ZoomOut,
-            "the 56px rail these stood on is deleted (DESIGN §5, 2026-09-09, user \"option C\"); \
-             LANE R2 owns the right-click row on the thing each acts on",
-        ),
-        (
-            ActionId::ZoomFit,
-            "the 56px rail these stood on is deleted (DESIGN §5, 2026-09-09, user \"option C\"); \
-             LANE R2 owns the right-click row on the thing each acts on",
-        ),
-        (
-            ActionId::ToggleSnap,
-            "the 56px rail these stood on is deleted (DESIGN §5, 2026-09-09, user \"option C\"); \
-             LANE R2 owns the right-click row on the thing each acts on",
-        ),
-        (
-            ActionId::AddVideoLane,
-            "the 56px rail these stood on is deleted (DESIGN §5, 2026-09-09, user \"option C\"); \
-             LANE R2 owns the right-click row on the thing each acts on",
-        ),
-        (
-            ActionId::AddAudioLane,
-            "the 56px rail these stood on is deleted (DESIGN §5, 2026-09-09, user \"option C\"); \
-             LANE R2 owns the right-click row on the thing each acts on",
-        ),
-        (
-            ActionId::AddSubtitleLane,
-            "the 56px rail these stood on is deleted (DESIGN §5, 2026-09-09, user \"option C\"); \
-             LANE R2 owns the right-click row on the thing each acts on",
-        ),
-        (
-            ActionId::RemoveSubtitleLane,
-            "the 56px rail these stood on is deleted (DESIGN §5, 2026-09-09, user \"option C\"); \
-             LANE R2 owns the right-click row on the thing each acts on",
-        ),
+        // The rail's own eighteen are gone from this list: the right-click
+        // parity (DESIGN §5 as amended 2026-09-09, user decision "option C")
+        // gave every one of them a door on the thing it acts on -- the clip
+        // menu, the ruler's, the lane head's -- and the staleness check below
+        // is what deleted their entries as each landed.
         (
             ActionId::Screenshot,
-            "the 56px rail these stood on is deleted (DESIGN §5, 2026-09-09, user \"option C\"); \
-             LANE R2 owns the right-click row on the thing each acts on",
+            "the picture the frame is written from is the *watched* frame and \
+             nothing else is under the pointer to right-click for it: keyboard \
+             and the KEYS card, like the selection accelerators above",
         ),
     ];
     let darkroom = [
