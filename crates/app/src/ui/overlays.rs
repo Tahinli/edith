@@ -131,7 +131,7 @@ impl Player {
         // would be a right-click that opens nothing.
         let idx = match menu.on {
             MenuOn::Clip(idx) => Some(idx),
-            MenuOn::Gap(..) => None,
+            MenuOn::Gap(..) | MenuOn::Bench | MenuOn::Head => None,
         };
         let clip = idx.and_then(|idx| session.lane_clips(menu.lane).get(idx).copied());
         let source = clip.and_then(|clip| session.sources().get(clip.source).cloned());
@@ -173,6 +173,8 @@ impl Player {
             })
         };
         let mut rows: Vec<AnyElement> = Vec::new();
+        // Whether the rule line before the destructive rows has been drawn.
+        let mut ruled = false;
         if let (true, Some((clip, source))) = (menu.details, clip.zip(source.clone())) {
             // Read-only, so no ids and no hover: this side is a card, not a
             // list of things to click. Each value is one truncated line, which
@@ -259,9 +261,34 @@ impl Player {
             // `menu_items`, so there is no second answer to keep in step. The
             // state refusals below stay, dimmed and saying why -- the next
             // click of the playhead lights them.
-            let idx = idx.expect("MenuOn::Gap handled above");
-            let ctx = self.ctx(Some((menu.lane, idx)));
-            for action in menu_items(ctx) {
+            // The clip's own state where a clip was clicked; the editor's
+            // otherwise -- the bench and the lane head both ask about the
+            // selection ([`Player::ctx`] falls back to it), which is exactly
+            // what the cut machinery's rows act on.
+            let ctx = self.ctx(idx.map(|idx| (menu.lane, idx)));
+            // Three lists, one render: what the thing under the pointer can be
+            // told (DESIGN §9). Nothing here is a second version of an action
+            // -- every row is an [`ActionId`] the keyboard already reaches, so
+            // the label and the chord still come out of the registry.
+            let actions = match menu.on {
+                MenuOn::Bench => BENCH_ITEMS.to_vec(),
+                MenuOn::Head => lane_items(menu.lane),
+                _ => menu_items(ctx),
+            };
+            for action in actions {
+                // DESIGN §9's rule line: the verbs that take something away sit
+                // under a seam, wherever they are listed. Drawn once, before
+                // the first of them, and never as the plate's own top edge.
+                if destructive(action) && !rows.is_empty() && !ruled {
+                    ruled = true;
+                    rows.push(
+                        div()
+                            .my(px(3.))
+                            .h(px(1.))
+                            .bg(rgba(DARK_SEAM()))
+                            .into_any_element(),
+                    );
+                }
                 // The registry's own answer, the same one the actions card
                 // dims a row with -- and a row that takes no click says *why*
                 // rather than printing a stroke that would do nothing.
@@ -286,10 +313,16 @@ impl Player {
                     .or_else(|| full.split_once(" — ").map(|(head, _)| head))
                     .or_else(|| full.split_once(": ").map(|(head, _)| head))
                     .unwrap_or(full);
-                let label = if matches!(action, ActionId::ToggleMute | ActionId::Paste) {
-                    format!("{verb} (global)")
-                } else {
-                    verb.to_string()
+                let label = match action {
+                    ActionId::ToggleMute | ActionId::Paste => format!("{verb} (global)"),
+                    // A switch says which way it is set: a row reading "Snap on
+                    // / off" beside a chord tells nobody whether snapping is on
+                    // right now, which is the one thing the spine's badge did
+                    // say before it went.
+                    ActionId::ToggleSnap => {
+                        format!("Snap — {}", if self.snap { "on" } else { "off" })
+                    }
+                    _ => verb.to_string(),
                 };
                 let say: SharedString = full.to_string().into();
                 rows.push(
@@ -336,7 +369,7 @@ impl Player {
                                         // the list of them on this clip rather than
                                         // the next one stepped to behind the click.
                                         // The stroke still steps -- same door.
-                                        if action == ActionId::Fit {
+                                        if let (ActionId::Fit, Some(idx)) = (action, idx) {
                                             this.open_picker(
                                                 Pick::Fit(menu.lane, idx),
                                                 event.position(),

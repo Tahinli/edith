@@ -908,6 +908,15 @@ fn lane_row(
                     cx.new(|_| Tip(head_ghost.clone()))
                 })
                 .tooltip(crate::ui::widgets::tip_hover("Reorder lane", "drag", None))
+                // The head's own verbs, never the bed's: a right-click here
+                // names the *track* (DESIGN §9), so it opens the lane menu and
+                // not the clip menu the bed beside it opens.
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                        this.open_head_menu(lane, event.position, cx);
+                    }),
+                )
                 .children(hitmap::dynamic(
                     move || {
                         (
@@ -1120,12 +1129,26 @@ fn lane_row(
                 .on_mouse_down(
                     MouseButton::Right,
                     cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                        // A clip's (or a caption's) own handler has already run
+                        // by the time this bubbles up and has set its menu: the
+                        // scrim swallows every press while a menu is open, so a
+                        // menu standing here can only be the one this very
+                        // press just opened, and the bed must not replace it.
+                        if this.context_menu.is_some() {
+                            return;
+                        }
                         let Some(session) = this.session.as_ref() else {
                             return;
                         };
                         let frame = this.frame_under(event.position.x);
-                        if let Some((start, frames)) = session.gap_at(lane, frame) {
-                            this.open_gap_menu(lane, start, frames, event.position, cx);
+                        match session.gap_at(lane, frame) {
+                            Some((start, frames)) => {
+                                this.open_gap_menu(lane, start, frames, event.position, cx);
+                            }
+                            // Empty bed past the end of the lane's contents: no
+                            // hole to close there, so what the pointer is over
+                            // is the bench itself (DESIGN §9).
+                            None => this.open_bench_menu(event.position, cx),
                         }
                     }),
                 )
@@ -1393,6 +1416,15 @@ pub(crate) fn render(
                         this.scrub_to(event.position.x, true, cx);
                     }),
                 )
+                // The bench's own menu, on the strip that *is* the timeline:
+                // walking the cuts, the zoom, the snap and the undo pair, none
+                // of which is about a clip (DESIGN §9).
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                        this.open_bench_menu(event.position, cx);
+                    }),
+                )
                 .children(ticks.into_iter().map(|(x, label)| {
                     div().absolute().top_0().left(px(x)).child(
                         div()
@@ -1480,6 +1512,18 @@ pub(crate) fn render(
         .child(
             div()
                 .id("bench-lanes")
+                // Empty room below the last lane is still the bench: the same
+                // menu the ruler opens, and the same guard the bed carries --
+                // a menu standing here belongs to the press that opened it.
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                        if this.context_menu.is_some() {
+                            return;
+                        }
+                        this.open_bench_menu(event.position, cx);
+                    }),
+                )
                 .flex_1()
                 .min_h(px(0.))
                 .overflow_y_scroll()
