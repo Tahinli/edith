@@ -2447,7 +2447,6 @@ fn hdr_reference_rows_read_content_light_and_use_the_established_empty_state() {
 fn every_action_has_a_darkroom_widget_home_or_explicit_owner() {
     use crate::ActionId;
     const EXPLICITLY_OWNED_ELSEWHERE: &[(ActionId, &str)] = &[
-        (ActionId::Crossfade, "fade parity owns crossfade controls"),
         (
             ActionId::FocusPanels,
             "keyboard-only by design: a mouse already focuses whatever it \
@@ -2470,6 +2469,35 @@ fn every_action_has_a_darkroom_widget_home_or_explicit_owner() {
             "clicking a clip already selects it with the mouse; `{` is a keyboard-only \
              accelerator for cycling that existing selection, not a new door -- legacy had no \
              toolbar button for it either",
+        ),
+        // The group trio: a group is *made* with the pointer already --
+        // ctrl-click the halves and the grammar is the selection itself
+        // (DESIGN §9) -- so a row per verb in the clip menu was three rows
+        // saying what the click had already said. Chords and KEYS rows keep
+        // them reachable.
+        (
+            ActionId::Group,
+            "made by ctrl-clicking the halves: the selection is the grammar",
+        ),
+        (
+            ActionId::Detach,
+            "made by ctrl-clicking the halves: the selection is the grammar",
+        ),
+        (
+            ActionId::Regroup,
+            "made by ctrl-clicking the halves: the selection is the grammar",
+        ),
+        // The keyboard's own trim: `^[` and `^]` do with a stroke what the
+        // pointer does by dragging the clip edge to the spot it wants, and
+        // that drag is the door -- a menu row for it would be a second name
+        // for a gesture the bench already answers.
+        (
+            ActionId::TrimInToPlayhead,
+            "the pointer's version is dragging the clip edge to the playhead",
+        ),
+        (
+            ActionId::TrimOutToPlayhead,
+            "the pointer's version is dragging the clip edge to the playhead",
         ),
         // The rail's own eighteen are gone from this list: the right-click
         // parity (DESIGN §5 as amended 2026-09-09, user decision "option C")
