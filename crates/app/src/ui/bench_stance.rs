@@ -1229,6 +1229,9 @@ fn lane_row(
 
 /// The bench's content: pinned ruler, pinned heads, lane stack -- compressed
 /// evenly to [`LANES_COMPRESS`] rows and then scrolling (DESIGN §7).
+/// The bench's side gutter, spent inside [`render`]'s own content box.
+const BENCH_GUTTER: f32 = 12.;
+
 pub(crate) fn render(
     player: &mut Player,
     box_h: f32,
@@ -1292,6 +1295,10 @@ pub(crate) fn render(
         .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
             this.timeline_wheel(event, cx);
         }))
+        // The bench's side gutter, spent here rather than by the `bench` div
+        // above, so this element's bounds -- and the catch-all release below
+        // with them -- reach the window edge (note at `ui::stance::bench`).
+        .px(px(BENCH_GUTTER))
         // The catch-all release: a clip let go of anywhere on the bench that is
         // not a lane row -- left of the tracks, in the gap between two rows, on
         // the empty bench below the last one -- lands on the lane and the x the
