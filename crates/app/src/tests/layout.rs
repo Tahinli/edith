@@ -3904,6 +3904,70 @@ fn no_region_root_wears_a_focus_ring() {
 }
 
 
+/// The user could not find the three columns (2026-09-10: "I couldn't realize
+/// them when I look at"), because their heads were 12px `ink3` -- the room's
+/// quietest type -- with a prose tail running on after each one. DESIGN §3's
+/// new line: a room/column head is 15px Archivo 700 `ink1`, and the prose is a
+/// hover plate (DESIGN §8), never ambient text on the head itself.
+#[test]
+fn the_settings_columns_wear_room_heads_not_section_heads() {
+    let source = src_text("ui/settings_stance.rs");
+    let start = source.find("fn room_head(").expect("the room head");
+    let body = &source[start..source[start..].find("\n}\n").unwrap() + start];
+    for needle in [
+        "type_scale::LABEL_ROW_PX",
+        "FontWeight::BOLD",
+        "rgb(INK1())",
+        ".tooltip(",
+        ".pb(px(12.))",
+    ] {
+        assert!(body.contains(needle), "a room head lost {needle}");
+    }
+    assert!(
+        !body.contains("INK3()") && !body.contains("type_scale::head()"),
+        "the room heads fell back to the 12px in-list section head"
+    );
+    // Each column head is one word, and its prose lives on the plate.
+    for head in ["\"PROJECT\"", "\"EDITOR\"", "\"EXPORT\""] {
+        assert!(source.contains(head), "the settings room lost its {head} head");
+    }
+    for run_on in ["PROJECT \u{b7}", "EDITOR \u{b7}", "EXPORT \u{b7}"] {
+        assert!(
+            !source.contains(run_on),
+            "a settings head grew its prose tail back: {run_on}"
+        );
+    }
+}
+
+/// The Picture row said every refused format's reason after its value
+/// (`H.264 no picture -- an mp4 would \u{b7} AV1 no picture -- ...`; the user
+/// called it "funny"). A row says its own pick: one value, and a refusal only
+/// when *that* pick is the refused one.
+#[test]
+fn the_picture_row_tail_is_the_current_format_alone() {
+    let source = src_text("ui/settings_stance.rs");
+    let start = source.find("fn export_section(").expect("the export section");
+    let body = &source[start..];
+    let body = &body[..body.find("\n/// The page itself").expect("the page's render fn")];
+    assert!(
+        !body.contains("PICTURE_CYCLE"),
+        "the Picture row walks the whole cycle to build its tail again"
+    );
+    assert!(
+        !body.contains(".join("),
+        "an EXPORT row concatenates a list into one row's tail again"
+    );
+    assert!(
+        body.contains("format_refusal(session, format)"),
+        "the Picture row's refusal is no longer asked about the current format"
+    );
+    // Six words at most, and the value greys with the refusal it carries.
+    assert!(
+        body.contains("short_reason(&why)") && body.contains("picture_ink"),
+        "the Picture row lost its short reason or its greyed value"
+    );
+}
+
 /// The monitoring level's home. Cleanse round 2 took the mute button, the
 /// `- +` pair and the slider off the time band on the promise that the level
 /// "lives in Settings" (DESIGN 5) -- a promise nothing kept until this row,

@@ -37,18 +37,27 @@ use crate::ui::type_scale;
 use crate::*;
 use engine::colorspace::ContentLight;
 
-/// A 9px uppercase Archivo section head, `ink3` -- [`dock_stance::section_head`]'s
-/// exact shape, repeated rather than imported across a `pub(crate)` seam for
-/// one nine-line function.
-fn section_head(text: impl Into<SharedString>) -> impl IntoElement {
-    let style = type_scale::head();
+/// The room's three anchors (user 2026-09-10: "I couldn't realize them when I
+/// look at"): 15px Archivo 700 `ink1`, uppercase, with a row's own height of
+/// air below (+12px past a row's gap) so a head reads as the start of a
+/// column and not as one more line in it. The prose that used to trail each
+/// head (`· stored in the .edith file`) is a hover plate on the head now,
+/// ≤6 words -- DESIGN §8: a distinction that matters is a plate, not ambient
+/// text. In-list section heads (the dock's own KEYS head) stay 12px
+/// `ink3`.
+fn room_head(id: &'static str, text: &'static str, tail: &'static str) -> impl IntoElement {
+    let style = type_scale::label(type_scale::LABEL_ROW_PX, gpui::FontWeight::BOLD);
+    let tail: SharedString = tail.into();
     div()
+        .id(id)
         .flex_none()
         .pt(px(4.))
+        .pb(px(12.))
         .font(style.font)
         .text_size(style.size)
-        .text_color(rgb(INK3()))
-        .child(text.into())
+        .text_color(rgb(INK1()))
+        .tooltip(move |_, cx| cx.new(|_| Tip(tail.clone())).into())
+        .child(text)
 }
 
 /// One row: a ≤16-char label, its current value in mono (units carried,
@@ -318,7 +327,11 @@ fn project_section(player: &Player, cx: &mut Context<Player>) -> impl IntoElemen
         .flex()
         .flex_col()
         .gap(px(2.))
-        .child(section_head("PROJECT · stored in the .edith file"))
+        .child(room_head(
+            "settings-head-project",
+            "PROJECT",
+            "stored in the .edith file",
+        ))
         .child(row_ink(
             "settings-resolution",
             "Resolution",
@@ -405,7 +418,11 @@ fn editor_section(player: &Player, cx: &mut Context<Player>) -> impl IntoElement
         .flex()
         .flex_col()
         .gap(px(2.))
-        .child(section_head("EDITOR · this machine, this window"))
+        .child(room_head(
+            "settings-head-editor",
+            "EDITOR",
+            "this machine, this window",
+        ))
         // The monitoring level, which lost its slider when the time band was
         // cleansed (DESIGN §5 -- "the level lives in Settings"). A readout and
         // not a widget: the number is spent rarely, so the wheel over the row
@@ -567,8 +584,9 @@ pub(crate) fn picture_label(format: Format) -> String {
 
 /// The next file in [`PICTURE_CYCLE`] this machine can actually write.
 /// `refused` is the same door [`Player::set_format`] asks, so the stroke never
-/// stops on a codec the setter would only refuse back -- the refused ones are
-/// still *said*, on the row's own greyed tail (DESIGN §8: never hidden).
+/// stops on a codec the setter would only refuse back -- a refusal is said on
+/// the row only when the *current* pick is the refused one (DESIGN §8: never
+/// hidden, never a list of the reasons for formats nobody picked).
 /// `current` where every other stop is refused, so `c` cannot cycle to
 /// nothing.
 pub(crate) fn next_picture(current: Format, refused: impl Fn(Format) -> bool) -> Format {
@@ -625,20 +643,18 @@ pub(crate) fn short_reason(why: &str) -> String {
 /// the budget; the codec, the sound, the encoder and the range are here.
 fn export_section(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
     let format = player.format;
-    let refusals: Vec<String> = PICTURE_CYCLE
-        .into_iter()
-        .filter_map(|f| {
-            player
-                .session
-                .as_ref()
-                .and_then(|session| format_refusal(session, f))
-                .map(|why| format!("{} {}", format_label(f), short_reason(&why)))
-        })
-        .collect();
-    // Never hidden (DESIGN §8): a codec this machine has no encoder for stays
-    // on the row, greyed, with the reason beside it -- the export card's own
-    // refusal rows, in the one place a codec is picked now.
-    let refused_tail = (!refusals.is_empty()).then(|| (refusals.join(" \u{b7} ").into(), INK4()));
+    // The row says *this* pick, and a refusal only where this pick is the one
+    // refused (user 2026-09-10: every other format's reason ran on after the
+    // value -- "funny"). Never hidden (DESIGN §8): when the current format is
+    // one this machine cannot write, the value greys and the reason stands
+    // beside it in six words; the formats a person is not on say nothing,
+    // because `c` never stops on them anyway ([`next_picture`]).
+    let refused_now: Option<(SharedString, u32)> = player
+        .session
+        .as_ref()
+        .and_then(|session| format_refusal(session, format))
+        .map(|why| (short_reason(&why).into(), INK4()));
+    let picture_ink = if refused_now.is_some() { INK4() } else { INK1() };
     let (codec, rated) = sound_codec(format);
     let seat = player.encoder_seat();
     let av1_gpu = seat == EncoderSeat::Hardware && matches!(format, Format::Av1 | Format::Av1Mp4);
@@ -655,19 +671,24 @@ fn export_section(player: &Player, cx: &mut Context<Player>) -> impl IntoElement
         .flex()
         .flex_col()
         .gap(px(2.))
-        .child(section_head("EXPORT \u{b7} what a delivery is written as"))
-        .child(row_chord(
+        .child(room_head(
+            "settings-head-export",
+            "EXPORT",
+            "what a delivery is written as",
+        ))
+        .child(row_full(
             "settings-export-picture",
             "Picture",
             picture_label(format),
             "the codec the picture is written with and the box it lands in; the export moment asks only for the file and the budget",
-            "c",
-            refused_tail,
+            Some("c".into()),
+            refused_now,
             player,
             cx.listener(|this, _: &ClickEvent, _, cx| {
                 this.cycle_export_picture();
                 cx.notify();
             }),
+            picture_ink,
         ))
         .children(rated.then(|| {
             row_chord(
