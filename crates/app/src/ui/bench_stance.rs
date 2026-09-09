@@ -337,6 +337,7 @@ fn clip_box(
                 move |_, _, _, cx| cx.new(|_| Tip(ghost.clone()))
             },
         )
+        .tooltip(crate::ui::widgets::tip_hover("Clip", "drag to move", None))
         .children(hitmap::dynamic(
             move || {
                 (
@@ -357,6 +358,12 @@ fn clip_box(
                 .filter(|_| trims(span))
                 .map(|edge| {
                     let mut zone = div()
+                        // An id only so the strip can carry a hover plate --
+                        // gpui's `.tooltip` lives on a stateful div.
+                        .id((
+                            "bench-clip-trim",
+                            (lane.ord * 1000 + idx) * 2 + usize::from(edge == Edge::End),
+                        ))
                         .absolute()
                         .top_0()
                         .h_full()
@@ -379,6 +386,7 @@ fn clip_box(
                                 this.open_menu(lane, idx, event.position, cx);
                             }),
                         )
+                        .tooltip(crate::ui::widgets::tip_hover("Trim clip edge", "drag", None))
                         .children(hitmap::dynamic(
                             move || {
                                 (
@@ -580,6 +588,10 @@ fn clip_box(
             d.children([Edge::Start, Edge::End].into_iter().map(|edge| {
                 let is_in = edge == Edge::Start;
                 let mut handle = div()
+                    .id((
+                        "bench-clip-fade",
+                        (lane.ord * 1000 + idx) * 2 + usize::from(!is_in),
+                    ))
                     .absolute()
                     .top_0()
                     .w(px(FADE_HANDLE_W))
@@ -593,6 +605,7 @@ fn clip_box(
                             this.start_fade_drag(lane, idx, is_in, event.position.x, cx);
                         }),
                     )
+                    .tooltip(crate::ui::widgets::tip_hover("Fade handle", "drag", None))
                     .children(hitmap::dynamic(
                         move || {
                             (
@@ -713,6 +726,7 @@ fn sub_box(
                 move |_, _, _, cx| cx.new(|_| Tip(ghost.clone()))
             },
         )
+        .tooltip(crate::ui::widgets::tip_hover("Subtitle", "drag to move", None))
         .children(hitmap::dynamic(
             move || {
                 (
@@ -893,6 +907,7 @@ fn lane_row(
                 .on_drag(LaneDrag(lane), move |_, _, _, cx| {
                     cx.new(|_| Tip(head_ghost.clone()))
                 })
+                .tooltip(crate::ui::widgets::tip_hover("Reorder lane", "drag", None))
                 .children(hitmap::dynamic(
                     move || {
                         (
@@ -1189,6 +1204,7 @@ fn lane_row(
                         this.preview_ghost_pick(track, lane, event.event.position.x, cx);
                     }),
                 )
+                .tooltip(crate::ui::widgets::tip_hover("Lane bed", "drop media here", None))
                 .children(hitmap::dynamic(
                     move || {
                         (

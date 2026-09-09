@@ -3447,3 +3447,116 @@ fn the_only_hue_in_the_export_section_is_the_av1_gpu_notice() {
         );
     }
 }
+
+/// Every control the hitmap names wears a hover line (the user, 2026-09-09,
+/// over a screenshot of the time band: "each and every button needs hover
+/// over information ... I don't know some of them"). The hitmap already
+/// carries the pair a plate needs -- an id and a label -- so the sweep walks
+/// the same emitters: a builder chain that records a control and never calls
+/// `.tooltip` is a glyph the user cannot name.
+///
+/// A scan and not a render: this crate has no gpui window in its tests, so
+/// the function body is the finest grain available. One control may emit two
+/// hitmap ids (a row and the selection inside it), which is what
+/// `DOUBLE_NAMED` allows for, by name and with its reason.
+#[test]
+fn every_hitmap_control_wears_a_hover_line() {
+    // (file, fn, ids beyond the first that name the SAME control)
+    const DOUBLE_NAMED: &[(&str, &str, usize)] = &[(
+        "dock_stance.rs",
+        "subtitle_tab_rows",
+        // `subtitle.N.M.row` and `subtitle.N.M.select` are one row: the
+        // second id is the harness's aim point for picking it.
+        1,
+    )];
+    let mut controls = 0;
+    let mut naked = Vec::new();
+    for path in source_files() {
+        let text = std::fs::read_to_string(&path).expect("a source file");
+        if !text.contains("hitmap::") {
+            continue;
+        }
+        let file = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("a file name")
+            .to_string();
+        let mut at = 0;
+        while let Some(found) = text[at..].find("fn ") {
+            let start = at + found;
+            at = start + 3;
+            let name: String = text[at..]
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if name.is_empty() {
+                continue;
+            }
+            let Some(open) = text[at..].find('{').map(|i| at + i) else {
+                continue;
+            };
+            let mut depth = 0usize;
+            let mut end = text.len();
+            for (i, c) in text[open..].char_indices() {
+                match c {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = open + i;
+                            break;
+                        }
+                    }
+                    _ => (),
+                }
+            }
+            let body = &text[start..end];
+            let emitters = ["hitmap::control(", "hitmap::dynamic(", "hitmap::action("]
+                .iter()
+                .map(|needle| body.matches(needle).count())
+                .sum::<usize>();
+            if emitters == 0 {
+                continue;
+            }
+            controls += emitters;
+            let allowed = DOUBLE_NAMED
+                .iter()
+                .find(|(f, n, _)| *f == file && *n == name)
+                .map_or(0, |(_, _, extra)| *extra);
+            let tips = body.matches(".tooltip(").count();
+            if tips + allowed < emitters {
+                naked.push(format!(
+                    "{file}::{name} -- {emitters} hitmap controls, {tips} tooltips"
+                ));
+            }
+        }
+    }
+    assert!(
+        controls >= 40,
+        "the hover sweep found only {controls} controls -- it has gone blind"
+    );
+    assert!(
+        naked.is_empty(),
+        "controls with no hover line (attach `widgets::tip_hover`/`action_hover` \
+         in the shared constructor): {naked:#?}"
+    );
+}
+
+/// The one hover shape for the whole room: `<name> · <chord>`, and a control
+/// the state refuses says why instead of naming a stroke that will not fire
+/// (DESIGN §4/§8 -- a tooltip is not a sentence).
+#[test]
+fn a_hover_line_is_a_name_and_a_chord() {
+    use crate::ui::widgets::tip_line;
+    assert_eq!(
+        tip_line("One frame forward", "right", None),
+        "One frame forward · right"
+    );
+    assert_eq!(
+        tip_line("Split", "s", Some("nothing selected")),
+        "Split · nothing selected"
+    );
+    // `Keymap::chord`'s unbound badge is not a stroke.
+    assert_eq!(tip_line("Add files", "--", None), "Add files");
+    assert_eq!(tip_line("Source", "", None), "Source");
+}

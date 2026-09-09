@@ -118,7 +118,6 @@ fn ghost_verb(
     verb_label: &'static str,
     action: ActionId,
     active: bool,
-    hint: &str,
     player: &Player,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> Option<impl IntoElement> {
@@ -127,11 +126,6 @@ fn ghost_verb(
         return None;
     }
     let key = player.keymap.chord(action);
-    let say: SharedString = match enabled.why() {
-        Some(why) => format!("{key} — {why}"),
-        None => format!("{key} — {hint}"),
-    }
-    .into();
     let on = enabled.yes();
     let label_style = label(type_scale::LABEL_ROW_PX, FontWeight::MEDIUM);
     let chord_style = mono(type_scale::CHORD_METADATA_MIN_PX, FontWeight::MEDIUM);
@@ -146,7 +140,10 @@ fn ghost_verb(
             .px(px(8.))
             .rounded(px(3.))
             .when(active, |d| d.bg(rgb(DARK_RAISED())))
-            .tooltip(move |_, cx| cx.new(|_| Tip(say.clone())).into())
+            // One hover line for the whole room (`widgets::tip_line`): the
+            // verb and its stroke, not the sentence this row used to carry
+            // (DESIGN §8 -- a tooltip is not instructional prose).
+            .tooltip(crate::ui::widgets::action_hover(player, action))
             .when(!on, |d| d.opacity(0.4).cursor_not_allowed())
             .when(on, |d| {
                 d.cursor_pointer()
@@ -203,6 +200,7 @@ fn dock_tab(
             save(this.dock_src_active);
             cx.notify();
         }))
+        .tooltip(crate::ui::widgets::tip_hover(&format!("Show {}", label_text.to_lowercase()), "", None))
         .children(hitmap::control(id, label_text, true))
         .child(
             div()
@@ -408,6 +406,7 @@ fn source_row(
                     cx.new(|_| Tip(ghost.clone()))
                 })
         })
+        .tooltip(crate::ui::widgets::tip_hover("Source", "drag to a lane", None))
         .children(hitmap::dynamic(
             move || (format!("source.{i}.row"), "Source row".into()),
             usable,
@@ -734,6 +733,7 @@ fn subtitle_tab_rows(player: &Player, cx: &mut Context<Player>) -> (usize, Vec<A
                                     cx.notify();
                                 }))
                         })
+                        .tooltip(crate::ui::widgets::tip_hover("Subtitle track", "drag to a lane", None))
                         .children(hitmap::dynamic(
                             move || {
                                 (
@@ -803,6 +803,7 @@ fn subtitle_tab_rows(player: &Player, cx: &mut Context<Player>) -> (usize, Vec<A
                                     cx.stop_propagation();
                                     this.remove_subtitle_track(track, cx);
                                 }))
+                                .tooltip(crate::ui::widgets::tip_hover("Remove subtitle track", "", None))
                                 .children(hitmap::dynamic(
                                     move || {
                                         (
@@ -839,6 +840,7 @@ fn subtitle_tab_rows(player: &Player, cx: &mut Context<Player>) -> (usize, Vec<A
                             }
                             cx.notify();
                         }))
+                        .tooltip(crate::ui::widgets::tip_hover("Fold this source", "click", None))
                         .children(hitmap::dynamic(
                             move || {
                                 (
@@ -1022,6 +1024,7 @@ fn sources_tab(player: &Player, window: &mut Window, cx: &mut Context<Player>) -
                     this.dock_filter_edit = true;
                     cx.notify();
                 }))
+                .tooltip(crate::ui::widgets::tip_hover("Filter sources", "type to narrow", None))
                 .children(hitmap::control("dock.filter", "Filter sources", true))
                 .child(match player.dock_filter.is_empty() {
                     true => "⌕ filter".to_string(),
@@ -1052,6 +1055,7 @@ fn sources_tab(player: &Player, window: &mut Window, cx: &mut Context<Player>) -
                             this.library_tab = tab;
                             cx.notify();
                         }))
+                        .tooltip(crate::ui::widgets::tip_hover(&format!("Show {} only", tab.label().to_lowercase()), "", None))
                         .children(hitmap::dynamic(
                             move || {
                                 (
@@ -1132,7 +1136,6 @@ fn sources_tab(player: &Player, window: &mut Window, cx: &mut Context<Player>) -
                     "Add files",
                     ActionId::AddFiles,
                     false,
-                    "adds a file to this list — or drop one on the window",
                     player,
                     cx.listener(|this, _: &ClickEvent, _, cx| this.pick_and_import(cx)),
                 ))
@@ -1141,7 +1144,6 @@ fn sources_tab(player: &Player, window: &mut Window, cx: &mut Context<Player>) -
                     "Paste path",
                     ActionId::PasteFilePath,
                     false,
-                    "imports the file named on the clipboard",
                     player,
                     cx.listener(|this, _: &ClickEvent, _, cx| this.paste_file_path(cx)),
                 ))
@@ -1156,7 +1158,6 @@ fn sources_tab(player: &Player, window: &mut Window, cx: &mut Context<Player>) -
                     "Import subtitles",
                     ActionId::ImportSubtitles,
                     false,
-                    "reads an .srt/.ass file onto a subtitle lane",
                     player,
                     cx.listener(|this, _: &ClickEvent, window, cx| {
                         this.act(ActionId::ImportSubtitles, window, cx)
@@ -1217,6 +1218,7 @@ fn transition_row(player: &Player, cx: &mut Context<Player>) -> Option<impl Into
             .bg(rgb(DARK_RAISED()))
             .cursor_pointer()
             .hover(|s| s.text_color(rgb(INK1())))
+            .tooltip(crate::ui::widgets::tip_hover(label, "", None))
             .children(hitmap::control(id, label, true))
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                 this.nudge_transition(lane, idx, by, cx);
@@ -1239,6 +1241,7 @@ fn transition_row(player: &Player, cx: &mut Context<Player>) -> Option<impl Into
                     .text_size(label_style.size)
                     .text_color(rgb(INK2()))
                     .cursor_pointer()
+                    .tooltip(crate::ui::widgets::tip_hover("Transition duration", "click to type", None))
                     .children(hitmap::control(
                         "transition-duration-field",
                         "Transition duration, type-in",
@@ -1313,7 +1316,6 @@ fn clip_tab(
                     "Speed",
                     ActionId::Speed,
                     player.speed_open.is_some(),
-                    "how fast this clip and its group play",
                     player,
                     cx.listener(|this, _: &ClickEvent, _, cx| this.open_speed(cx)),
                 ))
@@ -1322,7 +1324,6 @@ fn clip_tab(
                     "Colour",
                     ActionId::Color,
                     player.color_open.is_some(),
-                    "exposure, contrast, saturation and temperature",
                     player,
                     cx.listener(|this, _: &ClickEvent, _, cx| this.open_color(cx)),
                 ))
@@ -1331,7 +1332,6 @@ fn clip_tab(
                     "Transform",
                     ActionId::Transform,
                     player.transform_open.is_some(),
-                    "position, scale, rotation and crop for this clip",
                     player,
                     cx.listener(|this, _: &ClickEvent, _, cx| this.open_transform(cx)),
                 ))
@@ -1340,7 +1340,6 @@ fn clip_tab(
                     "EQ",
                     ActionId::Equalizer,
                     player.eq_open.is_some(),
-                    "the bands this clip's sound is filtered through",
                     player,
                     cx.listener(|this, _: &ClickEvent, _, cx| this.open_eq(cx)),
                 ))
@@ -1357,7 +1356,6 @@ fn clip_tab(
                     "Silence",
                     ActionId::Silence,
                     player.silence_open.is_some(),
-                    "scans for quiet stretches to cut or speed up",
                     player,
                     cx.listener(|this, _: &ClickEvent, _, cx| this.open_silence(cx)),
                 ))
@@ -1366,7 +1364,6 @@ fn clip_tab(
                     "Mix",
                     ActionId::Mix,
                     player.mix_open,
-                    "track volumes and the limiter",
                     player,
                     cx.listener(|this, _: &ClickEvent, _, cx| this.open_mix(None, cx)),
                 ))
@@ -1383,7 +1380,6 @@ fn clip_tab(
                     "Fit",
                     ActionId::Fit,
                     false,
-                    "how this picture is placed on the project canvas",
                     player,
                     cx.listener(|this, _: &ClickEvent, _, cx| this.cycle_fit(cx)),
                 )),

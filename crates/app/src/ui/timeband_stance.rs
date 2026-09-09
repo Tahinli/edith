@@ -165,6 +165,10 @@ fn ghost(
             this.act(action, window, cx);
         }))
         .children(hitmap::action(action, player.enable(action, None).yes()))
+        // The glyphs he could not name (`|◂`, `∞`, `‹|`): the hover line is built
+        // where the ghost is, so a glyph added to this band tomorrow cannot
+        // ship without one.
+        .tooltip(crate::ui::widgets::action_hover(player, action))
         .font(glyph_style.font)
         .text_size(glyph_style.size)
         .text_color(rgb(if active { INK1() } else { INK2() }))
@@ -571,6 +575,7 @@ fn grip(id: &'static str, left: bool, top: bool) -> impl IntoElement {
             PAN_ANCHOR.with(|a| a.set(Some(f32::from(event.position.x))));
             cx.stop_propagation();
         })
+        .tooltip(crate::ui::widgets::tip_hover("Pan the timeline window", "drag", None))
         .children(hitmap::control(id, "Timeline viewport grip", true))
 }
 
@@ -610,6 +615,7 @@ fn export_chip(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
             }
             cx.notify();
         }))
+        .tooltip(crate::ui::widgets::action_hover(player, if exporting { ActionId::CancelExport } else { ActionId::Export }))
         .children(hitmap::action(
             if exporting {
                 ActionId::CancelExport
@@ -928,6 +934,7 @@ fn save_verb(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
         .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
             this.act(ActionId::Save, window, cx);
         }))
+        .tooltip(crate::ui::widgets::action_hover(player, ActionId::Save))
         .children(hitmap::action(
             ActionId::Save,
             player.enable(ActionId::Save, None).yes(),
