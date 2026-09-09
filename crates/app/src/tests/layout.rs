@@ -1212,7 +1212,7 @@ fn the_subtitles_toggle_says_what_is_placed_and_never_the_picked_row() {
 
 /// The door this editor answers "don't make me import the film again" with,
 /// and it is in the dock's IMPORT section beside the other two imports
-/// (`ui/dock_stance.rs`'s own doc comment: it moved off the spine's crowded
+/// (`ui/dock_stance.rs`'s own doc comment: it moved off the old rail's crowded
 /// TRACK group here): reads a file's subtitle tracks onto the open timeline
 /// -- a release's `.mkv`, an `.srt` beside it -- while the file itself
 /// joins nothing. It is the *action* and not a second implementation of it,
@@ -2030,14 +2030,15 @@ fn every_seam_in_the_layout_has_a_divider_on_it() {
     );
 }
 
-/// DESIGN.md §12 step 2: the stance skeleton draws its six regions -- spine,
-/// screen, time band, bench, ledger, dock -- in the order §5's diagram lays
-/// them out, and `Player::render` actually reaches it when the flag is on.
+/// DESIGN.md §12 step 2 as amended 2026-09-09 (user decision "option C"):
+/// the stance skeleton draws its five regions -- screen, time band, bench,
+/// ledger, dock -- in the order §5's diagram lays them out, and
+/// `Player::render` actually reaches it when the flag is on. The sixth, the
+/// 56px rail, is deleted -- the room root is centre | dock.
 #[test]
-fn the_stance_renders_its_six_regions_in_the_documented_order() {
+fn the_stance_renders_its_five_regions_in_the_documented_order() {
     let stance = src_text("ui/stance.rs");
     let order = [
-        "stance-spine",
         "stance-screen",
         "stance-time-band",
         "stance-bench",
@@ -2054,7 +2055,7 @@ fn the_stance_renders_its_six_regions_in_the_documented_order() {
         .collect();
     assert!(
         defined.windows(2).all(|w| w[0] < w[1]),
-        "the six regions are not defined in DESIGN §5's order: {defined:?}"
+        "the five regions are not defined in DESIGN §5's order: {defined:?}"
     );
 
     // Defined in order is not composed in order -- `render()` has to call
@@ -2066,7 +2067,6 @@ fn the_stance_renders_its_six_regions_in_the_documented_order() {
     // regions player/window state to read, so their call sites carry
     // arguments now. Order is what this asserts, not arity.
     let calls = [
-        "spine(",
         "screen(",
         "time_band(",
         "bench(",
@@ -2424,7 +2424,7 @@ fn hdr_reference_rows_read_content_light_and_use_the_established_empty_state() {
 /// The parity class this user has reported four separate times: "some
 /// options are only reachable via keyboard shortcut". A source scan (this
 /// binary has no `TestAppContext` to click through) over every darkroom
-/// surface -- the spine, the dock, the bench/timeband transport, the
+/// surface -- the dock, the bench/timeband transport, the
 /// settings page, the maximized cards and the clip context menu
 /// (`menus.rs`'s `MENU_ITEMS`, rendered mouse-and-chord-visible by
 /// `overlays.rs`) -- for a literal `ActionId::<variant>` mention. An
@@ -2447,16 +2447,7 @@ fn hdr_reference_rows_read_content_light_and_use_the_established_empty_state() {
 fn every_action_has_a_darkroom_widget_home_or_explicit_owner() {
     use crate::ActionId;
     const EXPLICITLY_OWNED_ELSEWHERE: &[(ActionId, &str)] = &[
-        (
-            ActionId::RemoveVideoLane,
-            "lane-header remove parity owns video-lane controls",
-        ),
-        (
-            ActionId::RemoveAudioLane,
-            "lane-header remove parity owns audio-lane controls",
-        ),
         (ActionId::Crossfade, "fade parity owns crossfade controls"),
-        (ActionId::Dissolve, "fade parity owns dissolve controls"),
         (
             ActionId::FocusPanels,
             "keyboard-only by design: a mouse already focuses whatever it \
@@ -2480,6 +2471,112 @@ fn every_action_has_a_darkroom_widget_home_or_explicit_owner() {
              accelerator for cycling that existing selection, not a new door -- legacy had no \
              toolbar button for it either",
         ),
+        // The rail's own eighteen. Deleting the spine (DESIGN §5 as amended
+        // 2026-09-09, user decision "option C") took the only pointer door
+        // each of these had; LANE R2's right-click parity is what gives them
+        // a new one, on the thing each acts on. The staleness check below
+        // deletes the exemption the moment that lands, so this cannot become
+        // a permanent hole.
+        (
+            ActionId::Undo,
+            "the 56px rail these stood on is deleted (DESIGN §5, 2026-09-09, user \"option C\"); \
+             LANE R2 owns the right-click row on the thing each acts on",
+        ),
+        (
+            ActionId::Redo,
+            "the 56px rail these stood on is deleted (DESIGN §5, 2026-09-09, user \"option C\"); \
+             LANE R2 owns the right-click row on the thing each acts on",
+        ),
+        (
+            ActionId::WalkCutPrev,
+            "the 56px rail these stood on is deleted (DESIGN §5, 2026-09-09, user \"option C\"); \
+             LANE R2 owns the right-click row on the thing each acts on",
+        ),
+        (
+            ActionId::WalkCutNext,
+            "the 56px rail these stood on is deleted (DESIGN §5, 2026-09-09, user \"option C\"); \
+             LANE R2 owns the right-click row on the thing each acts on",
+        ),
+        (
+            ActionId::WalkCutNext10,
+            "the 56px rail these stood on is deleted (DESIGN §5, 2026-09-09, user \"option C\"); \
+             LANE R2 owns the right-click row on the thing each acts on",
+        ),
+        (
+            ActionId::WalkCutPrev10,
+            "the 56px rail these stood on is deleted (DESIGN §5, 2026-09-09, user \"option C\"); \
+             LANE R2 owns the right-click row on the thing each acts on",
+        ),
+        (
+            ActionId::TrimIn,
+            "the 56px rail these stood on is deleted (DESIGN §5, 2026-09-09, user \"option C\"); \
+             LANE R2 owns the right-click row on the thing each acts on",
+        ),
+        (
+            ActionId::TrimOut,
+            "the 56px rail these stood on is deleted (DESIGN §5, 2026-09-09, user \"option C\"); \
+             LANE R2 owns the right-click row on the thing each acts on",
+        ),
+        (
+            ActionId::TrimInToPlayhead,
+            "the 56px rail these stood on is deleted (DESIGN §5, 2026-09-09, user \"option C\"); \
+             LANE R2 owns the right-click row on the thing each acts on",
+        ),
+        (
+            ActionId::TrimOutToPlayhead,
+            "the 56px rail these stood on is deleted (DESIGN §5, 2026-09-09, user \"option C\"); \
+             LANE R2 owns the right-click row on the thing each acts on",
+        ),
+        (
+            ActionId::LoopTrim,
+            "the 56px rail these stood on is deleted (DESIGN §5, 2026-09-09, user \"option C\"); \
+             LANE R2 owns the right-click row on the thing each acts on",
+        ),
+        (
+            ActionId::ZoomIn,
+            "the 56px rail these stood on is deleted (DESIGN §5, 2026-09-09, user \"option C\"); \
+             LANE R2 owns the right-click row on the thing each acts on",
+        ),
+        (
+            ActionId::ZoomOut,
+            "the 56px rail these stood on is deleted (DESIGN §5, 2026-09-09, user \"option C\"); \
+             LANE R2 owns the right-click row on the thing each acts on",
+        ),
+        (
+            ActionId::ZoomFit,
+            "the 56px rail these stood on is deleted (DESIGN §5, 2026-09-09, user \"option C\"); \
+             LANE R2 owns the right-click row on the thing each acts on",
+        ),
+        (
+            ActionId::ToggleSnap,
+            "the 56px rail these stood on is deleted (DESIGN §5, 2026-09-09, user \"option C\"); \
+             LANE R2 owns the right-click row on the thing each acts on",
+        ),
+        (
+            ActionId::AddVideoLane,
+            "the 56px rail these stood on is deleted (DESIGN §5, 2026-09-09, user \"option C\"); \
+             LANE R2 owns the right-click row on the thing each acts on",
+        ),
+        (
+            ActionId::AddAudioLane,
+            "the 56px rail these stood on is deleted (DESIGN §5, 2026-09-09, user \"option C\"); \
+             LANE R2 owns the right-click row on the thing each acts on",
+        ),
+        (
+            ActionId::AddSubtitleLane,
+            "the 56px rail these stood on is deleted (DESIGN §5, 2026-09-09, user \"option C\"); \
+             LANE R2 owns the right-click row on the thing each acts on",
+        ),
+        (
+            ActionId::RemoveSubtitleLane,
+            "the 56px rail these stood on is deleted (DESIGN §5, 2026-09-09, user \"option C\"); \
+             LANE R2 owns the right-click row on the thing each acts on",
+        ),
+        (
+            ActionId::Screenshot,
+            "the 56px rail these stood on is deleted (DESIGN §5, 2026-09-09, user \"option C\"); \
+             LANE R2 owns the right-click row on the thing each acts on",
+        ),
     ];
     let darkroom = [
         "ui/bench_stance.rs",
@@ -2487,7 +2584,6 @@ fn every_action_has_a_darkroom_widget_home_or_explicit_owner() {
         "ui/dock_stance.rs",
         "ui/overlays.rs",
         "ui/settings_stance.rs",
-        "ui/spine_stance.rs",
         "ui/stance.rs",
         "ui/timeband_stance.rs",
         "menus.rs",
@@ -2500,6 +2596,14 @@ fn every_action_has_a_darkroom_widget_home_or_explicit_owner() {
             .find(|(owned, _)| *owned == action)
         {
             assert!(!owner.is_empty(), "ActionId::{action:?} needs an owner");
+            // An exemption is a debt, not a licence: once the owning lane
+            // has mounted the action, the entry has to go, or the sweep
+            // goes blind on an action that is covered.
+            assert!(
+                !darkroom.contains(&format!("ActionId::{action:?}")),
+                "ActionId::{action:?} has a darkroom home now -- delete its \
+                 EXPLICITLY_OWNED_ELSEWHERE entry ({owner})"
+            );
             continue;
         }
         let name = format!("{action:?}");
@@ -2654,8 +2758,8 @@ fn hitmap_names_every_darkroom_pointer_entry_surface() {
 
 /// An external file drag (gpui `ExternalPaths`, Wayland `text/uri-list`) has
 /// to be heard over the DOCK -- the Sources/library panel -- and not only
-/// over the centre column: the dock and the spine are the centre's flex
-/// siblings, so the handler `stance-centre` used to carry covered none of
+/// over the centre column: the dock is the centre's flex sibling, so the
+/// handler `stance-centre` used to carry covered none of
 /// the library panel, which is exactly the shipped "drag and drop file
 /// import is not working on library panel" defect. The listener therefore
 /// belongs to the room root (`stance-room`), above every region, and it must
@@ -2953,63 +3057,6 @@ fn a_dock_ring_never_moves_what_it_rings() {
     );
 }
 
-/// The spine is 56px and every pair must fit inside it. Measured at
-/// 1280x720 the full-size halves did not: hitmap `action.WalkCutPrev10
-/// x=-5 w=31`, `action.AddVideoLane x=-2 w=28` -- the `‹10` glyph was cut
-/// at the window's own left edge. Fixed by subtraction (13px + 1px padding
-/// for the paired halves, 3px row gap), so this scan is what keeps a new
-/// pair from being written at the full row size again.
-#[test]
-fn every_paired_spine_glyph_is_drawn_at_the_narrow_size() {
-    let src = src_text("ui/spine_stance.rs");
-    // Inside every `pair(...)` call, both halves come from `small`.
-    let mut rest = src.as_str();
-    let mut pairs = 0;
-    while let Some(at) = rest.find("pair(") {
-        let after = &rest[at..];
-        // The definition and the doc comments are not call sites.
-        if rest[..at].ends_with("fn ") || rest[..at].ends_with('`') {
-            rest = &after[5..];
-            continue;
-        }
-        let mut depth = 0i32;
-        let mut end = after.len();
-        for (i, c) in after.char_indices() {
-            match c {
-                '(' => depth += 1,
-                ')' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        end = i;
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-        let body = &after[..end];
-        assert!(
-            !body.contains("glyph("),
-            "a spine pair draws a full-size glyph, which lays out past the \
-             56px rail: {}",
-            &body[..body.len().min(120)]
-        );
-        pairs += 1;
-        rest = &after[end..];
-    }
-    assert!(pairs >= 8, "the spine's pairs went missing ({pairs} found)");
-    // And `small` is the narrow one: one step down the §3 scale, 1px sides.
-    assert!(
-        src.contains("type_scale::CHORD_METADATA_MIN_PX")
-            && src.contains("let pad = if paired { 1. } else { 3. };"),
-        "the paired size/padding subtraction is gone from spine_stance"
-    );
-    assert!(
-        src.contains(".gap(px(3.))\n        .child(left)"),
-        "the pair row's own gap grew again"
-    );
-}
-
 /// DESIGN §9 as amended 2026-09-09: the keys list is the dock's third tab,
 /// not a plate over the bench. The overlay the user asked about ("clicking
 /// them opens a menu ... probably location problem") is gone with its scrim,
@@ -3054,14 +3101,59 @@ fn the_keys_list_is_a_dock_tab_and_the_plate_is_gone() {
     );
 }
 
-/// The user's screenshot: the spine ended with `?` over `?`. A ghost whose
-/// primary chord IS its glyph wears no badge; every other one still does.
+/// The user's screenshot: the old rail ended with `?` over `?`. The rule
+/// outlived the rail -- a ledger room ghost whose primary chord IS its own
+/// name wears no badge; every other one still does.
 #[test]
-fn the_spine_question_mark_wears_no_second_question_mark() {
+fn a_room_ghost_wears_no_chord_that_repeats_its_name() {
     let src = src_text("ui/stance.rs");
     assert!(
-        src.contains(".when(player.keymap.chord(action) != glyph, |el| {"),
-        "the spine ghost draws its chord badge even when the badge repeats the glyph"
+        src.contains(".when(player.keymap.chord(action) != name, |el| {"),
+        "a room ghost draws its chord badge even when the badge repeats its name"
+    );
+}
+
+/// DESIGN §5 as amended 2026-09-09 (user decision "option C"): there is no
+/// rail. The room root is centre | dock, `spine_stance` is deleted, and the
+/// four verbs that act on the ROOM -- the only ones with no thing under the
+/// cursor to be right-clicked -- live at the ledger's right end, each
+/// wearing its chord, `CC` carrying the shown/hidden state the rail's glyph
+/// used to.
+#[test]
+fn the_ledger_carries_the_rooms_four_verbs_and_no_rail_remains() {
+    let src = src_text("ui/stance.rs");
+    for gone in ["stance-spine", "spine_stance", "SPINE_W", "fn spine("] {
+        assert!(!src.contains(gone), "the rail is still in the stance: {gone}");
+    }
+    let ledger = &src[src.find("fn ledger(").expect("the ledger strip")
+        ..src.find("/// The dock:").expect("the dock frame")];
+    for (name, action) in [
+        ("CC", "ActionId::ToggleSubtitles"),
+        ("settings", "ActionId::Settings"),
+        ("keys", "ActionId::ShowActions"),
+        ("full", "ActionId::Fullscreen"),
+    ] {
+        assert!(
+            ledger.contains(&format!("\"{name}\",")) && ledger.contains(action),
+            "the ledger lost its {name} room verb"
+        );
+    }
+    // Before the position timecode, which stays the strip's last word.
+    assert!(
+        ledger.find("room_ghost(").expect("a room verb")
+            < ledger.find(".child(tc),").expect("the position"),
+        "the room verbs drew after the position timecode"
+    );
+    // Each wears its chord, live off the keymap (DESIGN §4), and `CC` reads
+    // active while subtitles are shown.
+    let ghost = &src[src.find("fn room_ghost(").expect("the room ghost")..];
+    assert!(
+        ghost.contains("player.keymap.chord(action)") && ghost.contains("widgets::action_hover"),
+        "a room verb lost its live chord or its hover plate"
+    );
+    assert!(
+        ledger.contains("player.subs_on"),
+        "`CC` no longer shows whether subtitles are shown"
     );
 }
 
@@ -3173,7 +3265,9 @@ fn the_time_band_never_paints_outside_its_own_column() {
 /// rung, and the sheddable groups go in a fixed order (chords, then the
 /// monitoring cluster, then sync/loop, then the range marks), never all at
 /// once. Thresholds are the measured group widths; this pins their order and
-/// the 1280x720 column (939px measured, spine 56 + dock 285) landing on the
+/// the 1280x720 column (939px measured when a 56px rail still stood left of
+/// it; the rail is gone since 2026-09-09, so the same window measures ~989px)
+/// landing on the
 /// marks-only rung, which is what makes Export fit there (it ended at x=991
 /// inside a column ending at 995, against x=1113 under the dock before).
 #[test]

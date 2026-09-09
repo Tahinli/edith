@@ -1850,7 +1850,7 @@ fn maximizing_a_card_grows_its_box_without_moving_where_a_value_sits_in_it() {
 /// room each mount site is fed after the fix: [`dock_stance`]'s un-maximized
 /// mount is handed the dock's own real width (not the window's, the "480 in
 /// 280" shape of the width-clip bug), and a maximized card is handed
-/// `stance-centre`'s width -- the window minus the spine and the dock it
+/// `stance-centre`'s width -- the window minus the dock it
 /// escaped -- which must come out *larger*, not smaller, than the docked
 /// room it replaces. A future change that re-nests the maximize mount back
 /// inside the dock, or hands it the dock's width again, fails this.
@@ -1859,11 +1859,9 @@ fn a_maximized_cards_room_is_bigger_than_the_docked_rooms_not_smaller() {
     use crate::SPLIT_W;
     use crate::layout::{Split, split_size};
 
-    // Mirrors `ui/stance.rs`'s private `SPINE_W` (56.) and `layout::SPLIT_W`
-    // (the one divider between `stance-centre` and the dock): recomputed
-    // rather than imported, same as this test file's other private-constant
-    // checks, so a change to either number is felt here too.
-    const SPINE_W: f32 = 56.;
+    // `layout::SPLIT_W` is the one divider between `stance-centre` and the
+    // dock; the 56px rail that used to eat the centre's left edge is gone
+    // (2026-09-09, "option C"), so the centre is everything but the dock.
 
     for window_w in [960., 1280., 1920.] {
         let window = size(px(window_w), px(720.));
@@ -1872,7 +1870,7 @@ fn a_maximized_cards_room_is_bigger_than_the_docked_rooms_not_smaller() {
         // now feeds its un-maximized cards as their "room".
         let dock_w = split_size(Split::Dock, None, 2, window, false);
         let docked_room_w = dock_w;
-        let maximized_room_w = window_w - SPINE_W - SPLIT_W - dock_w;
+        let maximized_room_w = window_w - SPLIT_W - dock_w;
 
         assert!(
             maximized_room_w > docked_room_w,
