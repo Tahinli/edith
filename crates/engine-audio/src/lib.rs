@@ -426,6 +426,9 @@ impl Drop for Session {
 #[unsafe(no_mangle)]
 pub extern "C" fn ao_open(sample_rate: u32, channels: u32) -> *mut c_void {
     catch_unwind(AssertUnwindSafe(|| {
+        if std::env::var_os("VE_NO_AO").is_some_and(|v| v == "1") {
+            return std::ptr::null_mut();
+        }
         if !(8_000..=768_000).contains(&sample_rate)
             || channels == 0
             || channels as usize > spa::param::audio::MAX_CHANNELS

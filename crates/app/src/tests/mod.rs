@@ -65,7 +65,7 @@ use std::path::{Path, PathBuf};
 
 use std::time::{Duration, Instant};
 
-use std::sync::{LazyLock, Mutex, MutexGuard};
+use std::sync::{LazyLock, Mutex, MutexGuard, Once};
 
 static CONFIG_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
@@ -73,6 +73,19 @@ fn config_env_lock() -> MutexGuard<'static, ()> {
     CONFIG_ENV_LOCK
         .lock()
         .expect("config environment lock poisoned")
+}
+
+/// Tests never open PipeWire. The output seam also refuses a cargo-test
+/// binary under `target/*/deps/`; this pin is the documented door and the
+/// source-scan guard below.
+fn pin_silent_output() {
+    static PIN: Once = Once::new();
+    PIN.call_once(|| {
+        // SAFETY: this process is the test binary; no other thread has
+        // opened a device yet because `asset()` (every session fixture)
+        // calls this first.
+        unsafe { std::env::set_var("VE_NO_AO", "1") };
+    });
 }
 
 /// Every line of the window's source there is, as one string. The regions have
@@ -157,6 +170,7 @@ fn source_files() -> Vec<PathBuf> {
 }
 
 fn asset(name: &str) -> PathBuf {
+    pin_silent_output();
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../assets")
         .join(name)
@@ -246,4 +260,20 @@ fn sub(path: &str, track: Option<u64>, label: &str) -> engine::subtitle::Subtitl
         bitmap: false,
         refused: None,
     }
+}
+
+#[test]
+fn the_suite_pins_a_silent_output() {
+    pin_silent_output();
+    assert!(
+        src_text("tests/mod.rs").contains("VE_NO_AO"),
+        "the fixture no longer pins silent output"
+    );
+    let session = PlaybackSession::open(asset("test_av.mp4")).expect("open");
+    let _ = session.set_gain(0.0);
+    assert_eq!(
+        engine::ao::AoSession::devices_opened(),
+        0,
+        "a test opened the speakers"
+    );
 }

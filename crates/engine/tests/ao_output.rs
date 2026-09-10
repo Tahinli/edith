@@ -40,9 +40,16 @@ fn tone() -> Vec<f32> {
 /// bytes alone) and a person with the app open. The upgrade path is recording
 /// a null sink and asserting on the samples that come back.
 fn open_silent() -> AoSession {
+    want_real_device();
     let ao = AoSession::open(RATE, CHANNELS).expect("no PipeWire playback available");
     assert!(ao.set_volume(0.0), "mute rejected");
     ao
+}
+
+fn want_real_device() {
+    // SAFETY: this ignored suite is --test-threads=1 and is the one
+    // process that is allowed a real sink.
+    unsafe { std::env::set_var("VE_AO", "1") };
 }
 
 /// Waits up to `limit` for the clock to report a played position past zero.
@@ -160,11 +167,13 @@ fn muting_silences_without_stopping_the_clock() {
 #[test]
 #[ignore = "needs libengine_audio.so and a PipeWire daemon"]
 fn no_daemon_opens_nothing() {
+    want_real_device();
     assert!(AoSession::probe(), "plugin not loadable");
     // SAFETY: the suite is documented to run with --test-threads=1.
     unsafe { std::env::set_var("PIPEWIRE_REMOTE", "/nonexistent") };
     let start = Instant::now();
     let session = AoSession::open(RATE, CHANNELS);
+
     let elapsed = start.elapsed();
     unsafe { std::env::remove_var("PIPEWIRE_REMOTE") };
 
