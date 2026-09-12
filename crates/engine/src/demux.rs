@@ -136,22 +136,30 @@ impl Codec {
     }
 
     /// Why a file can be refused outright. Two true answers, one per shape of
-    /// "no decoder here": every codec but H.264 and VP8 has no software
-    /// decoder at all (H.264's is the native `ec-h264`), so the refusal names
-    /// the plugin as the only way; VP8's software decoder *is* libvpx inside
-    /// the plugin, so "there is no software decoder" would be a lie the day
-    /// the plugin grew that arm -- the refusal keeps naming the plugin,
-    /// because that is still the thing to make present. Shared so playback
-    /// and export refuse in the same words.
+    /// "no decoder here": H.264 and AV1 have software seats of this project's
+    /// own (`ec-h264`, `ec-av1`) and are never refused for missing hardware on
+    /// the *playback* path; HEVC and VP9 have no software decoder at all, so
+    /// the refusal names the plugin as the only way. VP8's software decoder
+    /// *is* libvpx inside the plugin, so "there is no software decoder" would
+    /// be a lie the day the plugin grew that arm -- the refusal keeps naming
+    /// the plugin, because that is still the thing to make present. AV1's arm
+    /// is the one refusal left that can reach it: the software *export*
+    /// decoder is H.264-only (`export::SwDecoder`), so an AV1 source on a
+    /// machine with no plugin exports through nothing. Shared so playback and
+    /// export refuse in the same words.
     pub fn needs_plugin(self) -> String {
         match self {
             Self::Vp8 => {
                 "VP8 needs the VA-API plugin (libengine_hw.so) — its decoder is libvpx, inside the plugin"
                     .to_string()
             }
+            Self::Av1 => {
+                "AV1 needs the VA-API plugin (libengine_hw.so) — playback decodes it in software, the software export path does not"
+                    .to_string()
+            }
             other => format!(
                 "{name} needs the VA-API plugin (libengine_hw.so) — there is no software {name} decoder",
-                name = other.name()
+                name = other.name(),
             ),
         }
     }
@@ -616,9 +624,10 @@ impl Demuxer {
 
     /// Bits per luma sample the stream is coded at: 8 for everything but an
     /// HEVC Main 10 or a 10-bit AV1 track, which decode into a P010 surface
-    /// rather than an NV12 one. Not part of [`VideoMeta`] because nothing above
-    /// the plugin has a use for it -- what comes out of the read-back is 8-bit
-    /// either way.
+    /// rather than an NV12 one. Not part of [`VideoMeta`] because the read-back
+    /// is 8-bit either way -- the two readers are the plugin's surface pool and
+    /// the software AV1 seat's narrowing ([`crate::decode::narrow_av1`]), and
+    /// both consume the depth and hand out bytes.
     pub fn bit_depth(&self) -> u8 {
         match self {
             Self::Mp4(d) => d.bit_depth,

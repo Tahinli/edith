@@ -2,9 +2,10 @@
 //! arrives in a container of its own -- `mp4 0.14` knows no `av01` sample entry
 //! at all, so AV1 comes in as Matroska and the demuxer walks the EBML itself.
 //!
-//! The container and refusal checks need nothing installed. The decode and
-//! export twins need a built `libengine_hw.so` and a VA-API driver with an AV1
-//! decode entrypoint (`vainfo | grep AV1`), so they are `#[ignore]`d:
+//! Decoding has two seats: the project's own `ec-av1` in this process, and the
+//! VA-API plugin's (`vainfo | grep AV1`) in front of it. The software seat needs
+//! nothing installed, so its witnesses run unignored (`VE_SW` pins it); the
+//! hardware twins need a built `libengine_hw.so` and are `#[ignore]`d:
 //!
 //! ```text
 //! cargo build -p engine -p engine-hw --release
@@ -12,8 +13,8 @@
 //!   cargo test -p engine --release --test av1 -- --include-ignored --nocapture --test-threads=1
 //! ```
 //!
-//! `VE_SW` is process-wide, hence `--test-threads=1`: the refusal test sets it
-//! and puts it back so the hardware twins below really are hardware.
+//! `VE_SW` is process-wide, hence `--test-threads=1`: the software-seat tests
+//! set it and put it back so the hardware twins below really are hardware.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -142,44 +143,250 @@ fn every_block_comes_back_and_keyframes_carry_the_sequence_header() {
     assert_eq!((after[0] >> 3) & 0xF, 1, "{}", after[0]);
 }
 
-/// There is no software AV1 decoder, so the software path must refuse by name
-/// rather than feed AV1 bytes to `ec-h264` -- and it must refuse where a
-/// caller can still show it, i.e. out of `open`, not from inside the worker.
+/// The seat this file used to refuse by name now exists: `ec-av1`, in this
+/// process, behind the same `VE_SW` pin the H.264 seat takes. A linear open
+/// delivers every frame the container indexes, labelled `0..n` in display
+/// order -- the contract the transport reads and the one the hardware seat
+/// always kept.
 #[test]
-fn the_software_path_refuses_av1_by_name() {
+fn the_software_seat_decodes_every_frame() {
+    // SAFETY: the suite is documented to run with --test-threads=1. The pin
+    // stays up until the frames are drained: it is read on the worker thread
+    // when the span opens, not only at the door here.
+    unsafe { std::env::set_var("VE_SW", "1") };
+    let (meta, rx) = DecodeSession::open(asset("test_av1.mkv")).expect("software AV1 open");
+    assert_eq!(meta.frame_count, FRAMES);
+    let indices: Vec<u32> = rx.into_iter().map(|f| f.index).collect();
+    unsafe { std::env::remove_var("VE_SW") };
+    assert_eq!(indices, (0..FRAMES).collect::<Vec<_>>(), "frames must arrive 0..n in display order");
+}
+
+/// ...and the 10-bit twin, whose samples arrive as `u16` in `0..=1023` and
+/// narrow to the same 8-bit planes the plugin's P010 read-back produces.
+#[test]
+fn the_software_seat_decodes_ten_bit_av1() {
+    // SAFETY: the suite is documented to run with --test-threads=1; held
+    // through the drain, as above.
+    unsafe { std::env::set_var("VE_SW", "1") };
+    let (meta, rx) = DecodeSession::open(asset("test_av1_10.mkv")).expect("software AV1 open");
+    assert_eq!(meta.frame_count, FRAMES);
+    let count = rx.into_iter().count();
+    unsafe { std::env::remove_var("VE_SW") };
+    assert_eq!(count, FRAMES as usize, "every 10-bit frame came out");
+}
+
+/// Seeking may only change *when* a picture arrives, never the picture: a seek
+/// onto the software seat lands on the very bytes a linear decode of the same
+/// index delivered, on either side of and away from a keyframe. The promise
+/// `hw_decode::seek_matches_linear_every_container` makes of the hardware
+/// seat, made here of the software one -- which is why this runs unignored.
+#[test]
+fn seek_lands_on_the_picture_a_linear_software_decode_delivered() {
     // SAFETY: the suite is documented to run with --test-threads=1.
     unsafe { std::env::set_var("VE_SW", "1") };
-    let refused =
-        DecodeSession::open(asset("test_av1.mkv")).expect_err("software must not accept AV1");
-    let refused = refused.to_string();
-    // Restored immediately: the hardware tests in this binary share the process.
+    let path = asset("test_av1.mkv");
+    let (meta, rx) = DecodeSession::open(&path).expect("software open");
+    let mut targets = vec![0, 1, 29, 30, 31, 45, meta.frame_count - 1];
+    targets.retain(|&t| t < meta.frame_count);
+    targets.sort_unstable();
+    targets.dedup();
+    let linear: Vec<(u32, Vec<u8>)> = rx
+        .into_iter()
+        .filter(|f| targets.contains(&f.index))
+        .map(|f| (f.index, f.bgra))
+        .collect();
+    assert_eq!(
+        linear.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+        targets,
+        "linear decode never delivered every target"
+    );
+    for (target, want) in linear {
+        let (_, rx, _cancel) = DecodeSession::open_at(&path, target).expect("open_at");
+        let seeked = rx
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("no frame after seek to {target}"));
+        assert_eq!(seeked.index, target, "first frame after seek is not the target");
+        assert!(
+            seeked.bgra == want,
+            "seek to {target} handed back a different picture than a linear decode of {target}"
+        );
+    }
     unsafe { std::env::remove_var("VE_SW") };
-
-    assert!(refused.contains("AV1"), "{refused}");
-    assert!(refused.contains("plugin"), "{refused}");
 }
 
 /// A timeline is *not* refused a source coded differently -- every clip opens
-/// its own decoder. What survives is the reason the codec gate existed: on a
-/// machine that cannot decode AV1 the file is refused at the door, by the
-/// decoder's own name, rather than becoming a clip of black frames.
+/// its own decoder, and since the `ec-av1` seat that is true with no plugin
+/// and no driver in the room: the no-plugin machine, forced, takes the AV1
+/// source beside its H.264 one.
 #[test]
-fn a_timeline_takes_the_other_codec_or_names_the_missing_decoder() {
+fn a_timeline_takes_av1_on_a_machine_with_no_plugin() {
     let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open test_av.mp4");
-    // The no-plugin machine, forced.
-    // SAFETY: the suite is documented to run with --test-threads=1.
+    // SAFETY: the suite is documented to run with --test-threads=1. The pin
+    // stays up until the import has been through the seat's door (and the
+    // worker it spawned has opened its span on it), then comes back down.
     unsafe { std::env::set_var("VE_SW", "1") };
-    let refused = session
+    let imported = session
         .import(&asset("test_av1.mkv"))
-        .expect_err("no AV1 decoder means no AV1 clip")
-        .to_string();
+        .is_ok();
+    assert!(imported, "the software seat is a seat: the timeline takes AV1");
+    assert_eq!(session.sources().len(), 2, "both sources stand");
     unsafe { std::env::remove_var("VE_SW") };
-    assert_eq!(refused, Codec::Av1.needs_plugin());
+}
+
+// --- the refusal witness ---------------------------------------------------
+//
+// The minimal EBML this file's refusal fixture is written with -- the same
+// builders `mkv_encodings.rs` uses, kept local because test binaries do not
+// share code. Every size goes out in the 8-byte long form, legal everywhere
+// and arithmetic-free.
+
+const SEGMENT: u32 = 0x1853_8067;
+const INFO: u32 = 0x1549_A966;
+const TIMESTAMP_SCALE: u32 = 0x2AD7B1;
+const TRACKS: u32 = 0x1654_AE6B;
+const TRACK_ENTRY: u32 = 0xAE;
+const TRACK_NUMBER: u32 = 0xD7;
+const TRACK_TYPE: u32 = 0x83;
+const CODEC_ID: u32 = 0x86;
+const CODEC_PRIVATE: u32 = 0x63A2;
+const DEFAULT_DURATION: u32 = 0x23E383;
+const VIDEO: u32 = 0xE0;
+const PIXEL_WIDTH: u32 = 0xB0;
+const PIXEL_HEIGHT: u32 = 0xBA;
+const CLUSTER: u32 = 0x1F43_B675;
+const CLUSTER_TIMESTAMP: u32 = 0xE7;
+const SIMPLE_BLOCK: u32 = 0xA3;
+
+fn el(id: u32, body: &[u8]) -> Vec<u8> {
+    let mut out: Vec<u8> = id.to_be_bytes()[(id.leading_zeros() / 8) as usize..].to_vec();
+    out.push(0x01);
+    out.extend_from_slice(&(body.len() as u64).to_be_bytes()[1..]);
+    out.extend_from_slice(body);
+    out
+}
+
+fn uint(id: u32, value: u64) -> Vec<u8> {
+    el(id, &value.to_be_bytes())
+}
+
+/// A `SimpleBlock` of `track`, `rel` ticks into its cluster; `flags` carries
+/// the keyframe bit (0x80).
+fn block(track: u8, rel: i16, flags: u8, body: &[u8]) -> Vec<u8> {
+    let mut b = vec![0x80 | track];
+    b.extend_from_slice(&rel.to_be_bytes());
+    b.push(flags);
+    b.extend_from_slice(body);
+    el(SIMPLE_BLOCK, &b)
+}
+
+/// One OBU's total length inside a low-overhead stream: the header byte (plus
+/// its extension byte, which this fixture format never writes) and the
+/// leb128 size that `obu_has_size_field` promises.
+fn obu_len(stream: &[u8]) -> usize {
+    assert_eq!(stream[0] & 0x2, 2, "obu_has_size_field: low-overhead format");
+    let mut len = 1;
+    let mut size: usize = 0;
+    loop {
+        let byte = stream[len];
+        len += 1;
+        size = size << 7 | usize::from(byte & 0x7F);
+        if byte & 0x80 == 0 {
+            break;
+        }
+    }
+    len + size
+}
+
+/// A stream whose GOP structure is broken in a way the container cannot see:
+/// the second keyframe-flagged block carries an *inter* frame's bytes, as a
+/// remux that trusted the wrong key index would write one. The demuxer opens
+/// it, injects the sequence header ahead of it, and `ec-av1` refuses it by
+/// name -- an inter frame with no key frame behind it finds no saved CDF state
+/// to resume from, one of the live refusals its inventory pins -- and the seat
+/// fails the span in words instead of a panic or a garbage picture: the frames
+/// decoded so far stand, then the channel closes.
+#[test]
+fn a_broken_gop_is_refused_in_words_and_never_a_panic() {
+    // The pieces, off the real fixture: the sequence header OBU the demuxer
+    // injects (the `av1C` payload) and a real inter frame's block bytes.
+    let (_, mut demuxer) = Demuxer::open(&asset("test_av1.mkv")).expect("open test_av1.mkv");
+    let key_au = demuxer.next_access_unit().expect("read").expect("key au");
+    let seq_len = obu_len(&key_au);
+    let seq_header = &key_au[..seq_len];
+    let key_body = &key_au[seq_len..];
+    // The very next access unit is frame 1, a real inter frame: no injection
+    // ahead of a non-sync sample, so its bytes are the block verbatim.
+    let inter_body = demuxer.next_access_unit().expect("read").expect("inter au");
+
+    // The words first, at the decoder's own door: the crafted chunk is
+    // refused, and the refusal is a sentence, not a panic.
+    let mut broken = seq_header.to_vec();
+    broken.extend_from_slice(&inter_body);
+    let refused = ec_av1::stream::decode_stream(&broken)
+        .expect_err("an inter frame with no key frame behind it is refused");
     assert!(
-        !refused.contains("H.264"),
-        "the timeline's own codec is no longer a reason: {refused}"
+        refused.to_string().contains("no saved CDF state"),
+        "the refusal names its reason: {refused}"
     );
-    assert_eq!(session.sources().len(), 1, "a refusal left no row");
+
+    // The same broken stream as a file, through the seat: open succeeds (the
+    // container is valid), the first GOP decodes, the second chunk refuses,
+    // and the span ends cleanly with exactly the pictures decoded so far.
+    let av1c = [0x81u8, 0x00, 0x0C, 0x00];
+    let mut private = av1c.to_vec();
+    private.extend_from_slice(seq_header);
+    let track = el(
+        TRACK_ENTRY,
+        &[
+            uint(TRACK_NUMBER, 1),
+            uint(TRACK_TYPE, 1),
+            el(CODEC_ID, b"V_AV1"),
+            el(CODEC_PRIVATE, &private),
+            uint(DEFAULT_DURATION, 33_333_333),
+            el(VIDEO, &[uint(PIXEL_WIDTH, 1280), uint(PIXEL_HEIGHT, 720)].concat()),
+        ]
+        .concat(),
+    );
+    let cluster = el(
+        CLUSTER,
+        &[
+            uint(CLUSTER_TIMESTAMP, 0),
+            block(1, 0, 0x80, key_body),
+            block(1, 33, 0x80, &inter_body),
+        ]
+        .concat(),
+    );
+    let segment = [
+        el(INFO, &uint(TIMESTAMP_SCALE, 1_000_000)),
+        el(TRACKS, &track),
+        cluster,
+    ]
+    .concat();
+    let file = [
+        el(0x1A45_DFA3, &[]),
+        el(SEGMENT, &segment),
+    ]
+    .concat();
+    let scratch = Scratch::file("broken_gop_av1", "mkv");
+    std::fs::write(&scratch, &file).expect("write fixture");
+
+    let (meta, mut opened) = Demuxer::open(&scratch).expect("the container itself is valid");
+    assert_eq!(meta.codec, Codec::Av1);
+    assert_eq!(meta.frame_count, 2);
+    // Both blocks are key-flagged, so both lead with the injected sequence
+    // header -- which is what makes the second one a chunk boundary, and the
+    // refusal the decoder's own answer to what it finds there.
+    let first = opened.next_access_unit().expect("read").expect("au");
+    assert_eq!((first[0] >> 3) & 0xF, 1);
+
+    // SAFETY: the suite is documented to run with --test-threads=1; the pin
+    // held through the drain, as in every seat test above.
+    unsafe { std::env::set_var("VE_SW", "1") };
+    let (_, rx) = DecodeSession::open(&scratch).expect("open succeeds; the container is fine");
+    let frames: Vec<u32> = rx.into_iter().map(|f| f.index).collect();
+    unsafe { std::env::remove_var("VE_SW") };
+    assert_eq!(frames, vec![0], "the first GOP stands, the broken one refuses");
 }
 
 /// The end-to-end user path: opening the file yields pictures, all of them,
