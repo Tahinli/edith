@@ -253,17 +253,42 @@ fn the_join_carries_no_second_priming_packet() {
 fn a_source_that_disagrees_on_layout_is_refused() {
     // Import refuses these up front (one output device, one *layout*); the copy
     // and the decode paths refuse them again rather than mislabel one esds for
-    // two different tracks. Stream 1 of the multi-audio fixture is 22.05 kHz
-    // mono against the timeline's 44.1 kHz stereo -- its rate is conformed at
-    // the decoder's door now, its layout is what is left to refuse.
-    let mixed = [(asset("test_av.mp4"), 0), (asset("test_multiaudio.mp4"), 1)];
+    // two different tracks. What a *decode* still refuses (c871d71 let a mono
+    // source up-mix, DEBT #46; ceddd4c before it conformed the rate) is a
+    // source **wider** than the timeline -- a stereo source on a mono one is
+    // the same refusal read the other way. Stream 1 of the multi-audio fixture
+    // is the shape that stopped being a refusal: 22.05 kHz mono against a
+    // 44.1 kHz stereo timeline. The decode path widens and resamples it; the
+    // copy path still refuses it, because copied packets can be neither
+    // widened nor resampled and one esds cannot declare two tracks.
+    let mono = [(asset("test_av.mp4"), 0), (asset("test_multiaudio.mp4"), 1)];
     let segs = [(Some(0), 0.0, 1.0), (Some(1), 0.0, 1.0)];
-    // (`.err()`, not `unwrap_err`: neither Ok payload is `Debug`.)
+    let msg = AudioSession::copy_multi_streams(&mono, &segs)
+        .err()
+        .expect("copied packets cannot be widened or resampled")
+        .to_string();
+    assert!(msg.contains("source 1"), "{msg}");
+    // (`.expect` twice: neither Ok payload is `Debug`.)
+    let (_, rx) = AudioSession::open_multi_streams(&mono, &segs)
+        .expect("a mono source at another rate is conformed, not refused")
+        .expect("the first source has an audio track");
+    let (samples, _, _) = drain(rx);
+    let frames = samples.len() / CHANNELS;
+    assert!(
+        (frames as i64 - 2 * RATE as i64).unsigned_abs() < PACKET,
+        "{frames} frames for two seconds"
+    );
+    assert!(samples.iter().any(|s| *s != 0.0), "the widened stream plays");
+
+    // The refusal that is left, in both paths, in words that name the source:
+    // stereo onto a timeline whose first source is mono. (`test_audio_only`
+    // is 44.1 kHz *mono* -- no rate in the way, only the width.)
+    let wide = [(asset("test_audio_only.mp4"), 0), (asset("test_av.mp4"), 0)];
     for e in [
-        AudioSession::copy_multi_streams(&mixed, &segs).err(),
-        AudioSession::open_multi_streams(&mixed, &segs).err(),
+        AudioSession::copy_multi_streams(&wide, &segs).err(),
+        AudioSession::open_multi_streams(&wide, &segs).err(),
     ]
-    .map(|e| e.expect("a source at another rate must be refused"))
+    .map(|e| e.expect("a source wider than the timeline must be refused"))
     {
         let msg = e.to_string();
         assert!(msg.contains("source 1"), "{msg}");
