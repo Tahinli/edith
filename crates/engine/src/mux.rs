@@ -2258,7 +2258,7 @@ mod tests {
                 pcm.push(s);
             }
         }
-        let mut encoder = rusty_aac::AacEncoder::new(rusty_aac::AacEncoderConfig::default());
+        let mut encoder = ec_aac::AacEncoder::new(ec_aac::AacEncoderConfig::default());
         encoder.push_pcm(&pcm, channels, rate).unwrap();
         encoder.finish();
         let mut packets = Vec::new();
@@ -2346,6 +2346,94 @@ mod tests {
         let rms = (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt();
         assert!(rms > 0.1, "the tone came back silent (rms {rms})");
         std::fs::remove_file(&out).unwrap();
+    }
+
+    /// The seat an export encodes with, at every width the Matroska muxer can
+    /// carry: a track it encoded comes back through the project's own decode
+    /// door -- symphonia's reader for mono and stereo, the family's own
+    /// `ec-aac` decoder for 5.1, which is where the decode splits -- with its
+    /// rate and loudness intact, no delivered channel silent. A width wider
+    /// than a pair arrives folded to stereo ([`crate::audio::downmix`] at the
+    /// decoder's door), so the 5.1 leg asserts the pair, not the six.
+    #[test]
+    fn a_seat_encoded_track_round_trips_at_mono_stereo_and_five_one_widths() {
+        let sequence = obu(1, &[0x11, 0x22, 0x33]);
+        let mut key = sequence.clone();
+        key.extend_from_slice(&obu(6, &[0xAA; 8]));
+        let inter = obu(6, &[0xBB; 5]);
+        for (channels, name) in [(1u16, "mono"), (2, "stereo"), (6, "5.1")] {
+            let packets = tone_packets(48_000, channels);
+            let heard: usize = packets.iter().map(|p| p.samples as usize).sum();
+
+            let out = Scratch::file("ve_mkv_seat_widths", "mkv");
+            let mut muxer = MkvMuxer::create(
+                &out,
+                &Av1Params {
+                    width: 640,
+                    height: 360,
+                    frame_rate: 30.0,
+                    config: av1_sequence_header(&key).unwrap(),
+                },
+                Some((
+                    &AudioParams {
+                        freq_index: 3, // 48000
+                        chan_conf: channels as u8,
+                        sample_rate: 48_000,
+                        opus_pre_skip: None,
+                    },
+                    packets,
+                )),
+                Vec::new(),
+            )
+            .unwrap();
+            muxer.write_frame(&key, true).unwrap();
+            for _ in 0..14 {
+                muxer.write_frame(&inter, false).unwrap();
+            }
+            muxer.finish().unwrap();
+
+            // What the door reports: the file's own width, folded to a pair
+            // for anything wider -- the door's contract, not a defect.
+            let want = channels.min(2);
+            let probe = crate::audio::AudioSession::probe(&out, 0)
+                .unwrap()
+                .expect("the file has an audio track");
+            assert_eq!(
+                (probe.sample_rate, probe.channels),
+                (48_000, want),
+                "{name}: probed with the wrong shape"
+            );
+            let (audio, chunks) = crate::audio::AudioSession::open(&out)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{name}: track decodes through the project's own reader"));
+            assert_eq!(
+                (audio.sample_rate, audio.channels),
+                (48_000, want),
+                "{name}: opened with the wrong shape"
+            );
+            let samples: Vec<f32> = chunks.into_iter().flat_map(|c| c.samples).collect();
+            let frames = samples.len() / usize::from(want);
+            assert!(
+                frames + 1024 >= heard && frames <= heard + 2048,
+                "{name}: {frames} frames read back of {heard} written"
+            );
+            // Every delivered channel carries the tone -- a fold that lost a
+            // side or a dead decoder would starve one of these.
+            for c in 0..usize::from(want) {
+                let n = samples.len() / usize::from(want);
+                let rms = (samples
+                    .iter()
+                    .skip(c)
+                    .step_by(usize::from(want))
+                    .take(n)
+                    .map(|s| s * s)
+                    .sum::<f32>()
+                    / n as f32)
+                    .sqrt();
+                assert!(rms > 0.05, "{name}: channel {c} came back silent (rms {rms})");
+            }
+            std::fs::remove_file(&out).unwrap();
+        }
     }
 
     /// The same stream in the other container: AV1 into an mp4, whose `av01`

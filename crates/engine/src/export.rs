@@ -21,7 +21,7 @@
 //! through the encoder exactly as it always did. Where the *sound* cannot be
 //! copied — a second audio lane to mix in, a speeded clip, an
 //! equalized one, a source that is not AAC inside an mp4's own sample table —
-//! the sound is decoded, mixed and encoded again with `rusty_aac`
+//! the sound is decoded, mixed and encoded again with `ec-aac`
 //! ([`encode_audio`]). The audio-only formats have no such split: `hound` writes
 //! PCM, `flacenc` encodes FLAC, `rusty_mp3` encodes MP3 and `rusty_vorbis`
 //! encodes Vorbis, so those are always *decoded* out of the timeline. The worker owns everything: the caller gets an
@@ -159,7 +159,7 @@ const HEVC_QP_MAX: i32 = 40;
 /// WAV, FLAC, MP3 and Ogg Vorbis are the standalone audio formats with a
 /// pure-Rust encoder: `hound`, `flacenc`, `rusty_mp3` and `rusty_vorbis`. Opus
 /// still has none -- `oxideav-opus` encodes CELT alone, which is half a codec.
-/// (AAC has one too -- `rusty_aac`, which is what a re-encoded video track's
+/// (AAC has one too -- `ec-aac`, which is what a re-encoded video track's
 /// sound leaves through -- but AAC is a container's own audio, never a file of
 /// its own here.) VP9 and VP8 are the
 /// codecs that come in through the plugin and stop there, HEVC having
@@ -864,7 +864,7 @@ fn audio_label(
             // has the test), which is why the condition is in this comment
             // instead of in the string.
             false if format.is_mkv() => "Opus · SW encode (ec-opus)",
-            false => "AAC · SW encode (rusty_aac)",
+            false => "AAC · SW encode (ec-aac)",
         },
     }
 }
@@ -889,7 +889,7 @@ fn measured_audio_label(
         // Encoded, into a container that would have carried Opus, and it is not
         // Opus: the fidelity gate sent it to AAC ([`OPUS_MIN_FIDELITY`]), or
         // the mix was not 48 kHz at a width the seat is measured in.
-        (Some(false), false) if format.is_mkv() => "AAC · SW encode (rusty_aac)",
+        (Some(false), false) if format.is_mkv() => "AAC · SW encode (ec-aac)",
         // `sound` is already what happened, not a prediction, so `copied` is
         // filled in and `ranged` never reaches the branch that reads it.
         _ => audio_label(project, format, sound.is_some(), sound, false),
@@ -1940,9 +1940,10 @@ impl CopyPlan {
 /// the sound starts at timeline frame 0 as a copied track's does.
 ///
 /// corner-cut: the mix sits in memory as f32 before it is encoded (~46 MB a
-/// minute of 48 kHz stereo), for [`run_audio`]'s reason -- `rusty_aac` buffers
-/// the whole stream anyway, since it encodes its frames in parallel. Upgrade
-/// path is a chunked push once that encoder streams.
+/// minute of 48 kHz stereo), for [`run_audio`]'s reason -- sizing the track
+/// against the timeline, publishing the mix third of the bar as it goes and
+/// answering a cancel before the encode are whole-mix concerns here. The
+/// upgrade path is a chunked push: `ec_aac`'s encoder itself streams.
 fn encode_audio(
     project: &Project,
     meta: &VideoMeta,
@@ -1977,7 +1978,7 @@ fn encode_audio(
     else {
         return Ok(None); // no audio to write, exactly as a copy of nothing is
     };
-    let freq_index = rusty_aac::sf_index_for_rate(audio.sample_rate).ok_or_else(|| {
+    let freq_index = ec_aac::sf_index_for_rate(audio.sample_rate).ok_or_else(|| {
         format!(
             "{} Hz is not an AAC sample rate: export WAV, FLAC, MP3 or OGG, which write it as \
              it is",
@@ -2058,7 +2059,7 @@ fn encode_audio(
 
     // The caller's rate, never the encoder's own 128 default -- see
     // [`DEFAULT_AUDIO_KBPS`] for why the untouched figure is 256.
-    let mut encoder = rusty_aac::AacEncoder::new(rusty_aac::AacEncoderConfig {
+    let mut encoder = ec_aac::AacEncoder::new(ec_aac::AacEncoderConfig {
         bitrate_bps: kbps * 1_000,
         ..Default::default()
     });
