@@ -256,6 +256,75 @@ fn a_seek_into_his_film_lands_on_the_second_it_asked_for() {
     }
 }
 
+/// The 5.1 **AAC** film: the multichannel seat `ec-aac` took from the vendored
+/// `rusty_aac`, exercised on the kind of track it exists for -- a BluRay
+/// remux's 48 kHz AAC-LC 5.1, decoded, folded to the pair the timeline
+/// carries, seeked across the film, and correlated against ffmpeg's own decode
+/// of the same window. A wrong channel order, a wrong rate, or a fold that
+/// lost a side all move the correlation; a seat that refuses the track fails
+/// the open.
+///
+/// Skipped, not failed, where the film or ffmpeg is not -- it is a 4K remux
+/// named by the local `real_library.toml`, not a fixture in this repository.
+#[test]
+fn a_seek_into_his_five_one_aac_film_lands_on_the_second_it_asked_for() {
+    let Some(film) = engine::real_library::film("hevc_4k_pgs") else {
+        return;
+    };
+    if std::process::Command::new("ffmpeg")
+        .arg("-version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| !s.success())
+        .unwrap_or(true)
+    {
+        eprintln!("skipped: no ffmpeg to decode the reference window with");
+        return;
+    }
+    const SEARCH: f64 = 5.0;
+    for want in [600.0, 2400.0, 5400.0] {
+        let (meta, rx) = AudioSession::open_at(&film, want)
+            .expect("open")
+            .expect("the film has audio");
+        assert_eq!(meta.sample_rate, 48_000);
+        assert_eq!(meta.channels, 2, "5.1 reaches the timeline as a pair");
+        let rate = f64::from(meta.sample_rate);
+        let channels = usize::from(meta.channels);
+        let mut probe: Vec<f32> = Vec::with_capacity(meta.sample_rate as usize);
+        for chunk in &rx {
+            probe.extend(
+                chunk
+                    .samples
+                    .chunks_exact(channels)
+                    .map(|f| f.iter().sum::<f32>() / channels as f32),
+            );
+            if probe.len() >= meta.sample_rate as usize {
+                break;
+            }
+        }
+        drop(rx);
+        probe.truncate(meta.sample_rate as usize);
+        assert_eq!(probe.len(), meta.sample_rate as usize, "a second to locate");
+
+        let from = want - SEARCH;
+        let reference = ffmpeg_mono(&film, from, 2.0 * SEARCH + 2.0, meta.sample_rate);
+        let (lag, score) = best_lag(&probe, &reference);
+        let at = from + lag as f64 / rate;
+        eprintln!("asked {want}s, content at {at:.3}s (correlation {score:.3})");
+        assert!(
+            score > 0.5,
+            "asked {want}s: nothing in the reference window correlates ({score:.3}) -- \
+             the measurement, not the seek, is what failed"
+        );
+        assert!(
+            (at - want).abs() <= 0.05,
+            "asked {want}s, heard {at:.3}s -- {:+.3}s of sound against picture",
+            at - want
+        );
+    }
+}
+
 /// `dur` seconds of `path`'s first audio track from `start`, decoded by ffmpeg,
 /// summed to mono at `rate`. The reference this engine's own landing is measured
 /// against, because a decoder cannot be its own witness about where it landed.

@@ -35,7 +35,9 @@ const SW_CODECS: [(&str, &str, bool, bool); 10] = [
     ("H.264", "ec-h264", true, true),
     ("HEVC", "oxideav-h265 intra", false, true),
     ("AV1", "rav1e", false, true),
-    ("AAC", "rusty_aac", true, true),
+    // Decode is split by width: symphonia carries stereo and narrower, `ec-aac`
+    // everything wider; the encoder is `rusty_aac`.
+    ("AAC", "symphonia / ec-aac / rusty_aac", true, true),
     ("MP3", "symphonia / rusty_mp3", true, true),
     ("FLAC", "symphonia / flacenc", true, true),
     ("PCM", "symphonia / hound", true, true),
