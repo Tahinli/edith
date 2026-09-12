@@ -19,7 +19,7 @@ use crate::audio::AudioChunk;
 /// straddles zero, so silence draws as a flat line.
 ///
 /// Decoding the whole file runs at ~1700x realtime for an mp4's stereo AAC and
-/// ~50x for a film's 5.1 AAC in an mkv (six channels through `rusty_aac`), but
+/// ~260x for a film's 5.1 AAC in an mkv (six channels through `ec-aac`), but
 /// it is linear in source length either way: callers cache the result per source
 /// *and stream* — two streams of one file are two different envelopes, and a
 /// cache keyed on the path alone would draw the first one under both. Memory is

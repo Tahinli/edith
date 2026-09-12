@@ -58,18 +58,21 @@ ec-h264 = { path = "../../../edith_codecs/crates/ec-h264" }
 # Its shared IR (packets, frames, the registry decoder contract the seat is
 # written against), direct because decode.rs names those types itself.
 ec-core = { path = "../../../edith_codecs/crates/ec-core" }
-# Both halves of AAC, and the only crate here that is asked for both. The
-# *encoder*, so an mp4's sound can be a mix rather than a copy: an equalized (or
-# otherwise processed) lane has to be decoded, and what is decoded has to be
-# encoded again. The *decoder*, because symphonia's own refuses anything wider
-# than stereo outright (`aac/mod.rs:93`, "aac: aac too complex") and a 5.1 film
-# soundtrack in an mkv is exactly that -- this one hands 5.1 back already
-# reordered into FL, FR, FC, LFE, BL, BR, which is the order the downmix in
-# `audio` folds. Pure Rust with no C or FFI, Apache-2.0, the same Mata Network
-# family the retired `rusty_h264` came from. Nothing else in the ecosystem
-# encodes AAC without linking
-# Fraunhofer's C library, which this project's no-install rule forbids. Built
-# from `vendor/rusty_aac` -- see the patch table in the workspace manifest.
+# The multichannel AAC decode seat: symphonia's own refuses anything wider than
+# stereo outright (`aac/mod.rs:93`, "aac: aac too complex"), and a 5.1 or 7.1
+# film soundtrack is exactly that. `ec-aac`, the family's own decoder, took the
+# seat the vendored `rusty_aac` held -- it hands 5.1 back already reordered
+# into FL, FR, FC, LFE, BL, BR, the order the downmix in `audio` folds, the
+# same one the seat always delivered.
+ec-aac = { path = "../../../edith_codecs/crates/ec-aac" }
+# The AAC *encoder*, and its last seat in the tree: so an mp4's sound can be a
+# mix rather than a copy, an equalized (or otherwise processed) lane has to be
+# decoded, and what is decoded has to be encoded again. Pure Rust with no C or
+# FFI, Apache-2.0, the same Mata Network family the retired `rusty_h264` came
+# from. Nothing else in the ecosystem encodes AAC without linking Fraunhofer's
+# C library, which this project's no-install rule forbids. Built from
+# `vendor/rusty_aac` -- see the patch table in the workspace manifest. Its
+# *decoder* left the tree when `ec-aac` above took the multichannel seat.
 rusty_aac = "0.5"
 # The MP3 encoder, so that format is a row a user can pick rather than a licence
 # note: pure Rust, Apache-2.0, CBR and VBR. The decoder side of mp3 is
