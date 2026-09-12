@@ -42,7 +42,7 @@ const SW_CODECS: [(&str, &str, bool, bool); 10] = [
     ("MP3", "symphonia / rusty_mp3", true, true),
     ("FLAC", "symphonia / flacenc", true, true),
     ("PCM", "symphonia / hound", true, true),
-    ("AC-3", "oxideav-ac3", true, false),
+    ("AC-3", "ec-ac3", true, false),
     ("Vorbis", "symphonia / rusty_vorbis", true, true),
     ("ALAC", "symphonia", true, false),
 ];
@@ -164,7 +164,7 @@ mod tests {
         }
         // Decode-only crates must not read as encoders, and the seat words are
         // the only thing saying which is which.
-        assert!(line.contains("AC-3 dec (oxideav-ac3)"));
+        assert!(line.contains("AC-3 dec (ec-ac3)"));
         assert!(line.contains("H.264 dec+enc (ec-h264)"));
         assert!(line.contains("HEVC enc (oxideav-h265 intra)"));
     }
