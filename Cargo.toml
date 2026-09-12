@@ -7,7 +7,6 @@ exclude = [
     "vendor/cros-codecs",
     "vendor/rusty_aac",
     "vendor/oxideav-h265",
-    "vendor/rusty_h264-common",
     "vendor/mp4",
 ]
 
@@ -17,7 +16,7 @@ edition = "2024"
 
 # Five upstream crates vendored verbatim except for one clearly marked fix each,
 # all blockers on this machine and all still unfixed upstream as of
-# 0.0.6/0.0.13/0.5.0/0.0.9/0.9.1:
+# 0.0.6/0.0.13/0.5.0/0.0.9/0.14:
 #   cros-libva  - fails to build against libva >= 1.23 headers
 #   cros-codecs - probes VA-API with a 16x16 context that Mesa radeonsi refuses;
 #                 and creates every decode context as 8-bit 4:2:0, which no HEVC
@@ -66,21 +65,6 @@ edition = "2024"
 #                 69bde5a6e, and it is a plain path dependency (no
 #                 `[patch.crates-io]` line) because nothing else in the tree
 #                 asks for it.
-#   rusty_h264-common - declares `rusty_alloc` (its authors' own mimalloc
-#                 remake) as the `#[global_allocator]` of whatever application
-#                 links it, under a feature that `rusty_h264-{decoder,encoder}`
-#                 turn on from *their* defaults, so no downstream feature choice
-#                 can decline it. It crashed us: under sustained ruler scrubbing
-#                 edith churns decode-worker threads, and that allocator
-#                 segfaulted inside `span_from_segments` on a new thread's first
-#                 allocation (two cores, 2026-08-13). The patch is the feature
-#                 default and the six-line declaration in `src/lib.rs`; every
-#                 line of codec code is byte-identical to 0.9.1, so decode stays
-#                 bit-exact and the process gets glibc's malloc back.
-#                 (Since 2026-09-12 only the software H.264 *encode* seat
-#                 still links this crate -- decode is `ec-h264`, which carries
-#                 no allocator of its own; the patch stays until the encode
-#                 seat moves too.)
 #   mp4         - reads the `mp4a` sample entry as ISO only: the 8 bytes
 #                 QuickTime uses for version/revision/vendor are skipped as
 #                 reserved, so a version-1 SoundDescription's 16-byte tail
@@ -89,12 +73,16 @@ edition = "2024"
 #                 AAC track "with no esds", every Resolve / Final Cut / `ffmpeg
 #                 -f mov` file silent. The patch is `Mp4aBox::read_box` and a
 #                 `WaveBox` fourcc; writing is untouched.
-# Drop `vendor/` entirely once released versions handle all six.
+# A sixth, `rusty_h264-common`, left the tree on 2026-09-12 with the last
+# `rusty_h264` seat: it was vendored only to declaw `rusty_alloc` -- its
+# authors' allocator installed itself as the process `#[global_allocator]` and
+# segfaulted the editor on a new thread's first allocation -- and once
+# `ec-h264` carried both H.264 seats there was nothing left to patch.
+# Drop `vendor/` entirely once released versions handle all five.
 [patch.crates-io]
 cros-libva = { path = "vendor/cros-libva" }
 cros-codecs = { path = "vendor/cros-codecs" }
 rusty_aac = { path = "vendor/rusty_aac" }
-rusty_h264-common = { path = "vendor/rusty_h264-common" }
 # Drops the `pub use proc_macro;` re-export (E0365 future-incompat, rustc
 # warns on every workspace build); nothing in the crate or its users names it.
 proc-macro-error2 = { path = "vendor/proc-macro-error2" }

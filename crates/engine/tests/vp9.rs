@@ -56,7 +56,7 @@ fn the_demuxer_reports_a_vp9_track() {
 }
 
 /// There is no software VP9 decoder, so the software path must refuse by name
-/// rather than feed VP9 bytes to `rusty_h264` -- and it must refuse where a
+/// rather than feed VP9 bytes to `ec-h264` -- and it must refuse where a
 /// caller can still show it, i.e. out of `open`, not from inside the worker.
 #[test]
 fn the_software_path_refuses_vp9_by_name() {
