@@ -5,7 +5,6 @@ members = ["crates/engine", "crates/engine-hw", "crates/engine-audio", "crates/a
 exclude = [
     "vendor/cros-libva",
     "vendor/cros-codecs",
-    "vendor/rusty_aac",
     "vendor/oxideav-h265",
     "vendor/mp4",
 ]
@@ -14,9 +13,9 @@ exclude = [
 version = "0.1.0"
 edition = "2024"
 
-# Five upstream crates vendored verbatim except for one clearly marked fix each,
+# Four upstream crates vendored verbatim except for one clearly marked fix each,
 # all blockers on this machine and all still unfixed upstream as of
-# 0.0.6/0.0.13/0.5.0/0.0.9/0.14:
+# 0.0.6/0.0.13/0.0.9/0.14:
 #   cros-libva  - fails to build against libva >= 1.23 headers
 #   cros-codecs - probes VA-API with a 16x16 context that Mesa radeonsi refuses;
 #                 and creates every decode context as 8-bit 4:2:0, which no HEVC
@@ -47,13 +46,6 @@ edition = "2024"
 #                 (2.2 GB over a 719-frame export). Both are fixed in place
 #                 and marked LOCAL PATCH
 
-#   rusty_aac   - its *decoder* runs the direct O(N²) IMDCT with a `cos` call per
-#                 term (the fast path in the same file serves the encoder only),
-#                 which is 4x slower than real time for 5.1 and therefore not
-#                 playable at all; the patch routes the IMDCT through the same
-#                 N/4-point FFT the encoder's MDCT already uses (`dsp::dct4`),
-#                 40x the matrix version it started as -- 2 hours of 5.1 for a
-#                 waveform in 2.4 minutes rather than an hour
 #   oxideav-h265 - its intra encoder writes `conformance_window_flag = 0` and
 #                 refuses any dimension that is not a multiple of the 16-sample
 #                 CTB, so 1920x1080 could not be written at all; the patch adds
@@ -78,11 +70,17 @@ edition = "2024"
 # authors' allocator installed itself as the process `#[global_allocator]` and
 # segfaulted the editor on a new thread's first allocation -- and once
 # `ec-h264` carried both H.264 seats there was nothing left to patch.
-# Drop `vendor/` entirely once released versions handle all five.
+#   rusty_aac   - a seventh vendor whose whole entry left with its last seat:
+#                 `ec-aac`, the family's own, took the *encode* seat on
+#                 2026-09-13 after already carrying the decode one, and the
+#                 vendored crate went with them. Its patch had routed the
+#                 decoder's O(N^2) IMDCT through the encoder's N/4-point FFT
+#                 (`dsp::dct4`, 40x the matrix version) so 5.1 was playable at
+#                 all -- a fix for a crate the tree no longer carries.
+# Drop `vendor/` entirely once released versions handle all four.
 [patch.crates-io]
 cros-libva = { path = "vendor/cros-libva" }
 cros-codecs = { path = "vendor/cros-codecs" }
-rusty_aac = { path = "vendor/rusty_aac" }
 # Drops the `pub use proc_macro;` re-export (E0365 future-incompat, rustc
 # warns on every workspace build); nothing in the crate or its users names it.
 proc-macro-error2 = { path = "vendor/proc-macro-error2" }
