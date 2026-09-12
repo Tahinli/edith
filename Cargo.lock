@@ -1597,6 +1597,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ec-ac3"
+version = "0.1.0"
+dependencies = [
+ "ec-core",
+ "ec-dsp",
+]
+
+[[package]]
 name = "ec-av1"
 version = "0.1.0"
 dependencies = [
@@ -1705,6 +1713,7 @@ name = "engine"
 version = "0.1.0"
 dependencies = [
  "ec-aac",
+ "ec-ac3",
  "ec-av1",
  "ec-core",
  "ec-h264",
@@ -1716,7 +1725,6 @@ dependencies = [
  "libloading",
  "miniz_oxide",
  "mp4",
- "oxideav-ac3",
  "oxideav-ass",
  "oxideav-core",
  "oxideav-h265",
@@ -4013,15 +4021,6 @@ checksum = "9aa2b01e1d916879f73a53d01d1d6cee68adbb31d6d9177a8cfce093cced1d50"
 dependencies = [
  "futures-core",
  "pin-project-lite",
-]
-
-[[package]]
-name = "oxideav-ac3"
-version = "0.0.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4c60744c9688507efb6849b1bff197fb17e742b56f8a7f914129464bc86197ad"
-dependencies = [
- "oxideav-core",
 ]
 
 [[package]]
