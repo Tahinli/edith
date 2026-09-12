@@ -92,7 +92,7 @@ fn every_sync_sample_carries_annex_b_vps_sps_and_pps() {
 }
 
 /// There is no software HEVC decoder, so the software path must refuse by name
-/// rather than feed HEVC bytes to `rusty_h264` -- and it must refuse where a
+/// rather than feed HEVC bytes to `ec-h264` -- and it must refuse where a
 /// caller can still show it, i.e. out of `open`, not from inside the worker.
 #[test]
 fn the_software_path_refuses_hevc_by_name() {

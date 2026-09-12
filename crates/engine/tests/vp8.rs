@@ -53,7 +53,7 @@ fn the_demuxer_reports_a_vp8_track() {
 }
 
 /// There is no software VP8 decoder *in this binary*, so the software path
-/// must refuse by name rather than feed VP8 bytes to `rusty_h264` -- and it
+/// must refuse by name rather than feed VP8 bytes to `ec-h264` -- and it
 /// must refuse where a caller can still show it, i.e. out of `open`, not from
 /// inside the worker. The decoder the refusal names is the plugin's libvpx
 /// arm, which is why the sentence names the plugin and not a nonexistent

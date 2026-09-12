@@ -9,12 +9,16 @@
 //! ```
 //!
 //! The round trip goes out through the plugin and back in through the *software*
-//! decoder (`rusty_h264` directly, not `DecodeSession`), so a bug on one side
-//! cannot cancel out a bug on the other.
+//! decoder (`ec-h264` driven by hand, not `DecodeSession`), so a bug in the
+//! session plumbing cannot cancel out a plugin bug; the independent witness for
+//! the stream's well-formedness is ffmpeg, in the export suite.
 
 use std::time::{Duration, Instant};
 
 use engine::hw::{HwEncoder, HwPicture, HwSession};
+use ec_core::registry::{CodecId, CodecParameters, Decoder as _};
+use ec_core::{Packet, TimeBase};
+use ec_h264::H264Decoder;
 
 const FPS: u32 = 30;
 const BITRATE: u64 = 4_000_000;
@@ -64,10 +68,88 @@ fn encode(width: u32, height: u32, count: u32) -> Option<(Vec<u8>, u32)> {
     Some((stream, units))
 }
 
-fn decode(stream: &[u8]) -> Vec<rusty_h264::YuvFrame> {
-    rusty_h264::Decoder::new()
-        .decode_stream(stream)
-        .expect("software decode of the hardware-encoded stream")
+fn decode(stream: &[u8]) -> Vec<Decoded> {
+    let mut decoder =
+        H264Decoder::new(CodecParameters::new(CodecId::H264)).expect("ec-h264 takes its codec id");
+    let mut frames = Vec::new();
+    for au in access_units(stream) {
+        decoder
+            .send_packet(&Packet::new(0, TimeBase::new(1, 1), au.as_slice()))
+            .expect("software decode of the hardware-encoded stream");
+        collect(&mut decoder, &mut frames);
+    }
+    decoder
+        .flush()
+        .expect("flush of the hardware-encoded stream");
+    collect(&mut decoder, &mut frames);
+    frames
+}
+
+/// Takes everything the decoder has released so far.
+fn collect(decoder: &mut H264Decoder, frames: &mut Vec<Decoded>) {
+    while let Ok(frame) = decoder.receive_frame() {
+        let ec_core::frame::Frame::Video(pic) = frame else {
+            continue;
+        };
+        frames.push(Decoded {
+            width: pic.width as usize,
+            height: pic.height as usize,
+            y: pic.planes[0].data[..].to_vec(),
+            u: pic.planes[1].data[..].to_vec(),
+            v: pic.planes[2].data[..].to_vec(),
+        });
+    }
+}
+
+/// One decoded picture as plain planes, whatever the decoder calls them.
+struct Decoded {
+    width: usize,
+    height: usize,
+    y: Vec<u8>,
+    u: Vec<u8>,
+    v: Vec<u8>,
+}
+
+/// Splits an Annex-B stream into access units: a new one at each slice NAL
+/// that follows a picture, parameter sets and SEI riding with the slice that
+/// follows them. The plugin emits one AU per picture; the split exists so the
+/// decoder sees the packet shape a demuxer hands it for a file.
+fn access_units(stream: &[u8]) -> Vec<Vec<u8>> {
+    // (offset of the start code, its length); the sentinel ends the last NAL.
+    let mut bounds: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i + 2 < stream.len() {
+        if stream[i] == 0 && stream[i + 1] == 0 && stream[i + 2] == 1 {
+            bounds.push(if i > 0 && stream[i - 1] == 0 {
+                (i - 1, 4)
+            } else {
+                (i, 3)
+            });
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    bounds.push((stream.len(), 0));
+    let mut aus: Vec<Vec<u8>> = Vec::new();
+    let mut current: Vec<u8> = Vec::new();
+    let mut has_slice = false;
+    for pair in bounds.windows(2) {
+        let (at, sc) = pair[0];
+        let nal = &stream[at..pair[1].0];
+        let kind = nal[sc] & 0x1f;
+        let slice = kind == 1 || kind == 5;
+        if slice && has_slice {
+            aus.push(std::mem::take(&mut current));
+            has_slice = false;
+        }
+        current.extend_from_slice(nal);
+        has_slice |= slice;
+    }
+    if !current.is_empty() {
+        aus.push(current);
+    }
+    aus
 }
 
 fn mean_abs_diff(a: &[u8], b: &[u8]) -> f64 {

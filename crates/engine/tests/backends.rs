@@ -50,7 +50,7 @@ fn an_h264_source_probes_as_one_of_the_two_seats() {
 
 /// HEVC has no software decoder here at all. A box with the plugin answers
 /// hardware; a box without it is refused by name -- and *never* told that
-/// `rusty_h264` will take it, which is the one answer that would be a lie.
+/// `ec-h264` will take it, which is the one answer that would be a lie.
 #[test]
 fn hevc_probes_as_hardware_or_as_a_refusal() {
     match probe(&asset("test_hevc.mkv")) {
@@ -96,7 +96,7 @@ fn a_playing_session_reports_the_seat_the_probe_named() {
 /// about the machine, which is exactly what this whole surface is for.
 ///
 /// Every picture format, because each one is a different pair of seats: H.264
-/// through `rusty_h264` or the plugin, and AV1 through `rav1e` in either
+/// through `ec-h264` or the plugin, and AV1 through `rav1e` in either
 /// container -- a container is not an encoder, and the card must not say it is.
 #[test]
 fn the_planned_encoders_are_the_ones_the_job_opens() {
