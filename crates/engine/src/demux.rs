@@ -137,12 +137,12 @@ impl Codec {
 
     /// Why a file can be refused outright. Two true answers, one per shape of
     /// "no decoder here": every codec but H.264 and VP8 has no software
-    /// decoder at all, so the refusal names the plugin as the only way; VP8's
-    /// software decoder *is* libvpx inside the plugin, so "there is no
-    /// software decoder" would be a lie the day the plugin grew that arm --
-    /// the refusal keeps naming the plugin, because that is still the thing
-    /// to make present. Shared so playback and export refuse in the same
-    /// words.
+    /// decoder at all (H.264's is the native `ec-h264`), so the refusal names
+    /// the plugin as the only way; VP8's software decoder *is* libvpx inside
+    /// the plugin, so "there is no software decoder" would be a lie the day
+    /// the plugin grew that arm -- the refusal keeps naming the plugin,
+    /// because that is still the thing to make present. Shared so playback
+    /// and export refuse in the same words.
     pub fn needs_plugin(self) -> String {
         match self {
             Self::Vp8 => {

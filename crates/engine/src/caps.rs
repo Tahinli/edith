@@ -17,7 +17,7 @@
 //! never the GPU's. [`HW_CODECS`] does not carry the bit, because this file's
 //! one job is not presenting a seat as a GPU feat that no GPU has.
 
-use crate::hw::{CAP_AV1, CAP_H264, CAP_HEVC, CAP_VP9, VhCaps};
+use crate::hw::{VhCaps, CAP_AV1, CAP_H264, CAP_HEVC, CAP_VP9};
 
 /// The codecs a hardware line can name, in the order it lists them.
 const HW_CODECS: [(u32, &str); 4] = [
@@ -32,7 +32,7 @@ const HW_CODECS: [(u32, &str); 4] = [
 /// because the answer to "why is my HEVC file so large" is `oxideav-h265
 /// intra`, and the row that says so is the row that answers it.
 const SW_CODECS: [(&str, &str, bool, bool); 10] = [
-    ("H.264", "rusty_h264", true, true),
+    ("H.264", "ec-h264 / rusty_h264", true, true),
     ("HEVC", "oxideav-h265 intra", false, true),
     ("AV1", "rav1e", false, true),
     ("AAC", "rusty_aac", true, true),
@@ -154,8 +154,6 @@ mod tests {
     }
 
     #[test]
-
-    #[test]
     fn the_software_line_names_every_encoder_this_build_carries() {
         let line = software();
         for name in ["rusty_h264", "oxideav-h265 intra", "rav1e", "rusty_aac"] {
@@ -164,7 +162,7 @@ mod tests {
         // Decode-only crates must not read as encoders, and the seat words are
         // the only thing saying which is which.
         assert!(line.contains("AC-3 dec (oxideav-ac3)"));
-        assert!(line.contains("H.264 dec+enc (rusty_h264)"));
+        assert!(line.contains("H.264 dec+enc (ec-h264 / rusty_h264)"));
         assert!(line.contains("HEVC enc (oxideav-h265 intra)"));
     }
 }
