@@ -1589,6 +1589,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
+name = "ec-core"
+version = "0.1.0"
+
+[[package]]
+name = "ec-h264"
+version = "0.1.0"
+dependencies = [
+ "ec-core",
+ "ec-h264-syntax",
+ "wide 1.7.0",
+]
+
+[[package]]
+name = "ec-h264-syntax"
+version = "0.1.0"
+dependencies = [
+ "ec-core",
+]
+
+[[package]]
 name = "edith"
 version = "0.1.0"
 dependencies = [
@@ -1636,6 +1656,8 @@ checksum = "66b7e2430c6dff6a955451e2cfc438f09cea1965a9d6f87f7e3b90decc014099"
 name = "engine"
 version = "0.1.0"
 dependencies = [
+ "ec-core",
+ "ec-h264",
  "flacenc",
  "hound",
  "image",
@@ -5149,7 +5171,7 @@ name = "rusty_h264-common"
 version = "0.9.1"
 dependencies = [
  "bytemuck",
- "wide",
+ "wide 0.7.33",
 ]
 
 [[package]]
@@ -5228,6 +5250,15 @@ name = "safe_arch"
 version = "0.7.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "96b02de82ddbe1b636e6170c21be622223aea188ef2e139be0a5b219ec215323"
+dependencies = [
+ "bytemuck",
+]
+
+[[package]]
+name = "safe_arch"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "42c6efa15875e6ecb39ca61fb0b0c1a40b84fac5a5ffe71eef7d1000c8eb3f5f"
 dependencies = [
  "bytemuck",
 ]
@@ -7077,7 +7108,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ce5da8ecb62bcd8ec8b7ea19f69a51275e91299be594ea5cc6ef7819e16cd03"
 dependencies = [
  "bytemuck",
- "safe_arch",
+ "safe_arch 0.7.4",
+]
+
+[[package]]
+name = "wide"
+version = "1.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8cf05ca94c9fba0c51316899caa1d1e74a064fc310a5efa7375e614343d415be"
+dependencies = [
+ "bytemuck",
+ "safe_arch 1.2.0",
 ]
 
 [[package]]

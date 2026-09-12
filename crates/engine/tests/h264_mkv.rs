@@ -2,7 +2,7 @@
 //! container that used to refuse it by name. Nothing new decodes here -- the
 //! demuxer reframes the `avcC`-prefixed blocks to Annex-B and hands them to the
 //! same dispatch an mp4's samples go to -- so the whole file runs with nothing
-//! installed, on `rusty_h264` if the plugin is absent.
+//! installed, on the software seat (`ec-h264`) if the plugin is absent.
 //!
 //! ```text
 //! cargo test -p engine --test h264_mkv

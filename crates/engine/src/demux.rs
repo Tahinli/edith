@@ -132,10 +132,10 @@ impl Codec {
         }
     }
 
-    /// Why a file can be refused outright: `rusty_h264` is the only software
-    /// decoder in the project and there is no pure-Rust HEVC or VP9 one to fall
-    /// back to, so without the plugin there is nothing to decode with. Shared
-    /// so playback and export refuse in the same words.
+    /// Why a file can be refused outright: the software decoder this project
+    /// carries is H.264's (`ec-h264`), and there is no pure-Rust HEVC or VP9
+    /// one to fall back to, so without the plugin there is nothing to decode
+    /// with. Shared so playback and export refuse in the same words.
     pub fn needs_plugin(self) -> String {
         format!(
             "{name} needs the VA-API plugin (libengine_hw.so) — there is no software {name} decoder",
