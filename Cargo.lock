@@ -1597,7 +1597,7 @@ name = "ec-dsp"
 version = "0.1.0"
 dependencies = [
  "ec-core",
- "wide 1.7.0",
+ "wide",
 ]
 
 [[package]]
@@ -1606,7 +1606,7 @@ version = "0.1.0"
 dependencies = [
  "ec-core",
  "ec-h264-syntax",
- "wide 1.7.0",
+ "wide",
 ]
 
 [[package]]
@@ -1622,7 +1622,7 @@ version = "0.1.0"
 dependencies = [
  "ec-core",
  "ec-dsp",
- "wide 1.7.0",
+ "wide",
 ]
 
 [[package]]
@@ -1692,7 +1692,6 @@ dependencies = [
  "oxideav-subtitle",
  "rav1e",
  "rusty_aac",
- "rusty_h264",
  "rusty_mp3",
  "rusty_vorbis",
  "symphonia",
@@ -5044,43 +5043,6 @@ name = "rusty_aac"
 version = "0.5.0"
 
 [[package]]
-name = "rusty_h264"
-version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "690044fc22dedcc09367177bd50cc7f6b46b72f3227d35a9311e69c64c2a73d4"
-dependencies = [
- "rusty_h264-common",
- "rusty_h264-decoder",
- "rusty_h264-encoder",
-]
-
-[[package]]
-name = "rusty_h264-common"
-version = "0.9.1"
-dependencies = [
- "bytemuck",
- "wide 0.7.33",
-]
-
-[[package]]
-name = "rusty_h264-decoder"
-version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1cd475fe0f7480930bf735275111922733a323cb9ef7d83d825a0222ccde9fb4"
-dependencies = [
- "rusty_h264-common",
-]
-
-[[package]]
-name = "rusty_h264-encoder"
-version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8100c6b118fa62ff4f021b47cf2d6feb423dad78e3dec5d8dfc2d0ff3a6729bb"
-dependencies = [
- "rusty_h264-common",
-]
-
-[[package]]
 name = "rusty_mp3"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5132,15 +5094,6 @@ name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
-
-[[package]]
-name = "safe_arch"
-version = "0.7.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "96b02de82ddbe1b636e6170c21be622223aea188ef2e139be0a5b219ec215323"
-dependencies = [
- "bytemuck",
-]
 
 [[package]]
 name = "safe_arch"
@@ -6957,22 +6910,12 @@ dependencies = [
 
 [[package]]
 name = "wide"
-version = "0.7.33"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ce5da8ecb62bcd8ec8b7ea19f69a51275e91299be594ea5cc6ef7819e16cd03"
-dependencies = [
- "bytemuck",
- "safe_arch 0.7.4",
-]
-
-[[package]]
-name = "wide"
 version = "1.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8cf05ca94c9fba0c51316899caa1d1e74a064fc310a5efa7375e614343d415be"
 dependencies = [
  "bytemuck",
- "safe_arch 1.2.0",
+ "safe_arch",
 ]
 
 [[package]]

@@ -1444,7 +1444,8 @@ fn align64(v: u32) -> u32 {
 /// header, and cros-codecs supplies none (`h264/vaapi.rs` says as much in its
 /// "use packed headers" TODO). Every other bit of the slice is correct, so the
 /// whole damage is one byte per slice: measured on radeonsi, patching it turns
-/// a stream neither ffmpeg nor `rusty_h264` will touch into one both decode.
+/// a stream neither ffmpeg nor the `rusty_h264` then in the tree would touch
+/// into one both decode (the crate has since left; the fix's proof stands).
 ///
 /// An all-zero byte after a start code is never valid H.264, so drivers that do
 /// write the header (Intel's, which is what cros-codecs was built against) fall
