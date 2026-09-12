@@ -34,46 +34,30 @@ mp4 = "0.14"
 # pulls this exact version in through `png`, and it is the pure-Rust inflate the
 # rest of the ecosystem is built on.
 miniz_oxide = "0.8"
-# The software H.264 *encoder* -- since the decode seat moved to `ec-h264`
-# above, the only seat still on this crate. Pinned exactly, like
-# `oxideav-ac3` below, because a codec is a reproducibility dependency; the
-# 0.9.1 pin is the one the decode half set on 2026-08-12, when 750 pictures of
-# a 1080p High and a 720p Main clip decoded byte-for-byte against ffmpeg where
-# 0.8 had drifted (software *encode* was unchanged within noise across that
-# bump, so the pin costs the encoder nothing). `default-features = false` is
-# what keeps `asm` off: those are vendored openh264 SIMD kernels that want
-# `nasm` at build time, which this project's no-install rule forbids, and the
-# crate enables them by default.
+# The software H.264 seats, both of them the project's own: `ec-h264` (I/P/B
+# encode, CAVLC and CABAC, full DPB decode, weighted prediction, in-loop
+# deblocking), bit-exact against the JVT conformance suite. The decode seat
+# moved on 2026-09-12; the encode seat followed the same day, which retired the
+# last of `rusty_h264` -- whose `rusty_h264-common` installed its authors'
+# `rusty_alloc`, a pure-Rust mimalloc remake, as the process-wide
+# `#[global_allocator]` of whatever application linked it, no downstream
+# feature choice being able to decline it, and that allocator segfaulted the
+# editor on a new decode-worker thread's first allocation (2026-08-13). It had
+# been survivable only through a vendored patch, which is gone with the crate.
 #
-# What that line does not turn off, and cannot: the facade asks for its three
-# sub-crates with *their* defaults, and `rusty_h264-common`'s default installs
-# `rusty_alloc` -- a pure-Rust mimalloc remake, MIT -- as the process-wide
-# `#[global_allocator]`, for the whole application rather than the codec. It was
-# faster on a synthetic 2M-allocation churn (0.104 s against glibc's 0.142 s)
-# and it crashed the editor: sustained scrubbing churns decode-worker threads,
-# and it segfaulted on a new thread's *first* allocation. `common` is therefore
-# vendored with that declaration removed (workspace root `[patch.crates-io]`),
-# which is the only way to decline it -- the codec itself is untouched. When
-# the export encode seat moves to `ec_h264::Encoder`, this line, the patch and
-# the vendored crate go with it.
-# The software H.264 *decoder*, which is the project's own: `ec-h264`
-# (I/P/B, CAVLC and CABAC, full DPB, weighted prediction, in-loop deblocking),
-# bit-exact against the JVT conformance suite. It took this seat from
-# `rusty_h264` on 2026-09-12. Raw decode throughput (demux+decode, no render,
-# best of three warm passes, otherwise idle machine): 1.5x `rusty_h264` on a
-# 1080p Main export and a 4K Main render, 1.0x on a 1440p High screen
-# recording, 1.17x on a CAVLC Baseline fixture; 0.80x on the two B-picture
-# CABAC streams measured (a 720p High fixture and a 720p Blu-ray episode) --
-# the price of the full DPB the old seat skipped with its decode-order
-# corner-cut, which scrambled exactly those streams. It hands pictures back in
-# display order, which is what every reader of `frame.index` already assumed
-# (the hardware backend always did; see `tests/sw_backends.rs` for the
-# byte-exactness witness against `rusty_h264`, kept as the independent oracle).
+# Decode throughput, measured at the decode swap (demux+decode, no render, best
+# of three warm passes, otherwise idle machine): 1.5x `rusty_h264` on a 1080p
+# Main export and a 4K Main render, 1.0x on a 1440p High screen recording,
+# 1.17x on a CAVLC Baseline fixture; 0.80x on the two B-picture CABAC streams
+# measured (a 720p High fixture and a 720p Blu-ray episode) -- the price of the
+# full DPB the old seat skipped with its decode-order corner-cut, which
+# scrambled exactly those streams. It hands pictures back in display order,
+# which is what every reader of `frame.index` already assumed (the hardware
+# backend always did).
 ec-h264 = { path = "../../../edith_codecs/crates/ec-h264" }
 # Its shared IR (packets, frames, the registry decoder contract the seat is
 # written against), direct because decode.rs names those types itself.
 ec-core = { path = "../../../edith_codecs/crates/ec-core" }
-rusty_h264 = { version = "=0.9.1", default-features = false }
 # Both halves of AAC, and the only crate here that is asked for both. The
 # *encoder*, so an mp4's sound can be a mix rather than a copy: an equalized (or
 # otherwise processed) lane has to be decoded, and what is decoded has to be
@@ -81,8 +65,9 @@ rusty_h264 = { version = "=0.9.1", default-features = false }
 # than stereo outright (`aac/mod.rs:93`, "aac: aac too complex") and a 5.1 film
 # soundtrack in an mkv is exactly that -- this one hands 5.1 back already
 # reordered into FL, FR, FC, LFE, BL, BR, which is the order the downmix in
-# `audio` folds. Pure Rust with no C or FFI, Apache-2.0, same family as
-# `rusty_h264` above. Nothing else in the ecosystem encodes AAC without linking
+# `audio` folds. Pure Rust with no C or FFI, Apache-2.0, the same Mata Network
+# family the retired `rusty_h264` came from. Nothing else in the ecosystem
+# encodes AAC without linking
 # Fraunhofer's C library, which this project's no-install rule forbids. Built
 # from `vendor/rusty_aac` -- see the patch table in the workspace manifest.
 rusty_aac = "0.5"
