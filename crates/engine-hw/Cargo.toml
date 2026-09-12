@@ -14,3 +14,7 @@ engine = { path = "../engine" }
 cros-codecs = { version = "0.0.6", features = ["vaapi"] }
 # Same version cros-codecs already pulls in; we allocate output frames ourselves.
 gbm = { version = "0.15", default-features = false, features = ["drm-support"] }
+# Same version `engine` pins for its own dlopens (`hw.rs`, `ao.rs`); this is
+# the plugin's half of the same philosophy, one level down: `libvpx` for the
+# software VP8 seat (`src/vpx.rs`), resolved at runtime like libva itself.
+libloading = "0.8"

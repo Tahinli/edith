@@ -453,6 +453,14 @@ struct Player {
     /// Where an export writes. Built once from the source path, which is not
     /// otherwise kept.
     export_path: PathBuf,
+    /// The export target this window itself last wrote or confirmed, so the
+    /// overwrite question ([`Player::export_ask`]) can tell "the file exists"
+    /// apart from "the file exists and is a stranger's": an export over a
+    /// path this window never wrote asks first, a re-export over its own
+    /// output does not (user 2026-09-11, "not just save but export too").
+    /// Path equality, not a flag: retargeting the destination to somewhere
+    /// else makes the answer foreign again.
+    export_known: Option<PathBuf>,
     /// Where the save action writes: the project this timeline was loaded from,
     /// or the one derived beside the media it started as. Saving twice
     /// overwrites the same file rather than making a second one.
@@ -484,6 +492,23 @@ struct Player {
     /// While it is up it owns the keyboard -- three answers and nothing else
     /// ([`ui::stance`]'s root `on_key_down`).
     quit_ask: bool,
+    /// Whether the overwrite question is on screen: raised by Save's own
+    /// door ([`Player::save_guarded`]) when the save's target exists on
+    /// disk but `autosave_armed` says this window never loaded or wrote it
+    /// -- a `.edith` the timeline only derives its name from beside an
+    /// imported media file (user 2026-09-11, "saving over an existing file
+    /// must warn first"). Same shape as `quit_ask` above: while it is up
+    /// it owns the keyboard, and answering `enter` confirms the overwrite
+    /// -- the save then arms `autosave_armed`, so later saves on this
+    /// file are silent.
+    save_ask: bool,
+    /// Whether the export's overwrite question is on screen: raised inside
+    /// [`Player::start_export`] -- after its refusals, so an export that
+    /// cannot run never asks -- when `export_path` exists on disk and
+    /// `export_known` says this window never wrote it. Same shape as
+    /// `save_ask` above: while it is up it owns the keyboard, and answering
+    /// `enter` marks the target known and starts the export.
+    export_ask: bool,
     /// Whether `project_path` names a file this window itself put there --
     /// loaded from a `.edith` ([`Player::install_project`]) or written by a
     /// manual save ([`Player::save_project`]) -- rather than one merely
@@ -970,12 +995,15 @@ fn main() {
                     // `open_media`/`load_project` a drop goes through: an
                     // export beside the picture, a save beside it too.
                     export_path: PathBuf::new(),
+                    export_known: None,
                     project_path: PathBuf::new(),
                     autosave_dirty: false,
                     autosave_last_edit: None,
                     autosave_last_run: None,
                     recovery_sidecar: None,
                     quit_ask: false,
+                    save_ask: false,
+                    export_ask: false,
                     autosave_armed: false,
                     keymap: keymap.clone(),
                     keys_open: false,

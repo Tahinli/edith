@@ -1584,8 +1584,30 @@ impl Player {
         clips > 0 && dirty
     }
 
-    /// Writes the timeline back to its project file. Overwrites silently, like
-    /// an export: the path was chosen once and the notice is the confirmation.
+    /// Whether a save has to be answered instead of obeyed: `project_path`
+    /// names a file on disk that this window itself did not put there --
+    /// neither loaded ([`Player::install_project`]) nor written
+    /// ([`Player::save_project`]) -- so the first ^s would clobber a
+    /// `.edith` this timeline only derives its name from beside an
+    /// imported media file (user 2026-09-11). `autosave_armed` is the
+    /// whole difference: once this window's own save has confirmed the
+    /// overwrite, later saves on the file are silent again.
+    pub(crate) fn save_needs_answer(&self) -> bool {
+        Self::save_asks(self.project_path.exists(), self.autosave_armed)
+    }
+
+    /// The overwrite question as a value: a target on disk and a window
+    /// that has not earned the write. Split out of
+    /// [`Player::save_needs_answer`] so the rule can be read and tested
+    /// without a window or a session, the way [`Player::close_asks`] is.
+    pub(crate) fn save_asks(target_exists: bool, armed: bool) -> bool {
+        target_exists && !armed
+    }
+
+    /// Writes the timeline back to its project file -- the confirmed write.
+    /// The overwrite question, when one is owed at all, was asked by Save's
+    /// door ([`Player::save_guarded`]) or already answered at the quit
+    /// plate; the notice here is the confirmation, not the permission.
     pub(crate) fn save_project(&mut self, cx: &mut Context<Self>) {
         let saved = self
             .session
@@ -1615,6 +1637,22 @@ impl Player {
         eprintln!("{text}");
         self.notify_user(text.into());
         cx.notify();
+    }
+
+    /// Save's door: asks before the first overwrite of a file this window
+    /// never put there, saves straight through once the file is the
+    /// window's own. Raising the question does not save -- the overwrite
+    /// plate (the root `on_key_down` in `ui::stance`) owns the keyboard
+    /// until it is answered, and only its `enter` comes back to
+    /// [`Player::save_project`], which is what arms `autosave_armed` and
+    /// makes every later save on the file silent.
+    pub(crate) fn save_guarded(&mut self, cx: &mut Context<Self>) {
+        if self.save_needs_answer() {
+            self.save_ask = true;
+            cx.notify();
+            return;
+        }
+        self.save_project(cx);
     }
 
     /// Marks that an edit has landed since the sidecar last caught up, and
@@ -1945,6 +1983,24 @@ mod autosave_tests {
             "saved work closes without a question"
         );
         assert!(Player::close_asks(1, true));
+    }
+
+    /// The overwrite question Save's door asks: a target that exists on
+    /// disk but was never this window's (an import-derived `project_path`,
+    /// `autosave_armed` still false) warns before the first clobber; a
+    /// fresh path writes silently, and a file the window itself already
+    /// saved keeps every later ^s silent. The close rule's sibling.
+    #[test]
+    fn only_a_foreign_existing_file_asks_before_a_save_overwrites_it() {
+        assert!(Player::save_asks(true, false));
+        assert!(
+            !Player::save_asks(false, false),
+            "nothing on disk yet -- a first save needs no warning"
+        );
+        assert!(
+            !Player::save_asks(true, true),
+            "the window's own file -- later saves stay silent"
+        );
     }
 
     /// The three answers [`Player::recovery_offer`] gives, off nothing but a

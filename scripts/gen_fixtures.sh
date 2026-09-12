@@ -98,6 +98,125 @@ ffmpeg -y -f lavfi -i testsrc2=size=1280x720:rate=30:duration=2 \
 ffmpeg -y -f lavfi -i testsrc2=size=1280x720:rate=30:duration=2 \
     -c:v libvpx-vp9 -b:v 2M -g 30 -profile:v 2 -pix_fmt yuv420p10le \
     -an assets/test_vp9_10.webm
+# VP8 fixture pair, the twins of the VP9 ones. ffmpeg's mov muxer carries no
+# VP8 tag for mp4 at all (and its VP9 path re-parses the frames it is handed,
+# dropping them), so the mp4 half is assembled by hand: the picture is encoded
+# to an IVF, the AAC sound to an mp4 of its own, and the video track is
+# spliced in with the `vp08` sample entry written out byte for byte -- the
+# very entry `demux::sample_entry` reads by hand, which is what this fixture
+# exists to exercise. `-enc_time_base 1/30` keeps the IVF timestamps exact,
+# which is what the mp4 stts and the 30 fps the tests assert come from.
+ffmpeg -y -f lavfi -i testsrc2=size=1280x720:rate=30:duration=2 \
+    -c:v libvpx -b:v 2M -g 30 -enc_time_base 1/30 -pix_fmt yuv420p -an \
+    assets/.test_vp8.ivf
+ffmpeg -y -f lavfi -i "sine=frequency=440:duration=2" \
+    -f lavfi -i "sine=frequency=880:duration=2" \
+    -filter_complex "[0:a][1:a]join=inputs=2:channel_layout=stereo,volume='0.5+0.5*sin(2*PI*t)':eval=frame[a]" \
+    -map "[a]" -c:a aac -b:a 128k assets/.test_vp8_audio.mp4
+python3 - <<'SPLICE'
+import struct
+
+def boxes(buf, start, end):
+    res, at = [], start
+    while at + 8 <= end:
+        size = int.from_bytes(buf[at:at + 4], 'big')
+        hdr = 8
+        if size == 1:
+            size = int.from_bytes(buf[at + 8:at + 16], 'big')
+            hdr = 16
+        if size == 0:
+            size = end - at
+        res.append((bytes(buf[at + 4:at + 8]), at, at + size, at + hdr))
+        at += size
+    return res
+
+def box(typ, payload):
+    return struct.pack('>I', 8 + len(payload)) + typ + payload
+
+def full(typ, ver_flags, payload):
+    return box(typ, struct.pack('>I', ver_flags) + payload)
+
+ivf = open('assets/.test_vp8.ivf', 'rb').read()
+assert ivf[:4] == b'DKIF'
+frames, at = [], 32
+while at + 12 <= len(ivf):
+    (n,) = struct.unpack_from('<I', ivf, at)
+    frames.append(ivf[at + 12:at + 12 + n])
+    at += 12 + n
+assert len(frames) == 60, len(frames)
+video = b''.join(frames)
+
+data = bytearray(open('assets/.test_vp8_audio.mp4', 'rb').read())
+top = boxes(data, 0, len(data))
+mdat = next(b for b in top if b[0] == b'mdat')
+moov = next(b for b in top if b[0] == b'moov')
+mvhd = next(b for b in boxes(data, moov[3], moov[2]) if b[0] == b'mvhd')
+assert data[mvhd[3]] == 0
+movie_ts = int.from_bytes(data[mvhd[3] + 12:mvhd[3] + 16], 'big')
+next_id = int.from_bytes(data[mvhd[3] + 96:mvhd[3] + 100], 'big')
+TIMESCALE, DELTA = 15360, 512  # exact 30 fps
+vid_dur = len(frames) * DELTA
+movie_dur = vid_dur * movie_ts // TIMESCALE
+old_dur = int.from_bytes(data[mvhd[3] + 16:mvhd[3] + 20], 'big')
+assert movie_dur >= old_dur, 'video shorter than audio'
+splice_at = moov[1]  # the video bytes go in right here, inside mdat
+
+UNITY = struct.pack('>9I', 0x10000, 0, 0, 0, 0x10000, 0, 0, 0, 0x40000000)
+entry = box(b'vp08',
+            b'\0' * 6 + struct.pack('>H', 1)            # resv, data ref index
+            + struct.pack('>HHI', 0, 0, 0)              # pre_def, resv, pre_def
+            + struct.pack('>HH', 1280, 720)             # width, height
+            + struct.pack('>II', 0x480000, 0x480000)    # 72 dpi resolutions
+            + b'\0' * 12 + struct.pack('>H', 1)         # resv, frame_count
+            + b'\0' * 32                                # compressorname
+            + struct.pack('>HH', 0x18, 0xFFFF))         # depth, pre_defined
+assert len(entry) == 86
+stco = bytearray(full(b'stco', 0, struct.pack('>II', 1, splice_at)))
+tkhd = full(b'tkhd', 3,
+            struct.pack('>IIIII', 0, 0, next_id, 0, movie_dur)
+            + b'\0' * 8 + struct.pack('>HHHH', 0, 0, 0, 0) + UNITY
+            + struct.pack('>II', 1280 << 16, 720 << 16))
+mdhd = full(b'mdhd', 0,
+            struct.pack('>IIII', 0, 0, TIMESCALE, vid_dur)
+            + struct.pack('>HH', 0x55C4, 0))            # language und
+hdlr = full(b'hdlr', 0, struct.pack('>I', 0) + b'vide' + b'\0' * 12 + b'\0')
+minf = box(b'minf',
+           full(b'vmhd', 1, struct.pack('>HHHH', 0, 0, 0, 0))
+           + box(b'dinf', box(b'dref',
+                  struct.pack('>II', 0, 1) + full(b'url ', 1, b'')))
+           + box(b'stbl',
+                 full(b'stsd', 0, struct.pack('>I', 1) + entry)
+                 + full(b'stts', 0, struct.pack('>III', 1, len(frames), DELTA))
+                 + full(b'stsc', 0, struct.pack('>IIII', 1, 1, len(frames), 1))
+                 + full(b'stsz', 0, struct.pack('>II', 0, len(frames))
+                        + b''.join(struct.pack('>I', len(f)) for f in frames))
+                 + bytes(stco)))
+mdia = box(b'mdia', mdhd + full(b'hdlr', 0,
+                                struct.pack('>I', 0) + b'vide' + b'\0' * 12 + b'\0')
+           + minf)
+trak = box(b'trak', tkhd + mdia)
+
+new = bytearray(data[:moov[1]])
+new += video
+struct.pack_into('>I', new, mdat[1], (mdat[2] - mdat[1]) + len(video))
+moov_new = bytearray(data[moov[1]:moov[2]])
+m = next(b for b in boxes(moov_new, 8, len(moov_new)) if b[0] == b'mvhd')
+struct.pack_into('>I', moov_new, m[3] + 16, max(old_dur, movie_dur))
+struct.pack_into('>I', moov_new, m[3] + 96, next_id + 1)
+moov_new += trak
+struct.pack_into('>I', moov_new, 0, len(moov_new))
+open('assets/test_vp8.mp4', 'wb').write(bytes(new + moov_new + data[moov[2]:]))
+SPLICE
+rm -f assets/.test_vp8.ivf assets/.test_vp8_audio.mp4
+# ...and the Matroska twin, the recipe of test_vp9.webm with libvpx rather
+# than libvpx-vp9 for the picture and the same Opus sound a `.webm` carries.
+# The engine reads `V_VP8` since the demux dispatch learned it; the decode
+# half is the plugin's (there is no software VP8 decoder here), so both files
+# are container and refusal fixtures.
+ffmpeg -y -f lavfi -i testsrc2=size=1280x720:rate=30:duration=2 \
+    -f lavfi -i "sine=frequency=440:duration=2" \
+    -c:v libvpx -b:v 2M -g 30 -pix_fmt yuv420p \
+    -c:a libopus -b:a 96k assets/test_vp8.webm
 # One Matroska file per audio codec the refusal string in `audio.rs` claims is
 # decodable, as five tracks of one file: FLAC, MP3, Vorbis, ALAC and PCM. The
 # string said "AAC and AC-3 only" long after every one of these decoded, which is

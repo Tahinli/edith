@@ -558,6 +558,12 @@ impl Player {
     /// with shift. Clamped to the engine's own bounds, so the number on the
     /// row is the number the encoder is given.
     pub(crate) fn nudge_budget(&mut self, steps: i32, coarse: bool) {
+        // A video setting, like the field `n` opens: the sound-only moment
+        // draws no row for the lever, so nothing moves what it does not
+        // show -- the arrows, `+`/`-` and the wheel answer nothing there.
+        if !self.format.has_video() {
+            return;
+        }
         let step = i64::from(steps)
             * match coarse {
                 true => BPS_COARSE as i64,
@@ -592,6 +598,12 @@ impl Player {
     /// (`850k`, `6.5M`, `6.5`, `1.2G` of file), not a way to edit digits, and
     /// the number in force is still on the row until enter takes the new one.
     pub(crate) fn edit_budget(&mut self) {
+        // A video setting: the sound-only moment draws no row to type into,
+        // so its door opens nothing either -- the chord stays swallowed (the
+        // moment owns the keyboard) but no field opens under it.
+        if !self.format.has_video() {
+            return;
+        }
         self.budget_edit = Some(String::new());
     }
 
@@ -755,6 +767,26 @@ impl Player {
         }
     }
 
+    /// Whether an export has to be answered instead of started: the target
+    /// exists on disk and is not a file this window wrote (or had confirmed)
+    /// -- the same rule the save door keeps, with `export_known` playing
+    /// `autosave_armed`'s part (user 2026-09-11, "not just save but export
+    /// too": exporting over an existing file must warn first).
+    pub(crate) fn export_needs_answer(&self) -> bool {
+        Self::export_asks(
+            self.export_path.exists(),
+            self.export_known.as_deref() == Some(self.export_path.as_path()),
+        )
+    }
+
+    /// The export question as a value: a target that is there and not ours.
+    /// Split out of [`Player::export_needs_answer`] so the rule can be read
+    /// and tested without a window or a session -- the same shape
+    /// [`Player::save_asks`] keeps for Save.
+    pub(crate) fn export_asks(target_exists: bool, known: bool) -> bool {
+        target_exists && !known
+    }
+
     /// Writes the edit list out, at the settings the card was left at. Playback
     /// stops first: the exporter opens its own decoder -- and, on the hardware
     /// path, an encoder -- so a running player would only compete with it for
@@ -777,6 +809,10 @@ impl Player {
         // calls for the *estimate* and which nothing else needs a subtitle for.
         settings.subtitles = self.export_subs();
         settings.range = self.range;
+        // Asked here, before `session` borrows `self` mutably for the fences
+        // below; nothing between here and the ask touches `export_path` or
+        // `export_known`, so the answer cannot go stale on the way.
+        let overwrite = self.export_needs_answer();
         let Some(session) = &mut self.session else {
             self.notify_user("NOTHING TO EXPORT — no file open".into());
             cx.notify();
@@ -801,8 +837,25 @@ impl Player {
             cx.notify();
             return;
         }
+        // The last fence, after every refusal so an export that cannot run
+        // never asks: writing over a file this window did not write is a
+        // question, not a default. The card closes with the asking -- the
+        // plate rises where notices rise and the moment is an overlay over
+        // exactly that strip, so the two may not be on screen together.
+        // `enter` there ([`ui::stance`]'s root handler) marks the target
+        // known and comes back through this door, which then passes.
+        if overwrite {
+            self.close_card();
+            self.export_ask = true;
+            cx.notify();
+            return;
+        }
         session.pause();
         self.export = Some(session.export_to_with(&self.export_path, &settings));
+        // Ours from the first packet on: a re-export over this window's own
+        // output is not a question (the plate's `enter` sets the same mark
+        // before coming back through the door).
+        self.export_known = Some(self.export_path.clone());
         // The clock starts with the worker, not with the first repaint that
         // happens to notice it.
         self.export_started = Some(Instant::now());

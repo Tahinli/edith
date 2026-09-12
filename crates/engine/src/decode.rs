@@ -625,7 +625,7 @@ impl DecodeSession {
     ) -> crate::Result<(VideoMeta, FrameStream)> {
         let path = path.as_ref().to_path_buf();
         let (meta, demuxer) = Demuxer::open(&path)?;
-        // No software HEVC or VP9 decoder exists, so such a file the plugin will
+        // No software HEVC, VP9 or VP8 decoder exists, so such a file the plugin will
         // not take is refused *here*, where the caller still has somewhere to
         // show it -- a worker that opened and then produced nothing is a black
         // screen with no explanation. The probe session is opened, made to
@@ -1005,8 +1005,8 @@ fn run_span(
         opened.hw = None;
         eprintln!("hardware decode failed before any frame, falling back to software");
     }
-    // ...except where there is nothing to fall back to. Feeding HEVC or VP9
-    // bytes to `rusty_h264` would be garbage, not a fallback.
+    // ...except where there is nothing to fall back to. Feeding HEVC, VP9 or
+    // VP8 bytes to `rusty_h264` would be garbage, not a fallback.
     if opened.meta.codec != Codec::H264 {
         eprintln!("{}", opened.meta.codec.needs_plugin());
         return;

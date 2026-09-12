@@ -532,7 +532,7 @@ fn an_imports_subtitles_are_read_by_the_worker_and_only_pushed_here() {
 #[test]
 fn every_codec_row_is_offered_or_says_why_not() {
     // One row per codec, and the boxes it can go in are the container row's
-    // business: seven rows that pick, one that says why it cannot. A codec
+    // business: seven rows that pick, two that say why they cannot. A codec
     // twice over (AV1 · MKV beside AV1 · MP4) was two rows asking the same
     // question, and five picture rows above the fold is what the card was
     // called unfriendly for.
@@ -626,9 +626,9 @@ fn every_codec_row_is_offered_or_says_why_not() {
             "{key} is already the card's own"
         );
     }
-    // The one codec left that this program reads and cannot write is a row
-    // of its own, refused by name rather than absent: VP9, because AV1 is
-    // the row that replaced it. Its reason travels with it, in the row or in
+    // The codecs this program reads and cannot write are rows of their own,
+    // refused by name rather than absent: VP9 and VP8, because AV1 is the
+    // row that replaced them. Their reason travels with them, in the row or
     // the footer line that collects them -- either way it is on screen
     // without a click. OGG was the other one until `rusty_vorbis` gave this
     // project an encoder, and the row that says so is the row above.
@@ -638,6 +638,12 @@ fn every_codec_row_is_offered_or_says_why_not() {
         .expect("VP9 has a row");
     assert!(row.is_empty(), "VP9 is not offered");
     assert!(detail.contains("replaces it"), "VP9: {detail}");
+    let (row, _, _, detail) = FORMATS
+        .into_iter()
+        .find(|(_, _, name, _)| *name == "VP8")
+        .expect("VP8 has a row");
+    assert!(row.is_empty(), "VP8 is not offered");
+    assert!(detail.contains("replaces it"), "VP8: {detail}");
     let (row, _, _, detail) = FORMATS
         .into_iter()
         .find(|(_, _, name, _)| *name == "OGG")

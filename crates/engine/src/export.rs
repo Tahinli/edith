@@ -157,8 +157,8 @@ const HEVC_QP_MAX: i32 = 40;
 /// still has none -- `oxideav-opus` encodes CELT alone, which is half a codec.
 /// (AAC has one too -- `rusty_aac`, which is what a re-encoded video track's
 /// sound leaves through -- but AAC is a container's own audio, never a file of
-/// its own here.) VP9 is the
-/// one codec left that comes in through the plugin and stops there, HEVC having
+/// its own here.) VP9 and VP8 are the
+/// codecs that come in through the plugin and stop there, HEVC having
 /// gained an encoder (an intra-only one, which the rows say). A front-end says
 /// so rather than hiding the row.
 ///

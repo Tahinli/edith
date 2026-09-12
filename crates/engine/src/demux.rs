@@ -111,13 +111,15 @@ pub fn cancelled_read_error() -> crate::Error {
 }
 
 /// What the video track is coded with. Not a decoder choice by itself: only
-/// H.264 has a software decoder here, which is what [`Codec::needs_plugin`]
-/// says for the others.
+/// H.264 has a software decoder in this binary, and VP8's (libvpx) lives
+/// inside the plugin -- which is what [`Codec::needs_plugin`] says for the
+/// rest, per codec, in the words that stay true.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Codec {
     H264,
     Hevc,
     Vp9,
+    Vp8,
     Av1,
 }
 
@@ -128,19 +130,30 @@ impl Codec {
             Self::H264 => "H.264",
             Self::Hevc => "HEVC",
             Self::Vp9 => "VP9",
+            Self::Vp8 => "VP8",
             Self::Av1 => "AV1",
         }
     }
 
-    /// Why a file can be refused outright: `rusty_h264` is the only software
-    /// decoder in the project and there is no pure-Rust HEVC or VP9 one to fall
-    /// back to, so without the plugin there is nothing to decode with. Shared
-    /// so playback and export refuse in the same words.
+    /// Why a file can be refused outright. Two true answers, one per shape of
+    /// "no decoder here": every codec but H.264 and VP8 has no software
+    /// decoder at all, so the refusal names the plugin as the only way; VP8's
+    /// software decoder *is* libvpx inside the plugin, so "there is no
+    /// software decoder" would be a lie the day the plugin grew that arm --
+    /// the refusal keeps naming the plugin, because that is still the thing
+    /// to make present. Shared so playback and export refuse in the same
+    /// words.
     pub fn needs_plugin(self) -> String {
-        format!(
-            "{name} needs the VA-API plugin (libengine_hw.so) — there is no software {name} decoder",
-            name = self.name()
-        )
+        match self {
+            Self::Vp8 => {
+                "VP8 needs the VA-API plugin (libengine_hw.so) — its decoder is libvpx, inside the plugin"
+                    .to_string()
+            }
+            other => format!(
+                "{name} needs the VA-API plugin (libengine_hw.so) — there is no software {name} decoder",
+                name = other.name()
+            ),
+        }
     }
 
     /// The other refusal: the plugin *is* here and opened the file, and then
@@ -168,6 +181,7 @@ const CODEC_IDS: &[(Codec, &str, &[u8; 4])] = &[
     (Codec::H264, "V_MPEG4/ISO/AVC", b"avc1"),
     (Codec::Hevc, "V_MPEGH/ISO/HEVC", b"hvc1"),
     (Codec::Vp9, "V_VP9", b"vp09"),
+    (Codec::Vp8, "V_VP8", b"vp08"),
     (Codec::Av1, "V_AV1", b"av01"),
 ];
 
@@ -182,8 +196,6 @@ const UNSUPPORTED: &[(&str, &str)] = &[
     // carries them in-band only; `mp4 0.14` parses no `avc3` sample entry at all
     // either, so `sequence_parameter_set()` would come back empty-handed.
     ("avc3", "H.264 with parameter sets in-band only"),
-    ("vp08", "no VP8 decoder: cros-codecs carries none"),
-    ("V_VP8", "no VP8 decoder: cros-codecs carries none"),
     ("V_MPEG2", "no MPEG-2 decoder, hardware or software"),
     (
         "V_MS/VFW/FOURCC",
@@ -764,8 +776,8 @@ impl Mp4Demuxer {
                 parameter_sets = sets;
                 bit_depth = depth;
             }
-            // No parameter sets: a VP9 sample is self-contained.
-            Codec::Vp9 => {}
+            // No parameter sets: a VP8 or VP9 sample is self-contained.
+            Codec::Vp8 | Codec::Vp9 => {}
         }
         let sync_samples = track
             .trak
@@ -841,9 +853,9 @@ impl Mp4Demuxer {
         let Some(sample) = sample else {
             return Ok(None);
         };
-        // A VP9 mp4 sample is one (super)frame the decoder parses on its own:
-        // no length prefixes to strip, no parameter sets to re-inject.
-        if self.codec == Codec::Vp9 {
+        // A VP8 or VP9 mp4 sample is one (super)frame the decoder parses on
+        // its own: no length prefixes to strip, no parameter sets to re-inject.
+        if matches!(self.codec, Codec::Vp8 | Codec::Vp9) {
             return Ok(Some(sample.bytes.to_vec()));
         }
         // An AV1 one is a whole temporal unit, likewise unframed -- with the
@@ -1059,7 +1071,7 @@ impl MkvDemuxer {
                             format!("{codec} video in a Matroska file is not supported — {why}")
                         }
                         None => format!(
-                            "{codec} video in a Matroska file is not supported — AV1, HEVC, H.264 and VP9 are"
+                            "{codec} video in a Matroska file is not supported — AV1, HEVC, H.264, VP9 and VP8 are"
                         ),
                     }
                     .into(),
@@ -1418,9 +1430,9 @@ impl MkvDemuxer {
     }
 
     /// Next access unit in decode order: the block verbatim for AV1, which is
-    /// one temporal unit already, and for VP9, whose block is one (super)frame;
-    /// Annex-B for HEVC and H.264, whose blocks hold the same length-prefixed
-    /// NALs an mp4 sample does.
+    /// one temporal unit already, and for VP8 and VP9, whose blocks are one
+    /// (super)frame each; Annex-B for HEVC and H.264, whose blocks hold the
+    /// same length-prefixed NALs an mp4 sample does.
     fn next_access_unit(&mut self) -> crate::Result<Option<Vec<u8>>> {
         // Reading off the end of the window is not the end of the track: it is
         // the next cluster, not yet walked. The end of the track is the end of
@@ -1449,7 +1461,7 @@ impl MkvDemuxer {
         // the bytes as a codec's: a stripped block is not a NAL and an inflated
         // one is not where it was read from.
         unpack.frame(scratch)?;
-        if matches!(self.codec, Codec::Av1 | Codec::Vp9) {
+        if matches!(self.codec, Codec::Av1 | Codec::Vp8 | Codec::Vp9) {
             let mut au = Vec::with_capacity(head + self.scratch.len());
             au.extend_from_slice(&self.config[..head]);
             au.extend_from_slice(&self.scratch);
@@ -2377,6 +2389,12 @@ fn mkv_track_entry(
         // the container either, so it is read off the first keyframe by
         // [`Demuxer::fill_vp9_depth`]; 8 here is what that probe starts from.
         Codec::Vp9 => (Codec::Vp9, 0, Vec::new(), 8),
+        // A VP8 block is one self-contained frame, exactly as a VP9 one: no
+        // length prefixes to strip, no configuration record to re-inject -- a
+        // `.webm` writes no `CodecPrivate` for it, and the `vp08` an mp4
+        // carries no record beside. 8 is not an assumption here but the
+        // format itself: VP8 has no depth but 8.
+        Codec::Vp8 => (Codec::Vp8, 0, Vec::new(), 8),
     };
     Ok(MkvEntry::Video(MkvVideo {
         number,
@@ -2492,7 +2510,7 @@ fn mp4_no_video<R>(path: &Path, reader: &Mp4Reader<R>) -> crate::Error {
         Some(kind) => match UNSUPPORTED.iter().find(|(id, _)| *id == kind) {
             Some((_, why)) => format!("{kind} video in this mp4 is not supported — {why}"),
             None => {
-                format!("{kind} video in this mp4 is not supported — H.264, HEVC, VP9 and AV1 are")
+                format!("{kind} video in this mp4 is not supported — H.264, HEVC, VP9, AV1 and VP8 are")
             }
         }
         .into(),
@@ -2500,7 +2518,7 @@ fn mp4_no_video<R>(path: &Path, reader: &Mp4Reader<R>) -> crate::Error {
         // which is a thing a person really does hand an editor. The Matroska
         // door's own answer, and the same type for the same reason.
         None => crate::Error::from(NoVideoTrack(
-            "no H.264, HEVC, VP9 or AV1 video track in file".to_string(),
+            "no H.264, HEVC, VP9, AV1 or VP8 video track in file".to_string(),
         )),
     }
 }
@@ -4679,7 +4697,7 @@ mod tests {
     /// compile until it has been routed.
     #[test]
     fn every_codec_is_reachable_from_both_containers() {
-        for codec in [Codec::H264, Codec::Hevc, Codec::Vp9, Codec::Av1] {
+        for codec in [Codec::H264, Codec::Hevc, Codec::Vp9, Codec::Vp8, Codec::Av1] {
             let row = CODEC_IDS
                 .iter()
                 .find(|(c, ..)| *c == codec)
