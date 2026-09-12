@@ -1649,6 +1649,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ec-vp8"
+version = "0.1.0"
+dependencies = [
+ "ec-core",
+]
+
+[[package]]
 name = "edith"
 version = "0.1.0"
 dependencies = [
@@ -1738,9 +1745,9 @@ name = "engine-hw"
 version = "0.1.0"
 dependencies = [
  "cros-codecs",
+ "ec-vp8",
  "engine",
  "gbm",
- "libloading",
 ]
 
 [[package]]
