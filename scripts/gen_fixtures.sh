@@ -85,7 +85,7 @@ ffmpeg -y -f lavfi -i testsrc2=size=1280x720:rate=30:duration=2 \
 # other VP9 file in the wild actually arrives: `V_VP9` used to fall through the
 # mkv track dispatch and be refused by name while the mp4 twin above decoded.
 # Opus audio because that is what a .webm carries -- the sound decodes here now
-# (`ruopus`), and this is the webm cell of the Opus row in `capability_matrix`.
+# (`ec-opus`), and this is the webm cell of the Opus row in `capability_matrix`.
 ffmpeg -y -f lavfi -i testsrc2=size=1280x720:rate=30:duration=2 \
     -f lavfi -i "sine=frequency=440:duration=2" \
     -c:v libvpx-vp9 -b:v 2M -g 30 -pix_fmt yuv420p \

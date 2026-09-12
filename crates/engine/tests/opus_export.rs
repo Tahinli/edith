@@ -1,6 +1,6 @@
 //! Opus on the way *out*: an edited Opus source leaves a Matroska export as
 //! Opus instead of being turned into AAC, and comes back in through this
-//! project's own door -- symphonia's mkv reader for the container, `ruopus` for
+//! project's own door -- symphonia's mkv reader for the container, `ec-opus` for
 //! the packets, which is the pair a film already plays through.
 //!
 //! Three claims, and each is measured rather than asserted from the code:
@@ -12,9 +12,10 @@
 //! * a timeline nobody has touched still *copies* its AAC packets rather than
 //!   taking the new encoder: Opus is what an edit costs, never what a passthrough
 //!   costs;
-//! * and the envelope itself -- 48 kHz, stereo, at most
-//!   `OPUS_MAX_KBPS` -- is a measurement of `opus-rs 0.1.26` and is pinned here,
-//!   so the day the crate is bumped past its high-rate bug this suite says so.
+//! * and the envelope itself -- 48 kHz, mono or stereo, at most
+//!   `OPUS_MAX_KBPS` -- is measured here: the high band and the mono path are
+//!   exactly where `opus-rs 0.1.26`, the encoder this seat replaced, wrote
+//!   files only it could read back, and a regression fails here, loudly.
 //!
 //! Nothing here needs a GPU: the picture is 320x180 and HEVC's intra encoder is
 //! software by construction, so the whole file runs anywhere. Add
@@ -33,8 +34,9 @@ use engine::scratch::Scratch;
 use engine::{AudioSession, Clip, ExportHandle, Project};
 
 /// The picture: 320x180 at 24 fps, 30 s (`scripts/gen_fixtures.sh`). Its own
-/// sound is mono Opus and is deliberately left off the audio lane -- see
-/// [`a_mono_mix_keeps_the_aac_path`].
+/// sound is mono Opus and is deliberately left off the audio lane -- except by
+/// the mono test, which puts it there on purpose
+/// ([`a_mono_mix_leaves_as_opus_too`]).
 const VIDEO: &str = "test_seek_chirp.mkv";
 /// The sound: 5.1 Opus, 440 Hz in FL and 880 Hz in BR, folded to stereo on the
 /// way to the timeline -- so the mix this export encodes *is* an Opus source's,
@@ -135,7 +137,7 @@ fn export(name: &str, project: Project, video: &Path) -> Scratch {
 
 /// Interleaved samples of a written file through the engine's own reader: the
 /// door an import comes in through, and for an Opus track that is symphonia's
-/// mkv reader handing `CodecPrivate` and blocks to `ruopus`.
+/// mkv reader handing `CodecPrivate` and blocks to `ec-opus`.
 fn decode(path: &Path) -> (engine::AudioMeta, Vec<f32>) {
     let (meta, chunks) = AudioSession::open(path)
         .expect("reopen the export")
@@ -255,7 +257,8 @@ fn an_edited_opus_source_leaves_a_matroska_export_as_opus() {
              the export is either not this sound or not in this place"
         );
         // Past the first frame, where the encoder's cold start is behind it:
-        // 0.997 left and 0.993 right, measured, against 0.9948/0.9825 with the
+        // 0.997 left and 0.993 right, measured at 128 kbps under the seat's
+        // previous encoder (opus-rs 0.1.26), against 0.9948/0.9825 with the
         // head in. That gap *is* the ramp the pre-skip cannot cover, and it is
         // asserted from both sides so neither can drift unnoticed.
         let settled = corr(&w[OPUS_FRAME_SAMPLES..span], &g[OPUS_FRAME_SAMPLES..span]);
@@ -264,13 +267,14 @@ fn an_edited_opus_source_leaves_a_matroska_export_as_opus() {
             "{name}: correlation {settled:.4} past the first frame"
         );
         // ...and the head specifically, which is what the pre-skip and the
-        // warm-up frame are for. Measured at 128 kbps: 0.990 left, 0.953 right,
-        // where the same export with no warm-up frame scored 0.9788 left and a
-        // mis-declared pre-skip would score far less than either. The gap to the
-        // 0.99 above is one frame of cold start -- `opus-rs 0.1.26` opens about
-        // 6 dB down whatever is fed in ahead of it (two warm-up frames change
-        // this in no decimal place) -- so this threshold is that ramp stated
-        // rather than a shrug.
+        // warm-up frame are for. Measured at 128 kbps under that same
+        // previous encoder: 0.990 left, 0.953 right, where the same export
+        // with no warm-up frame scored 0.9788 left and a mis-declared
+        // pre-skip would score far less than either. The gap to the 0.99
+        // above is one frame of cold start -- an encoder's first frame opens
+        // a few dB down whatever is fed in ahead of it, opus-rs 0.1.26 by
+        // about 6 dB, and two warm-up frames change this in no decimal
+        // place -- so this threshold is that ramp stated rather than a shrug.
         let head = corr(&w[..12_000], &g[..12_000]);
         assert!(head >= 0.94, "{name}: the first 250 ms correlate {head:.4}");
     }
@@ -311,21 +315,57 @@ fn an_untouched_timeline_still_copies_its_aac_into_an_mkv() {
     );
 }
 
-/// A mono mix keeps AAC, and that is a *measurement* and not a preference:
-/// `opus-rs 0.1.26` mis-encodes mono at rates it is asked for here (see the
-/// envelope test in `export.rs`), so the file that would play back wrong is
-/// never written. `test_seek_chirp.mkv` carries mono Opus, which is exactly the
-/// source that would tempt this path.
+/// A mono mix leaves as Opus too, and that is a *measurement*: `opus-rs 0.1.26`
+/// mis-encoded mono at every rate (see the envelope test in `export.rs`), which
+/// is why this file used to assert the AAC path instead. `test_seek_chirp.mkv`
+/// carries mono Opus, which is exactly the source that used to tempt this path
+/// onto the rocks.
 #[test]
-fn a_mono_mix_keeps_the_aac_path() {
+fn a_mono_mix_leaves_as_opus_too() {
     let source = asset(VIDEO);
     let out = export("mono", project(&source, &source, 1), &source);
     let bytes = std::fs::read(&*out).expect("read the export back");
+    let head = find(&bytes, b"OpusHead").expect("an OpusHead in the CodecPrivate");
     assert!(
-        find(&bytes, b"A_AAC").is_some(),
-        "a mono mix is written as AAC"
+        find(&bytes, b"A_OPUS").is_some(),
+        "a mono mix is written as Opus"
     );
-    assert!(find(&bytes, b"A_OPUS").is_none());
+    assert!(find(&bytes, b"A_AAC").is_none());
+    assert_eq!(bytes[head + 9], 1, "OpusHead: mono");
+    assert_eq!(bytes[head + 18], 0, "OpusHead: mapping family 0");
+
+    // ...and it is the sound that went in, in the right place: the same second
+    // of the same source, at lag zero, as the 5.1 test asks of its fixture.
+    let (meta, got) = decode(&out);
+    assert_eq!((meta.sample_rate, meta.channels), (48_000, 1));
+    let want: Vec<f32> = {
+        let (_, chunks) = AudioSession::open_segments(asset(VIDEO), &[(1.0, 2.0)])
+            .expect("open the source")
+            .expect("the source has sound");
+        let mut s = Vec::new();
+        for chunk in chunks {
+            s.extend(chunk.samples);
+        }
+        s
+    };
+    assert!(
+        got.len() >= want.len() - 2 && got.len() <= want.len() + OPUS_FRAME_SAMPLES * 2,
+        "the track is {} samples where the timeline is {}",
+        got.len(),
+        want.len()
+    );
+    let span = want.len().min(got.len());
+    let aligned = corr(&want[..span], &got[..span]);
+    assert!(
+        aligned >= 0.98,
+        "correlation {aligned:.4} against the source at lag zero -- \
+         the export is either not this sound or not in this place"
+    );
+    let settled = corr(&want[OPUS_FRAME_SAMPLES..span], &got[OPUS_FRAME_SAMPLES..span]);
+    assert!(
+        settled >= 0.99,
+        "correlation {settled:.4} past the first frame"
+    );
 }
 
 /// His own library, not a fixture: a real Opus film, cut, exported, read back.
