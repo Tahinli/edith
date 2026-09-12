@@ -201,9 +201,13 @@ fn seek_matches_linear() {
 #[test]
 #[ignore = "needs libengine_hw.so and a VA-API driver"]
 fn seek_matches_linear_every_container() {
-    // The hardware path for these, including AV1's fixture: the point is the
-    // seek against the same seat a linear decode ran on, which the tests
-    // below pin for the software seat.
+    // Sanitize at entry: sibling tests leak `VE_SW=1` by design and run before
+    // this one alphabetically, and a leaked pin makes the plugin-only HEVC
+    // fixtures refuse at open. The hardware path for these, including AV1's
+    // fixture: the point is the seek against the same seat a linear decode ran
+    // on, which the tests below pin for the software seat. SAFETY:
+    // --test-threads=1, which the documented invocation keeps.
+    unsafe { std::env::remove_var("VE_SW") };
     for name in [
         "test_baseline.mp4",
         "test_high.mp4",
