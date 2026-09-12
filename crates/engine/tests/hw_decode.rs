@@ -201,9 +201,9 @@ fn seek_matches_linear() {
 #[test]
 #[ignore = "needs libengine_hw.so and a VA-API driver"]
 fn seek_matches_linear_every_container() {
-    // The hardware path for all of these: there is no software HEVC or AV1
-    // decoder to compare against. SAFETY: --test-threads=1.
-    unsafe { std::env::remove_var("VE_SW") };
+    // The hardware path for these, including AV1's fixture: the point is the
+    // seek against the same seat a linear decode ran on, which the tests
+    // below pin for the software seat.
     for name in [
         "test_baseline.mp4",
         "test_high.mp4",
@@ -404,4 +404,72 @@ fn hardware_matches_software_on_frame_30() {
     let diff = hw.iter().zip(&sw).filter(|(a, b)| a != b).count();
     eprintln!("frame 30 differing bytes: {diff} / {}", hw.len());
     assert_eq!(diff, 0, "hardware and software decode disagree");
+}
+
+/// The AV1 twin of [`hardware_matches_software_on_frame_30`]: the plugin's
+/// VA-API decoder against the project's own `ec-av1`, whole file, byte for
+/// byte -- 8-bit AV1 decode is bit-exact by the same conformance argument the
+/// H.264 twin makes, and a mismatch means a deviation in one of the two
+/// decoders, reported rather than swallowed.
+#[test]
+#[ignore = "needs libengine_hw.so and a VA-API driver with AV1 decode"]
+fn av1_hardware_matches_software_on_every_frame() {
+    const NAME: &str = "test_av1.mkv";
+    let (hw_count, hw_frame_30) = decode_all_hw(NAME);
+
+    // Pin the comparison side to software ourselves: without this, running the
+    // suite without VE_SW=1 would compare hardware against hardware and pass
+    // vacuously. SAFETY: the suite is documented to run with --test-threads=1.
+    unsafe { std::env::set_var("VE_SW", "1") };
+    let path = asset(NAME);
+    let start = Instant::now();
+    let (meta, rx) = DecodeSession::open(&path).expect("software open");
+    let mut sw_count = 0usize;
+    let mut sw_frame_30 = Vec::new();
+    for frame in rx {
+        if frame.index == 30 {
+            sw_frame_30 = frame.bgra;
+        }
+        sw_count += 1;
+    }
+    let sw_elapsed = start.elapsed();
+    unsafe { std::env::remove_var("VE_SW") };
+    eprintln!("{NAME}: hardware {hw_count} frames, software {sw_count} frames in {sw_elapsed:?}");
+    assert_eq!(sw_count, hw_count, "frame count");
+    assert_eq!(sw_count, usize::try_from(meta.frame_count).expect("count"));
+    assert_eq!(hw_frame_30.len(), sw_frame_30.len(), "frame size");
+    let diff = hw_frame_30.iter().zip(&sw_frame_30).filter(|(a, b)| a != b).count();
+    eprintln!("frame 30 differing bytes: {diff} / {}", sw_frame_30.len());
+    assert_eq!(diff, 0, "hardware and software AV1 decode disagree");
+}
+
+/// The 10-bit twin: the plugin reads a P010 surface back as the high byte of
+/// each pair; `ec-av1` hands `u16` planes the seat downshifts by two. Same
+/// truncation, same picture -- or one of the two seats is wrong.
+#[test]
+#[ignore = "needs libengine_hw.so and a VA-API driver with 10-bit AV1 decode"]
+fn av1_ten_bit_hardware_matches_software_on_every_frame() {
+    const NAME: &str = "test_av1_10.mkv";
+    let (hw_count, hw_frame_30) = decode_all_hw(NAME);
+    // SAFETY: the suite is documented to run with --test-threads=1.
+    unsafe { std::env::set_var("VE_SW", "1") };
+    let path = asset(NAME);
+    let start = Instant::now();
+    let (_, rx) = DecodeSession::open(&path).expect("software open");
+    let mut sw_count = 0usize;
+    let mut sw_frame_30 = Vec::new();
+    for frame in rx {
+        if frame.index == 30 {
+            sw_frame_30 = frame.bgra;
+        }
+        sw_count += 1;
+    }
+    let sw_elapsed = start.elapsed();
+    unsafe { std::env::remove_var("VE_SW") };
+    eprintln!("{NAME}: hardware {hw_count} frames, software {sw_count} frames in {sw_elapsed:?}");
+    assert_eq!(sw_count, hw_count, "frame count");
+    assert_eq!(hw_frame_30.len(), sw_frame_30.len(), "frame size");
+    let diff = hw_frame_30.iter().zip(&sw_frame_30).filter(|(a, b)| a != b).count();
+    eprintln!("frame 30 differing bytes: {diff} / {}", sw_frame_30.len());
+    assert_eq!(diff, 0, "hardware and software 10-bit AV1 decode disagree");
 }

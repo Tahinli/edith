@@ -58,6 +58,13 @@ ec-h264 = { path = "../../../edith_codecs/crates/ec-h264" }
 # Its shared IR (packets, frames, the registry decoder contract the seat is
 # written against), direct because decode.rs names those types itself.
 ec-core = { path = "../../../edith_codecs/crates/ec-core" }
+# The software AV1 decode seat, the project's own: a whole AV1 decoder
+# (entropy, prediction, transforms, loop filters, film grain) with no
+# third-party codec library under it, the same claim `ec-h264` makes for H.264.
+# The seat decodes one GOP chunk at a time off the demuxer's reassembled OBU
+# stream (`decode::run_av1`), so peak memory is one output picture plus the
+# reference bank, and seeks stay the demuxer's job.
+ec-av1 = { path = "../../../edith_codecs/crates/ec-av1" }
 # Both halves of AAC, and the only crate here that is asked for both. The
 # *encoder*, so an mp4's sound can be a mix rather than a copy: an equalized (or
 # otherwise processed) lane has to be decoded, and what is decoded has to be
