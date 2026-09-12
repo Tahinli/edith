@@ -98,7 +98,7 @@ fn every_audio_codec_the_refusal_names_really_decodes() {
     // 5.1 film soundtrack is remuxed into, and the standalone `.opus`. It was
     // the last codec the notice named as absent while both readers here already
     // *parsed* it -- `A_OPUS` and `OpusHead` have always mapped to symphonia's
-    // `CODEC_ID_OPUS`; only the decoder was missing, and it is `ruopus` now.
+    // `CODEC_ID_OPUS`; only the decoder was missing, and it is `ec-opus` now.
     for (file, what, channels) in [
         ("test_vp9.webm", "opus in a webm", 1),
         // 5.1 arrives as the stereo fold, exactly as a 5.1 AC-3 track does.

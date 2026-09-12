@@ -859,7 +859,7 @@ fn audio_label(
             // It is one line and 76 characters wide (`summary_head` in the app
             // has the test), which is why the condition is in this comment
             // instead of in the string.
-            false if format.is_mkv() => "Opus · SW encode (opus-rs)",
+            false if format.is_mkv() => "Opus · SW encode (ec-opus)",
             false => "AAC · SW encode (rusty_aac)",
         },
     }
@@ -881,10 +881,10 @@ fn measured_audio_label(
     opus: bool,
 ) -> &'static str {
     match (sound, opus) {
-        (_, true) => "Opus · SW encode (opus-rs)",
+        (_, true) => "Opus · SW encode (ec-opus)",
         // Encoded, into a container that would have carried Opus, and it is not
-        // Opus: the fidelity gate sent it to AAC ([`OPUS_MIN_FIDELITY`]), or the
-        // mix was not the 48 kHz stereo that seat is measured in.
+        // Opus: the fidelity gate sent it to AAC ([`OPUS_MIN_FIDELITY`]), or
+        // the mix was not 48 kHz at a width the seat is measured in.
         (Some(false), false) if format.is_mkv() => "AAC · SW encode (rusty_aac)",
         // `sound` is already what happened, not a prediction, so `copied` is
         // filled in and `ranged` never reaches the branch that reads it.
@@ -2020,29 +2020,30 @@ fn encode_audio(
     );
 
     // Opus where the container carries it and the mix is inside the envelope
-    // this encoder was *measured* correct in ([`encode_opus`]): a Matroska file,
-    // 48 kHz, stereo. An Opus source edited into an mkv export therefore leaves
-    // as Opus instead of being turned into AAC on the way out, which is the one
-    // generation of loss an all-Opus timeline used to pay for being cut.
+    // this encoder is *measured* correct in ([`encode_opus`]): a Matroska file,
+    // 48 kHz, mono or stereo. An Opus source edited into an mkv export
+    // therefore leaves as Opus instead of being turned into AAC on the way
+    // out, which is the one generation of loss an all-Opus timeline used to
+    // pay for being cut.
     //
     // Everything else falls through to the AAC below and is unchanged by this:
-    // every mp4, a mono mix, a 44.1 kHz timeline. The rate is the mix's own --
-    // there is no resampler on this path, and inventing one to reach 48 kHz
-    // would resample a whole timeline to satisfy a codec, which is a bigger
-    // change to the sound than the codec is.
+    // every mp4, a 44.1 kHz timeline. The rate is the mix's own -- there is no
+    // resampler on this path, and inventing one to reach 48 kHz would resample
+    // a whole timeline to satisfy a codec, which is a bigger change to the
+    // sound than the codec is.
     // ...and again before either encoder is entered: both of them run to the
     // end of the mix without a checkpoint of their own, so this is the last
     // moment a cancel costs seconds rather than the whole encode.
     cancelled(shared)?;
     if mkv
         && audio.sample_rate == OPUS_RATE
-        && channels == 2
-        && let Some((packets, pre_skip)) = encode_opus(&samples, kbps)?
+        && (1..=2).contains(&channels)
+        && let Some((packets, pre_skip)) = encode_opus(&samples, kbps, channels)?
     {
         return Ok(Some(ExportAudio {
             params: crate::AacTrackParams {
                 freq_index,
-                chan_conf: 2,
+                chan_conf: channels as u8,
                 sample_rate: OPUS_RATE,
             },
             packets,
@@ -2095,13 +2096,16 @@ pub(crate) const OPUS_RATE: u32 = 48_000;
 /// Matroska block timestamp in whole milliseconds is exact.
 const OPUS_FRAME: usize = 960;
 
-/// The most this project asks of `opus-rs`, in kbps, and why it is a cap rather
-/// than the four rates the Sound row offers: this encoder falls off a cliff at a
-/// rate that depends on the *content*, and above it a conformant decoder gets
-/// noise back. Measured on three one-second spans of a real 5.1 Opus film,
-/// encoded here and decoded with `ruopus` -- which is not the suspect, since it
-/// decodes ffmpeg's own libopus at 256 kbps to correlation 1.00000 on the same
-/// material:
+/// The most this project asks of the Opus encoder, in kbps, and why it is a cap
+/// rather than the four rates the Sound row offers.
+///
+/// History, because the number moved once already and the reason it could is
+/// part of the record. Under `opus-rs 0.1.26` the ceiling was 128: that encoder
+/// fell off a cliff at a rate that depended on the *content*, and above it a
+/// conformant decoder got noise back. Measured on three one-second spans of a
+/// real 5.1 Opus film, encoded there and decoded with `ruopus` -- which was not
+/// the suspect, since it decoded ffmpeg's own libopus at 256 kbps to
+/// correlation 1.00000 on the same material:
 ///
 /// ```text
 /// kbps     120     128     136     144     152     160
@@ -2111,18 +2115,21 @@ const OPUS_FRAME: usize = 960;
 /// libopus 0.997   0.998     --      --      --    0.996   (same spans, control)
 /// ```
 ///
-/// So: usable to 128, ruined by 136 on real film sound, and the pure-tone
-/// fixtures that first suggested a 165 kbps ceiling were simply easy material.
-/// 128 kbps stereo Opus is around transparency anyway (libopus scores 0.998
-/// there on the worst of those spans), so the cap costs nothing a listener has.
-/// It is still not *trusted*: every track is decoded again and measured before
-/// it is written ([`opus_fidelity`]), because a cliff whose edge moves with the
-/// material is not something a constant can be safe against on its own.
+/// So: usable to 128, ruined by 136 on real film sound -- and mono worse, at
+/// every rate, which is why a mono mix kept the AAC path entirely. `ec-opus`
+/// has no such cliff: its own suite holds every rate of the format's table to
+/// the reference decoders, mono, stereo and 5.1 alike, and this project
+/// re-measures the high band and the mono path where the old encoder failed
+/// (`the_opus_encoder_is_pinned_to_the_band_it_was_measured_in`).
 ///
-/// corner-cut: the ceiling is this encoder's, not the format's. Upgrade path is a
-/// released `opus-rs` that survives its own high rates -- the unit test pins the
-/// failure, so it fails the day the bug is fixed and this can be raised.
-pub(crate) const OPUS_MAX_KBPS: u32 = 128;
+/// It is still not *trusted*: every track is decoded again and measured before
+/// it is written ([`opus_fidelity`]), because a rate nobody measured on *your*
+/// sound is not something a constant can be safe against on its own.
+/// The ceiling is the Sound row's ([`AUDIO_KBPS`]), not the format's 510 kbps:
+/// a rate nothing in the product can ask for is a rate nothing here measures.
+/// 320 covers the row honestly, including the 256 default
+/// ([`DEFAULT_AUDIO_KBPS`]) the old cap silently halved on a Matroska export.
+pub(crate) const OPUS_MAX_KBPS: u32 = 320;
 
 /// How well a track has to survive its own round trip to be written as Opus:
 /// the correlation between the mix and the decode of what was encoded from it.
@@ -2142,24 +2149,33 @@ const OPUS_MIN_FIDELITY: f64 = 0.95;
 const OPUS_PRE_SKIP: u16 = 120;
 
 /// The mix as Opus packets, one per [`OPUS_FRAME`], plus the pre-skip that has
-/// to be declared in front of them. Stereo and [`OPUS_RATE`] only -- the caller
-/// checks both, because outside that pair this encoder is not one this project
-/// is willing to write files with ([`OPUS_MAX_KBPS`]).
+/// to be declared in front of them. Mono or stereo, at [`OPUS_RATE`] -- the
+/// caller checks all of it, because outside that envelope this encoder is not
+/// one this project is willing to write files with ([`OPUS_MAX_KBPS`]).
 ///
 /// The tail frame is padded with silence rather than dropped: Opus codes whole
 /// frames and a track a few milliseconds short under a picture that is not is
 /// the drift every other path here is written to avoid. The pre-skip trims the
 /// front; the container's duration trims the back.
-fn encode_opus(samples: &[f32], kbps: u32) -> crate::Result<Option<(Vec<crate::AacPacket>, u16)>> {
-    let mut encoder = opus_rs::OpusEncoder::new(OPUS_RATE as i32, 2, opus_rs::Application::Audio)
-        .map_err(|e| format!("the Opus encoder refused 48 kHz stereo: {e}"))?;
-    encoder.bitrate_bps = (kbps.min(OPUS_MAX_KBPS) * 1_000) as i32;
-    encoder.complexity = 10;
+fn encode_opus(
+    samples: &[f32],
+    kbps: u32,
+    channels: usize,
+) -> crate::Result<Option<(Vec<crate::AacPacket>, u16)>> {
+    let mut encoder = ec_opus::Encoder::new(OPUS_RATE, channels, ec_opus::Application::Audio)
+        .map_err(|e| format!("the Opus encoder refused 48 kHz {channels}-channel sound: {e}"))?;
+    // CBR, the crate's default: every packet exactly the rate's size. The old
+    // seat ran opus-rs's VBR; the gate below measures either, and a fixed
+    // packet size is the friendlier neighbour to a muxer's block budget.
+    encoder.set_bitrate(kbps.min(OPUS_MAX_KBPS) * 1_000);
+    // No complexity knob on this crate: the reference's default (9) is baked
+    // into its rate arithmetic, one percent of equiv rate away from the 10 the
+    // old encoder was asked for.
     let mut packets = Vec::new();
-    let mut frame = vec![0f32; OPUS_FRAME * 2];
+    let mut frame = vec![0f32; OPUS_FRAME * channels];
     // 1275 bytes is the most one Opus frame may weigh (RFC 6716 §3.2); this is
-    // that with room for the TOC and a padded frame, so `encode` never has to
-    // refuse for want of a buffer.
+    // that with room for the TOC and a padded frame, so `encode_float` never
+    // has to refuse for want of a buffer.
     let mut out = vec![0u8; 1500];
     // The head, coded **twice**. An encoder's very first frame has no history
     // behind it and comes out ramped and out of phase -- measured on a 440 Hz
@@ -2170,19 +2186,19 @@ fn encode_opus(samples: &[f32], kbps: u32) -> crate::Result<Option<(Vec<crate::A
     // once to warm the encoder, and thrown away again by the pre-skip: exactly
     // what pre-skip is for (RFC 7845 §4.2), at the cost of one packet.
     let coded = std::time::Instant::now();
-    let warm = samples.len().min(OPUS_FRAME * 2);
+    let warm = samples.len().min(OPUS_FRAME * channels);
     // ...and one silent frame after the sound, for the same delay seen from the
     // other end: the encoder is [`OPUS_PRE_SKIP`] samples behind its input, so
     // without a frame to push them out the last 2.5 ms of the timeline stay
     // inside it and the track ends short under a picture that does not.
     let blocks = std::iter::once(&samples[..warm])
-        .chain(samples.chunks(OPUS_FRAME * 2))
+        .chain(samples.chunks(OPUS_FRAME * channels))
         .chain(std::iter::once(&samples[..0]));
     for block in blocks {
         frame[..block.len()].copy_from_slice(block);
         frame[block.len()..].fill(0.0);
         let len = encoder
-            .encode(&frame, OPUS_FRAME, &mut out)
+            .encode_float(&frame, OPUS_FRAME, &mut out)
             .map_err(|e| format!("Opus encode failed: {e}"))?;
         packets.push(crate::AacPacket {
             bytes: out[..len].to_vec(),
@@ -2202,7 +2218,7 @@ fn encode_opus(samples: &[f32], kbps: u32) -> crate::Result<Option<(Vec<crate::A
     let encoded = coded.elapsed().as_secs_f64();
     let pre_skip = OPUS_PRE_SKIP + OPUS_FRAME as u16;
     let measured = std::time::Instant::now();
-    let fidelity = opus_fidelity(&packets, samples, usize::from(pre_skip));
+    let fidelity = opus_fidelity(&packets, samples, usize::from(pre_skip), channels);
     eprintln!(
         "export audio: Opus encode {encoded:.1} s, fidelity {fidelity:.4} measured in {:.1} s",
         measured.elapsed().as_secs_f64()
@@ -2240,8 +2256,11 @@ const FIDELITY_FLOOR: f64 = 1e-9;
 /// cannot read is exactly what this is here to catch.
 ///
 /// **Sampled above a minute of sound, and the median window is the answer.**
-/// This decode is the whole cost of exporting a feature film: `ruopus` runs its
-/// inverse MDCT at 0.2x real time here (measured, 24.2 s for 121.5 s of stereo),
+/// This decode was the whole cost of exporting a feature film under the
+/// previous decoder: `ruopus` ran its inverse MDCT at 0.2x real time (measured,
+/// 24.2 s for 121.5 s of stereo; `ec-opus`, the decoder here now, is far
+/// quicker, and the sampling survives it because it costs almost nothing to
+/// keep),
 /// so judging every packet of a two-and-a-half-hour film costs half an hour
 /// before a byte of picture is written -- which is what it did, and what made a
 /// copy export that has no encoding to do at all sit at zero for twenty minutes.
@@ -2269,12 +2288,18 @@ const FIDELITY_FLOOR: f64 = 1e-9;
 /// by a margin no single window can (0.998 against under 0.7) -- and a track
 /// under a minute is one window, where median and whole-track correlation are
 /// the same number the gate always used.
-fn opus_fidelity(packets: &[crate::AacPacket], samples: &[f32], pre_skip: usize) -> f64 {
+fn opus_fidelity(
+    packets: &[crate::AacPacket],
+    samples: &[f32],
+    pre_skip: usize,
+    channels: usize,
+) -> f64 {
     // Short enough to hear all of: every fixture, every unit test, and any
     // track under a minute. There is nothing to sample from.
     let all = FIDELITY_WINDOW * FIDELITY_WINDOWS;
     if packets.len() <= all {
-        return window_fidelity(packets, samples, pre_skip, 0, 0, packets.len()).unwrap_or(1.0);
+        return window_fidelity(packets, samples, pre_skip, channels, 0, 0, packets.len())
+            .unwrap_or(1.0);
     }
     // Evenly spread, first window at the head: the head is where an encoder's
     // own warm-up would show, and the last starts a window short of the end so
@@ -2285,7 +2310,7 @@ fn opus_fidelity(packets: &[crate::AacPacket], samples: &[f32], pre_skip: usize)
         let at = w * step;
         let from = at.saturating_sub(FIDELITY_WARMUP);
         let Some(fidelity) =
-            window_fidelity(packets, samples, pre_skip, from, at, at + FIDELITY_WINDOW)
+            window_fidelity(packets, samples, pre_skip, channels, from, at, at + FIDELITY_WINDOW)
         else {
             continue; // silence: nothing to correlate, and not a failure
         };
@@ -2306,24 +2331,31 @@ fn window_fidelity(
     packets: &[crate::AacPacket],
     samples: &[f32],
     pre_skip: usize,
+    channels: usize,
     from: usize,
     measure: usize,
     to: usize,
 ) -> Option<f64> {
-    let mut decoder = ruopus::MultistreamDecoder::with_rate(OPUS_RATE, 1, 1, &[0, 1]);
+    let (streams, coupled, mapping) = match channels {
+        1 => (1, 0, vec![0u8]),
+        // One coupled stream: the stereo shape every fixture and every mix
+        // here decodes back through.
+        _ => (1, 1, vec![0, 1]),
+    };
+    let mut decoder = ec_opus::MultistreamDecoder::with_rate(OPUS_RATE, streams, coupled, &mapping);
     let (mut num, mut da, mut db) = (0.0, 0.0, 0.0);
     // Where in the mix this window's first decoded sample lands: every packet
     // is [`OPUS_FRAME`] long, and the pre-skip is what the front of the stream
     // owes before the first of them is the timeline's frame 0.
-    let mut at = (from * OPUS_FRAME * 2).saturating_sub(pre_skip * 2);
-    let mut drop = (pre_skip * 2).saturating_sub(from * OPUS_FRAME * 2);
+    let mut at = (from * OPUS_FRAME * channels).saturating_sub(pre_skip * channels);
+    let mut drop = (pre_skip * channels).saturating_sub(from * OPUS_FRAME * channels);
     let mut counted = 0usize;
     for (index, packet) in packets.iter().enumerate().take(to).skip(from) {
         let Ok(pcm) = decoder.decode_packet(&packet.bytes) else {
             return Some(0.0);
         };
         let pcm = &pcm[drop.min(pcm.len())..];
-        drop = drop.saturating_sub(packet.samples as usize * 2);
+        drop = drop.saturating_sub(packet.samples as usize * channels);
         // The warm-up is decoded for its state and not for its numbers.
         if index < measure {
             at += pcm.len();
@@ -4733,17 +4765,31 @@ mod tests {
             .collect()
     }
 
+    /// Three seconds of the same two tones summed onto one channel: the mono
+    /// mix `opus-rs 0.1.26` mis-encoded at every rate, which is why a mono
+    /// export kept the AAC path until `ec-opus` took the seat.
+    fn mono_tones(secs: usize) -> Vec<f32> {
+        (0..OPUS_RATE as usize * secs)
+            .map(|i| {
+                let t = i as f32 / OPUS_RATE as f32;
+                let tau = std::f32::consts::TAU;
+                0.3 * (tau * 440.0 * t).sin() + 0.2 * (tau * 1234.0 * t).sin()
+            })
+            .collect()
+    }
+
     /// The best correlation of one channel of `got` against `want`, and the
-    /// offset it sat at.
-    fn align(want: &[f32], got: &[f32]) -> (f64, usize) {
+    /// offset it sat at. `stride` is the interleave width: 2 for the stereo
+    /// fixtures, 1 for mono.
+    fn align(want: &[f32], got: &[f32], stride: usize) -> (f64, usize) {
         let (mut best, mut at) = (-2.0, 0);
         let window = OPUS_RATE as usize;
         for lag in 0..1400 {
             let (mut num, mut da, mut db) = (0.0, 0.0, 0.0);
             for (x, y) in want[..window]
                 .iter()
-                .step_by(2)
-                .zip(got[lag * 2..].iter().step_by(2))
+                .step_by(stride)
+                .zip(got[lag * stride..].iter().step_by(stride))
             {
                 num += f64::from(*x) * f64::from(*y);
                 da += f64::from(*x) * f64::from(*x);
@@ -4757,8 +4803,22 @@ mod tests {
         (best, at)
     }
 
-    fn ruopus_decode(packets: &[crate::AacPacket]) -> Vec<f32> {
-        let mut decoder = ruopus::MultistreamDecoder::with_rate(OPUS_RATE, 1, 1, &[0, 1]);
+    fn ec_decode(packets: &[crate::AacPacket]) -> Vec<f32> {
+        let mut decoder = ec_opus::MultistreamDecoder::with_rate(OPUS_RATE, 1, 1, &[0, 1]);
+        let mut pcm = Vec::new();
+        for packet in packets {
+            pcm.extend(
+                decoder
+                    .decode_packet(&packet.bytes)
+                    .expect("a valid packet"),
+            );
+        }
+        pcm
+    }
+
+    /// [`ec_decode`] for a mono packet stream: one stream, no coupling.
+    fn ec_decode_mono(packets: &[crate::AacPacket]) -> Vec<f32> {
+        let mut decoder = ec_opus::MultistreamDecoder::with_rate(OPUS_RATE, 1, 0, &[0]);
         let mut pcm = Vec::new();
         for packet in packets {
             pcm.extend(
@@ -4771,20 +4831,22 @@ mod tests {
     }
 
     /// Why [`OPUS_MAX_KBPS`] is a cap, why [`OPUS_PRE_SKIP`] is a constant and
-    /// why [`opus_fidelity`] exists at all -- all three measured here against
-    /// `ruopus`, the decoder this project reads every Opus file back with, and
-    /// which matches ffmpeg's libopus decode of a libopus file to correlation
-    /// 1.00000 on this very signal.
+    /// why [`opus_fidelity`] exists at all -- all three measured here through
+    /// the same decoder door the product reads every Opus file back with, the
+    /// decoder being the witness and the *encoder* the one under test.
     ///
-    /// The last third **asserts the bug**: at 256 kbps stereo `opus-rs 0.1.26`
-    /// writes packets that only its own decoder reads back, and pinning that
-    /// here is what makes a version bump that fixes it *fail* -- which is the
-    /// signal to raise the cap rather than a reason to widen it quietly.
+    /// The second half pins the two failures the seat's move here fixed: under
+    /// `opus-rs 0.1.26` the encoder wrote stereo packets that only its own
+    /// decoder read back above roughly 165 kbps (fidelity 0.06 at 256), and it
+    /// mis-encoded mono at every rate -- which is what the old 128 cap and the
+    /// mono-mix-keeps-AAC rule stood on. Both asserts are survival now, and a
+    /// regression fails here, loudly: that is the signal to lower
+    /// [`OPUS_MAX_KBPS`] again, not a reason to widen it quietly.
     #[test]
     fn the_opus_encoder_is_pinned_to_the_band_it_was_measured_in() {
         let pcm = two_tones(3);
         for kbps in [96, OPUS_MAX_KBPS] {
-            let (packets, pre_skip) = encode_opus(&pcm, kbps)
+            let (packets, pre_skip) = encode_opus(&pcm, kbps, 2)
                 .expect("the encoder opens")
                 .expect("and inside the band it passes its own round trip");
             assert_eq!(pre_skip, OPUS_PRE_SKIP + OPUS_FRAME as u16);
@@ -4793,16 +4855,16 @@ mod tests {
                 pcm.len().div_ceil(OPUS_FRAME * 2) + 2,
                 "one packet per 20 ms frame, plus the warm-up and the flush"
             );
-            let decoded = ruopus_decode(&packets);
-            let (c, lag) = align(&pcm, &decoded);
+            let decoded = ec_decode(&packets);
+            let (c, lag) = align(&pcm, &decoded, 2);
             // From the first audible sample, head included -- and the head is
             // why this is 0.98 and not the 0.999 below: the encoder's first
-            // audible 20 ms still comes out about 6 dB down whatever is fed in
-            // ahead of it (a second warm-up frame changes the numbers here in
-            // no decimal place), so that ramp is a property of `opus-rs 0.1.26`
-            // and is stated rather than hidden behind a loose threshold.
+            // audible 20 ms comes out a few dB down (one frame of cold start;
+            // a second warm-up frame changes the numbers in no decimal place),
+            // so that ramp is stated rather than hidden behind a loose
+            // threshold.
             assert!(c >= 0.98, "{kbps} kbps came back at correlation {c:.4}");
-            let (settled, _) = align(&pcm[OPUS_FRAME * 2..], &decoded[OPUS_FRAME * 2..]);
+            let (settled, _) = align(&pcm[OPUS_FRAME * 2..], &decoded[OPUS_FRAME * 2..], 2);
             assert!(
                 settled >= 0.999,
                 "{kbps} kbps past the first frame: correlation {settled:.4}"
@@ -4824,38 +4886,50 @@ mod tests {
             );
             // The gate the export runs before it writes anything, on a track
             // that deserves to pass it.
-            let fidelity = opus_fidelity(&packets, &pcm, usize::from(pre_skip));
+            let fidelity = opus_fidelity(&packets, &pcm, usize::from(pre_skip), 2);
             assert!(
                 fidelity >= OPUS_MIN_FIDELITY,
                 "{kbps} kbps scored {fidelity:.4} on its own round trip"
             );
         }
 
-        // Above the band, straight at the crate, since `encode_opus` clamps: the
-        // packets come back as noise, and the gate says so. This is the check
-        // that the guard actually catches the failure it is built for -- and the
-        // one that fails, loudly, the day `opus-rs` fixes it.
-        let mut encoder =
-            opus_rs::OpusEncoder::new(OPUS_RATE as i32, 2, opus_rs::Application::Audio).unwrap();
-        encoder.bitrate_bps = 256_000;
-        encoder.complexity = 10;
-        let mut out = vec![0u8; 1500];
-        let packets: Vec<crate::AacPacket> = pcm
-            .chunks_exact(OPUS_FRAME * 2)
-            .map(|block| {
-                let len = encoder.encode(block, OPUS_FRAME, &mut out).unwrap();
-                crate::AacPacket {
-                    bytes: out[..len].to_vec(),
-                    samples: OPUS_FRAME as u32,
-                }
-            })
-            .collect();
-        let fidelity = opus_fidelity(&packets, &pcm, usize::from(OPUS_PRE_SKIP));
-        assert!(
-            fidelity < OPUS_MIN_FIDELITY,
-            "opus-rs now encodes 256 kbps stereo that a conformant decoder reads \
-             back (fidelity {fidelity:.4}): raise OPUS_MAX_KBPS and delete this half"
-        );
+        // Mono, the shape `opus-rs 0.1.26` mis-encoded at every rate and the
+        // reason a mono mix kept the AAC path: straight through the same seat,
+        // including at the rate where the old encoder was already writing
+        // stereo noise, let alone mono.
+        let mono = mono_tones(3);
+        for kbps in [96, 256] {
+            let (packets, pre_skip) = encode_opus(&mono, kbps, 1)
+                .expect("the encoder opens")
+                .expect("and mono passes its own round trip");
+            assert_eq!(pre_skip, OPUS_PRE_SKIP + OPUS_FRAME as u16);
+            let decoded = ec_decode_mono(&packets);
+            let (c, lag) = align(&mono, &decoded, 1);
+            assert!(
+                c >= 0.98,
+                "mono at {kbps} kbps came back at correlation {c:.4}"
+            );
+            let (settled, _) = align(&mono[OPUS_FRAME..], &decoded[OPUS_FRAME..], 1);
+            assert!(
+                settled >= 0.999,
+                "mono at {kbps} kbps past the first frame: correlation {settled:.4}"
+            );
+            assert_eq!(
+                lag,
+                usize::from(pre_skip),
+                "mono at {kbps} kbps: the declared pre-skip is not where the sound starts"
+            );
+            assert!(
+                decoded.len() - usize::from(pre_skip) >= mono.len(),
+                "mono at {kbps} kbps: the track ends {} samples short of the timeline",
+                mono.len() + usize::from(pre_skip) - decoded.len()
+            );
+            let fidelity = opus_fidelity(&packets, &mono, usize::from(pre_skip), 1);
+            assert!(
+                fidelity >= OPUS_MIN_FIDELITY,
+                "mono at {kbps} kbps scored {fidelity:.4} on its own round trip"
+            );
+        }
     }
 
     /// The gate on a track too long to listen to whole: it samples, and the
@@ -4872,7 +4946,7 @@ mod tests {
     #[test]
     fn a_long_track_is_judged_by_the_middle_of_what_it_samples() {
         let pcm = two_tones(61);
-        let (packets, pre_skip) = encode_opus(&pcm, 96)
+        let (packets, pre_skip) = encode_opus(&pcm, 96, 2)
             .expect("the encoder opens")
             .expect("and passes its own round trip");
         assert!(
@@ -4881,7 +4955,7 @@ mod tests {
             packets.len()
         );
         let pre_skip = usize::from(pre_skip);
-        let whole = opus_fidelity(&packets, &pcm, pre_skip);
+        let whole = opus_fidelity(&packets, &pcm, pre_skip, 2);
         assert!(whole >= OPUS_MIN_FIDELITY, "a good track scored {whole:.4}");
 
         // One window's worth of the *mix* replaced by its own phase inverse:
@@ -4896,7 +4970,7 @@ mod tests {
         for sample in &mut one_bad[from..(from + FIDELITY_WINDOW * OPUS_FRAME * 2).min(pcm.len())] {
             *sample = -*sample;
         }
-        let dip = opus_fidelity(&packets, &one_bad, pre_skip);
+        let dip = opus_fidelity(&packets, &one_bad, pre_skip, 2);
         assert!(
             dip >= OPUS_MIN_FIDELITY,
             "one ruined window sank the whole track ({dip:.4})"
@@ -4909,7 +4983,7 @@ mod tests {
         for sample in &mut ruined[pcm.len() / 4..] {
             *sample = -*sample;
         }
-        let ruined = opus_fidelity(&packets, &ruined, pre_skip);
+        let ruined = opus_fidelity(&packets, &ruined, pre_skip, 2);
         assert!(
             ruined < OPUS_MIN_FIDELITY,
             "a track that is no longer the mix scored {ruined:.4}"
@@ -4918,10 +4992,10 @@ mod tests {
         // ...and silence is silence: nothing to correlate is not a round trip
         // that failed. Short, because the floor is the same on either path.
         let quiet = vec![0f32; OPUS_RATE as usize * 2 * 2];
-        let (packets, pre_skip) = encode_opus(&quiet, 96)
+        let (packets, pre_skip) = encode_opus(&quiet, 96, 2)
             .expect("the encoder opens")
             .expect("silence is written as Opus, not sent to AAC");
-        let fidelity = opus_fidelity(&packets, &quiet, usize::from(pre_skip));
+        let fidelity = opus_fidelity(&packets, &quiet, usize::from(pre_skip), 2);
         assert!(
             fidelity >= OPUS_MIN_FIDELITY,
             "a silent track scored {fidelity:.4} and would fall back to AAC"
