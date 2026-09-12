@@ -1,10 +1,11 @@
 //! VA-API decode (H.264, HEVC, VP9 and AV1) -- and VP8, which decodes on
-//! `libvpx`, dlopen'd by this plugin in turn ([`vpx`], software, no VA-API
-//! anything) -- and encode (H.264 and HEVC, and AV1 where the GPU has an
-//! entrypoint for it), shipped as a
+//! `ec-vp8` ([`vpx`], this project's own, software, no VA-API anything),
+//! linked into the plugin itself -- and encode (H.264 and HEVC, and AV1
+//! where the GPU has an entrypoint for it), shipped as a
 //! `dlopen`-able plugin so the main binary never gets a DT_NEEDED on
-//! libva/gbm/drm -- nor on libvpx, the same rule one level down. Every entry
-//! point is
+//! libva/gbm/drm. VP8's seat is the one codec with no runtime dlopen
+//! behind it anywhere: the old libvpx FFI is gone with the library it
+//! loaded. Every entry point is
 //! `extern "C"`, catches unwinds and reports failure as a null pointer or a
 //! negative code: the caller's contract is "any failure means use the software
 //! codec".
@@ -71,10 +72,7 @@ use cros_codecs::{Fourcc, FrameLayout, PlaneLayout, Resolution};
 use gbm::{BufferObjectFlags, Format as GbmFormat};
 
 use engine::demux::{Codec, Demuxer, VideoMeta};
-use engine::hw::{
-    CAP_AV1, CAP_H264, CAP_HEVC, CAP_VP8, CAP_VP9, VhCaps, VhDma, VhFrame, VhMeta,
-};
-use vpx::VpxCtx;
+use engine::hw::{CAP_AV1, CAP_H264, CAP_HEVC, CAP_VP8, CAP_VP9, VhCaps, VhDma, VhFrame, VhMeta};
 
 type PooledFrame = PooledVideoFrame<GenericDmaVideoFrame>;
 type Dec<C> = StatelessDecoder<C, VaapiBackend<PooledFrame>>;
@@ -872,19 +870,19 @@ impl OpenSession {
     }
 }
 
-/// One libvpx decode session: the VP8 half of the plugin, the whole of the
+/// One VP8 decode session: the VP8 half of the plugin, the whole of the
 /// same job [`Session`] does for the VA-API codecs. No display, no GBM, no
-/// surface pool -- libvpx hands the planes back in memory, and the only
+/// surface pool -- `ec-vp8` hands the planes back in memory, and the only
 /// shapes worth carrying over from the other half are the ones the caller
 /// sees: [`VhMeta`], one picture per `pump`, the same [`VhFrame`] layout, the
 /// same skip/position arithmetic a seek is.
 ///
-/// VP8 reorders nothing: every access unit fed is one picture out, in feed
-/// order, which is why `position` advances exactly as the VA-API half's does
-/// without any of its drain machinery.
+/// VP8 reorders nothing: every access unit fed is *at most* one picture out,
+/// in feed order (a hidden altref frame produces none), which is why
+/// `position` advances exactly as the VA-API half's does without any of its
+/// drain machinery.
 struct VpxSession {
-    vpx: &'static vpx::Vpx,
-    ctx: VpxCtx,
+    dec: vpx::Decoder,
     demuxer: Demuxer,
     meta: VhMeta,
     flushed: bool,
@@ -905,10 +903,11 @@ struct VpxSession {
 
 impl VpxSession {
     fn opened(meta: VideoMeta, demuxer: Demuxer) -> Option<Self> {
-        let vpx = vpx::vpx()?;
-        let mut session = Self {
-            vpx,
-            ctx: VpxCtx::default(),
+        // The decoder cannot refuse to exist any more: it is linked in. The
+        // `Option` is the shape [`OpenSession::open_at`] routes on, shared
+        // with [`Session::opened`], whose failures are real.
+        Some(Self {
+            dec: vpx::Decoder::new(),
             demuxer,
             meta: VhMeta {
                 width: meta.width,
@@ -922,50 +921,30 @@ impl VpxSession {
             out: Vec::new(),
             luma: 0,
             chroma: 0,
-        };
-        if let Err(e) = session.init() {
-            eprintln!("engine_hw: {e}");
-            return None;
-        }
-        Some(session)
-    }
-
-    /// (Re-)initialises the decoder. libvpx has no mid-stream reset, so this
-    /// *is* the flush: a seek pays destroy + init, and what makes that safe
-    /// is the demuxer's sync-sample seek, which restarts the feed where the
-    /// reference chain restarts -- the same discipline [`Session`]'s VA-API
-    /// flush leans on.
-    fn init(&mut self) -> Result<(), String> {
-        self.vpx.dec_init(&mut self.ctx)
+        })
     }
 
     /// Feeds one access unit. VP8 emits at most one picture per unit, so the
     /// pull belongs to the `pump` loop, not here.
     fn decode(&mut self, au: &[u8]) -> Result<(), String> {
-        if au.is_empty() {
-            return Ok(());
-        }
-        self.vpx.decode(&mut self.ctx, au)
+        self.dec.decode(au)
     }
 
     fn pump(&mut self) -> Result<bool, String> {
         loop {
             // Whatever the last fed unit produced is the picture this call
-            // hands back. The iterator starts fresh per feed because VP8
-            // queues nothing: one unit in, at most one picture out.
-            let mut iter: *const c_void = std::ptr::null();
-            while let Some(img) = self.vpx.get_frame(&mut self.ctx, &mut iter) {
+            // hands back. The slot is taken, not peeked -- the next fed unit
+            // overwrites it, because VP8 queues nothing: one unit in, at
+            // most one picture out.
+            if let Some(pic) = self.dec.get_frame() {
                 // One picture further along, shown or skipped past alike --
-                // the same walk [`Session::pump`] makes. The fields the copy
-                // needs are taken by value, which ends the context's borrow
-                // before `emit` may take the session again.
-                let (planes, stride, (w, h)) = (img.planes, img.stride, img.display());
+                // the same walk [`Session::pump`] makes.
                 self.position += 1;
                 if self.skip > 0 {
                     self.skip -= 1;
                     continue;
                 }
-                self.emit(planes, stride, w, h);
+                self.emit(&pic);
                 return Ok(true);
             }
             if self.flushed {
@@ -974,11 +953,12 @@ impl VpxSession {
             match self.demuxer.next_access_unit() {
                 Ok(Some(au)) => self.decode(&au)?,
                 Ok(None) => {
-                    // End of the track: the empty `vpx_codec_decode` that
-                    // releases anything held back is this decoder's flush,
-                    // and it costs no iteration of its own -- the pull at the
-                    // top of the loop drains it.
-                    self.vpx.flush(&mut self.ctx)?;
+                    // End of the track. VP8 holds nothing back -- the flush
+                    // is the formality [`vpx::Decoder::flush`] documents --
+                    // and it costs no iteration of its own: the pull at the
+                    // top of the loop finds the slot empty and ends the
+                    // stream.
+                    self.dec.flush()?;
                     self.flushed = true;
                 }
                 Err(e) => return Err(e.to_string()),
@@ -990,27 +970,24 @@ impl VpxSession {
     /// for a decoder that hands the planes back in memory rather than behind
     /// a `vaGetImage`. VP8 output is always 8-bit 4:2:0, so there is no
     /// 10-bit branch to mirror.
-    fn emit(&mut self, planes: [*mut u8; 4], stride: [std::ffi::c_int; 4], w: u32, h: u32) {
-        let (w, h) = (w as usize, h as usize);
+    fn emit(&mut self, pic: &vpx::Picture) {
+        let (w, h) = (usize::from(pic.width), usize::from(pic.height));
         let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
         if self.luma != w * h || self.chroma != cw * ch {
             self.luma = w * h;
             self.chroma = cw * ch;
             self.out = vec![0u8; self.luma + 2 * self.chroma];
         }
-        self.meta.width = w as u32;
-        self.meta.height = h as u32;
+        self.meta.width = u32::from(pic.width);
+        self.meta.height = u32::from(pic.height);
         let (dst_y, rest) = self.out.split_at_mut(self.luma);
         let (dst_u, dst_v) = rest.split_at_mut(self.chroma);
-        // SAFETY: libvpx guarantees the planes stride-cover the *display*
-        // size (4:2:0, so the chroma planes cover cw x ch) for the life of
-        // the image, which ends at this session's next `get_frame` -- after
-        // the copies below.
-        unsafe {
-            copy_plane(planes[0], stride[0] as usize, dst_y, w, h);
-            copy_plane(planes[1], stride[1] as usize, dst_u, cw, ch);
-            copy_plane(planes[2], stride[2] as usize, dst_v, cw, ch);
-        }
+        // The planes stride-cover the visible frame by the `Picture`
+        // contract (4:2:0, so the chroma planes cover cw x ch), and they are
+        // owned by this session -- no lifetime to out-think, no unsafe.
+        copy_plane(&pic.y, pic.stride, dst_y, w, h);
+        copy_plane(&pic.u, pic.uv_stride, dst_u, cw, ch);
+        copy_plane(&pic.v, pic.uv_stride, dst_v, cw, ch);
     }
 
     fn fill(&self, out: &mut VhFrame) {
@@ -1031,9 +1008,9 @@ impl VpxSession {
 
     /// Repositions the session, exactly [`Session::seek_to`]: the same
     /// forward walk within [`FORWARD_SECS`], the same demuxer seek to a sync
-    /// sample otherwise -- and for the decoder, destroy + re-init where the
-    /// VA-API half pays a flush, because VP8 is stateful to its last inter
-    /// frame and libvpx offers no softer reset.
+    /// sample otherwise -- and for the decoder, a fresh [`vpx::Decoder`]
+    /// where the VA-API half pays a flush, because VP8 is stateful to its
+    /// last inter frame.
     fn seek_to(&mut self, target_sample: u32) -> Result<(), String> {
         let target_frame = target_sample.saturating_sub(1);
         if let Reposition::Forward(ahead) = reposition(
@@ -1045,11 +1022,11 @@ impl VpxSession {
             self.skip = forward_skip(self.skip, ahead);
             return Ok(());
         }
-        // Dropping every reference the decoder holds. The destroy's answer is
-        // not checked against `Ok` because the init below re-zeroes the
-        // context either way; a destroy that failed has nothing to leak.
-        self.vpx.destroy(&mut self.ctx);
-        self.init()?;
+        // Dropping every reference the decoder holds: the whole of what the
+        // FFI seat paid as destroy + re-init is now the assignment of an
+        // owned value. What makes it safe is unchanged -- the demuxer's
+        // sync-sample seek restarts the feed where the reference chain does.
+        self.dec = vpx::Decoder::new();
         self.flushed = false;
         let first = self.demuxer.seek_to_sync_at_or_before(target_frame);
         self.skip = (i64::from(target_frame) - first).max(0) as u32;
@@ -1058,20 +1035,11 @@ impl VpxSession {
     }
 }
 
-impl Drop for VpxSession {
-    fn drop(&mut self) {
-        self.vpx.destroy(&mut self.ctx);
-    }
-}
-
 /// One strided plane down to tightly packed rows: the whole of the read-back
 /// a VP8 picture costs, where the VA-API half pays `vaGetImage` for the same.
-///
-/// # Safety
-/// `src` must stride-cover `w` x `h`, and `dst` must be `w` x `h`.
-unsafe fn copy_plane(src: *const u8, stride: usize, dst: &mut [u8], w: usize, h: usize) {
+fn copy_plane(src: &[u8], src_stride: usize, dst: &mut [u8], w: usize, h: usize) {
     for row in 0..h {
-        let s = unsafe { std::slice::from_raw_parts(src.add(row * stride), w) };
+        let s = &src[row * src_stride..row * src_stride + w];
         dst[row * w..(row + 1) * w].copy_from_slice(s);
     }
 }
@@ -1079,8 +1047,8 @@ unsafe fn copy_plane(src: *const u8, stride: usize, dst: &mut [u8], w: usize, h:
 /// Opens `path` for hardware decode, positioned so the first
 /// [`vh_next_frame`] returns sample `target_sample` (1-based; 0 and 1 both mean
 /// the start of the stream). Returns null on any failure at all: no libva
-/// runtime, no render node, no libvpx for a VP8 file, unsupported profile,
-/// unreadable file.
+/// runtime, no render node, unsupported profile, unreadable file, a VP8
+/// stream the decoder rejects.
 ///
 /// # Safety
 /// `path` must be a valid NUL-terminated C string.
@@ -1215,7 +1183,7 @@ pub unsafe extern "C" fn vh_next_frame_dma(
         let session = unsafe { &mut *(session as *mut OpenSession) };
         // SAFETY: as above.
         unsafe { *dma = VhDma::default() };
-        // A libvpx picture has no GPU buffer to hand over: this session reads
+        // A VP8 picture has no GPU buffer to hand over: this session reads
         // back, exactly as `vh_next_frame` does, and the caller's `dma` keeps
         // the fd-below-zero default that says so.
         match session {
@@ -1333,12 +1301,13 @@ const CAP_TABLE: [(u32, &[VAProfile::Type], &[VAProfile::Type], Option<VAProfile
 /// codecs this plugin actually implements can light up -- `CAP_TABLE` is that
 /// half of the intersection.
 ///
-/// VP8 is the one bit asked of nobody: it is this plugin's libvpx seat, lit
-/// when the library loads and nothing else -- no profile, no entrypoint, no
-/// display. It rides along only when the display *is* answerable, because
-/// this symbol's shape says a displayless machine has nothing to report at
-/// all; the decode path itself needs no display for it
-/// ([`OpenSession::open_at`] routes VP8 before any device opens).
+/// VP8 is the one bit asked of nobody: it is this plugin's own native seat
+/// (`vpx`, `ec-vp8` linked in), lit unconditionally -- no profile, no
+/// entrypoint, no display, no library to load. It rides along only when the
+/// display *is* answerable, because this symbol's shape says a displayless
+/// machine has nothing to report at all; the decode path itself needs no
+/// display for it ([`OpenSession::open_at`] routes VP8 before any device
+/// opens).
 ///
 /// `None` when there is no display to ask at all, which is the same "software
 /// only" a missing plugin means.
@@ -1354,10 +1323,8 @@ fn query_caps() -> Option<VhCaps> {
                 .query_config_entrypoints(profile)
                 .is_ok_and(|e| e.contains(&entrypoint))
     };
-    let decodes = |list: &[VAProfile::Type]| {
-        list.iter()
-            .any(|&p| has(p, VAEntrypoint::VAEntrypointVLD))
-    };
+    let decodes =
+        |list: &[VAProfile::Type]| list.iter().any(|&p| has(p, VAEntrypoint::VAEntrypointVLD));
     let mut caps = VhCaps::default();
     for (bit, eight, ten, encode) in CAP_TABLE {
         if decodes(eight) {
@@ -1374,10 +1341,10 @@ fn query_caps() -> Option<VhCaps> {
         }
     }
     // The plugin's own software decoder, on its own account rather than the
-    // driver's -- the plugin's capability, never a GPU feat.
-    if vpx::vpx().is_some() {
-        caps.decode |= CAP_VP8;
-    }
+    // driver's -- the plugin's capability, never a GPU feat. Native now, so
+    // the bit has no "when it loads" condition left: it lights on every
+    // machine this plugin runs on.
+    caps.decode |= CAP_VP8;
     Some(caps)
 }
 

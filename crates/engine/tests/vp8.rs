@@ -1,7 +1,7 @@
 //! VP8 import: the container half, and the decode half -- software, on the
-//! libvpx the plugin dlopens (`engine-hw`'s `vpx.rs`), which is why these
-//! twins need a built `libengine_hw.so` and a `libvpx.so` but **no VA-API
-//! VP8 profile**: no such profile exists on this GPU, and none is asked for.
+//! plugin's own native decoder (`ec-vp8`, `engine-hw`'s `vpx.rs`), which is
+//! why these twins need a built `libengine_hw.so` but **no VA-API VP8
+//! profile**: no such profile exists on this GPU, and none is asked for.
 //!
 //! ```text
 //! cargo build -p engine -p engine-hw --release
@@ -55,9 +55,9 @@ fn the_demuxer_reports_a_vp8_track() {
 /// There is no software VP8 decoder *in this binary*, so the software path
 /// must refuse by name rather than feed VP8 bytes to `ec-h264` -- and it
 /// must refuse where a caller can still show it, i.e. out of `open`, not from
-/// inside the worker. The decoder the refusal names is the plugin's libvpx
-/// arm, which is why the sentence names the plugin and not a nonexistent
-/// absence.
+/// inside the worker. The decoder the refusal names is the plugin's own
+/// (`ec-vp8`), which is why the sentence names the plugin and not a
+/// nonexistent absence.
 #[test]
 fn the_software_path_refuses_vp8_by_name() {
     // SAFETY: the suite is documented to run with --test-threads=1.
@@ -73,10 +73,10 @@ fn the_software_path_refuses_vp8_by_name() {
 }
 
 /// The end-to-end user path: opening the file yields pictures, all of them,
-/// through the plugin's libvpx arm. The `.webm` is the file this decodes,
+/// through the plugin's VP8 arm. The `.webm` is the file this decodes,
 /// the container half being the Matroska demuxer's `V_VP8` row.
 #[test]
-#[ignore = "needs a built libengine_hw.so and libvpx.so.9 -- no VA-API profile involved"]
+#[ignore = "needs a built libengine_hw.so -- no VA-API profile involved"]
 fn the_plugin_decodes_every_vp8_frame() {
     let start = Instant::now();
     let (meta, frames) = DecodeSession::open(asset("test_vp8.webm")).expect("open test_vp8.webm");
@@ -117,7 +117,7 @@ fn the_plugin_decodes_every_vp8_frame() {
 /// Export re-encodes to H.264 whatever the source was coded with: the packet
 /// copy path is audio-only, so no VP8 byte can reach an `avc1` track.
 #[test]
-#[ignore = "needs a built libengine_hw.so and libvpx.so.9 -- no VA-API profile involved"]
+#[ignore = "needs a built libengine_hw.so -- no VA-API profile involved"]
 fn a_vp8_source_exports_as_h264() {
     let session = PlaybackSession::open(asset("test_vp8.webm")).expect("open test_vp8.webm");
     let meta = *session.meta();
