@@ -267,7 +267,7 @@ mod tests {
 
     /// The shape the ask came from: a film in an mkv with a 5.1 AAC track,
     /// which no symphonia decoder takes (`aac: aac too complex`) and which
-    /// therefore reaches the lane through `rusty_aac` and the stereo fold. A
+    /// therefore reaches the lane through `ec-aac` and the stereo fold. A
     /// clip of one draws a waveform like any other -- an envelope that is not
     /// flat -- rather than the empty band a silent file makes.
     #[test]
