@@ -62,7 +62,11 @@ use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use rusty_h264::{Decoder, Encoder, EncoderConfig, Preset, YuvFrame};
+use ec_core::frame::VideoFrame;
+use ec_core::registry::{CodecId, CodecParameters};
+use ec_core::registry::Decoder as _;
+use ec_core::{Packet, TimeBase};
+use ec_h264::{Encoder, EncoderConfig, H264Decoder, PictureView, Preset};
 
 use flacenc::component::BitRepr;
 use flacenc::error::Verify;
@@ -783,7 +787,7 @@ pub const NO_HW_SEAT: &str = "no HW seat here — pick Auto or Software";
 
 /// How a front-end names a video seat: which of the two encoders has the file,
 /// and which library that is. Not the codec -- a caller shows this beside the
-/// format it picked, and `rav1e` names AV1 as `rusty_h264` names H.264. One
+/// format it picked, and `rav1e` names AV1 as `ec-h264` names H.264. One
 /// place, so what a card says before an export and what its progress line says
 /// during one cannot drift apart.
 fn video_label(format: Format, hw: bool) -> &'static str {
@@ -791,7 +795,7 @@ fn video_label(format: Format, hw: bool) -> &'static str {
         (_, true) => HW_LABEL,
         (Format::Hevc | Format::HevcMp4, false) => "SW encode (oxideav-h265 intra)",
         (Format::Av1 | Format::Av1Mp4, false) => "SW encode (rav1e)",
-        (_, false) => "SW encode (rusty_h264)",
+        (_, false) => "SW encode (ec-h264)",
     }
 }
 
@@ -3784,10 +3788,10 @@ enum Enc {
     Hw(HwEncoder),
     Sw {
         encoder: Encoder,
-        /// The last access unit; owned because `rusty_h264` hands back a `Vec`
-        /// while the plugin lends a slice, and the two have to look alike here.
+        /// The access unit currently lent out: the encoder hands back an owned
+        /// `Vec` where the seat's contract lends a slice, so one lives here
+        /// between the two.
         au: Vec<u8>,
-        flushed: bool,
     },
     /// AV1 on the GPU, through the same plugin the H.264 seat uses.
     Av1Hw(HwEncoder),
@@ -3881,8 +3885,20 @@ impl Enc {
             eprintln!("export encoder: hardware (VA-API plugin)");
             return Ok(Self::Hw(hw));
         }
-        eprintln!("export encoder: software (rusty_h264)");
-        let mut cfg = EncoderConfig::new(meta.width as usize, meta.height as usize);
+        eprintln!("export encoder: software (ec-h264)");
+        // 4:2:0 addresses its conformance window in *chroma* samples, so an odd
+        // picture cannot be cropped back to itself -- and an odd dimension has
+        // no chroma plane of its own to begin with. Named rather than padded to
+        // something a decoder would then show a column of: the same refusal the
+        // HEVC seat makes, and x264's and ffmpeg's own for 4:2:0 H.264.
+        if meta.width % 2 != 0 || meta.height % 2 != 0 {
+            return Err(format!(
+                "{}x{} cannot be written as H.264: 4:2:0 needs even dimensions",
+                meta.width, meta.height
+            )
+            .into());
+        }
+        let mut cfg = EncoderConfig::new(meta.width, meta.height);
         cfg.framerate = meta.frame_rate as f32;
         cfg.bitrate = bitrate.min(u32::MAX as u64) as u32;
         // Two seconds between key frames, and no B-frames on either path: the
@@ -3894,16 +3910,14 @@ impl Enc {
             false => (meta.frame_rate * 2.0).round().max(1.0) as u32,
         };
         cfg.bframes = 0;
-        let (fps_num, fps_den) = crate::mux::frame_timing(meta.frame_rate)?;
-        cfg.level_idc = h264_level_idc(meta.width, meta.height, fps_num, fps_den);
-        // S1 measured Fast at 1.30x realtime and Balanced at 0.46x for the same
-        // bitrate, so Fast is what a fallback should be.
+        // Fast, the rung a fallback is allowed to cost -- the cheaper arm of
+        // the preset ladder, the one the old seat's own S1 also picked when its
+        // Balanced rung halved the rate for the same bitrate.
         cfg.preset = Preset::Fast;
         let encoder = Encoder::new(cfg).map_err(|e| format!("software encoder: {e}"))?;
         Ok(Self::Sw {
             encoder,
             au: Vec::new(),
-            flushed: false,
         })
     }
 
@@ -4047,11 +4061,12 @@ impl Enc {
     /// a decoder may be started from -- which only the Matroska muxer asks, the
     /// mp4 one reading its own sync flag off the IDR slice.
     ///
-    /// corner-cut: `rusty_h264` buffers a whole GOP and returns it in one buffer
-    /// when its lookahead is active, which would make this "one access unit"
-    /// a lie and every sample duration with it. It is inactive here because
-    /// lookahead needs a zero bitrate and this path is always CBR; a future
-    /// constant-QP mode has to split the buffer per access unit first.
+    /// The contract is structural in the software seat now: `ec-h264` buffers
+    /// nothing -- no lookahead, and B pictures coded as none -- so one call is
+    /// one access unit by construction. The old seat only kept it because its
+    /// GOP-buffering lookahead needed a zero bitrate and this path was always
+    /// CBR; a future constant-QP mode would have had to split one buffer into
+    /// access units first.
     fn encode(
         &mut self,
         y: &[u8],
@@ -4116,18 +4131,17 @@ impl Enc {
             Self::Hw(hw) => Ok(hw
                 .encode(y, u, v, width, height, intra)?
                 .map(|au| (au, intra))),
-            Self::Sw { encoder, au, .. } => {
-                let frame = YuvFrame {
-                    width: width as usize,
-                    height: height as usize,
-                    y: y.to_vec(),
-                    u: u.to_vec(),
-                    v: v.to_vec(),
-                };
-                *au = encoder
-                    .try_encode(&frame)
+            Self::Sw { encoder, au } => {
+                // The key flag is what the bitstream says -- an IDR where the
+                // GOP asked for one, every picture on an intraframe export --
+                // which is what the hardware seat's `intra` carries too. The
+                // planes go in as borrows; the old seat was handed a copy.
+                let view = PictureView::i420(width, height, y, u, v);
+                let coded = encoder
+                    .encode(&view)
                     .map_err(|e| format!("software encode: {e}"))?;
-                Ok(Some((&au[..], false)).filter(|(au, _)| !au.is_empty()))
+                *au = coded.au;
+                Ok(Some((&au[..], coded.key_frame)).filter(|(au, _)| !au.is_empty()))
             }
         }
     }
@@ -4201,20 +4215,9 @@ impl Enc {
                 Ok(pop_hevc(hevc))
             }
             Self::Hw(hw) => Ok(hw.drain()?.map(|au| (au, false))),
-            Self::Sw {
-                encoder,
-                au,
-                flushed,
-            } => {
-                if *flushed {
-                    return Ok(None);
-                }
-                *flushed = true;
-                *au = encoder
-                    .try_flush()
-                    .map_err(|e| format!("software encoder flush: {e}"))?;
-                Ok(Some((&au[..], false)).filter(|(au, _)| !au.is_empty()))
-            }
+            // Nothing is held back: every picture `encode` took already came
+            // back with its access unit, so end of stream is the empty answer.
+            Self::Sw { .. } => Ok(None),
         }
     }
 }
@@ -4627,12 +4630,14 @@ impl Pictures {
                     return Ok(None);
                 }
                 let frame = sw.frame.as_ref().expect("advance stored a picture");
+                let [y, u, v] = [&frame.planes[0], &frame.planes[1], &frame.planes[2]];
+                debug_assert_eq!(y.stride, frame.width as usize, "padded luma plane");
                 Ok(Some(Yuv::pixels(
-                    &frame.y,
-                    &frame.u,
-                    &frame.v,
-                    frame.width as u32,
-                    frame.height as u32,
+                    &y.data,
+                    &u.data,
+                    &v.data,
+                    frame.width,
+                    frame.height,
                 )))
             }
         }
@@ -4641,12 +4646,15 @@ impl Pictures {
 
 struct SwDecoder {
     demuxer: Demuxer,
-    decoder: Decoder,
+    decoder: H264Decoder,
     /// Display index of the next picture the decoder will produce. Signed: a
     /// sync sample inside what the edit list trims is before frame 0.
     index: i64,
     start: u32,
-    frame: Option<YuvFrame>,
+    /// Set once the demuxer runs dry: `flush` has then released what the
+    /// decoder's reorder still held, and only those pictures are left.
+    flushed: bool,
+    frame: Option<VideoFrame>,
 }
 
 impl SwDecoder {
@@ -4654,7 +4662,7 @@ impl SwDecoder {
         let (meta, mut demuxer) = Demuxer::open(path)?;
         // The software decoder is H.264-only; an HEVC or VP9 source that got
         // this far means the plugin refused it, and the export says so instead
-        // of handing those bytes to `rusty_h264`.
+        // of handing those bytes to `ec-h264`.
         if meta.codec != crate::demux::Codec::H264 {
             return Err(meta.codec.needs_plugin().into());
         }
@@ -4663,30 +4671,56 @@ impl SwDecoder {
         let index = demuxer.seek_to_sync_at_or_before(start_frame);
         Ok(Self {
             demuxer,
-            decoder: Decoder::new(),
+            decoder: H264Decoder::new(CodecParameters::new(CodecId::H264))
+                .expect("ec-h264 takes its own codec id"),
             index,
             start: start_frame,
+            flushed: false,
             frame: None,
         })
     }
 
     /// Decodes up to and including the next picture at or after the in point,
-    /// leaving it in `frame`. `false` at end of stream.
+    /// leaving it in `frame`. `false` at end of stream. Pictures leave the
+    /// decoder in display order -- clause C.4.5.3, the same contract the
+    /// playback seat keeps -- so the landing index, itself a display index by
+    /// the demuxer's contract, counts one to one with them.
     fn advance(&mut self) -> crate::Result<bool> {
         loop {
-            let Some(au) = self.demuxer.next_access_unit()? else {
-                return Ok(false);
-            };
-            let decoded = self
-                .decoder
-                .decode(&au)
-                .map_err(|e| format!("decode at picture {}: {e}", self.index))?;
-            let Some(yuv) = decoded else { continue };
-            let wanted = self.index >= i64::from(self.start);
-            self.index += 1;
-            if wanted {
-                self.frame = Some(yuv);
-                return Ok(true);
+            if !self.flushed {
+                match self.demuxer.next_access_unit()? {
+                    Some(au) => self
+                        .decoder
+                        .send_packet(&Packet::new(0, TimeBase::new(1, 1), au))
+                        .map_err(|e| format!("decode at picture {}: {e}", self.index))?,
+                    None => {
+                        self.flushed = true;
+                        self.decoder
+                            .flush()
+                            .map_err(|e| format!("decode at end of stream: {e}"))?;
+                    }
+                }
+            }
+            match self.decoder.receive_frame() {
+                Ok(frame) => {
+                    let ec_core::frame::Frame::Video(pic) = frame else {
+                        continue;
+                    };
+                    if self.index < i64::from(self.start) {
+                        self.index += 1;
+                        continue;
+                    }
+                    self.index += 1;
+                    self.frame = Some(pic);
+                    return Ok(true);
+                }
+                // End of stream counts once the flush has happened; before it,
+                // either answer means go back for the next access unit.
+                Err(e) if e.is_eof() && self.flushed => return Ok(false),
+                Err(e) if e.is_need_more() || e.is_eof() => {}
+                Err(e) => {
+                    return Err(format!("decode at picture {}: {e}", self.index).into())
+                }
             }
         }
     }

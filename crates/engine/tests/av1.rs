@@ -143,7 +143,7 @@ fn every_block_comes_back_and_keyframes_carry_the_sequence_header() {
 }
 
 /// There is no software AV1 decoder, so the software path must refuse by name
-/// rather than feed AV1 bytes to `rusty_h264` -- and it must refuse where a
+/// rather than feed AV1 bytes to `ec-h264` -- and it must refuse where a
 /// caller can still show it, i.e. out of `open`, not from inside the worker.
 #[test]
 fn the_software_path_refuses_av1_by_name() {

@@ -36,6 +36,9 @@ use engine::project::{Lane, Source, Speed};
 use engine::scale::FitPolicy;
 use engine::scratch::Scratch;
 use engine::{DecodeSession, ExportHandle, PlaybackSession, Project};
+use ec_core::registry::{CodecId, CodecParameters, Decoder as _};
+use ec_core::{Packet, TimeBase};
+use ec_h264::H264Decoder;
 
 const FPS: f64 = 30.0;
 
@@ -750,16 +753,26 @@ fn hardware_access_units_repack_into_mp4() {
 
     let (meta, mut demuxer) = engine::demux::Demuxer::open(&out).unwrap();
     assert_eq!(meta.frame_count, 10);
-    let mut decoder = rusty_h264::Decoder::new();
+    let mut decoder = H264Decoder::new(CodecParameters::new(CodecId::H264))
+        .expect("ec-h264 takes its own codec id");
     let mut decoded = 0;
     while let Some(au) = demuxer.next_access_unit().unwrap() {
-        if decoder
-            .decode(&au)
-            .expect("software decode of the remuxed stream")
-            .is_some()
-        {
+        decoder
+            .send_packet(&Packet::new(0, TimeBase::new(1, 1), au))
+            .expect("software decode of the remuxed stream");
+        while let Ok(frame) = decoder.receive_frame() {
+            let ec_core::frame::Frame::Video(_) = frame else {
+                continue;
+            };
             decoded += 1;
         }
+    }
+    decoder.flush().expect("flush of the remuxed stream");
+    while let Ok(frame) = decoder.receive_frame() {
+        let ec_core::frame::Frame::Video(_) = frame else {
+            continue;
+        };
+        decoded += 1;
     }
     assert_eq!(decoded, 10, "every remuxed picture decodes again");
     std::fs::remove_file(&out).unwrap();

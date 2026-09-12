@@ -1,15 +1,11 @@
-//! The H.264 software decode seat swap: `ec-h264` (the in-project decoder) is
-//! the seat, `rusty_h264` -- the decoder this seat carried for years, and still
-//! the encoder behind software H.264 export -- is the independent witness.
-//!
-//! H.264 8-bit decode is bit-exact by conformance, so two correct decoders
-//! handed the same access units must return the same pictures, byte for byte;
-//! this is the software twin of `hw_decode::hardware_matches_software_on_frame_30`.
-//! The one deliberate difference is *order*: `rusty_h264` releases pictures in
-//! decode order, `ec-h264` in display order (clause C.4.5.3), which is what the
-//! rest of the engine already assumed -- the hardware backend behaves the same
-//! way, `frame.index` is a timeline position, and the old seat's decode-order
-//! corner-cut scrambled B-picture streams.
+//! The H.264 software decode seat's witnesses, after the swap that made
+//! `ec-h264` -- the in-project decoder -- the seat. The independent one is
+//! ffmpeg: 8-bit H.264 decode is bit-exact by conformance, so a correct decoder
+//! handed a file must return the pictures the outside decoder returns, byte for
+//! byte. (The witness these tests were first written against, `rusty_h264`,
+//! retired with the crate on 2026-09-12 when the encode seat moved too; ffmpeg
+//! took the outside role.) The seat's own two output orders must also agree:
+//! display order is a reordering, not a rewrite.
 //!
 //! ```text
 //! cargo test -p engine --test sw_backends -- --test-threads=1
@@ -59,23 +55,6 @@ impl Picture {
     }
 }
 
-/// `rusty_h264`, decode order -- the order it has always emitted.
-fn decode_rusty(aus: &[Vec<u8>]) -> Vec<Picture> {
-    let mut decoder = rusty_h264::Decoder::new();
-    let mut pictures = Vec::new();
-    for au in aus {
-        if let Some(yuv) = decoder.decode(au).expect("rusty decode") {
-            pictures.push(Picture {
-                width: yuv.width,
-                y: yuv.y,
-                u: yuv.u,
-                v: yuv.v,
-            });
-        }
-    }
-    pictures
-}
-
 /// `ec-h264` in the requested output order, drained to end of stream.
 fn decode_ec(aus: &[Vec<u8>], order: ec_h264::OutputOrder) -> Vec<Picture> {
     let mut decoder = H264Decoder::new(CodecParameters::new(CodecId::H264)).expect("ec decoder");
@@ -114,6 +93,51 @@ fn decode_ec(aus: &[Vec<u8>], order: ec_h264::OutputOrder) -> Vec<Picture> {
     pictures
 }
 
+/// Every picture ffmpeg releases for the file, in display order, as I420
+/// planes. `None` where ffmpeg is not installed -- the same skip the export
+/// suite's `ffmpeg_complaints` takes.
+fn decode_ffmpeg(path: &Path) -> Option<Vec<Picture>> {
+    let installed = std::process::Command::new("ffmpeg")
+        .arg("-version")
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false);
+    if !installed {
+        return None;
+    }
+    let (meta, _) = engine::demux::Demuxer::open(path).expect("open");
+    let (w, h) = (meta.width as usize, meta.height as usize);
+    let frame = w * h + 2 * (w / 2) * (h / 2);
+    let out = std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(path)
+        .args(["-f", "rawvideo", "-pix_fmt", "yuv420p", "-"])
+        .output()
+        .expect("run ffmpeg");
+    assert!(
+        out.status.success(),
+        "ffmpeg read {} and failed: {}",
+        path.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let raw = out.stdout;
+    assert_eq!(raw.len() % frame, 0, "ffmpeg handed back a partial frame");
+    Some(
+        raw.chunks_exact(frame)
+            .map(|data| {
+                let (luma, rest) = data.split_at(w * h);
+                let (cb, cr) = rest.split_at((w / 2) * (h / 2));
+                Picture {
+                    width: w,
+                    y: luma.to_vec(),
+                    u: cb.to_vec(),
+                    v: cr.to_vec(),
+                }
+            })
+            .collect(),
+    )
+}
+
 fn assert_same_pictures(a: &Picture, b: &Picture, what: &str, index: usize) {
     assert_eq!(a.width, b.width, "{what}: picture {index} width");
     assert_eq!(a.y, b.y, "{what}: picture {index} luma");
@@ -121,33 +145,36 @@ fn assert_same_pictures(a: &Picture, b: &Picture, what: &str, index: usize) {
     assert_eq!(a.v, b.v, "{what}: picture {index} cr");
 }
 
-/// Same access units in, same pictures out, byte for byte, on both a CAVLC
-/// Baseline and a CABAC High stream with B pictures. Decode order on both
-/// sides makes the sequences one to one regardless of reordering.
+/// The seat against the outside decoder, byte for byte, on both a CAVLC
+/// Baseline and a CABAC High stream with B pictures. Display order on both
+/// sides: ffmpeg releases pictures as they play, and so does the seat.
 #[test]
-fn sw_decoders_agree_byte_for_byte() {
+fn sw_decode_matches_ffmpeg_byte_for_byte() {
     for name in ["test_baseline.mp4", "test_high.mp4"] {
-        let aus = access_units(&asset(name));
-        let rusty = decode_rusty(&aus);
-        let ec = decode_ec(&aus, ec_h264::OutputOrder::Decode);
-        assert_eq!(rusty.len(), ec.len(), "{name}: picture count");
-        for (i, (a, b)) in rusty.iter().zip(&ec).enumerate() {
+        let path = asset(name);
+        let Some(want) = decode_ffmpeg(&path) else {
+            eprintln!("no ffmpeg: skipping the outside decoder's word on {name}");
+            continue;
+        };
+        let got = decode_ec(&access_units(&path), ec_h264::OutputOrder::Display);
+        assert_eq!(got.len(), want.len(), "{name}: picture count");
+        for (i, (a, b)) in got.iter().zip(&want).enumerate() {
             assert_same_pictures(a, b, name, i);
         }
-        eprintln!("{name}: {} pictures agree byte for byte", rusty.len());
+        eprintln!("{name}: {} pictures agree byte for byte with ffmpeg", got.len());
     }
 }
 
 /// Display order is a reordering, not a rewrite: the same multiset of
 /// pictures the decode-order run releases, possibly in a different sequence.
-/// On the B-picture fixture the sequences genuinely differ -- that is the
-/// corner-cut being retired -- and on the Baseline fixture they cannot (no
+/// On the B-picture fixture the sequences genuinely differ -- the reordering
+/// is the point of the DPB -- and on the Baseline fixture they cannot (no
 /// B pictures, nothing to reorder).
 #[test]
 fn display_order_releases_the_same_pictures() {
     for name in ["test_baseline.mp4", "test_high.mp4"] {
         let aus = access_units(&asset(name));
-        let decode_order = decode_rusty(&aus);
+        let decode_order = decode_ec(&aus, ec_h264::OutputOrder::Decode);
         let display_order = decode_ec(&aus, ec_h264::OutputOrder::Display);
         assert_eq!(decode_order.len(), display_order.len(), "{name}: count");
         let mut want: Vec<u64> = decode_order.iter().map(Picture::hash).collect();
