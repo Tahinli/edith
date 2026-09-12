@@ -14,7 +14,7 @@ engine = { path = "../engine" }
 cros-codecs = { version = "0.0.6", features = ["vaapi"] }
 # Same version cros-codecs already pulls in; we allocate output frames ourselves.
 gbm = { version = "0.15", default-features = false, features = ["drm-support"] }
-# Same version `engine` pins for its own dlopens (`hw.rs`, `ao.rs`); this is
-# the plugin's half of the same philosophy, one level down: `libvpx` for the
-# software VP8 seat (`src/vpx.rs`), resolved at runtime like libva itself.
-libloading = "0.8"
+# The software VP8 seat, this project's own (`ec-vp8`, RFC 6386): linked in
+# as ordinary Rust, the one codec with no runtime dlopen behind it -- the
+# `libloading` the old libvpx FFI needed is gone with the FFI.
+ec-vp8 = { path = "../../../edith_codecs/crates/ec-vp8" }

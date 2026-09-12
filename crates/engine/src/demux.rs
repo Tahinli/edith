@@ -110,8 +110,8 @@ pub fn cancelled_read_error() -> crate::Error {
     CANCELLED.into()
 }
 
-/// What the video track is coded with. Not a decoder choice by itself: only
-/// H.264 has a software decoder in this binary, and VP8's (libvpx) lives
+/// What the video track is coded with. Not a decoder choice by itself: H.264
+/// and AV1 have software decoders in this binary, and VP8's (`ec-vp8`) lives
 /// inside the plugin -- which is what [`Codec::needs_plugin`] says for the
 /// rest, per codec, in the words that stay true.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,9 +140,9 @@ impl Codec {
     /// own (`ec-h264`, `ec-av1`) and are never refused for missing hardware on
     /// the *playback* path; HEVC and VP9 have no software decoder at all, so
     /// the refusal names the plugin as the only way. VP8's software decoder
-    /// *is* libvpx inside the plugin, so "there is no software decoder" would
-    /// be a lie the day the plugin grew that arm -- the refusal keeps naming
-    /// the plugin, because that is still the thing to make present. AV1's arm
+    /// *is* this project's own `ec-vp8`, inside the plugin, so "there is no
+    /// software decoder" would be a lie -- the refusal keeps naming the
+    /// plugin, because that is still the thing to make present. AV1's arm
     /// is the one refusal left that can reach it: the software *export*
     /// decoder is H.264-only (`export::SwDecoder`), so an AV1 source on a
     /// machine with no plugin exports through nothing. Shared so playback and
@@ -150,7 +150,7 @@ impl Codec {
     pub fn needs_plugin(self) -> String {
         match self {
             Self::Vp8 => {
-                "VP8 needs the VA-API plugin (libengine_hw.so) — its decoder is libvpx, inside the plugin"
+                "VP8 needs the VA-API plugin (libengine_hw.so) — its decoder is ec-vp8, inside the plugin"
                     .to_string()
             }
             Self::Av1 => {

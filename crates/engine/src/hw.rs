@@ -178,10 +178,11 @@ pub const CAP_HEVC: u32 = 1 << 1;
 pub const CAP_VP9: u32 = 1 << 2;
 pub const CAP_AV1: u32 = 1 << 3;
 
-/// VP8 decodes on libvpx inside the plugin -- software, dlopen'd at runtime,
-/// no GPU and no VA-API profile anywhere in it -- so this bit is the
-/// *plugin's* seat, never the driver's. It lights up [`VhCaps::decode`] when
-/// the library is present; the hardware line in [`crate::caps`] deliberately
+/// VP8 decodes on `ec-vp8` inside the plugin -- software, linked into the
+/// plugin itself, no GPU and no VA-API profile anywhere in it -- so this bit
+/// is the *plugin's* seat, never the driver's, and it lights up
+/// [`VhCaps::decode`] unconditionally: there is no library whose presence the
+/// bit depends on any more. The hardware line in [`crate::caps`] deliberately
 /// keeps it off, being a line about what the GPU takes.
 pub const CAP_VP8: u32 = 1 << 4;
 
@@ -263,7 +264,7 @@ fn load() -> Option<Plugin> {
 /// "software only" for all of them, which is what they mean.
 ///
 /// VP8 sits outside that reading on a driverless machine: its decoder is
-/// libvpx inside the plugin, so the plugin may open a VP8 file where this
+/// `ec-vp8` inside the plugin, so the plugin may open a VP8 file where this
 /// table answers `None`. Nothing here promises otherwise -- the decode path
 /// asks the plugin, not this table -- and the one display-dependent half the
 /// front-end draws from this stays exactly as truthful as it was.

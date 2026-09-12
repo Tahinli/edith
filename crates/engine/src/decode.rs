@@ -1016,8 +1016,8 @@ fn run_span(
     }
     // ...except where there is nothing to fall back to. Feeding HEVC, VP9 or
     // VP8 bytes to either software seat would be garbage, not a fallback --
-    // VP8's software decoder is libvpx, inside the plugin. H.264 and AV1 each
-    // have one of this project's own: `ec-h264`, `ec-av1`.
+    // VP8's decoder is `ec-vp8`, inside the plugin. H.264 and AV1 each
+    // have one of this project's own here: `ec-h264`, `ec-av1`.
     match opened.meta.codec {
         Codec::H264 => {
             eprintln!("decode backend: software (ec-h264)");
