@@ -256,7 +256,7 @@ fn a_seek_into_his_film_lands_on_the_second_it_asked_for() {
     }
 }
 
-/// The 5.1 **AAC** film: the multichannel seat `ec-aac` took from the vendored
+/// The 5.1 **AAC** film: the multichannel seat `ec-aac` took over from
 /// `rusty_aac`, exercised on the kind of track it exists for -- a BluRay
 /// remux's 48 kHz AAC-LC 5.1, decoded, folded to the pair the timeline
 /// carries, seeked across the film, and correlated against ffmpeg's own decode
