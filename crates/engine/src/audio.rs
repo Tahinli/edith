@@ -9,7 +9,7 @@
 //! symphonia's own format probe, as does the AAC track of a **Matroska** file:
 //! same reader, `mkv` instead of `isomp4`, and a 5.1 film soundtrack folded to
 //! stereo on the way out ([`SymDecoder`]). An mp4's **AC-3** track is the third: the same
-//! sample tables, decoded by `oxideav-ac3` and downmixed to stereo by the
+//! sample tables, decoded by `ec-ac3` and downmixed to stereo by the
 //! decoder itself, which is what lets a 5.1 BluRay remux play on a stereo
 //! timeline. Everything downstream of [`Track`] sees the
 //! same samples either way; only the packet copy asks which reader it came from,
@@ -34,7 +34,6 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use mp4::{AudioObjectType, ChannelConfig, MediaType, Mp4Reader, Mp4Track, TrackType};
-use oxideav_core::{CodecId, CodecParameters, CodecRegistry, Decoder, Frame, Packet as Ac3Packet};
 use symphonia_codec_aac::AacDecoder;
 use symphonia_core::codecs::audio::{
     AudioCodecParameters, AudioDecoder, AudioDecoderOptions,
@@ -66,7 +65,7 @@ const EMPTY_EDIT: u64 = u32::MAX as u64;
 /// What the sound of a *Matroska* file is read with, named for a refusal:
 /// symphonia's registry as this project enables it (see the feature list in
 /// `Cargo.toml`) plus the two families no symphonia version carries and this
-/// project decodes anyway -- AC-3/E-AC-3 through `oxideav-ac3` ([`MkvAc3Track`])
+/// project decodes anyway -- AC-3/E-AC-3 through `ec-ac3` ([`MkvAc3Track`])
 /// and Opus through `ec-opus` ([`SymDecoder::Opus`]).
 ///
 /// Written down per container because capability is not one set: an mp4 video's
@@ -1489,12 +1488,12 @@ impl Track {
     fn channels(&self) -> u16 {
         match self {
             Self::Aac(t) => t.channels(),
-            // Already downmixed by the AC-3 decoder itself; `channels` is what
-            // comes *out* of it, and the 2.1 passthrough it leaves at 3 (see
-            // [`Ac3Track`]) is folded by [`decode_ac3`] like any other width.
-            Self::Ac3(t) => t.channels.min(2),
-            // Downmixed by the very same decoder, out of a Matroska file.
-            Self::Mkv(t) => t.channels.min(2),
+            // Downmixed to a pair by the AC-3 decoder itself (§7.8.2); a mono
+            // track passes through as the one channel it is (see [`ac3_decoder`]),
+            // so what `channels` measures is already the timeline width.
+            Self::Ac3(t) => t.channels,
+            // The same decoder, out of a Matroska file.
+            Self::Mkv(t) => t.channels,
             Self::Sym(t) => t.channels,
         }
     }
@@ -1549,10 +1548,10 @@ impl Track {
                 aac_decoder(&t.params, t.source_channels())?;
             }
             Self::Ac3(t) => {
-                ac3_decoder("ac3", t.requested)?;
+                ac3_decoder(t.requested)?;
             }
             Self::Mkv(t) => {
-                ac3_decoder(t.mkv.codec, t.requested)?;
+                ac3_decoder(t.requested)?;
             }
             Self::Sym(t) => {
                 t.decoder()?;
@@ -2068,15 +2067,18 @@ fn widen(samples: &mut Vec<f32>, from: usize, to: usize) {
 }
 
 /// One source's AC-3 track: the same mp4 sample tables the AAC track is read
-/// from, decoded through `oxideav-ac3` and **downmixed to stereo by the decoder
-/// itself** (ATSC A/52 §7.8, `channels: Some(2)`), because one output device and
-/// one timeline layout is all there is. A 5.1 BluRay track therefore arrives
-/// here as an ordinary stereo source, and its rows in the picker say so.
+/// from, decoded through `ec-ac3` and **downmixed to stereo by the decoder
+/// itself** (ATSC A/52 §7.8.2, [`ec_ac3::Downmix::Stereo`]), because one output
+/// device and one timeline layout is all there is. A 5.1 BluRay track therefore
+/// arrives here as an ordinary stereo source, and its rows in the picker say so.
 ///
 /// `channels` is what the decoder actually emitted for the first frame rather
-/// than an assumed 2: everything from mono to 5.1 downmixes to stereo, but a 2.1
-/// stream is a passthrough the library leaves at 3, and that is refused by name
-/// in [`Track::channels`] instead of being mislabelled.
+/// than an assumed 2: everything from stereo to 5.1 downmixes to stereo and a
+/// mono track passes through as the one channel it is (`acmod` carries the
+/// programme in the centre; duplicating it is the timeline's business, see
+/// [`widen`]). The §7.8.2 fold is position-aware — every `acmod` from 1/0 to
+/// 3/2 puts its centre and surrounds where the matrix says — so no width is
+/// refused or mislabelled.
 struct Ac3Track {
     reader: Mp4Reader<BufReader<File>>,
     track_id: u32,
@@ -2088,8 +2090,9 @@ struct Ac3Track {
     total_samples: Option<u64>,
     stts: Vec<(u32, u32)>,
     /// What the decoder is asked to hand out, from this track's own layout:
-    /// `Some(2)` for anything with more than one front channel, `None` — the
-    /// library's passthrough — for a mono track. See [`ac3_decoder`].
+    /// [`ec_ac3::Downmix::Stereo`] for anything with more than one front
+    /// channel, [`ec_ac3::Downmix::Native`] — the coded channels untouched —
+    /// for a mono track. See [`ac3_decoder`].
     requested: Option<u16>,
 }
 
@@ -2124,14 +2127,14 @@ impl Ac3Track {
         let first = reader
             .read_sample(track_id, 1)?
             .ok_or("the AC-3 track has no samples")?;
-        let sample_rate = oxideav_ac3::syncinfo::parse(&first.bytes)
+        let sample_rate = ec_ac3::syncinfo::parse(&first.bytes)
             .map_err(|e| format!("not a readable AC-3 syncframe: {e:?}"))?
             .sample_rate;
-        let nfchans = oxideav_ac3::bsi::parse(first.bytes.get(5..).unwrap_or_default())
+        let nfchans = ec_ac3::bsi::parse(first.bytes.get(5..).unwrap_or_default())
             .map_err(|e| format!("not a readable AC-3 bit stream information: {e:?}"))?
             .nfchans;
         let requested = (nfchans > 1).then_some(2);
-        let mut decoder = ac3_decoder("ac3", requested)?;
+        let mut decoder = ac3_decoder(requested)?;
         let channels = decode_ac3(&mut decoder, &first.bytes)?
             .map(|(pcm, samples)| (pcm.len() as u64 / samples.max(1)) as u16)
             .filter(|&c| c > 0)
@@ -2179,10 +2182,10 @@ impl Ac3Track {
 }
 
 /// One source's AC-3 or E-AC-3 track out of a **Matroska** file: the very same
-/// decoder and the very same §7.8 stereo downmix [`Ac3Track`] runs, fed out of
+/// decoder and the very same §7.8.2 stereo downmix [`Ac3Track`] runs, fed out of
 /// the container's blocks instead of an mp4 sample table. A 5.1 E-AC-3 remux
 /// therefore arrives on the timeline as an ordinary stereo source, exactly as
-/// the mp4 path's does, and the mono passthrough quirk is the same one.
+/// the mp4 path's does, and mono passes through exactly the same way.
 ///
 /// Matroska indexes no samples, so what an `stts` walk answers on the mp4 side
 /// is answered here by the blocks' own timestamps ([`crate::demux::MkvAudio`]):
@@ -2198,7 +2201,7 @@ struct MkvAc3Track {
     total_samples: Option<u64>,
     /// What the decoder is asked to hand out, from this track's own layout:
     /// `Some(2)` for anything with more than one front channel, `None` for a
-    /// mono track. The reason is [`ac3_decoder`]'s `corner-cut`, not this file's.
+    /// mono track. See [`ac3_decoder`].
     requested: Option<u16>,
 }
 
@@ -2233,20 +2236,20 @@ impl MkvAc3Track {
         // downmix decision wants.
         let (sample_rate, nfchans) = if mkv.codec == "eac3" {
             // Annex E's BSI starts right after the 16-bit syncword.
-            let bsi = oxideav_ac3::eac3::bsi::parse(first.get(2..).unwrap_or_default())
+            let bsi = ec_ac3::eac3::parse(first.get(2..).unwrap_or_default())
                 .map_err(|e| format!("not a readable E-AC-3 bit stream information: {e:?}"))?;
             (bsi.sample_rate, bsi.nfchans)
         } else {
-            let sync = oxideav_ac3::syncinfo::parse(&first)
+            let sync = ec_ac3::syncinfo::parse(&first)
                 .map_err(|e| format!("not a readable AC-3 syncframe: {e:?}"))?;
-            let bsi = oxideav_ac3::bsi::parse(first.get(5..).unwrap_or_default())
+            let bsi = ec_ac3::bsi::parse(first.get(5..).unwrap_or_default())
                 .map_err(|e| format!("not a readable AC-3 bit stream information: {e:?}"))?;
             (sync.sample_rate, bsi.nfchans)
         };
         let requested = (nfchans > 1).then_some(2);
-        let mut decoder = ac3_decoder(mkv.codec, requested)?;
-        let (pcm, samples) =
-            decode_ac3(&mut decoder, &first)?.ok_or("the first AC-3 syncframe decoded to nothing")?;
+        let mut decoder = ac3_decoder(requested)?;
+        let (pcm, samples) = decode_ac3(&mut decoder, &first)?
+            .ok_or("the first AC-3 syncframe decoded to nothing")?;
         let channels = (pcm.len() as u64 / samples.max(1)) as u16;
         if channels == 0 {
             return Err("the first AC-3 syncframe decoded to nothing".into());
@@ -2285,60 +2288,50 @@ impl MkvAc3Track {
     }
 }
 
-/// A fresh AC-3 decoder handing out `channels`: `Some(2)` is the library's own
-/// A/52 §7.8 stereo downmix, which is the whole reason the timeline can carry a
-/// 5.1 track at all. Fresh per segment for the same reason every other decoder
-/// here is: a seek leaves overlap-add state belonging to the frames we skipped.
+/// A fresh AC-3 / E-AC-3 decoder. `requested` is the downmix ask: `Some(2)`
+/// hands back the library's own A/52 §7.8.2 stereo fold — per-position
+/// coefficients from the frame's own `acmod` and mix levels, LFE dropped,
+/// normalised so a full-scale mix cannot clip — which is the whole reason the
+/// timeline can carry a 5.1 track at all; `None` passes the coded channels
+/// through, which is what a mono track asks for (`acmod` 1/0 carries the
+/// programme in the centre, and duplicating it is the timeline's business, see
+/// [`widen`]). Fresh per segment for the same reason every other decoder here
+/// is: a seek leaves overlap-add state belonging to the frames we skipped.
 ///
-/// corner-cut: `Some(2)` on a **mono** (`acmod` 1/0) source decodes to digital
-/// silence in oxideav-ac3 0.0.10 — measured, 5.1 and stereo are correct — so a
-/// mono track asks for no downmix at all and stays the mono source it is. The
-/// upgrade path is `Some(2)` unconditionally once the library duplicates the
-/// centre channel; the caller ([`Ac3Track::open`]) is the only thing to change.
-///
-/// `codec` is the track's own id — `ac3` or `eac3`, which the library registers
-/// separately (E-AC-3 claims up to 8 channels where AC-3 claims 6). The struct
-/// behind both dispatches per packet on `bsid` in any case, so what this picks
-/// is the capability set, not the syntax.
-fn ac3_decoder(codec: &str, channels: Option<u16>) -> crate::Result<Box<dyn Decoder>> {
-    let mut registry = CodecRegistry::new();
-    oxideav_ac3::register_codecs(&mut registry);
-    let mut params = CodecParameters::audio(CodecId::new(codec));
-    params.channels = channels;
-    registry
-        .first_decoder(&params)
-        .map_err(|e| format!("no AC-3 decoder: {e:?}").into())
+/// The syntax is not an argument: one decoder reads AC-3 and E-AC-3 alike,
+/// dispatching per packet on `bsid`.
+fn ac3_decoder(requested: Option<u16>) -> crate::Result<ec_ac3::Ac3Decoder> {
+    Ok(ec_ac3::Ac3Decoder::with_options(ec_ac3::Options {
+        downmix: requested
+            .map(|_| ec_ac3::Downmix::Stereo)
+            .unwrap_or(ec_ac3::Downmix::Native),
+        ..ec_ac3::Options::default()
+    }))
 }
 
 /// One syncframe in, one buffer of interleaved f32 out and the frames per
 /// channel it holds. `Ok(None)` when the decoder wants more input before it can
-/// hand a frame back, which is not an error. The library speaks S16
-/// little-endian; `/32768` is the whole conversion, and it lands in the
-/// `[-1, 1)` every other reader here emits.
+/// hand a frame back, which is not an error. The library speaks interleaved
+/// little-endian f32 — the same `[-1, 1)` every other reader here emits.
 ///
 /// The frame count comes back beside the samples because an E-AC-3 frame is not
 /// the fixed 1536 (6 blocks of 256) an AC-3 one is -- `numblkscod` may say 1, 2
 /// or 3 blocks instead of 6 -- and dividing by an assumed length would put the
 /// channel count and every media position after it out.
 fn decode_ac3(
-    decoder: &mut Box<dyn Decoder>,
+    decoder: &mut ec_ac3::Ac3Decoder,
     bytes: &[u8],
 ) -> crate::Result<Option<(Vec<f32>, u64)>> {
-    let packet = Ac3Packet::new(0, oxideav_core::TimeBase::new(1, 48_000), bytes.to_vec());
-    decoder
-        .send_packet(&packet)
-        .map_err(|e| format!("AC-3 decode failed: {e:?}"))?;
-    match decoder.receive_frame() {
-        Ok(Frame::Audio(audio)) => Ok(Some((
-            audio.data[0]
-                .chunks_exact(2)
-                .map(|s| f32::from(i16::from_le_bytes([s[0], s[1]])) / 32768.0)
+    match decoder.decode_frame(bytes) {
+        Ok(frame) => Ok(Some((
+            frame.data[0]
+                .chunks_exact(4)
+                .map(|s| f32::from_le_bytes([s[0], s[1], s[2], s[3]]))
                 .collect(),
-            u64::from(audio.samples),
+            frame.samples as u64,
         ))),
-        Ok(other) => Err(format!("AC-3 decoder handed back {other:?}").into()),
-        Err(oxideav_core::Error::NeedMore) => Ok(None),
-        Err(e) => Err(format!("AC-3 decode failed: {e:?}").into()),
+        Err(ec_ac3::Error::NeedMore) => Ok(None),
+        Err(e) => Err(format!("AC-3 decode failed: {e}").into()),
     }
 }
 
@@ -3312,7 +3305,7 @@ fn run_ac3(
     timeline: &mut u64,
     tx: &SyncSender<AudioChunk>,
 ) -> bool {
-    let mut decoder = match ac3_decoder("ac3", track.requested) {
+    let mut decoder = match ac3_decoder(track.requested) {
         Ok(decoder) => decoder,
         Err(e) => {
             eprintln!("audio decoder init failed: {e}");
@@ -3340,9 +3333,8 @@ fn run_ac3(
                 return true;
             }
         };
-        // The library's §7.8 downmix already handles everything but its own 2.1
-        // passthrough, which comes out at 3 and is folded here like any width.
-        downmix(&mut interleaved, usize::from(track.channels));
+        // §7.8.2 has already folded anything wider than a pair; only a mono
+        // track arrives here in its own width, and [`widen`]'s is the last word.
         widen(&mut interleaved, usize::from(track.channels), channels);
         let next = pos + samples;
         if !emit(
@@ -3378,7 +3370,7 @@ fn run_mkv_ac3(
     timeline: &mut u64,
     tx: &SyncSender<AudioChunk>,
 ) -> bool {
-    let mut decoder = match ac3_decoder(track.mkv.codec, track.requested) {
+    let mut decoder = match ac3_decoder(track.requested) {
         Ok(decoder) => decoder,
         Err(e) => {
             eprintln!("audio decoder init failed: {e}");
@@ -3406,8 +3398,7 @@ fn run_mkv_ac3(
                 return true;
             }
         };
-        // ...and the 2.1 passthrough folded here, as on the mp4 side.
-        downmix(&mut interleaved, usize::from(track.channels));
+        // ...and widened here, as on the mp4 side.
         widen(&mut interleaved, usize::from(track.channels), channels);
         let next = pos + samples;
         if !emit(

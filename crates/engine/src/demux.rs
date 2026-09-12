@@ -1750,7 +1750,7 @@ pub fn matroska_audio_tracks(path: &Path) -> crate::Result<Vec<MkvAudioTrack>> {
 pub struct MkvAudio {
     file: File,
     blocks: Vec<Block>,
-    /// The `oxideav-ac3` codec id these blocks are packets of: `ac3` or `eac3`.
+    /// The Matroska codec id these blocks are packets of: `ac3` or `eac3`.
     pub codec: &'static str,
     /// Seconds one `TimestampScale` tick is worth, resolved once at open.
     secs_per_tick: f64,
