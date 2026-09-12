@@ -77,6 +77,10 @@ edition = "2024"
 #                 default and the six-line declaration in `src/lib.rs`; every
 #                 line of codec code is byte-identical to 0.9.1, so decode stays
 #                 bit-exact and the process gets glibc's malloc back.
+#                 (Since 2026-09-12 only the software H.264 *encode* seat
+#                 still links this crate -- decode is `ec-h264`, which carries
+#                 no allocator of its own; the patch stays until the encode
+#                 seat moves too.)
 #   mp4         - reads the `mp4a` sample entry as ISO only: the 8 bytes
 #                 QuickTime uses for version/revision/vendor are skipped as
 #                 reserved, so a version-1 SoundDescription's 16-byte tail

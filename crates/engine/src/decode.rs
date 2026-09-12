@@ -7,7 +7,11 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::thread;
 
-use rusty_h264::Decoder;
+use ec_core::frame::VideoFrame;
+use ec_core::registry::{CodecId, CodecParameters};
+use ec_core::registry::Decoder as _;
+use ec_core::{Packet, TimeBase};
+use ec_h264::H264Decoder;
 
 use crate::color::ColorParams;
 use crate::colorspace::{ColorDescription, Matrix, Transfer};
@@ -21,7 +25,7 @@ use crate::transform::TransformParams;
 
 /// One decoded picture, ready to hand to a renderer.
 pub struct Frame {
-    /// Position in decode order, starting at 0.
+    /// Position in display order, starting at 0.
     pub index: u32,
     pub width: u32,
     pub height: u32,
@@ -42,7 +46,7 @@ pub enum Backend {
     Opening,
     /// The VA-API plugin (`libengine_hw.so`).
     Hardware,
-    /// `rusty_h264`, in this process.
+    /// `ec-h264`, in this process.
     Software,
     /// A still image: one `image` decode, no stream and no decoder to pick.
     Still,
@@ -1006,12 +1010,12 @@ fn run_span(
         eprintln!("hardware decode failed before any frame, falling back to software");
     }
     // ...except where there is nothing to fall back to. Feeding HEVC or VP9
-    // bytes to `rusty_h264` would be garbage, not a fallback.
+    // bytes to the H.264 decoder would be garbage, not a fallback.
     if opened.meta.codec != Codec::H264 {
         eprintln!("{}", opened.meta.codec.needs_plugin());
         return;
     }
-    eprintln!("decode backend: software (rusty_h264)");
+    eprintln!("decode backend: software (ec-h264)");
     backend.set(Backend::Software);
     run(&mut opened.demuxer, &tx, start, end, &mut render, abort, speed)
 }
@@ -1620,78 +1624,120 @@ fn run(
     // A decoder per span, and cheap: it is a parameter-set map and a picture
     // buffer, while the *demuxer* -- whose index cost seconds to build -- is the
     // one this worker keeps.
-    let mut decoder = Decoder::new();
+    let mut decoder = H264Decoder::new(CodecParameters::new(CodecId::H264))
+        .expect("ec-h264 takes its own codec id");
     // Decoding has to restart at a sync sample, so pictures between it and
     // `start_frame` are decoded (the target frame references them) but never
     // converted or sent. Signed, because the landing sync sample can sit inside
     // what the file's edit list trims, i.e. *before* frame 0.
     let mut index = demuxer.seek_to_sync_at_or_before(start_frame);
+    // Pictures leave the decoder in display order -- clause C.4.5.3 bumps the
+    // decoded picture buffer -- and the landing index above is a display index
+    // by the demuxer's own contract, so the two count one to one. The decode
+    // order this loop used to emit was a corner-cut that only held for
+    // Baseline: a stream with B pictures arrived scrambled and mislabelled,
+    // and every reader of `index` (the transport's playhead, `skip_for_speed`,
+    // the export's frame map) reads it as a timeline position.
     let mut skipped = 0;
-
-    // corner-cut: emits pictures in decode order. Fine for Baseline (no B-frames);
-    // reordering streams need POC-sorted output before display.
-    loop {
+    // Set once the demuxer runs dry: `flush` makes the decoder release every
+    // picture its reorder delay still holds, and the drain below ends on
+    // `Error::Eof` once they are out.
+    let mut flushed = false;
+    // Every way this span ends: abort, consumer gone, end of the requested
+    // range, end of stream.
+    let mut done = false;
+    while !done {
         if abort.hit() {
             break;
         }
-        let au = match demuxer.next_access_unit() {
-            Ok(Some(au)) => au,
-            Ok(None) => break,
+        // One access unit is one packet. No timestamps travel with it: the
+        // presentation order comes out of the bitstream's own POC, and `index`
+        // is counted off the pictures as the decoder releases them.
+        match demuxer.next_access_unit() {
+            Ok(Some(au)) => {
+                let packet = Packet::new(0, TimeBase::new(1, 1), au);
+                if let Err(e) = decoder.send_packet(&packet) {
+                    eprintln!("decode error at access unit {index}: {e}");
+                    break;
+                }
+            }
+            Ok(None) => {
+                flushed = true;
+                if let Err(e) = decoder.flush() {
+                    eprintln!("decode error at end of stream: {e}");
+                    break;
+                }
+            }
             Err(e) => {
                 eprintln!("demux error: {e}");
                 break;
             }
-        };
-        let yuv = match decoder.decode(&au) {
-            Ok(Some(yuv)) => yuv,
-            Ok(None) => continue,
-            Err(e) => {
-                eprintln!("decode error at access unit {index}: {e}");
-                break;
-            }
-        };
-        if index < i64::from(start_frame) {
-            index += 1;
-            continue;
         }
-        let due = index as u32;
-        index += 1;
-        if abort.late(due) {
-            if skipped < LATE_RUN {
-                skipped += 1;
+        // Take everything the packet released; `NeedMore` is the signal to go
+        // back for the next access unit.
+        loop {
+            let pic = match decoder.receive_frame() {
+                Ok(pic) => pic,
+                Err(e) if e.is_need_more() || e.is_eof() => break,
+                Err(e) => {
+                    eprintln!("decode error at access unit {index}: {e}");
+                    break;
+                }
+            };
+            let ec_core::frame::Frame::Video(pic) = pic else {
+                continue;
+            };
+            if index < i64::from(start_frame) {
+                index += 1;
+                continue;
+            }
+            let due = index as u32;
+            index += 1;
+            if abort.late(due) {
+                if skipped < LATE_RUN {
+                    skipped += 1;
+                } else {
+                    skipped = 0;
+                    if send_picture(&pic, due, render, tx) {
+                        done = true; // consumer went away
+                        break;
+                    }
+                }
+            } else if skip_for_speed(speed, start_frame, due, end_frame) {
+                // Redundant by construction, not by lateness: no run limit
+                // needed (see `skip_for_speed`).
             } else {
                 skipped = 0;
-                let frame = render.frame(
-                    due,
-                    &yuv.y,
-                    &yuv.u,
-                    &yuv.v,
-                    yuv.width as u32,
-                    yuv.height as u32,
-                );
-                if tx.send(frame).is_err() {
-                    break; // consumer went away
+                if send_picture(&pic, due, render, tx) {
+                    done = true; // consumer went away
+                    break;
                 }
             }
-        } else if skip_for_speed(speed, start_frame, due, end_frame) {
-            // Redundant by construction, not by lateness: no run limit needed
-            // (see `skip_for_speed`).
-        } else {
-            skipped = 0;
-            let frame = render.frame(
-                due,
-                &yuv.y,
-                &yuv.u,
-                &yuv.v,
-                yuv.width as u32,
-                yuv.height as u32,
-            );
-            if tx.send(frame).is_err() {
-                break; // consumer went away
+            if index >= i64::from(end_frame) {
+                done = true; // end of the requested range
+                break;
             }
         }
-        if index >= i64::from(end_frame) {
-            break; // end of the requested range
+        if flushed {
+            done = true;
         }
     }
+}
+
+/// Converts one decoded picture and queues it. `true` when the consumer went
+/// away, so the span stops rather than keeps decoding into a void.
+fn send_picture(pic: &VideoFrame, due: u32, render: &mut Render, tx: &SyncSender<Frame>) -> bool {
+    // The decoder crops each picture into tightly packed planes, the shape
+    // every converter below takes. A padded plane would render skewed rather
+    // than subtly wrong, so the assumption is pinned where it is relied on --
+    // free in a release build.
+    let (y, u, v) = (&pic.planes[0], &pic.planes[1], &pic.planes[2]);
+    debug_assert_eq!(y.stride, pic.width as usize, "padded luma plane");
+    debug_assert_eq!(
+        u.stride,
+        pic.width.div_ceil(2) as usize,
+        "padded chroma plane"
+    );
+    let frame = render.frame(due, &y.data, &u.data, &v.data, pic.width, pic.height);
+    tx.send(frame).is_err()
 }
