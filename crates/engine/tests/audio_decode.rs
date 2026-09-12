@@ -202,7 +202,7 @@ fn an_ac3_track_decodes_and_51_comes_down_to_stereo() {
 /// Opus, which used to be the codec the refusal string was *for*: a standalone
 /// `.opus`, the `.webm` sound off the web, and the 5.1 in an `.mka` that a film
 /// soundtrack is -- four Opus streams with a channel mapping table, decoded by
-/// `ruopus` and folded to stereo by the same fold the AC-3 and AAC paths use.
+/// `ec-opus` and folded to stereo by the same fold the AC-3 and AAC paths use.
 ///
 /// The 5.1 fixture is the channel-order check as well: its tone is in FL and BR
 /// and silent in between, so both output channels carry sound only if the

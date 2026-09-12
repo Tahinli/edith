@@ -67,7 +67,7 @@ const EMPTY_EDIT: u64 = u32::MAX as u64;
 /// symphonia's registry as this project enables it (see the feature list in
 /// `Cargo.toml`) plus the two families no symphonia version carries and this
 /// project decodes anyway -- AC-3/E-AC-3 through `oxideav-ac3` ([`MkvAc3Track`])
-/// and Opus through `ruopus` ([`SymDecoder::Opus`]).
+/// and Opus through `ec-opus` ([`SymDecoder::Opus`]).
 ///
 /// Written down per container because capability is not one set: an mp4 video's
 /// sound never reaches symphonia ([`Track::open`] answers before it), so it
@@ -1701,7 +1701,7 @@ impl SymTrack {
     /// (`aac/mod.rs:93`, "aac: aac too complex"), which is exactly the 5.1 and
     /// 7.1 tracks of a film, so those go to `rusty_aac` instead
     /// ([`aac_decoder`]), and it has no Opus decoder at all, so that one goes to
-    /// `ruopus`.
+    /// `ec-opus` ([`SymDecoder::Opus`]).
     fn decoder(&self) -> crate::Result<SymDecoder> {
         let from = usize::from(self.source_channels);
         if self.params.codec == CODEC_ID_OPUS {
@@ -1709,7 +1709,7 @@ impl SymTrack {
                 opus_layout(self.params.extra_data.as_deref().unwrap_or_default(), from)?;
             // 48 kHz whatever the container says: that is the only rate Opus
             // decodes at, and the rate both readers declare for it.
-            let decoder = ruopus::MultistreamDecoder::with_rate(48_000, streams, coupled, &mapping);
+            let decoder = ec_opus::MultistreamDecoder::with_rate(48_000, streams, coupled, &mapping);
             return Ok(SymDecoder::Opus(Box::new(decoder), from));
         }
         if self.params.codec == CODEC_ID_AAC {
@@ -1840,7 +1840,7 @@ enum SymDecoder {
     /// Every Opus track, mono to 7.1: one multistream decoder -- the streams of
     /// a packet, the channel mapping table and the routing between them are all
     /// its business -- and the same width.
-    Opus(Box<ruopus::MultistreamDecoder>, usize),
+    Opus(Box<ec_opus::MultistreamDecoder>, usize),
 }
 
 impl SymDecoder {

@@ -51,7 +51,7 @@ pub use project::{Clip, Project, Rate, Speed};
 ///
 /// Exactly the containers the engine's audio path reads (`audio::AudioSession`),
 /// Opus included: `.opus` is an Ogg file symphonia's probe already reads and
-/// `ruopus` now decodes, and `.mka` is the Matroska whose sound is all it
+/// `ec-opus` decodes, and `.mka` is the Matroska whose sound is all it
 /// has. A `.dts` or a bare `.ac3` is refused by the same door that refuses a
 /// `.txt` -- there is no reader here that opens an elementary stream -- which is
 /// the honest answer.
