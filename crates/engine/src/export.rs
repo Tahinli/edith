@@ -3909,11 +3909,18 @@ impl Enc {
             true => 1,
             false => (meta.frame_rate * 2.0).round().max(1.0) as u32,
         };
-        cfg.bframes = 0;
         // Fast, the rung a fallback is allowed to cost -- the cheaper arm of
         // the preset ladder, the one the old seat's own S1 also picked when its
         // Balanced rung halved the rate for the same bitrate.
         cfg.preset = Preset::Fast;
+        // 8x8 transform off. At this rung it is half the pure-encode cost
+        // (17.2 ms/frame against 35.1 at 720p across all cores, measured at
+        // the swap) for at most 0.7 dB BD-PSNR -- against an old seat that ran
+        // Constrained Baseline and never had the transform in the first
+        // place. The export stays Main-profile CABAC, which is where the
+        // quality over the old seat lives; a constant-QP mode would be the
+        // place to revisit the rung whole.
+        cfg.transform_8x8 = false;
         let encoder = Encoder::new(cfg).map_err(|e| format!("software encoder: {e}"))?;
         Ok(Self::Sw {
             encoder,
