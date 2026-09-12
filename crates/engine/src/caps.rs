@@ -37,8 +37,8 @@ const SW_CODECS: [(&str, &str, bool, bool); 10] = [
     ("HEVC", "oxideav-h265 intra", false, true),
     ("AV1", "rav1e", false, true),
     // Decode is split by width: symphonia carries stereo and narrower, `ec-aac`
-    // everything wider; the encoder is `rusty_aac`.
-    ("AAC", "symphonia / ec-aac / rusty_aac", true, true),
+    // everything wider; the encoder is `ec-aac` as well.
+    ("AAC", "symphonia / ec-aac / ec-aac", true, true),
     ("MP3", "symphonia / rusty_mp3", true, true),
     ("FLAC", "symphonia / flacenc", true, true),
     ("PCM", "symphonia / hound", true, true),
@@ -159,7 +159,7 @@ mod tests {
     #[test]
     fn the_software_line_names_every_encoder_this_build_carries() {
         let line = software();
-        for name in ["ec-h264", "oxideav-h265 intra", "rav1e", "rusty_aac"] {
+        for name in ["ec-h264", "oxideav-h265 intra", "rav1e", "ec-aac"] {
             assert!(line.contains(name), "{name} missing from {line}");
         }
         // Decode-only crates must not read as encoders, and the seat words are
