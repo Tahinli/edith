@@ -1077,7 +1077,7 @@ impl AudioSession {
                     // The profile still gates -- the writer rebuilds an
                     // AudioSpecificConfig and calls it LC -- but the layout no
                     // longer does: a 5.1 or 7.1 AAC track decodes through
-                    // `rusty_aac` and folds to the pair the timeline carries
+                    // `ec-aac` and folds to the pair the timeline carries
                     // ([`aac_decoder`]).
                     decodable: ac3.is_some()
                         || aac
@@ -1699,7 +1699,7 @@ impl SymTrack {
     /// Which decoder is not the caller's business, and it is not always
     /// symphonia's: its AAC decoder refuses anything wider than stereo outright
     /// (`aac/mod.rs:93`, "aac: aac too complex"), which is exactly the 5.1 and
-    /// 7.1 tracks of a film, so those go to `rusty_aac` instead
+    /// 7.1 tracks of a film, so those go to `ec-aac` instead
     /// ([`aac_decoder`]), and it has no Opus decoder at all, so that one goes to
     /// `ec-opus` ([`SymDecoder::Opus`]).
     fn decoder(&self) -> crate::Result<SymDecoder> {
@@ -1836,7 +1836,7 @@ enum SymDecoder {
     Sym(Box<dyn AudioDecoder>, usize),
     /// Boxed because the decoder carries its own IMDCT tables and this enum is
     /// moved into the worker.
-    Aac(Box<rusty_aac::AacDecoder>, usize),
+    Aac(Box<ec_aac::AacDecoder>, usize),
     /// Every Opus track, mono to 7.1: one multistream decoder -- the streams of
     /// a packet, the channel mapping table and the routing between them are all
     /// its business -- and the same width.
@@ -1875,7 +1875,7 @@ impl SymDecoder {
 /// The decoder an AAC track of `from` channels needs: symphonia's own refuses
 /// anything wider than stereo outright (`aac/mod.rs:93`, "aac: aac too
 /// complex"), which is exactly the 5.1 and 7.1 tracks of a film, so those go to
-/// `rusty_aac` instead -- the same routing [`SymTrack::decoder`] does for a
+/// `ec-aac` instead -- the same routing [`SymTrack::decoder`] does for a
 /// Matroska file, asked once here so an mp4's multichannel track takes it too.
 fn aac_decoder(params: &AudioCodecParameters, from: usize) -> crate::Result<SymDecoder> {
     if from > 2 {
@@ -1883,7 +1883,7 @@ fn aac_decoder(params: &AudioCodecParameters, from: usize) -> crate::Result<SymD
             .extra_data
             .as_deref()
             .ok_or("a multichannel AAC track with no AudioSpecificConfig")?;
-        let decoder = rusty_aac::AacDecoder::with_config_bytes(asc)
+        let decoder = ec_aac::AacDecoder::with_config_bytes(asc)
             .map_err(|e| format!("multichannel AAC decoder init failed: {e}"))?;
         return Ok(SymDecoder::Aac(Box::new(decoder), from));
     }
@@ -1986,9 +1986,9 @@ fn vorbis_to_film_order(samples: &mut [f32], from: usize) {
 /// player's puts it there.
 ///
 /// The film order is FL, FR, FC, LFE, BL, BR, SL, SR, which is what symphonia's
-/// decoders and `rusty_aac` both hand back (the latter reorders AAC's own
-/// C, L, R, Ls, Rs, LFE element order into it: `decode.rs:779`) and what the AC-3
-/// decoder's own passthrough uses.
+/// decoders and `ec-aac` both hand back (the latter reorders AAC's own
+/// C, L, R, Ls, Rs, LFE element order into it: its `film_order`) and what the
+/// AC-3 decoder's own passthrough uses.
 ///
 /// corner-cut: a width past 7.1 (22.2, ambisonics) keeps its front pair and drops
 /// the rest -- no table here places those, and inventing one silently would be

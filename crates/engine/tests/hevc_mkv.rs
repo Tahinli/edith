@@ -4,7 +4,7 @@
 //! Three things meet here and each is checked on its own: the demuxer reads an
 //! `hvcC` out of a `CodecPrivate` and reframes Matroska blocks to Annex-B, the
 //! plugin decodes Main 10 through a P010 surface pool, and the sound -- 5.1 AAC
-//! at 48 kHz -- is read by symphonia's mkv reader, decoded by `rusty_aac` and
+//! at 48 kHz -- is read by symphonia's mkv reader, decoded by `ec-aac` and
 //! folded to the stereo one output device carries.
 //!
 //! The container and audio checks need nothing installed. The decode twins need
