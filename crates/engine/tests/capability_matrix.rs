@@ -28,6 +28,7 @@ const MATRIX: &[(Codec, &str, &str)] = &[
     (Codec::H264, "test_baseline.mp4", "test_h264.mkv"),
     (Codec::Hevc, "test_hevc.mp4", "test_hevc.mkv"),
     (Codec::Vp9, "test_vp9.mp4", "test_vp9.webm"),
+    (Codec::Vp8, "test_vp8.mp4", "test_vp8.webm"),
     // `mp4 0.14` writes no `av01` sample entry, so there is no AV1 mp4 fixture
     // to open; the mp4 half of that row is `av01`'s presence in the dispatch
     // table, which `demux::tests` holds.

@@ -827,7 +827,11 @@ impl Player {
                         .border_1()
                         .border_color(rgba(DARK_SEAM()))
                         .child(file_row)
-                        .child(budget_row)
+                        // The budget is a video setting -- the engine takes
+                        // no bitrate for the sound-only formats -- so there
+                        // the moment mounts no row: a row it does not show
+                        // cannot have been changed.
+                        .children(self.format.has_video().then(|| budget_row))
                         .child(commit_row)
                         .into_any_element(),
                 )

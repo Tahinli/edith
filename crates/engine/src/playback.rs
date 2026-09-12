@@ -3964,11 +3964,12 @@ fn matches_timeline(
 ) -> crate::Result<Rate> {
     // The codec is *not* held to the timeline's -- every clip opens its own
     // decoder, so an H.264 take and an HEVC one play on one timeline. What the
-    // codec gate was really protecting against stays, in the one place that can
-    // actually answer it: on a machine without the VA-API plugin an HEVC or VP9
-    // clip would be black frames with the refusal on stderr alone, so the file
-    // is asked for a decoder *here*, at the door, where the `Err` is still
-    // something a front-end can show. A zero-length range probes and starts no
+    // codec gate was really protecting against stays, in the one place that
+    // can actually answer it: on a machine without the VA-API plugin an HEVC,
+    // VP9 or VP8 clip would be black frames with the refusal on stderr alone,
+    // so the file is asked for a decoder *here*, at the door, where the `Err`
+    // is still something a front-end can show. A zero-length range probes and
+    // starts no
     // worker, and H.264 costs nothing at all -- [`DecodeSession::open_worker`]
     // only enters VA-API off that path.
     DecodeSession::open_worker(

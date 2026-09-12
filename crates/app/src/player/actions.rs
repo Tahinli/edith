@@ -85,7 +85,10 @@ impl Player {
                 cx.notify();
             }
             ActionId::Export => self.open_export(cx),
-            ActionId::Save => self.save_project(cx),
+            // Asked before the first overwrite of a file this window never
+            // put there ([`Player::save_guarded`]); the window's own file
+            // saves straight through.
+            ActionId::Save => self.save_guarded(cx),
             ActionId::Copy => self.copy_selected(),
             ActionId::Paste => self.paste(cx),
             ActionId::Cut => self.cut(cx),

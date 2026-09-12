@@ -877,7 +877,12 @@ fn the_budget_is_the_one_number_the_engine_gets() {
     // One explicit rate, always: the Auto/Low/Medium/High/Exact ladder is
     // gone, so there is nothing left that sends `None` and lets the encoder
     // pick a figure the row never showed.
-    let settings = export_settings(6_500_000, Format::Mp4, DEFAULT_AUDIO_KBPS, EncoderSeat::Auto);
+    let settings = export_settings(
+        6_500_000,
+        Format::Mp4,
+        DEFAULT_AUDIO_KBPS,
+        EncoderSeat::Auto,
+    );
     assert_eq!(settings.bitrate, Some(6_500_000));
     assert!(!settings.exact, "the copy path is off this surface");
     assert_eq!(settings.audio_kbps, Some(DEFAULT_AUDIO_KBPS));
@@ -980,7 +985,14 @@ fn the_export_moment_is_three_rows_one_chip_and_no_list() {
         2,
         "one border for the plate and one for the chip: §4's single boxed chip"
     );
-    for gone in ["Advanced", "preset", "Quality", "Subtitles", "GPU: ", "Built in"] {
+    for gone in [
+        "Advanced",
+        "preset",
+        "Quality",
+        "Subtitles",
+        "GPU: ",
+        "Built in",
+    ] {
         assert!(!body.contains(gone), "the old card's {gone} is still here");
     }
     // Row 1 is one line at every width: the stem ellipsizes and the
@@ -1129,6 +1141,115 @@ fn the_picture_cycle_wraps_out_of_the_sound_only_formats() {
     // still moves: the sound-only stops are what is left of it.
     let sound_only = next_picture(Format::Ogg, |f| f.has_video());
     assert!(!sound_only.has_video() && sound_only != Format::Ogg);
+}
+
+/// The budget is a video setting -- the engine's own word is that the bitrate
+/// settings "mean nothing to the audio-only ones" -- yet the moment drew the
+/// row, and answered `n` with a typing field, for a file that carries no
+/// picture. The row now mounts only where the format writes one, and both
+/// doors into the number answer the same gate: a row the moment does not
+/// show cannot have been changed.
+#[test]
+fn the_budget_row_and_its_doors_are_video_only() {
+    // The row: still built, mounted under the gate -- a video format sees
+    // exactly the rows it saw before.
+    let cards = src_text("ui/cards.rs");
+    let start = cards.find("fn export_card(").expect("the moment");
+    let body = &cards[start
+        ..start
+            + cards[start..]
+                .find("\n    /// ")
+                .unwrap_or(cards.len() - start)];
+    assert!(
+        body.contains(".children(self.format.has_video().then(|| budget_row))"),
+        "the budget row is back on the sound-only moment"
+    );
+    // The `n` door: the moment's chord and the row's own click both funnel
+    // through `edit_budget`, so its gate is the one gate -- and it must sit
+    // ahead of the field it guards.
+    let typing = fn_body("edit_budget");
+    let (gate, _) = typing
+        .split_once("self.budget_edit = Some")
+        .expect("the typing field still opens");
+    assert!(
+        gate.contains("!self.format.has_video()"),
+        "`n` opens the budget field for a format that writes no picture"
+    );
+    // The value itself: arrows, `+`/`-` and the wheel all funnel through
+    // `nudge_budget` -- a lever nothing shows does not move either.
+    let lever = fn_body("nudge_budget");
+    let (gate, _) = lever
+        .split_once("self.custom_bps =")
+        .expect("the lever still sets the budget");
+    assert!(
+        gate.contains("!self.format.has_video()"),
+        "the hidden budget lever moves again"
+    );
+}
+
+/// Exporting over an existing file must warn first, "same pattern as the
+/// exit guard" (user 2026-09-11: "not just save but export too -- an export
+/// named like an existing video overrides it"). The question as a value: a
+/// target that is there and not this window's own asks; anything else just
+/// writes.
+#[test]
+fn only_a_foreign_existing_target_asks_before_an_export_overwrites_it() {
+    assert!(crate::Player::export_asks(true, false));
+    assert!(
+        !crate::Player::export_asks(false, false),
+        "nothing there to clobber"
+    );
+    assert!(!crate::Player::export_asks(false, true));
+    assert!(
+        !crate::Player::export_asks(true, true),
+        "a re-export over this window's own output is silent"
+    );
+}
+
+/// The guard's wiring: asked after every refusal (an export that cannot run
+/// never asks), before the worker starts; the moment closes with the asking
+/// (it overlays the strip the plate rises on); a started export marks the
+/// target this window's own so a re-export stays silent; and the plate's
+/// `enter` confirms the target before re-entering the door.
+#[test]
+fn the_export_overwrite_question_owns_the_door_and_the_keyboard() {
+    let body = fn_body("start_export");
+    assert!(
+        body.contains("self.export_needs_answer()"),
+        "start_export never asks before overwriting"
+    );
+    // The call is hoisted above the `&mut self.session` borrow (E0502); what
+    // must sit after the refusals is the *check* of its answer.
+    let (fences, rest) = body
+        .split_once("if overwrite {")
+        .expect("the guard's answer is never checked");
+    assert!(
+        fences.contains("format_refusal"),
+        "the question comes before the refusals: a refused export would ask"
+    );
+    let (guard, started) = rest
+        .split_once("export_to_with")
+        .expect("the worker is still started from start_export");
+    assert!(
+        guard.contains("self.close_card()") && guard.contains("self.export_ask = true"),
+        "asking leaves the moment up over the plate's strip"
+    );
+    assert!(
+        started.contains("self.export_known = Some(self.export_path.clone())"),
+        "a started export does not mark the target this window's own"
+    );
+    let stance = src_text("ui/stance.rs");
+    let (_, handler) = stance
+        .split_once("if this.export_ask {")
+        .expect("the export plate is up with no key answering it");
+    assert!(
+        handler.contains("this.export_known = Some(this.export_path.clone())"),
+        "the plate's enter does not confirm the target before re-entering the door"
+    );
+    assert!(
+        stance.contains("stance-export-ask") && stance.contains("file_name(&player.export_path)"),
+        "the export plate does not name the file it would overwrite"
+    );
 }
 
 /// One chord per thing, said the same on both surfaces: the moment's segments

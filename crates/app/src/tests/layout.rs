@@ -3420,6 +3420,22 @@ fn one_name_per_source_one_stem_helper_and_one_save_door() {
         stance.contains("UNSAVED — save ↵ · discard d · stay esc"),
         "the decision plate speaks prose instead of state + verb·chord"
     );
+    // The overwrite guard (user 2026-09-11: saving over an existing file
+    // must warn first, same pattern as the exit guard): Save no longer
+    // writes through the action directly -- it routes through the guarded
+    // door, which raises the plate with the target's own name, and the
+    // plate is answered by its own key block beside the quit plate's.
+    let actions = src_text("player/actions.rs");
+    assert!(
+        actions.contains("ActionId::Save => self.save_guarded(cx)")
+            && !actions.contains("ActionId::Save => self.save_project(cx)"),
+        "^s overwrites a foreign .edith without asking"
+    );
+    assert!(
+        stance.contains("if this.save_ask {")
+            && stance.contains("OVERWRITE {} — overwrite ↵ · keep esc"),
+        "the overwrite plate is up with no key answering it"
+    );
     assert!(
         !src_text("ui/timeband_stance.rs").contains("ActionId::Save"),
         "Save has two doors: the ledger's state word and the time band's ghost"

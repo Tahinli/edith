@@ -373,9 +373,9 @@ impl Tags {
 /// the demuxers already hold: the SPS VUI for H.264 and HEVC (Annex-B framed,
 /// which is how both demuxers keep them) and the sequence header OBU for AV1.
 ///
-/// Empty [`Tags`] for VP9, whose colour space lives in the uncompressed header
-/// of every frame rather than out of band, and for anything malformed: this is
-/// a middle tier, and the tier below it always has an answer.
+/// Empty [`Tags`] for VP9 and VP8, which state no out-of-band colour in either
+/// container path, and for anything malformed: this is a middle tier, and the
+/// tier below it always has an answer.
 pub fn bitstream_tags(codec: Codec, sets: &[u8]) -> Tags {
     match codec {
         // 7 is an H.264 SPS, 33 an HEVC one (whose NAL header is two bytes and
@@ -391,6 +391,7 @@ pub fn bitstream_tags(codec: Codec, sets: &[u8]) -> Tags {
             .unwrap_or_default(),
         Codec::Av1 => av1_sequence_header(sets),
         Codec::Vp9 => Tags::default(),
+        Codec::Vp8 => Tags::default(),
     }
 }
 

@@ -155,7 +155,7 @@ impl Drop for DmaFrame {
 }
 
 /// What *this machine* takes, as far as the plugin implements it: one bit per
-/// codec ([`CAP_H264`] and its three neighbours) in each mask, so a caller reads
+/// codec ([`CAP_H264`] and its four neighbours) in each mask, so a caller reads
 /// "H.264 decodes and encodes here, HEVC only decodes" off three `u32`s.
 ///
 /// The intersection is the plugin's to compute, never the driver's alone: a GPU
@@ -177,6 +177,13 @@ pub const CAP_H264: u32 = 1 << 0;
 pub const CAP_HEVC: u32 = 1 << 1;
 pub const CAP_VP9: u32 = 1 << 2;
 pub const CAP_AV1: u32 = 1 << 3;
+
+/// VP8 decodes on libvpx inside the plugin -- software, dlopen'd at runtime,
+/// no GPU and no VA-API profile anywhere in it -- so this bit is the
+/// *plugin's* seat, never the driver's. It lights up [`VhCaps::decode`] when
+/// the library is present; the hardware line in [`crate::caps`] deliberately
+/// keeps it off, being a line about what the GPU takes.
+pub const CAP_VP8: u32 = 1 << 4;
 
 struct Plugin {
     open_at: unsafe extern "C" fn(*const c_char, u32) -> *mut c_void,
@@ -254,6 +261,12 @@ fn load() -> Option<Plugin> {
 /// symbol (optional exactly as `vh_enc_av1_open` is: such a plugin still
 /// decodes), no driver, a driver that refuses the query -- and a caller says
 /// "software only" for all of them, which is what they mean.
+///
+/// VP8 sits outside that reading on a driverless machine: its decoder is
+/// libvpx inside the plugin, so the plugin may open a VP8 file where this
+/// table answers `None`. Nothing here promises otherwise -- the decode path
+/// asks the plugin, not this table -- and the one display-dependent half the
+/// front-end draws from this stays exactly as truthful as it was.
 ///
 /// Costs one VA-API init (~90 ms) the first time: ask it off a render thread.
 pub fn caps() -> Option<VhCaps> {

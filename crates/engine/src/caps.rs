@@ -11,6 +11,11 @@
 //! with the codecs the plugin implements. No plugin, an older plugin or no
 //! driver all read the same way -- "software only" -- because that is what they
 //! mean for the file a user is about to write.
+//!
+//! VP8 is deliberately on neither line: the plugin decodes it on libvpx,
+//! dlopen'd at runtime, and reports `CAP_VP8` for it -- the plugin's seat,
+//! never the GPU's. [`HW_CODECS`] does not carry the bit, because this file's
+//! one job is not presenting a seat as a GPU feat that no GPU has.
 
 use crate::hw::{CAP_AV1, CAP_H264, CAP_HEVC, CAP_VP9, VhCaps};
 
@@ -95,6 +100,7 @@ fn seats(decodes: bool, encodes: bool) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hw::CAP_VP8;
 
     #[test]
     fn the_hardware_line_says_what_the_plugin_answered_and_nothing_more() {
@@ -127,6 +133,27 @@ mod tests {
         };
         assert_eq!(hw_line(Some(h264_only)), "H.264 dec");
     }
+
+    /// The plugin's VP8 bit is its own libvpx software decoder. However lit
+    /// the mask is, the hardware line never reads it as a GPU seat -- and a
+    /// mask holding nothing *but* it still reads as the nothing a driver
+    /// without seats would answer.
+    #[test]
+    fn the_plugin_s_software_vp8_never_reads_as_a_gpu_seat() {
+        let vpx_only = VhCaps {
+            decode: CAP_VP8,
+            ..Default::default()
+        };
+        assert!(hw_line(Some(vpx_only)).starts_with("none —"));
+        let with_gpu = VhCaps {
+            decode: CAP_H264 | CAP_VP8,
+            encode: CAP_H264,
+            ..Default::default()
+        };
+        assert_eq!(hw_line(Some(with_gpu)), "H.264 dec+enc");
+    }
+
+    #[test]
 
     #[test]
     fn the_software_line_names_every_encoder_this_build_carries() {

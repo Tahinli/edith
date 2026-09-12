@@ -80,12 +80,12 @@ pub(crate) fn sample_rate_choices(current: Option<u32>) -> Vec<ChoiceRow> {
 /// `shine-rs` was the licence question, and it is not the only encoder any
 /// more), and HEVC stopped being one when OxideAV's pure-Rust H.265 gave it an
 /// encoder — an *intra-only* one, which the rows say rather than let a user
-/// find out from the size of the file. VP9 is the one this program still only
-/// *reads*: the plugin decodes it and there is no encoder for it here, so it is
-/// a row for the reason the refusals are rows at all — a codec that opens but
-/// never comes back out is exactly the gap a user would otherwise go looking
-/// for. AAC is not a row at all: it is what both containers' sound *is*, never a
-/// file of its own.
+/// find out from the size of the file. VP9 and VP8 are the ones this program
+/// still only *reads*: the plugin decodes them and there is no encoder for
+/// either here, so they are rows for the reason the refusals are rows at all —
+/// a codec that opens but never comes back out is exactly the gap a user
+/// would otherwise go looking for. AAC is not a row at all: it is what both
+/// containers' sound *is*, never a file of its own.
 ///
 /// A codec is one row, and the boxes it can be written into are the row's
 /// containers: the same AV1 picture and the same AAC track go into a Matroska
@@ -93,7 +93,7 @@ pub(crate) fn sample_rate_choices(current: Option<u32>) -> Vec<ChoiceRow> {
 /// the file, not about the encode. So the container is asked *once*, in a row
 /// of its own, and only where there is more than one to ask about -- five
 /// picture rows to read past were four of them saying the same codec twice.
-pub(crate) const FORMATS: [(&[Format], &str, &str, &str); 8] = [
+pub(crate) const FORMATS: [(&[Format], &str, &str, &str); 9] = [
     (
         &[Format::Mp4],
         "m",
@@ -122,6 +122,7 @@ pub(crate) const FORMATS: [(&[Format], &str, &str, &str); 8] = [
         "Vorbis (rusty_vorbis) — quality-coded, stereo",
     ),
     (&[], "", "VP9", "AV1 above replaces it"),
+    (&[], "", "VP8", "AV1 above replaces it"),
 ];
 
 /// The boxes one codec may be written into, in the order its container row

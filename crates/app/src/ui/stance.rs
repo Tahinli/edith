@@ -627,14 +627,16 @@ fn bench(
         .child(bench_stance::render(player, bench_h - BENCH_CHROME_H, cx))
 }
 
-/// DESIGN §8's "needs a decision" notice, and the only one the room raises:
-/// a red 3px spine, the state word, and the verbs that answer it -- state
-/// plus verb·chord, never a sentence. It rises where notices rise, directly
-/// above the ledger, so it is never over the picture. The keys behind it live
-/// in the root `on_key_down` above.
-fn decision_plate() -> impl IntoElement {
+/// DESIGN §8's "needs a decision" notice: a red 3px spine, the state word,
+/// and the verbs that answer it -- state plus verb·chord, never a sentence.
+/// The room raises one per question that owns the keyboard (the
+/// unsaved-work close guard, the overwrite guard on save), each passing its
+/// own element id and line. It rises where notices rise, directly above the
+/// ledger, so it is never over the picture. The keys behind it live in the
+/// root `on_key_down` above.
+fn decision_plate(id: &'static str, line: &str) -> impl IntoElement {
     div()
-        .id("stance-quit-ask")
+        .id(id)
         .flex_none()
         .h(px(LEDGER_H))
         .bg(rgb(DARK_PANEL()))
@@ -655,7 +657,7 @@ fn decision_plate() -> impl IntoElement {
                     gpui::FontWeight::MEDIUM,
                 ))
                 .text_color(rgb(INK1()))
-                .child("UNSAVED — save ↵ · discard d · stay esc"),
+                .child(line.to_owned()),
         )
 }
 
@@ -912,12 +914,68 @@ pub(crate) fn render(
                         // anywhere to route to (no file picker exists in the
                         // tree), and every timeline with a clip on it got a
                         // path from its first import (`project_path`).
+                        // corner-cut: the overwrite guard is Save's door (`Player::save_guarded`), not this plate's -- this save was already answered.
                         this.save_project(cx);
                         window.remove_window();
                     }
                     "d" => window.remove_window(),
                     "escape" => {
                         this.quit_ask = false;
+                        cx.notify();
+                    }
+                    _ => {}
+                }
+                return;
+            }
+            // The overwrite question (user 2026-09-11: saving over an
+            // existing file must warn first, "same pattern as the exit
+            // guard"). Raised only by Save's own door
+            // ([`Player::save_guarded`]) -- the target exists on disk and
+            // `autosave_armed` says this window never loaded or wrote it --
+            // so the ledger's unsaved ghost routes through the same ask.
+            // Same ownership as the plate above: two answers and nothing
+            // else -- `↵` overwrites and saves, `esc` keeps the file, any
+            // other key does nothing at all.
+            if this.save_ask {
+                match key {
+                    "enter" => {
+                        // The answer IS the confirmation, so this goes
+                        // straight to the unconditional write and never
+                        // back through the guard; [`Player::save_project`]
+                        // arms `autosave_armed`, making later ^s on this
+                        // file silent again.
+                        this.save_project(cx);
+                        this.save_ask = false;
+                        cx.notify();
+                    }
+                    "escape" => {
+                        this.save_ask = false;
+                        cx.notify();
+                    }
+                    _ => {}
+                }
+                return;
+            }
+            // The export's own overwrite question (user 2026-09-11: "not just
+            // save but export too"). Raised inside [`Player::start_export`]
+            // after its refusals, with the export moment closed behind it --
+            // the moment is an overlay over exactly the strip this plate
+            // rises on. Same ownership as the plates above: `↵` marks the
+            // target this window's own and goes back through the door, which
+            // now passes the guard and starts the worker; `esc` keeps the
+            // file; any other key does nothing at all.
+            if this.export_ask {
+                match key {
+                    "enter" => {
+                        // The answer IS the confirmation, so the target is
+                        // marked known *before* the door is re-entered --
+                        // the guard asks again otherwise.
+                        this.export_known = Some(this.export_path.clone());
+                        this.export_ask = false;
+                        this.start_export(cx);
+                    }
+                    "escape" => {
+                        this.export_ask = false;
                         cx.notify();
                     }
                     _ => {}
@@ -1123,7 +1181,34 @@ pub(crate) fn render(
                 .child(time_band(player, position, cx))
                 .child(divider(Split::Bench, player.split_drag == Some(Split::Bench), cx))
                 .child(bench(player, bench_h, window, cx))
-                .when(player.quit_ask, |el| el.child(decision_plate()))
+                .when(player.quit_ask, |el| {
+                    el.child(decision_plate(
+                        "stance-quit-ask",
+                        "UNSAVED — save ↵ · discard d · stay esc",
+                    ))
+                })
+                .when(player.save_ask, |el| {
+                    el.child(decision_plate(
+                        "stance-save-ask",
+                        &format!(
+                            "OVERWRITE {} — overwrite ↵ · keep esc",
+                            file_name(&player.project_path)
+                        ),
+                    ))
+                })
+                // The export overwrite plate sits with the other two, under
+                // the ledger: [`Player::start_export`] closes the export
+                // moment when it raises this, so the card that would cover
+                // the strip is never up together with the question.
+                .when(player.export_ask, |el| {
+                    el.child(decision_plate(
+                        "stance-export-ask",
+                        &format!(
+                            "OVERWRITE {} — overwrite ↵ · keep esc",
+                            file_name(&player.export_path)
+                        ),
+                    ))
+                })
                 .child(ledger(player, position, cx))
                 .when(player.settings_open, |el| {
                     el.child(settings_stance::render(player, window_size, cx))

@@ -1678,6 +1678,7 @@ dependencies = [
  "cros-codecs",
  "engine",
  "gbm",
+ "libloading",
 ]
 
 [[package]]
