@@ -3885,7 +3885,18 @@ impl Enc {
             eprintln!("export encoder: hardware (VA-API plugin)");
             return Ok(Self::Hw(hw));
         }
-        eprintln!("export encoder: software (ec-h264)");
+        // H.264 codes 16x16 macroblocks, and ec-h264's floor is the
+        // macroblock itself -- the old encoder took any positive even size.
+        // Named here, where a card can show it, rather than let the encoder's
+        // error surface from inside an export already under way.
+        if meta.width < 16 || meta.height < 16 {
+            return Err(format!(
+                "{}x{} cannot be written as H.264: the picture is smaller \
+                 than one 16x16 macroblock",
+                meta.width, meta.height
+            )
+            .into());
+        }
         // 4:2:0 addresses its conformance window in *chroma* samples, so an odd
         // picture cannot be cropped back to itself -- and an odd dimension has
         // no chroma plane of its own to begin with. Named rather than padded to
@@ -5351,6 +5362,25 @@ mod tests {
         assert!(refused.contains("even"), "{refused}");
         // ...and the even one it neighbours opens.
         assert!(Enc::open(&meta(1920, 1080), &settings).is_ok());
+    }
+
+    /// H.264 codes 16x16 macroblocks and ec-h264's floor is the macroblock
+    /// itself -- the old encoder took any positive even size -- so a
+    /// sub-macroblock picture is refused by name, like every other seat
+    /// refusal, rather than surfaced from inside a running export.
+    #[test]
+    fn a_sub_macroblock_picture_is_refused_an_h264_export_by_name() {
+        let settings = ExportSettings {
+            format: Format::Mp4,
+            seat: EncoderSeat::Software,
+            ..Default::default()
+        };
+        let refused = Enc::open(&meta(8, 8), &settings)
+            .err()
+            .expect("8x8 is smaller than one macroblock")
+            .to_string();
+        assert!(refused.contains("8x8"), "{refused}");
+        assert!(refused.contains("16x16"), "{refused}");
     }
 
     /// Weights ramp from just above 0 to just below 1 and never touch either
