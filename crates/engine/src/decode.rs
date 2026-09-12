@@ -8,9 +8,11 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::thread;
 
 use ec_core::frame::VideoFrame;
+use ec_av1::encode::Picture as Av1Picture;
+use ec_av1::stream::decode_stream_with;
 use ec_core::registry::{CodecId, CodecParameters};
 use ec_core::registry::Decoder as _;
-use ec_core::{Packet, TimeBase};
+use ec_core::{Error as Av1Error, Packet, TimeBase};
 use ec_h264::H264Decoder;
 
 use crate::color::ColorParams;
@@ -46,7 +48,8 @@ pub enum Backend {
     Opening,
     /// The VA-API plugin (`libengine_hw.so`).
     Hardware,
-    /// `ec-h264`, in this process.
+    /// This project's own software seat: `ec-h264` or `ec-av1`, in this
+    /// process.
     Software,
     /// A still image: one `image` decode, no stream and no decoder to pick.
     Still,
@@ -126,7 +129,7 @@ pub fn probe(path: &Path) -> crate::Result<(Option<Codec>, Backend)> {
     let (meta, _demuxer) = Demuxer::open(&path)?;
     match hw_decodes(&path, 0, meta.codec) {
         Ok(()) => return Ok((Some(meta.codec), Backend::Hardware)),
-        Err(e) if meta.codec != Codec::H264 => return Err(e.into()),
+        Err(e) if !matches!(meta.codec, Codec::H264 | Codec::Av1) => return Err(e.into()),
         Err(_) => {}
     }
     Ok((Some(meta.codec), Backend::Software))
@@ -634,8 +637,10 @@ impl DecodeSession {
         // show it -- a worker that opened and then produced nothing is a black
         // screen with no explanation. The probe session is opened, made to
         // decode one picture and dropped: it costs one extra VA-API init
-        // (~90 ms) plus that frame, and only off the H.264 path.
-        if meta.codec != Codec::H264 {
+        // (~90 ms) plus that frame, and only off the two codecs with a software
+        // seat of their own -- H.264 through `ec-h264`, AV1 through `ec-av1` --
+        // which fall back to it exactly where this probe would have refused.
+        if !matches!(meta.codec, Codec::H264 | Codec::Av1) {
             hw_decodes(&path, start_frame, meta.codec)?;
         }
         let end_frame = end_frame.min(meta.frame_count);
@@ -1010,15 +1015,22 @@ fn run_span(
         eprintln!("hardware decode failed before any frame, falling back to software");
     }
     // ...except where there is nothing to fall back to. Feeding HEVC, VP9 or
-    // VP8 bytes to the H.264 decoder (ec-h264) would be garbage, not a
-    // fallback — VP8's software decoder is libvpx, inside the plugin.
-    if opened.meta.codec != Codec::H264 {
-        eprintln!("{}", opened.meta.codec.needs_plugin());
-        return;
+    // VP8 bytes to either software seat would be garbage, not a fallback --
+    // VP8's software decoder is libvpx, inside the plugin. H.264 and AV1 each
+    // have one of this project's own: `ec-h264`, `ec-av1`.
+    match opened.meta.codec {
+        Codec::H264 => {
+            eprintln!("decode backend: software (ec-h264)");
+            backend.set(Backend::Software);
+            run(&mut opened.demuxer, &tx, start, end, &mut render, abort, speed);
+        }
+        Codec::Av1 => {
+            eprintln!("decode backend: software (ec-av1)");
+            backend.set(Backend::Software);
+            run_av1(&mut opened.demuxer, &tx, start, end, &mut render, abort, speed);
+        }
+        other => eprintln!("{}", other.needs_plugin()),
     }
-    eprintln!("decode backend: software (ec-h264)");
-    backend.set(Backend::Software);
-    run(&mut opened.demuxer, &tx, start, end, &mut render, abort, speed)
 }
 
 /// One clip's pictures on their way to the renderer: graded, placed on the
@@ -1721,6 +1733,183 @@ fn run(
         }
         if flushed {
             done = true;
+        }
+    }
+}
+
+/// Whether an access unit leads with a sequence header OBU, which is how both
+/// containers mark a random-access point for AV1: the demuxer prepends the
+/// `av1C`/`CodecPrivate` record (itself one sequence header OBU) ahead of every
+/// sync sample, so the marker rides on the same bytes the decoder needs. Type 1
+/// in bits 6..3 of the first OBU header byte.
+fn leads_with_sequence_header(au: &[u8]) -> bool {
+    matches!(au.first(), Some(&first) if first >> 3 & 0xF == 1)
+}
+
+/// One [`Av1Picture`] down to the tightly packed 8-bit I420 every converter
+/// here takes. 8-bit samples arrive as `u16` in `0..=255` and narrow losslessly;
+/// a 10-bit stream's `0..=1023` downshifts by two, the same truncation the
+/// hardware seat's P010 read-back performs when it takes the high byte of each
+/// pair (`p010_to_i420`, engine-hw) -- so the two seats hand the renderer
+/// byte-identical planes off the same file. 12-bit never reaches a seat: the
+/// demuxer refuses it at open, where `parse_av1c` reads the depth.
+fn narrow_av1(
+    picture: &Av1Picture,
+    ten_bit: bool,
+    y: &mut Vec<u8>,
+    u: &mut Vec<u8>,
+    v: &mut Vec<u8>,
+) {
+    let shift = u8::from(ten_bit) * 2;
+    let plane = |src: &[u16], dst: &mut Vec<u8>| {
+        dst.clear();
+        dst.extend(src.iter().map(|&sample| (sample >> shift) as u8));
+    };
+    plane(&picture.y, y);
+    plane(&picture.u, u);
+    plane(&picture.v, v);
+}
+
+/// Narrows one [`Av1Picture`] ([`narrow_av1`]) and queues it through the same
+/// [`Render`] every other seat's pictures go through. `true` when the consumer
+/// went away, so the span stops rather than keeps decoding into a void.
+fn send_av1(
+    picture: &Av1Picture,
+    due: u32,
+    ten_bit: bool,
+    render: &mut Render,
+    tx: &SyncSender<Frame>,
+    y: &mut Vec<u8>,
+    u: &mut Vec<u8>,
+    v: &mut Vec<u8>,
+) -> bool {
+    narrow_av1(picture, ten_bit, y, u, v);
+    let frame = render.frame(due, y, u, v, picture.width as u32, picture.height as u32);
+    tx.send(frame).is_err()
+}
+
+/// The AV1 software seat: one span of [`ec_av1`] through the same loop
+/// [`run`] drives `ec-h264` through. A decoder per span, and cheap -- it is the
+/// reference bank and one output picture, while the *demuxer* is the one this
+/// worker keeps. `ec-av1` has no packet-by-packet door; it takes one whole OBU
+/// stream, so the span is fed as it is built: every access unit from the landing
+/// sync sample up to (not including) the next one is one chunk, and a chunk is
+/// a legal random-access stream on its own -- it leads with the sequence header
+/// and a key frame, which is exactly what makes the chunk boundary detectable
+/// here ([`leads_with_sequence_header`]). A stream whose inter frames carried
+/// an in-band sequence header would be cut mid-GOP and refused by name below,
+/// never silently misread; container storage keeps the sequence header in the
+/// config record precisely so that does not happen.
+///
+/// Chunks decode to their end, so the reorder window of the chunk the span
+/// ends in always drains: hidden frames (`show_frame == 0`) are references
+/// and arrive at the sink with `shown == false`, and the frames they hold
+/// back in output order are the tail the sink still has to see.
+///
+/// A refusal out of `ec-av1` -- a real-world stream hitting a shape the
+/// decoder does not reconstruct -- fails the span in words, mid-film, the way
+/// the hardware seat's errors do: named on stderr, the pictures decoded so
+/// far stand, and no garbage is sent. The same sentinel ends a span that has
+/// delivered everything asked of it without decoding the rest of its last
+/// chunk.
+fn run_av1(
+    demuxer: &mut Demuxer,
+    tx: &SyncSender<Frame>,
+    start_frame: u32,
+    end_frame: u32,
+    render: &mut Render,
+    abort: &Abort,
+    speed: Speed,
+) {
+    // Signed, for the same reason [`run`]'s is: the landing sync sample can
+    // sit inside what an mp4's edit list trims, i.e. before frame 0.
+    let mut index = demuxer.seek_to_sync_at_or_before(start_frame);
+    // Reusable plane buffers: one allocation each for the whole span, refilled
+    // per picture by [`narrow_av1`].
+    let (mut y, mut u, mut v) = (Vec::new(), Vec::new(), Vec::new());
+    let mut skipped = 0;
+    // Every way this span ends: abort, consumer gone, the requested range
+    // delivered, the demuxer dry, or a refusal out of the decoder.
+    let mut done = false;
+    let mut demux_dry = false;
+    // An access unit read past a chunk boundary, waiting to head the next one.
+    let mut pending: Option<Vec<u8>> = None;
+    while !done && !demux_dry {
+        if abort.hit() {
+            break;
+        }
+        // One chunk: the access units from a sync sample up to the next one.
+        let mut stream = pending.take().unwrap_or_default();
+        while !demux_dry && pending.is_none() {
+            match demuxer.next_access_unit() {
+                Ok(Some(au)) => {
+                    if !stream.is_empty() && leads_with_sequence_header(&au) {
+                        pending = Some(au);
+                    } else {
+                        stream.extend_from_slice(&au);
+                    }
+                }
+                Ok(None) => demux_dry = true,
+                Err(e) => {
+                    eprintln!("demux error: {e}");
+                    return;
+                }
+            }
+        }
+        let ten_bit = demuxer.bit_depth() == 10;
+        let decode = decode_stream_with(&stream, |picture, _, shown| {
+            // Hidden frames are references: they take no display slot and
+            // are never sent, but they do hold the chunk's output order
+            // back, which is why the chunk decodes to its end.
+            if !shown {
+                return Ok(());
+            }
+            let due = index;
+            index += 1;
+            if due < i64::from(start_frame) {
+                return Ok(());
+            }
+            let due = due as u32;
+            // The three ends [`run`] reaches per picture, in its own shape:
+            // late for the playhead (one in [`LATE_RUN`] still goes through),
+            // redundant by construction at speed, or a conversion and a send.
+            let sent = if abort.late(due) {
+                if skipped < LATE_RUN {
+                    skipped += 1;
+                    false
+                } else {
+                    skipped = 0;
+                    send_av1(picture, due, ten_bit, render, tx, &mut y, &mut u, &mut v)
+                }
+            } else if skip_for_speed(speed, start_frame, due, end_frame) {
+                // Redundant by construction, not by lateness: no run limit
+                // needed (see `skip_for_speed`).
+                false
+            } else {
+                skipped = 0;
+                send_av1(picture, due, ten_bit, render, tx, &mut y, &mut u, &mut v)
+            };
+            if sent {
+                done = true; // consumer went away
+            }
+            if done || i64::from(due) + 1 >= i64::from(end_frame) {
+                done = true; // the range is out, or nobody is left to take it
+                // Stops the decode inside the chunk: everything the span
+                // asked for has been sent, and the chunk's remaining coded
+                // frames are references for pictures nobody asked for.
+                return Err(Av1Error::Eof);
+            }
+            Ok(())
+        });
+        // `done` was set by the sink itself for the `Eof` it returns -- the
+        // sentinel, not a refusal. Any other `Err` is a refusal out of the
+        // decoder, named where the hardware seat's decode errors are named;
+        // the pictures decoded so far stand and the span ends.
+        if let Err(e) = decode {
+            if !done {
+                eprintln!("software AV1 decode failed at frame {index}: {e}");
+                done = true;
+            }
         }
     }
 }

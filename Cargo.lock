@@ -1597,6 +1597,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "ec-av1"
+version = "0.1.0"
+dependencies = [
+ "ec-av1-syntax",
+ "ec-core",
+]
+
+[[package]]
+name = "ec-av1-syntax"
+version = "0.1.0"
+dependencies = [
+ "ec-core",
+]
+
+[[package]]
 name = "ec-core"
 version = "0.1.0"
 
@@ -1682,6 +1697,7 @@ name = "engine"
 version = "0.1.0"
 dependencies = [
  "ec-aac",
+ "ec-av1",
  "ec-core",
  "ec-h264",
  "ec-opus",

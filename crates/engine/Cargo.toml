@@ -65,6 +65,13 @@ ec-core = { path = "../../../edith_codecs/crates/ec-core" }
 # into FL, FR, FC, LFE, BL, BR, the order the downmix in `audio` folds, the
 # same one the seat always delivered.
 ec-aac = { path = "../../../edith_codecs/crates/ec-aac" }
+# The software AV1 decode seat, the project's own: a whole AV1 decoder
+# (entropy, prediction, transforms, loop filters, film grain) with no
+# third-party codec library under it, the same claim `ec-h264` makes for H.264.
+# The seat decodes one GOP chunk at a time off the demuxer's reassembled OBU
+# stream (`decode::run_av1`), so peak memory is one output picture plus the
+# reference bank, and seeks stay the demuxer's job.
+ec-av1 = { path = "../../../edith_codecs/crates/ec-av1" }
 # The AAC *encoder*, and its last seat in the tree: so an mp4's sound can be a
 # mix rather than a copy, an equalized (or otherwise processed) lane has to be
 # decoded, and what is decoded has to be encoded again. Pure Rust with no C or
