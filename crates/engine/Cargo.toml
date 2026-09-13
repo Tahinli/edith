@@ -188,14 +188,19 @@ oxideav-ass = { version = "0.0.9", default-features = false }
 # inside rav1e itself and is what keeps an export minutes rather than tens of
 # minutes; the cost of no assembly is measured in `export::Enc::open_av1`.
 rav1e = { version = "0.8.1", default-features = false, features = ["threading"] }
-# The software HEVC encoder, intra-only: OxideAV's pure-Rust H.265, MIT, no C
-# and no FFI like everything else here. Its *inter* modes run at 0.81 fps on
-# 1080p across 12 cores (measured 2026-08-11) and are therefore not an export
-# anyone would wait for; its intra AU is a stateless free function that fans out
-# across cores at 4.30 fps for the same picture, which is the export this
-# project offers -- an intraframe master, ProRes-shaped, large files and all.
-# Built from `vendor/oxideav-h265`; see the note in the workspace manifest.
-oxideav-h265 = { path = "../../vendor/oxideav-h265" }
+# The software HEVC encoder, intra-only: the project's own `ec-h265`, the seat
+# that replaces OxideAV's vendored intra encoder. Every picture is an IDR
+# carrying its own VPS/SPS/PPS -- an intraframe master, ProRes-shaped, large
+# files and all, the same file the old seat wrote -- and the wavefront inside
+# one picture (WPP, a worker per CTB row) spends every core on it, where the
+# old seat fanned one core across each of twelve frames in flight. The rate
+# knob stays a quality dial: the seat maps the bitrate row to a constant QP
+# ([`crate::export`]) and the encoder's own target-bits correction pass stays
+# unreached headroom.
+ec-h265 = { path = "../../../edith_codecs/crates/ec-h265" }
+# The HEVC bitstream syntax the encoder's config speaks -- the VUI types the
+# seat builds the SPS's colour description from. Same family, same workspace.
+ec-h265-syntax = { path = "../../../edith_codecs/crates/ec-h265-syntax" }
 oxideav-sub-image = "0.0.7"
 
 [dev-dependencies]

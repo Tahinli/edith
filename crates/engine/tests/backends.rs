@@ -135,7 +135,7 @@ fn the_planned_encoders_are_the_ones_the_job_opens() {
         assert!(planned.contains("AAC"), "{ext}: {planned}");
         if matches!(format, Format::Hevc | Format::HevcMp4) {
             assert!(
-                planned.contains("oxideav-h265 intra") || planned.contains("HW encode"),
+                planned.contains("ec-h265 intra") || planned.contains("HW encode"),
                 "{ext}: an HEVC job names one of the two HEVC seats: {planned}"
             );
         }
