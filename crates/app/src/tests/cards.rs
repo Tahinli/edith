@@ -1482,19 +1482,19 @@ fn a_held_key_moves_a_value_and_nothing_else() {
 #[test]
 fn the_silence_card_fits_the_smallest_window_and_never_slows_a_silence_down() {
     // The same 640x360 floor, and this card starts below the header: a
-    // title and a hint over its [`SILENCE_ROWS`] rows, the count line and
-    // the two buttons.
-    let (title, hint, count) = (17., 17., 17.);
+    // title over its [`SILENCE_ROWS`] rows, the count line, the keep-only
+    // switch, and the two apply buttons. Help is the head's `?`, not a line.
+    let (title, count) = (17., 17.);
+    let button_rows = 2.;
     let gaps = 6. * 5.;
     let padding = 24.;
     assert!(
         HEADER_H
             + 8.
             + title
-            + hint
             + SILENCE_ROWS as f32 * KEYS_ROW_H
             + count
-            + KEYS_ROW_H
+            + button_rows * KEYS_ROW_H
             + gaps
             + padding
             <= 360.,

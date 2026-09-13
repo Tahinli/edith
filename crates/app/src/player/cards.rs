@@ -1111,11 +1111,27 @@ impl Player {
         let Some(levels) = levels else {
             return;
         };
-        self.silence_marks = engine::silence::timeline_regions(
-            &clip,
-            self.fps,
-            &engine::silence::regions(&levels, self.silence),
-        );
+        // Keep-only flips what the applies act on: the *speech* between the
+        // quiet stretches, so a cut removes the words and leaves the room
+        // tone. Skipped when nothing was quiet -- inverting an empty scan
+        // would mark the whole clip, the one press this card must never make
+        // by accident.
+        let quiet = engine::silence::regions(&levels, self.silence);
+        let source = if self.silence_keep_only && !quiet.is_empty() {
+            let duration = levels.len() as f64 / f64::from(engine::silence::WINDOWS_PER_SEC);
+            engine::silence::invert(duration, &quiet)
+        } else {
+            quiet
+        };
+        self.silence_marks = engine::silence::timeline_regions(&clip, self.fps, &source);
+    }
+
+    /// Keep-only-silence off and on, the marks going with it: the same scan,
+    /// the complement of the quiet when it is on. A preview is not an edit,
+    /// so a flip costs nothing and changes nothing but what is marked.
+    pub(crate) fn toggle_silence_keep_only(&mut self) {
+        self.silence_keep_only = !self.silence_keep_only;
+        self.scan_silences();
     }
 
     /// Moves the picked row by `steps` and re-runs the scan against it, so the
@@ -1195,11 +1211,15 @@ impl Player {
     pub(crate) fn previewed(&mut self) -> Option<(Vec<(u32, u32)>, Vec<Lane>)> {
         if self.silence_marks.is_empty() {
             self.notify_user(
-                format!(
-                    "NO SILENCE — under {:.0} dBFS lasting {:.2} s",
-                    self.silence.threshold_db, self.silence.min_silence
-                )
-                .into(),
+                if self.silence_keep_only {
+                    "NO SPEECH TO CUT — keep-only-silence needs silence and speech".into()
+                } else {
+                    format!(
+                        "NO SILENCE — under {:.0} dBFS lasting {:.2} s",
+                        self.silence.threshold_db, self.silence.min_silence
+                    )
+                    .into()
+                },
             );
             return None;
         }
@@ -1246,9 +1266,10 @@ impl Player {
                 // moves indexes (a delete, a paste, an undo).
                 self.selected.clear();
                 self.reset_after_reseek();
+                let what = if self.silence_keep_only { "SPEECH" } else { "SILENCES" };
                 self.notify_user(
                     format!(
-                        "{count} SILENCES CUT {reach} — {} shorter · undo {}",
+                        "{count} {what} CUT {reach} — {} shorter · undo {}",
                         secs_label(saved),
                         self.keymap.display(ActionId::Undo)
                     )
@@ -1285,9 +1306,10 @@ impl Player {
                 // goes with them.
                 self.selected.clear();
                 self.reset_after_reseek();
+                let what = if self.silence_keep_only { "SPEECH" } else { "SILENCES" };
                 self.notify_user(
                     format!(
-                        "{count} SILENCES AT {rate} {reach} · undo {}",
+                        "{count} {what} AT {rate} {reach} · undo {}",
                         self.keymap.display(ActionId::Undo)
                     )
                     .into(),
@@ -1733,10 +1755,11 @@ impl Player {
             return true;
         }
         // The silence card, the same way again: the arrows pick one of its
-        // rows and move it, and its two apply keys are the two things it can
-        // do to the timeline. Card-local, every one of them -- and listed in
-        // the keys menu (keymap.rs `FIXED`), because a key that cuts forty
-        // places at once is not a secret.
+        // rows and move it, its two apply keys are the two things it can do
+        // to the timeline, and `k` flips which half of the sound they act
+        // on. Card-local, every one of them -- and listed in the keys menu
+        // (keymap.rs `FIXED`), because a key that cuts forty places at once
+        // is not a secret.
         if self.silence_open.is_some() {
             if key == ESCAPE && self.card_maximized {
                 self.toggle_maximize();
@@ -1755,6 +1778,9 @@ impl Player {
                 self.cut_silences(cx);
             } else if key == "f" {
                 self.speed_silences(cx);
+            } else if key == "k" {
+                self.toggle_silence_keep_only();
+                cx.notify();
             }
             return true;
         }

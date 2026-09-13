@@ -718,6 +718,12 @@ struct Player {
     /// inventing, and a made-up SPL would be a lie about what was measured);
     /// what it changes is which of the two spellings a person reads.
     silence_dbfs: bool,
+    /// Keep only the silences: the card's applies act on the *complement* of
+    /// what the scan found -- the speech between the quiet stretches -- so a
+    /// cut removes the words and leaves the room tone. Off, today's jumpcut,
+    /// until asked; kept across closes like [`Self::silence_dbfs`], which is
+    /// the same kind of switch: how the card reads, not what it scans.
+    silence_keep_only: bool,
     /// What the last scan found, in timeline frames: what the lane draws marks
     /// over and what an apply acts on -- *exactly* the previewed set, never a
     /// second scan at the moment of the press.
@@ -1044,6 +1050,7 @@ fn main() {
                     // The reference named, which is what the card said before
                     // there was a choice about it.
                     silence_dbfs: true,
+                    silence_keep_only: false,
                     silence_marks: Vec::new(),
                     silence_levels: HashMap::new(),
                     silence_scan: None,

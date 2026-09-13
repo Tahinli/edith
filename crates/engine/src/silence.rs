@@ -229,6 +229,30 @@ pub fn regions(levels: &[f32], cfg: Settings) -> Vec<(f64, f64)> {
     out
 }
 
+/// The stretches of `[0, duration)` that `regions` did not cover, same
+/// half-open `(from, to)` seconds, in order, never overlapping.
+pub fn invert(duration: f64, regions: &[(f64, f64)]) -> Vec<(f64, f64)> {
+    if !(duration.is_finite() && duration > 0.) {
+        return Vec::new();
+    }
+    let mut out: Vec<(f64, f64)> = Vec::new();
+    let mut cursor = 0.;
+    for &(from, to) in regions {
+        let (from, to) = (from.clamp(0., duration), to.clamp(0., duration));
+        if to <= from {
+            continue;
+        }
+        if from > cursor {
+            out.push((cursor, from));
+        }
+        cursor = cursor.max(to);
+    }
+    if cursor < duration {
+        out.push((cursor, duration));
+    }
+    out
+}
+
 /// Where those source stretches sit on the timeline, as `(start, len)` frame
 /// pairs of the lane `clip` is on -- what a preview marks and what
 /// [`crate::Project::cut_regions`] cuts.
@@ -283,7 +307,7 @@ fn floor_timeline(speed: Speed, offset: u32) -> u32 {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{Settings, levels, regions, timeline_regions};
+    use super::{Settings, invert, levels, regions, timeline_regions};
     use crate::project::{Clip, Speed};
     use crate::scale::FitPolicy;
 
@@ -545,5 +569,26 @@ mod tests {
         // Under a frame wide: nothing survives the rounding, and a zero-length
         // cut is never handed back.
         assert!(timeline_regions(&whole, 30., &[(1.01, 1.02)]).is_empty());
+    }
+
+    /// The complement, taken literally: what `regions` kept out is exactly
+    /// what `invert` hands back, an empty scan inverts to the whole span, a
+    /// scan of everything inverts to nothing, and a region hanging past the
+    /// end is clamped to it rather than dragging the answer past `duration`.
+    #[test]
+    fn invert_is_the_complement_of_the_regions_it_is_given() {
+        near(
+            &invert(10., &[(2., 3.), (6., 8.)]),
+            &[(0., 2.), (3., 6.), (8., 10.)],
+        );
+        near(&invert(10., &[]), &[(0., 10.)]);
+        assert!(invert(10., &[(0., 10.)]).is_empty());
+        near(&invert(10., &[(8., 20.)]), &[(0., 8.)]);
+        // No span to invert *of*: zero, negative and nonsense durations
+        // refuse rather than inventing one.
+        assert!(invert(0., &[]).is_empty());
+        assert!(invert(-1., &[]).is_empty());
+        assert!(invert(f64::NAN, &[]).is_empty());
+        assert!(invert(f64::INFINITY, &[]).is_empty());
     }
 }

@@ -121,7 +121,6 @@ fn dark_card_head(
                     .into()
                 })
                 .child(if max { "▣ m" } else { "⤢ m" })
-                .tooltip(crate::ui::widgets::overlay_tip_hover("Toggle card size", "", None))
                 .children(hitmap::control("card.maximize", "Toggle card size", true))
         }))
         .child(
@@ -2306,10 +2305,15 @@ impl Player {
                 scan.started.elapsed().as_secs_f32(),
                 scan.since.elapsed().as_secs_f32(),
             ),
-            None => match found {
-                0 => "nothing quiet enough for long enough".to_string(),
-                1 => format!("1 silence, {}", secs_label(secs)),
-                n => format!("{n} silences, {}", secs_label(secs)),
+            None => match (self.silence_keep_only, found) {
+                (true, 0) => "nothing to cut — need both silence and speech".to_string(),
+                (true, 1) => format!("1 speech stretch, {} — silences kept", secs_label(secs)),
+                (true, n) => {
+                    format!("{n} speech stretches, {} — silences kept", secs_label(secs))
+                }
+                (false, 0) => "nothing quiet enough for long enough".to_string(),
+                (false, 1) => format!("1 silence, {}", secs_label(secs)),
+                (false, n) => format!("{n} silences, {}", secs_label(secs)),
             },
         };
         let rows: Vec<_> = rows
@@ -2374,6 +2378,22 @@ impl Player {
             )
             .into_any_element()
         };
+        // The keep-only toggle rides in the same row, first: a switch, not a
+        // third apply, so it is always pressable -- even with nothing found,
+        // which is exactly when the two applies dim -- and its own ghost
+        // call rather than the `button` closure above, whose `active` means
+        // "there is something to apply".
+        let (cut_label, speed_label) = if self.silence_keep_only {
+            (
+                "Cut speech out (enter)",
+                format!("Play speech at {} (f)", self.silence_factor),
+            )
+        } else {
+            (
+                "Cut them out (enter)",
+                format!("Play them at {} (f)", self.silence_factor),
+            )
+        };
         Some(
             scrim()
                 .flex()
@@ -2418,13 +2438,21 @@ impl Player {
                         .map(move |d| d.child(head.unwrap()))
                         .children(rows)
                         .map(|d| d.child(dark_help(status.clone())))
-                        .child(div().flex().gap(px(4.)).children([
-                            button(0, "Cut them out (enter)".into(), Self::cut_silences),
-                            button(
-                                1,
-                                format!("Play them at {} (f)", self.silence_factor),
-                                Self::speed_silences,
+                        .child(
+                            dark_ghost_button(
+                                "silence-keep-only",
+                                "Keep only silence",
+                                "k",
+                                self.silence_keep_only,
+                                cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    this.toggle_silence_keep_only();
+                                    cx.notify();
+                                }),
                             ),
+                        )
+                        .child(div().flex().gap(px(4.)).children([
+                            button(0, cut_label.into(), Self::cut_silences),
+                            button(1, speed_label, Self::speed_silences),
                         ])),
                 ),
         )
