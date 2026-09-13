@@ -358,7 +358,7 @@ impl Player {
         // A format with no picture has no seat to probe -- and the *last*
         // format's is not its answer: cleared rather than left standing, or
         // picking MP3 after AV1 would read "SW encode (rav1e) · MP3 · SW
-        // (rusty_mp3)", which names an encoder that will not run.
+        // (ec-mp3)", which names an encoder that will not run.
         if !settings.format.has_video() {
             self.export_seat = None;
             return;

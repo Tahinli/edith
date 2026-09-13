@@ -22,7 +22,7 @@
 //! equalized one, a source that is not AAC inside an mp4's own sample table —
 //! the sound is decoded, mixed and encoded again with `ec-aac`
 //! ([`encode_audio`]). The audio-only formats have no such split: `hound` writes
-//! PCM, `flacenc` encodes FLAC, `rusty_mp3` encodes MP3 and `rusty_vorbis`
+//! PCM, `flacenc` encodes FLAC, `ec-mp3` encodes MP3 and `ec-vorbis`
 //! encodes Vorbis, so those are always *decoded* out of the timeline. The worker owns everything: the caller gets an
 //! [`ExportHandle`] and polls it from its render loop.
 //!
@@ -126,7 +126,7 @@ const MAX_EXPLICIT_BITRATE: u64 = 50_000_000;
 /// The rates the sound may be coded at, smallest first -- what a front-end
 /// offers and what [`ExportSettings::audio_kbps`] is clamped into. Every one of
 /// them is a legal MPEG-1 Layer III value, so the MP3 path writes the figure it
-/// was given rather than the nearest one `rusty_mp3` snaps to.
+/// was given rather than the nearest one `ec-mp3` snaps to.
 pub const AUDIO_KBPS: [u32; 4] = [128, 192, 256, 320];
 
 /// What the sound is coded at when nobody picked: the rate this project wrote
@@ -158,9 +158,9 @@ const HEVC_QP_MAX: i32 = 40;
 /// What an export writes. H.264-in-mp4, AV1 and HEVC -- each of the last two in
 /// Matroska or in mp4, the user's pick of container -- are the *video* pairs
 /// with both an encoder and a decoder under this project's no-install rule, and
-/// WAV, FLAC, MP3 and Ogg Vorbis are the standalone audio formats with a
-/// pure-Rust encoder: `hound`, `flacenc`, `rusty_mp3` and `rusty_vorbis`. Opus
-/// still has none -- `oxideav-opus` encodes CELT alone, which is half a codec.
+/// pure-Rust encoder: `hound`, `flacenc`, `ec-mp3` and `ec-vorbis`. Opus
+/// still has none as a *file* -- the Matroska seat is `ec-opus`, but a standalone
+/// `.opus` row this project does not offer.
 /// (AAC has one too -- `ec-aac`, which is what a re-encoded video track's
 /// sound leaves through -- but AAC is a container's own audio, never a file of
 /// its own here.) VP9 and VP8 are the
@@ -200,10 +200,10 @@ pub enum Format {
     Wav,
     /// The audio lanes alone, losslessly compressed.
     Flac,
-    /// The audio lanes alone, MPEG-1 Layer III CBR (`rusty_mp3`) at the rate
+    /// The audio lanes alone, MPEG-1 Layer III CBR (`ec-mp3`) at the rate
     /// [`ExportSettings::audio_kbps`] asks for.
     Mp3,
-    /// The audio lanes alone, Vorbis I in an Ogg container -- `rusty_vorbis`
+    /// The audio lanes alone, Vorbis I in an Ogg container -- `ec-vorbis`
     /// encoding, `oxideav-ogg` paging. Quality-coded and not rate-coded, which
     /// is why [`audio_rate_refusal`] takes the Sound row away here: see
     /// [`VORBIS_QUALITY`] for the operating point and how it was measured.
@@ -848,8 +848,8 @@ fn audio_label(
     match format {
         Format::Wav => "PCM · SW (hound)",
         Format::Flac => "FLAC · SW (flacenc)",
-        Format::Mp3 => "MP3 · SW (rusty_mp3)",
-        Format::Ogg => "Vorbis · SW (rusty_vorbis)",
+        Format::Mp3 => "MP3 · SW (ec-mp3)",
+        Format::Ogg => "Vorbis · SW (ec-vorbis)",
         _ => match copied.unwrap_or(!forces_encode(project, ranged)) {
             true => "AAC copy",
             // A Matroska file gets Opus where the mix allows it -- 48 kHz and
@@ -920,12 +920,12 @@ pub fn audio_rate_refusal(project: &Project, format: Format, ranged: bool) -> Op
     match format {
         _ if !has_sound(project) => Some("no sound to write"),
         Format::Wav | Format::Flac => Some("lossless — the samples themselves, at no rate"),
-        // Vorbis has a quality knob and no rate knob, and the two are not the
-        // same control wearing different words: measured across this suite's
-        // fixtures, the whole usable quality band lands between 55 and 175 kbps
-        // ([`VORBIS_QUALITY`]), so two of the four rates on offer here are not
-        // rates it can reach at all. A live row would print a figure the file
-        // does not hold, which is the one thing this card is built not to do.
+        // Vorbis is written at one measured operating point ([`VORBIS_QUALITY`]
+        // + [`VORBIS_TARGET_BPS`]), not at a rate a user may pick: its actual
+        // landing moves with the content around that target (124-134 kbps
+        // across this suite's bench inputs), so a live rate row would print a
+        // figure the file does not hold -- the one thing this card is built
+        // not to do.
         Format::Ogg => Some("quality-coded — Vorbis holds no rate to pick"),
         Format::Mp3 => None,
         _ if forces_encode(project, ranged) => None,
@@ -3321,20 +3321,21 @@ fn write_wav(out: &Path, samples: &[i32], audio: &AudioMeta) -> crate::Result<()
     Ok(())
 }
 
-/// The same samples as MPEG-1 Layer III, `rusty_mp3` doing the encoding -- pure
-/// Rust like every other encoder here, and the reason this format is a row at
-/// all: the LGPL `shine-rs` was the only one when it was not.
+/// The same samples as MPEG-1 Layer III, `ec-mp3` doing the encoding -- the
+/// family's own, taking the seat at the same contract (CBR in, frames out,
+/// `Mp3EncoderConfig`'s fields are the old seat's names), so the swap cost the
+/// call sites nothing.
 ///
 /// CBR at the caller's rate, [`DEFAULT_AUDIO_KBPS`] where there was none. Every
 /// offered rate is already a legal Layer III value, so the encoder's snap is a
 /// backstop and not a silent substitution; a sample rate MPEG has no frame for
-/// (anything but 8-48 kHz) is refused there by name rather than written as
-/// something else.
+/// (anything but the nine MPEG rates 8-48 kHz) is refused there by name rather
+/// than written as something else.
 ///
 /// corner-cut: CBR only -- the card offers rates and not a quality index. Upgrade
 /// path is `Mp3EncoderConfig::vbr_quality` behind a setting of its own.
 fn write_mp3(out: &Path, samples: &[i32], audio: &AudioMeta, kbps: u32) -> crate::Result<()> {
-    let mut encoder = rusty_mp3::Mp3Encoder::new(rusty_mp3::Mp3EncoderConfig {
+    let mut encoder = ec_mp3::encode::Mp3Encoder::new(ec_mp3::encode::Mp3EncoderConfig {
         bitrate_kbps: kbps,
         vbr_quality: None,
     });
@@ -3356,72 +3357,58 @@ fn write_mp3(out: &Path, samples: &[i32], audio: &AudioMeta, kbps: u32) -> crate
     Ok(())
 }
 
-/// The Vorbis quality every `.ogg` this program writes is coded at, on
-/// `rusty_vorbis`'s normalised `[0, 1]` scale -- about `-q 8.35` on the scale
-/// Vorbis itself is spoken in (`quality01_from_vorbis_q`).
+/// Where the Vorbis rate loop starts, on `ec-vorbis`'s normalised `[0, 1]`
+/// scale, beside [`VORBIS_TARGET_BPS`] -- the two numbers every `.ogg` this
+/// program writes is coded at.
 ///
-/// A measured number, not a taste. The 2026-08-11 bench encoded three of this
-/// suite's fixtures (`test_tone_48k.wav`, `test_av.mp4`, `test_tone.mp3`) at
-/// every quality from 0.40 to 0.95 and decoded each back with **symphonia** --
-/// an independent decoder, and the very one [`crate::audio`] reopens an export
-/// with. Two things came out of it:
-///
-/// * **Below 0.50 the encoder is quiet, not just coarse.** The decoded RMS
-///   against the source's runs 0.83-0.94 at quality 0.40 (a 1 to 1.6 dB level
-///   error), and at 0.10 and below the file decodes to near-silence -- the same
-///   class of failure the AC-3 mono downmix has in `crate::audio`. From 0.55 up
-///   the level sits at 1.000-1.009, which is what a lossy codec should do.
-/// * **The band tops out well under the rates the Sound row offers.** Quality
-///   0.85 measured 176, 144 and 148 kbps on the three fixtures; 0.95 only
-///   reaches ~200. That is why [`audio_rate_refusal`] takes the row away rather
-///   than mapping 128/192/256/320 onto quality steps: the top two are numbers
-///   this encoder cannot produce, and a card that printed them would be lying.
-///
-/// 0.85 is the top of the band where every fixture still decoded to *exactly*
-/// its own length (0.95 overshot one by 820 samples), which is the property
-/// [`write_ogg`] is built around.
+/// A measured operating point, not a taste (2026-09-13 bench, every output
+/// decoded back with **symphonia** -- an independent decoder, and the very one
+/// [`crate::audio`] reopens an export with). The incumbent seat's own 0.85 --
+/// its top quality that still decoded every fixture to exactly its own length
+/// -- measured 124-176 kbps across this suite's fixtures with correlation
+/// 0.9947-0.9957 against the source. The quality knob alone on the new seat
+/// saturates well under that band (0.98 lands ~87 kbps on a 30-second music
+/// clip), so the seat is driven the way its own rate gates are measured: the
+/// loop starts at 0.85 and is held to a 128 kbps target, which landed
+/// 124-134 kbps actual on the same inputs and beat the incumbent at its own
+/// operating point on every one of them -- correlation 0.9968 against 0.9947
+/// on the music clip, +3.1 dB PSNR -- at the same size of file. Against
+/// ffmpeg's own libvorbis at `-q 5` (125.8 kbps actual on the same clip) it
+/// reads 0.9968 against 0.9973: par at the same rate.
 const VORBIS_QUALITY: f32 = 0.85;
 
-/// The Vorbis block hop, and the size of the pre-roll [`write_ogg`] feeds the
-/// encoder. `rusty_vorbis` emits long blocks only (`N = 2048`, hop `N/2`).
-const VORBIS_HOP: usize = 1024;
+/// The rate [`VORBIS_QUALITY`]'s loop is held to, in bits per second. Measured
+/// landing within +1..+5% of target across the bench's inputs; the Sound row
+/// stays refused for this format because this target is the encoder's measured
+/// operating point, not a number a card may offer.
+const VORBIS_TARGET_BPS: i32 = 128_000;
 
-/// The same samples as Vorbis I in an Ogg container: `rusty_vorbis` encodes,
+/// The same samples as Vorbis I in an Ogg container: `ec-vorbis` encodes,
 /// `oxideav-ogg` pages. Pure Rust on both halves, like every other encoder here.
 ///
-/// Two corrections stand between that library pair and a file this project would
-/// ship, and both are measured rather than guessed (2026-08-11, decoded back
-/// with symphonia every time):
+/// The old seat's two corrections are gone with it, and the going is measured
+/// rather than assumed (2026-09-13, every output decoded back with symphonia).
+/// This encoder numbers its packets the spec's way -- the first audio packet
+/// at granule 0, every packet after at the absolute sample position its block
+/// ends on -- and clamps its final granule to the sample count it was fed, so
+/// a decoder trims the block grid's tail on its own. Written straight through,
+/// every file decodes to exactly the timeline's frame count with the
+/// correlation peak at lag zero, which is what the one-hop pre-roll and the
+/// two granule corrections this function used to carry around the old encoder
+/// were for.
 ///
-/// 1. **One hop of pre-roll.** `rusty_vorbis` advances the granule by a full hop
-///    on its *first* audio packet, which its own doc comment says decodes to
-///    zero samples. Written straight through, every sample lands ~1024 early:
-///    a marker signal whose only energy was its first and last 1024 samples came
-///    back with the head at 36% of its amplitude and a full-scale burst 1500
-///    samples *before* the real one, in what should have been silence. Feeding
-///    [`VORBIS_HOP`] samples of silence ahead of the mix and subtracting the same
-///    from every granule puts it back: head 0.86 against an input peak of 0.80,
-///    the phantom burst down to 0.04, the real burst at its own place. The
-///    decoder drops the pre-roll itself -- a first page whose granule is under
-///    what its packets decode to is exactly how Ogg says "skip this much".
-/// 2. **The tail is declared, not encoded.** The block grid overshoots the last
-///    sample, so the stream is padded out and the *last* page's granule is set
-///    to the timeline's own frame count. A decoder trims to it, which is what
-///    makes an `.ogg` here exactly as long as the WAV of the same timeline --
-///    the promise [`run_audio`] makes for every other audio format.
+/// **Stereo, always.** The format row promises stereo, so a mono mix is
+/// written as dual mono, both channels bit-identical (measured: `max|L-R|` is
+/// exactly 0; the encoder's own channel coupling codes the empty side channel
+/// for almost nothing). The encoder would serve a mono stream, but the row
+/// says stereo and folding the file back down must give exactly what was
+/// mixed. Wider than stereo cannot reach here -- [`crate::audio`] folds 5.1
+/// to stereo when the source is opened -- but it is refused by name rather
+/// than left to the library's own message.
 ///
-/// **Stereo, always.** The embedded setup header `rusty_vorbis` ships is a
-/// stereo profile: a mono push is refused outright ("bad coupling channels"),
-/// and so is anything wider. A mono mix is therefore written as dual mono, both
-/// channels bit-identical (measured: `max|L-R|` is exactly 0, and Vorbis's own
-/// channel coupling codes the empty side channel for almost nothing). Wider than
-/// stereo cannot reach here -- [`crate::audio`] folds 5.1 to stereo when the
-/// source is opened -- but it is refused by name rather than left to the
-/// library's own message.
-///
-/// corner-cut: one quality, [`VORBIS_QUALITY`], with no user control -- the Sound
-/// row is refused for this format because the rates it offers are not rates
-/// Vorbis reaches. Upgrade path is a quality picker of its own, worth building
+/// corner-cut: one operating point, [`VORBIS_QUALITY`] +
+/// [`VORBIS_TARGET_BPS`], with no user control -- the Sound row is refused for
+/// this format. Upgrade path is a quality picker of its own, worth building
 /// the day the card has a control that speaks in quality rather than kbps.
 fn write_ogg(out: &Path, samples: &[i32], audio: &AudioMeta) -> crate::Result<()> {
     if audio.channels > 2 {
@@ -3431,47 +3418,49 @@ fn write_ogg(out: &Path, samples: &[i32], audio: &AudioMeta) -> crate::Result<()
         )
         .into());
     }
-    // The mp3 path's conversion, so the two files are one mix, plus the pre-roll
-    // and (for a mono mix) the dual-mono widening: the same sample in both
-    // channels is the same signal, not a widening of it, so what a player folds
-    // back down is what was mixed.
-    let mut pcm: Vec<i16> = vec![0; VORBIS_HOP * 2];
-    match audio.channels < 2 {
-        true => pcm.extend(samples.iter().flat_map(|&s| [s as i16, s as i16])),
-        false => pcm.extend(samples.iter().map(|&s| s as i16)),
-    }
-    // The block grid has to run past the last real sample or the tail is never
-    // coded at all; the granule below is what trims the padding back off.
+    // The mp3 path's conversion, so the two files are one mix -- the same
+    // /32768 scaling this engine's own decoders do -- plus (for a mono mix)
+    // the dual-mono widening: the same sample in both channels is the same
+    // signal, not a widening of it, so what a player folds back down is what
+    // was mixed.
+    let pcm: Vec<f32> = match audio.channels < 2 {
+        true => samples
+            .iter()
+            .flat_map(|&s| [f32::from(s as i16) / 32768.0; 2])
+            .collect(),
+        false => samples
+            .iter()
+            .map(|&s| f32::from(s as i16) / 32768.0)
+            .collect(),
+    };
     let frames = samples.len() / usize::from(audio.channels).max(1);
-    pcm.resize(pcm.len() + VORBIS_HOP * 4 * 2, 0);
 
-    let mut encoder = rusty_vorbis::VorbisEncoder::new(rusty_vorbis::VorbisEncoderConfig {
-        bitrate_bps: rusty_vorbis::BITRATE_NOMINAL,
+    let mut encoder = ec_vorbis::VorbisEncoder::new(ec_vorbis::EncoderConfig {
+        sample_rate: audio.sample_rate,
+        channels: 2,
+        bitrate_bps: VORBIS_TARGET_BPS,
         quality: VORBIS_QUALITY,
-    });
+    })
+    .map_err(|e| format!("vorbis encode: {e}"))?;
     encoder
-        .push_pcm_s16(&pcm, 2, audio.sample_rate)
+        .push_interleaved(&pcm)
         .map_err(|e| format!("vorbis encode: {e}"))?;
     encoder.finish();
     let mut packets = Vec::new();
     loop {
         match encoder.next_packet() {
             Ok(packet) => packets.push(packet),
-            Err(rusty_vorbis::Error::Eof) => break,
+            Err(ec_core::Error::Eof) => break,
+            Err(ec_core::Error::NeedMore) => continue,
             Err(e) => return Err(format!("vorbis encode: {e}").into()),
         }
     }
-    // Identification, comment and setup, then at least one audio packet: fewer
-    // than four and there is no stream to page.
-    if packets.len() < 4 {
-        return Err(format!("vorbis encode: {} packets is not a stream", packets.len()).into());
+    // The three setup headers travel with the encoder, not in the packet
+    // stream; with no audio packets there is no stream to page.
+    if packets.is_empty() {
+        return Err("vorbis encode: no audio packets is not a stream".into());
     }
-    let headers = [
-        &packets[0].data[..],
-        &packets[1].data[..],
-        &packets[2].data[..],
-    ];
-    let extradata = oxideav_ogg::mux::xiph_lace(&headers)
+    let extradata = oxideav_ogg::mux::xiph_lace(&encoder.headers())
         .ok_or("vorbis encode: the three headers would not lace")?;
 
     let time_base = oxideav_core::TimeBase::new(1, i64::from(audio.sample_rate));
@@ -3495,18 +3484,14 @@ fn write_ogg(out: &Path, samples: &[i32], audio: &AudioMeta) -> crate::Result<()
     muxer
         .write_header()
         .map_err(|e| format!("ogg mux: {e:?}"))?;
-    let last = packets.len() - 1;
-    for (i, packet) in packets.iter().enumerate().skip(3) {
-        // Correction 1 on every packet, correction 2 on the last one.
-        let granule = match i == last {
-            true => frames as i64,
-            false => (packet.pts - VORBIS_HOP as i64).max(0),
-        };
+    for packet in &packets {
+        // The granule is the encoder's own: the absolute sample position this
+        // packet ends at, clamped to the mix's length on the last one.
         muxer
             .write_packet(
                 &oxideav_core::Packet::new(0, time_base, packet.data.clone())
-                    .with_pts(granule)
-                    .with_duration(packet.duration),
+                    .with_pts(packet.granule)
+                    .with_duration(packet.samples),
             )
             .map_err(|e| format!("ogg mux: {e:?}"))?;
     }

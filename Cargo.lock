@@ -1664,6 +1664,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ec-mp3"
+version = "0.1.0"
+dependencies = [
+ "ec-core",
+ "ec-dsp",
+]
+
+[[package]]
 name = "ec-opus"
 version = "0.1.0"
 dependencies = [
@@ -1671,6 +1679,14 @@ dependencies = [
  "ec-dsp",
  "rustfft",
  "wide",
+]
+
+[[package]]
+name = "ec-vorbis"
+version = "0.1.0"
+dependencies = [
+ "ec-core",
+ "ec-dsp",
 ]
 
 [[package]]
@@ -1735,7 +1751,9 @@ dependencies = [
  "ec-h264",
  "ec-h265",
  "ec-h265-syntax",
+ "ec-mp3",
  "ec-opus",
+ "ec-vorbis",
  "flacenc",
  "hound",
  "image",
@@ -1749,8 +1767,6 @@ dependencies = [
  "oxideav-sub-image",
  "oxideav-subtitle",
  "rav1e",
- "rusty_mp3",
- "rusty_vorbis",
  "symphonia",
  "symphonia-codec-aac",
  "symphonia-core",
@@ -5101,18 +5117,6 @@ name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
-
-[[package]]
-name = "rusty_mp3"
-version = "0.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a99f339ec9a2d84eec8fc2a42baa92426966b25238c498e79d57b4e49b14fbad"
-
-[[package]]
-name = "rusty_vorbis"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6eddf79e697ce9279ef0e012432cd2889a7b6305a45efb5bb16e8a1d6338646f"
 
 [[package]]
 name = "rustybuzz"

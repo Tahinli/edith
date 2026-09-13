@@ -650,7 +650,7 @@ fn every_codec_row_is_offered_or_says_why_not() {
         .expect("OGG has a row");
     assert_eq!(row, [Format::Ogg], "OGG is a row that picks now");
     assert!(
-        detail.contains("rusty_vorbis"),
+        detail.contains("ec-vorbis"),
         "the row names the encoder like every other live one: {detail}"
     );
     assert!(
