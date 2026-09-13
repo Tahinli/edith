@@ -613,7 +613,7 @@ pub enum Reach {
     Gesture,
 }
 
-pub static FIXED: std::sync::LazyLock<[Fixed; 27]> = std::sync::LazyLock::new(|| {
+pub static FIXED: std::sync::LazyLock<[Fixed; 28]> = std::sync::LazyLock::new(|| {
     [
         // Not a chord at all but a way of pressing one, and the only place the
         // editor can say so: holding a key that moves a *value* runs it, and
@@ -794,6 +794,12 @@ pub static FIXED: std::sync::LazyLock<[Fixed; 27]> = std::sync::LazyLock::new(||
             label: "Speed the silences up instead of cutting them",
             category: Category::Clips,
             reach: Reach::Click("silence-apply"),
+        },
+        Fixed {
+            chord: "k".into(),
+            label: "Keep only the silences the card found",
+            category: Category::Clips,
+            reach: Reach::Click("silence-keep-only"),
         },
     ]
 });

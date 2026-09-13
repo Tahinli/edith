@@ -407,3 +407,67 @@ fn scanning_a_clip_and_cutting_what_it_finds() {
     assert!(p.undo());
     assert_eq!(p.timeline_frames(), was);
 }
+
+/// The reverse cut: the same scan, its quiet regions inverted into the
+/// speech between them, and cutting *those* -- what is left is the silences
+/// themselves, a timeline shorter by exactly the speech, far shorter than
+/// the jumpcut's remains (which keep everything but the dips), and one undo
+/// press takes it all back.
+#[test]
+fn keeping_only_silence_cuts_the_speech() {
+    let mut p = fixture();
+    let was = p.timeline_frames();
+    let audio = Lane::new(LaneKind::Audio, 0);
+    let clip = p.lane(audio)[0];
+    let range = (
+        f64::from(clip.in_frame) / FPS,
+        f64::from(clip.out_frame) / FPS,
+    );
+    let levels = silence::levels(asset("test_av.mp4"), 0, range)
+        .expect("scan")
+        .expect("the fixture has audio");
+    let cfg = Settings {
+        threshold_db: -40.,
+        min_silence: 0.08,
+        padding: 0.02,
+        min_keep: 0.,
+    };
+    let quiet = silence::regions(&levels, cfg);
+    assert!(!quiet.is_empty(), "the fixture has silences to keep");
+    let duration = levels.len() as f64 / f64::from(engine::silence::WINDOWS_PER_SEC);
+    let speech = silence::invert(duration, &quiet);
+    let regions = silence::timeline_regions(&clip, FPS, &speech);
+    assert!(!regions.is_empty(), "the fixture has speech to cut");
+
+    let cut: u32 = regions.iter().map(|&(_, len)| len).sum();
+    let kept_quiet: u32 = silence::timeline_regions(&clip, FPS, &quiet)
+        .iter()
+        .map(|&(_, len)| len)
+        .sum();
+    p.cut_regions(&regions, &p.lanes().clone())
+        .expect("every lane is in scope");
+    assert_eq!(p.timeline_frames(), was - cut);
+    // What remains *is* the quiet: the scan's complement covers the span the
+    // silences do not. The two sums differ only where a boundary falls
+    // between frames -- both sides round inward, so one unclaimed frame can
+    // open at every meeting of a silence and the speech beside it, and
+    // nowhere else.
+    let remaining = was - cut;
+    assert!(
+        remaining >= kept_quiet,
+        "{remaining} left against {kept_quiet} of marked quiet"
+    );
+    assert!(
+        remaining - kept_quiet <= (quiet.len() + speech.len()) as u32,
+        "{remaining} left against {kept_quiet} of marked quiet"
+    );
+    // ...and the two cuts are opposites, not neighbours: five brief dips
+    // against the speech around them.
+    let jumpcut_left = was - kept_quiet;
+    assert!(
+        remaining * 4 < jumpcut_left,
+        "{remaining} left against the jumpcut's {jumpcut_left}"
+    );
+    assert!(p.undo());
+    assert_eq!(p.timeline_frames(), was);
+}
