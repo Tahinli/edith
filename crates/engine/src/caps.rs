@@ -39,11 +39,11 @@ const SW_CODECS: [(&str, &str, bool, bool); 10] = [
     // Decode is split by width: symphonia carries stereo and narrower, `ec-aac`
     // everything wider; the encoder is `ec-aac` as well.
     ("AAC", "symphonia / ec-aac / ec-aac", true, true),
-    ("MP3", "symphonia / rusty_mp3", true, true),
+    ("MP3", "symphonia / ec-mp3", true, true),
     ("FLAC", "symphonia / flacenc", true, true),
     ("PCM", "symphonia / hound", true, true),
     ("AC-3", "ec-ac3", true, false),
-    ("Vorbis", "symphonia / rusty_vorbis", true, true),
+    ("Vorbis", "symphonia / ec-vorbis", true, true),
     ("ALAC", "symphonia", true, false),
 ];
 
