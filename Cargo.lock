@@ -1648,6 +1648,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "ec-h265"
+version = "0.1.0"
+dependencies = [
+ "ec-core",
+ "ec-h265-syntax",
+ "wide",
+]
+
+[[package]]
+name = "ec-h265-syntax"
+version = "0.1.0"
+dependencies = [
+ "ec-core",
+]
+
+[[package]]
 name = "ec-opus"
 version = "0.1.0"
 dependencies = [
@@ -1717,6 +1733,8 @@ dependencies = [
  "ec-av1",
  "ec-core",
  "ec-h264",
+ "ec-h265",
+ "ec-h265-syntax",
  "ec-opus",
  "flacenc",
  "hound",
@@ -1727,7 +1745,6 @@ dependencies = [
  "mp4",
  "oxideav-ass",
  "oxideav-core",
- "oxideav-h265",
  "oxideav-ogg",
  "oxideav-sub-image",
  "oxideav-subtitle",
@@ -4042,13 +4059,6 @@ dependencies = [
  "bytemuck",
  "serde_json",
  "thiserror 2.0.20",
-]
-
-[[package]]
-name = "oxideav-h265"
-version = "0.0.9"
-dependencies = [
- "oxideav-core",
 ]
 
 [[package]]
