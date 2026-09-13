@@ -273,7 +273,7 @@ fn exports_the_timeline_as_a_flac() {
     std::fs::remove_file(&out).unwrap();
 }
 
-/// The third audio row, and the one that used to be a licence note: `rusty_mp3`
+/// The third audio row, and the one that used to be a licence note: `ec-mp3`
 /// encodes it, and the file is read straight back through symphonia's mp3
 /// decoder -- the very door an mp3 *import* comes in through, so an export can
 /// be dropped back onto the timeline it came from.
@@ -872,17 +872,17 @@ fn a_51_ac3_source_round_trips_through_a_wav() {
 }
 
 /// The fourth audio row, and the one that used to be a refusal: Vorbis in an Ogg
-/// container, `rusty_vorbis` encoding and `oxideav-ogg` paging, read straight
+/// container, `ec-vorbis` encoding and `oxideav-ogg` paging, read straight
 /// back through the engine's own reader like every other export here.
 ///
 /// The shape is asserted *exactly* -- `assert_timeline_shape`, the same the WAV
-/// and the FLAC are held to, and not the MP3's within-a-frame slack. That is the
-/// whole point of the two corrections in `export::write_ogg`: the encoder's own
-/// granule numbering puts every sample a block early and its block grid overruns
-/// the tail, so written straight through, this file would be a hop out of step
-/// and short of the timeline. The 1 Hz pulse is what proves the *timing* rather
-/// than merely the length -- a stream shifted by a block lands its peak nearer
-/// where the dip belongs.
+/// and the FLAC are held to, and not the MP3's within-a-frame slack. The old
+/// seat needed two corrections in `export::write_ogg` to earn that (its granule
+/// numbering ran a hop early and its block grid overran the tail); `ec-vorbis`
+/// reports spec granules and clamps its last one to the mix's own length, so
+/// the file is written straight through and still lands here. The 1 Hz pulse
+/// is what proves the *timing* rather than merely the length -- a stream
+/// shifted by a block lands its peak nearer where the dip belongs.
 #[test]
 fn exports_the_timeline_as_an_ogg_vorbis() {
     let out = out_path("ogg", "ogg");
@@ -1108,12 +1108,11 @@ fn a_split_and_crossfaded_clip_has_no_muted_interior() {
     std::fs::remove_file(&src).unwrap();
 }
 
-/// A **mono** timeline through the same door. `rusty_vorbis` ships one embedded
-/// setup header and it is a stereo profile -- a mono push is refused outright
-/// ("bad coupling channels") -- so `export::write_ogg` writes the mix as dual
-/// mono. This is the test that it is *dual mono* and not a widening: both
-/// channels come back bit-identical, so folding the file back down gives exactly
-/// what was mixed.
+/// A **mono** timeline through the same door. The format row promises stereo,
+/// so `export::write_ogg` writes a mono mix as dual mono (the encoder itself
+/// would serve a mono stream; the row is the contract). This is the test that
+/// it is *dual mono* and not a widening: both channels come back
+/// bit-identical, so folding the file back down gives exactly what was mixed.
 #[test]
 fn a_mono_timeline_exports_as_dual_mono_ogg() {
     // A mono fixture, written here because the suite has none: one second of

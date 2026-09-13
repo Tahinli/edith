@@ -119,7 +119,7 @@ pub(crate) const FORMATS: [(&[Format], &str, &str, &str); 9] = [
         &[Format::Ogg],
         "o",
         "OGG",
-        "Vorbis (rusty_vorbis) — quality-coded, stereo",
+        "Vorbis (ec-vorbis) — quality-coded, stereo",
     ),
     (&[], "", "VP9", "AV1 above replaces it"),
     (&[], "", "VP8", "AV1 above replaces it"),
