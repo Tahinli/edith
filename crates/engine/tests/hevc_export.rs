@@ -1,8 +1,7 @@
-//! HEVC export: the codec this project could read and not write until OxideAV's
-//! pure-Rust H.265 gave it an encoder -- an **intra-only** one, every frame a
-//! self-contained IDR, which is the only shape of it fast enough to wait for
-//! (the inter modes code 1080p at 0.81 fps across 12 cores; the intra path does
-//! 4.30 fps on the same picture).
+//! HEVC export: the codec this project could read and not write until a
+//! pure-Rust encoder for it arrived -- `ec-h265` now, **intra-only**, every
+//! frame a self-contained IDR coded on every core at once (WPP), where the
+//! seat it replaced fanned one core across each of twelve frames in flight.
 //!
 //! Three things are under test here: that the *containers* say HEVC in the
 //! words their readers expect (this project's own demuxer, and ffprobe where it
@@ -120,12 +119,14 @@ fn an_hevc_export_reopens_through_our_own_demuxer_in_either_container() {
     }
 }
 
-/// The %16 half, and the reason the vendored encoder carries a patch at all:
-/// 1080 is not a multiple of the 16-sample CTB, so the picture is coded at
-/// 1920x1088 and the SPS crops it back with a §7.4.3.2.1 conformance window.
-/// ffprobe is what says whether that worked -- it reads the *bitstream*, not
-/// the container's own claim -- and ffmpeg decoding the file without a
-/// complaint is what says the stream is legal.
+/// The conformance-window half: the encoder pads the coded picture to whole
+/// minimum coding blocks and the SPS crops the padding back off with the
+/// §7.4.3.2.1 window -- 1080 is already a multiple of 8, so here the coded
+/// and displayed sizes agree.
+///
+/// ffprobe reads the *bitstream* rather than the container's own claim, and
+/// ffmpeg decoding the file without a complaint is what says the stream is
+/// legal.
 #[test]
 fn a_1080p_export_states_1920x1080_through_the_conformance_window() {
     let Some(source) = fixture_1080p() else {
