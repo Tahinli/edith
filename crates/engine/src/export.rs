@@ -3,9 +3,8 @@
 //! MP3 or Ogg Vorbis of the timeline's audio alone.
 //!
 //! The HEVC pair is **intra-only**, and says so wherever it is offered: every
-//! frame is a self-contained IDR from the vendored `oxideav-h265`, which is the
-//! only shape of a pure-Rust HEVC encode fast enough to wait for (its inter
-//! modes code 1080p at 0.81 fps across 12 cores against the intra path's 4.30).
+//! frame is a self-contained IDR from `ec-h265`, the project's own pure-Rust
+//! HEVC encoder -- intra-only by construction, the same file the row promises.
 //! That makes it an intraframe master in the family of ProRes and DNxHD — large
 //! files, every frame a cut point — and not a delivery codec.
 //!
@@ -67,6 +66,10 @@ use ec_core::registry::{CodecId, CodecParameters};
 use ec_core::registry::Decoder as _;
 use ec_core::{Packet, TimeBase};
 use ec_h264::{Encoder, EncoderConfig, H264Decoder, PictureView, Preset};
+use ec_h265::encoder::{Encoder as HevcEncoder, EncoderConfig as HevcEncoderConfig, RateControl};
+use ec_h265_syntax::vui::{
+    ColourDescription as HevcColourDescription, VideoSignalType as HevcVideoSignalType,
+};
 
 use flacenc::component::BitRepr;
 use flacenc::error::Verify;
@@ -139,15 +142,14 @@ pub const DEFAULT_AUDIO_KBPS: u32 = 256;
 /// on a build with no assembly, which is what this one is.
 const AV1_SPEED: u8 = 10;
 
-/// The HEVC coding tree block this encoder is fixed at: the coded picture is a
-/// whole number of them, which is what the conformance window crops back.
-const CTB: usize = 16;
-/// How many frames the intra HEVC encoder codes at once. Twelve is where the
-/// 2026-08-11 bench stopped scaling on this box (4.30 fps at 1080p); more lanes
-/// only holds more decoded frames in memory.
+/// How many lane encoders the intra HEVC seat spreads frames across. Twelve
+/// is where the 2026-08-11 bench stopped scaling on this box; more lanes
+/// only holds more decoded frames in memory. The cores the lanes leave over
+/// go to the wavefront inside each lane's encoder.
 const HEVC_LANES: usize = 12;
-/// Bits per pixel the intra encoder spends at QP 27, measured on the same bench:
-/// 0.607 at 720p and 0.586 at 1080p. What [`hevc_qp`] maps a bitrate row through.
+/// Bits per pixel an intra HEVC encoder spends at QP 27: 0.607 at 720p and
+/// 0.586 at 1080p on the old seat's bench, and `ec-h265` lands on the same
+/// 0.6 anchor. What [`hevc_qp`] maps a bitrate row through.
 const HEVC_BPP_AT_27: f64 = 0.6;
 /// The band [`hevc_qp`] is clamped into, for the reason stated there.
 const HEVC_QP_MIN: i32 = 22;
@@ -187,9 +189,9 @@ pub enum Format {
     /// unchanged.
     Av1Mp4,
     /// HEVC in Matroska, **intra-only**: every frame is a self-contained IDR
-    /// picture ([`Enc::open_hevc`]), which is what makes a pure-Rust HEVC
-    /// encoder fast enough to be an export at all. An intraframe master, like
-    /// ProRes or DNxHD -- large files, and every frame a cut point.
+    /// picture ([`Enc::open_hevc`]) -- `ec-h265` codes intra and nothing else.
+    /// An intraframe master, like ProRes or DNxHD -- large files, and every
+    /// frame a cut point.
     Hevc,
     /// The same HEVC stream in an mp4 (`hvc1`), for everything that plays mp4
     /// and not Matroska -- the AV1 pair's split, for the same reason.
@@ -793,7 +795,7 @@ pub const NO_HW_SEAT: &str = "no HW seat here — pick Auto or Software";
 fn video_label(format: Format, hw: bool) -> &'static str {
     match (format, hw) {
         (_, true) => HW_LABEL,
-        (Format::Hevc | Format::HevcMp4, false) => "SW encode (oxideav-h265 intra)",
+        (Format::Hevc | Format::HevcMp4, false) => "SW encode (ec-h265 intra)",
         (Format::Av1 | Format::Av1Mp4, false) => "SW encode (rav1e)",
         (_, false) => "SW encode (ec-h264)",
     }
@@ -3810,43 +3812,46 @@ enum Enc {
         au: Vec<u8>,
         flushed: bool,
     },
-    /// HEVC, intra-only and software only: `encode_idr_intra_au_cropped` is a
-    /// *stateless* function of one picture, so a batch of frames is coded on as
-    /// many cores as there are lanes and collected back in order.
+    /// HEVC, intra-only and software only: `ec-h265` is an intra encoder --
+    /// every picture an IDR carrying its own VPS/SPS/PPS. A batch of frames
+    /// codes on as many lane encoders as there are pictures, and each
+    /// encoder's wavefront splits whatever cores the lanes leave over -- the
+    /// same shape as the seat it replaced, the cores spent on frames and
+    /// inside one picture at the same time.
     Hevc(HevcEnc),
 }
 
 /// The intra HEVC seat. Frames arrive one at a time (the export walk is one
-/// picture per timeline frame) and are held until there are [`lanes`] of them,
-/// then coded in parallel and queued in **display order** -- fanning out is the
-/// only thing that makes a pure-Rust HEVC export bearable (4.30 fps at 1080p on
-/// 12 lanes against 0.55 fps on one, measured 2026-08-11), and an export whose
-/// frames came back shuffled would be no export at all.
+/// picture per timeline frame) and are held until there is a lane for each,
+/// then coded in parallel and queued in **display order**. `ec-h265`'s
+/// wavefront spreads one picture across the workers it is given and the lanes
+/// spread the frames across the machine, so decode and render keep filling
+/// the next batch while this one codes -- a seat that coded one picture at a
+/// time would serialize the whole walk behind its encoder (measured: 7.4 fps
+/// against 11.8 at 1080p on the same box, which is the regression this
+/// batching exists to prevent).
 ///
-/// corner-cut: a batch of padded planes sits in memory (~3 MB a frame at 1080p,
-/// so ~37 MB at 12 lanes) and the tail of a timeline is coded on fewer lanes
-/// than the middle. Upgrade path is a pipeline that keeps every lane fed from a
-/// decoder running ahead of the encoder rather than a batch barrier.
+/// corner-cut: a batch of display-size planes sits in memory (~3 MB a frame
+/// at 1080p, so ~37 MB at 12 lanes) and the tail of a timeline is coded on
+/// fewer lanes than the middle. Upgrade path is a pipeline that keeps every
+/// lane fed from a decoder running ahead of the encoder rather than a batch
+/// barrier.
 struct HevcEnc {
-    /// Padded I420 planes waiting for a lane, in display order.
+    /// Display-size I420 pictures waiting for a lane, in display order. The
+    /// encoder pads to its own coded grid, so nothing is pre-padded here.
     pending: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>,
     /// Coded access units not yet collected, in the same order.
     ready: std::collections::VecDeque<Vec<u8>>,
-    /// The unit currently lent out, for the reason `Sw` owns one.
+    /// The unit currently lent out, for the reason `Sw` owns one: the encoder
+    /// hands back an owned `Vec`, the seat's contract lends a slice.
     au: Vec<u8>,
-    /// The *coded* size: the picture's, rounded up to the 16-sample CTB grid.
+    /// One encoder per lane. `ec-h265` is stateless from picture to picture
+    /// (every picture is an IDR), so a lane coding frame *n* needs nothing
+    /// the other lanes know.
+    lanes: Vec<HevcEncoder>,
+    /// The display width the planes arrive at; the height lives in each
+    /// encoder's config, where the coded grid is derived from it.
     width: usize,
-    height: usize,
-    /// Luma samples the conformance window crops off the right and the bottom,
-    /// so a decoder outputs the picture's own size ([`pad_to_ctb`]).
-    crop: (usize, usize),
-    qp: i32,
-    lanes: usize,
-    /// What the SPS says the samples mean. A decoder reads the bitstream before
-    /// it reads the container, so an HEVC stream without this renders BT.601 in
-    /// libavcodec however the file is tagged -- the container's `Colour` element
-    /// and `colr` box are not enough on their own.
-    signal: oxideav_h265::vui::VideoSignalType,
 }
 
 impl Enc {
@@ -4022,26 +4027,28 @@ impl Enc {
     }
 
     /// The HEVC pair: the plugin's VA-API seat where the GPU has one, and the
-    /// frame-parallel software encoder everywhere else -- below the driver's
-    /// 384x384 floor, on a plugin too old to carry the symbol, on a GPU with no
-    /// HEVC encode entrypoint. Silent either way, because both write the same
-    /// kind of file.
+    /// software intra encoder everywhere else -- below the driver's 384x384
+    /// floor, on a plugin too old to carry the symbol, on a GPU with no HEVC
+    /// encode entrypoint. Silent either way, because both write the same kind
+    /// of file.
     ///
-    /// **Intra-only, deliberately, on both seats.** The software encoder's inter
-    /// modes code
-    /// 1080p at 0.81 fps across 12 cores (measured 2026-08-11) -- a minute of
-    /// timeline in half an hour, which is not an export anybody waits for --
-    /// while the intra path does 4.30 fps on the same picture and the same
-    /// cores. So every frame is an IDR, the file is an intraframe master in the
-    /// shape of ProRes or DNxHD, and the card says so where a user picks it.
+    /// **Intra-only, on both seats, by construction.** `ec-h265` codes intra
+    /// and nothing else -- every picture an IDR -- which is the file this row
+    /// has always promised: an intraframe master in the shape of ProRes or
+    /// DNxHD, large files, every frame a cut point. The seat it replaced had
+    /// inter modes and turned them off for speed; this one has none to turn
+    /// off.
     ///
-    /// The picture is coded **padded** to the 16-sample CTB grid and the SPS
-    /// crops it back ([`pad_to_ctb`], the vendored conformance-window patch), so
-    /// 1920x1080 is a legal export rather than a refusal.
+    /// The picture is coded at its own size and padded to whole minimum coding
+    /// blocks *by the encoder*, which crops the padding back off with the SPS
+    /// conformance window, so 1920x1080 is a legal export rather than a
+    /// refusal.
     fn open_hevc(meta: &VideoMeta, settings: &ExportSettings) -> crate::Result<Self> {
         // The muxers time by it and the mp4 one wants an exact rational: asked
-        // here so an impossible rate fails before a frame is coded.
-        crate::mux::frame_timing(meta.frame_rate)?;
+        // here so an impossible rate fails before a frame is coded. The same
+        // rational goes into the SPS's VUI, whose timing is also where the
+        // encoder picks the level from.
+        let (fps_num, fps_den) = crate::mux::frame_timing(meta.frame_rate)?;
         // 4:2:0 addresses its conformance window in *chroma* samples, so an odd
         // picture cannot be cropped back to itself -- and an odd dimension has
         // no chroma plane of its own to begin with. Named rather than padded to
@@ -4057,22 +4064,35 @@ impl Enc {
             eprintln!("export encoder: hardware HEVC intra (VA-API plugin)");
             return Ok(Self::HevcHw(hw));
         }
-        let (width, height) = (
-            (meta.width as usize).next_multiple_of(CTB),
-            (meta.height as usize).next_multiple_of(CTB),
-        );
-        let lanes = std::thread::available_parallelism().map_or(1, |n| n.get());
-        eprintln!("export encoder: software HEVC intra (oxideav-h265)");
+        eprintln!("export encoder: software HEVC intra (ec-h265)");
+        // The cores are split between the lanes and the wavefront inside one:
+        // twelve lanes of one worker each on this box's twelve threads,
+        // fewer lanes on a smaller machine with a wider wavefront each.
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let lane_count = cores.min(HEVC_LANES).max(1);
+        let per_lane = cores.div_ceil(lane_count);
+        let mut lanes = Vec::with_capacity(lane_count);
+        for _ in 0..lane_count {
+            let mut cfg = HevcEncoderConfig::new(meta.width, meta.height);
+            // The bitrate row a user picked, mapped through the same measured
+            // anchor as before ([`hevc_qp`]) and held: a *quality* dial, not a
+            // rate controller. The encoder's own per-picture target-bits mode
+            // would chase the number with a correction pass -- named headroom,
+            // not behaviour this seat takes silently.
+            cfg.rate_control = RateControl::ConstantQp(hevc_qp(meta, settings));
+            cfg.timing = Some((fps_den, fps_num));
+            cfg.video_signal_type = Some(video_signal_type(meta.height));
+            cfg.threads = per_lane;
+            lanes.push(
+                HevcEncoder::new(cfg).map_err(|e| format!("HEVC software encoder: {e}"))?,
+            );
+        }
         Ok(Self::Hevc(HevcEnc {
             pending: Vec::new(),
             ready: std::collections::VecDeque::new(),
             au: Vec::new(),
-            width,
-            height,
-            crop: (width - meta.width as usize, height - meta.height as usize),
-            qp: hevc_qp(meta, settings),
-            lanes: lanes.min(HEVC_LANES),
-            signal: video_signal_type(meta.height),
+            lanes,
+            width: meta.width as usize,
         }))
     }
 
@@ -4080,12 +4100,13 @@ impl Enc {
     /// a decoder may be started from -- which only the Matroska muxer asks, the
     /// mp4 one reading its own sync flag off the IDR slice.
     ///
-    /// The contract is structural in the software seat now: `ec-h264` buffers
+    /// The H.264 seat keeps the contract structurally: `ec-h264` buffers
     /// nothing -- no lookahead, and B pictures coded as none -- so one call is
-    /// one access unit by construction. The old seat only kept it because its
-    /// GOP-buffering lookahead needed a zero bitrate and this path was always
-    /// CBR; a future constant-QP mode would have had to split one buffer into
-    /// access units first.
+    /// one access unit by construction. The HEVC seat's lanes hold a small
+    /// batch of pictures until there is a lane for each, so it says "at most
+    /// one" and means it; the old H.264 seat only kept the contract because
+    /// its GOP-buffering lookahead needed a zero bitrate and this path was
+    /// always CBR.
     fn encode(
         &mut self,
         y: &[u8],
@@ -4127,16 +4148,11 @@ impl Enc {
             // and not a driver's choice.
             Self::HevcHw(hw) => Ok(hw.encode(y, u, v, width, height, true)?.map(|au| (au, true))),
             Self::Hevc(hevc) => {
-                hevc.pending.push(pad_to_ctb(
-                    y,
-                    u,
-                    v,
-                    width as usize,
-                    height as usize,
-                    hevc.width,
-                    hevc.height,
-                ));
-                if hevc.pending.len() >= hevc.lanes {
+                // The display-size planes are kept as they came: `ec-h265`
+                // pads to its own coded grid and crops back through the SPS
+                // conformance window.
+                hevc.pending.push((y.to_vec(), u.to_vec(), v.to_vec()));
+                if hevc.pending.len() >= hevc.lanes.len() {
                     hevc.code_batch()?;
                 }
                 // Every intra AU is an IDR, so every one of them is a key
@@ -4225,9 +4241,9 @@ impl Enc {
                 Ok(pop_av1(ready, au))
             }
             Self::HevcHw(hw) => Ok(hw.drain()?.map(|au| (au, true))),
+            // The tail batch: fewer frames than lanes, coded on as many
+            // encoders as there are frames left.
             Self::Hevc(hevc) => {
-                // The tail batch: fewer frames than lanes, coded on as many
-                // cores as there are frames left.
                 if !hevc.pending.is_empty() {
                     hevc.code_batch()?;
                 }
@@ -4242,32 +4258,25 @@ impl Enc {
 }
 
 impl HevcEnc {
-    /// The whole pending batch, one frame per lane, collected back in the order
-    /// it went out -- `std::thread::scope`, because the encode borrows the
-    /// planes rather than copying them again. A panic inside a lane comes back
-    /// as an error rather than unwinding the export thread.
+    /// The whole pending batch, one frame per lane, collected back in the
+    /// order it went out -- `std::thread::scope`, because the encode borrows
+    /// the planes and the lanes rather than copying them again. A panic inside
+    /// a lane comes back as an error rather than unwinding the export thread.
     fn code_batch(&mut self) -> crate::Result<()> {
-        let (width, height, qp, crop) = (self.width, self.height, self.qp, self.crop);
-        let signal = self.signal;
+        let width = self.width;
+        let chroma = width / 2;
+        let pending = std::mem::take(&mut self.pending);
         let coded: Vec<crate::Result<Vec<u8>>> = std::thread::scope(|scope| {
             let lanes: Vec<_> = self
-                .pending
+                .lanes
                 .iter()
-                .map(|(y, cb, cr)| {
+                .zip(pending.iter())
+                .map(|(encoder, (y, cb, cr))| {
                     scope.spawn(move || {
-                        oxideav_h265::encoder::intra::encode_idr_intra_au_cropped(
-                            y,
-                            cb,
-                            cr,
-                            width,
-                            height,
-                            qp,
-                            crop.0,
-                            crop.1,
-                            Some(signal),
-                        )
-                        .map(|coded| coded.au)
-                        .map_err(|e| crate::Error::from(format!("HEVC intra encode: {e:?}")))
+                        encoder
+                            .encode_idr_planes(y, width, cb, chroma, cr, chroma)
+                            .map(|coded| coded.au)
+                            .map_err(|e| crate::Error::from(format!("software HEVC encode: {e}")))
                     })
                 })
                 .collect();
@@ -4282,50 +4291,17 @@ impl HevcEnc {
         for au in coded {
             self.ready.push_back(au?);
         }
-        self.pending.clear();
         Ok(())
     }
 }
 
 /// The oldest coded intra AU, lent out under the same "valid until the next
-/// call" contract [`pop_av1`] has. Every one of them is an IDR, so the key flag
-/// is not a guess.
+/// call" contract [`pop_av1`] has. Every one of them is an IDR, so the key
+/// flag is not a guess.
 fn pop_hevc(hevc: &mut HevcEnc) -> Option<(&[u8], bool)> {
     hevc.au = hevc.ready.pop_front()?;
     Some((&hevc.au[..], true))
 }
-
-/// One I420 picture copied onto the padded plane sizes the CTB grid needs, the
-/// added rows and columns filled by **replicating the edge** rather than with
-/// black: the padding is coded and then cropped away, and a black border would
-/// bleed into the last real column through the intra prediction and the
-/// transform that straddles it.
-fn pad_to_ctb(
-    y: &[u8],
-    u: &[u8],
-    v: &[u8],
-    width: usize,
-    height: usize,
-    padded_w: usize,
-    padded_h: usize,
-) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
-    let plane = |src: &[u8], w: usize, h: usize, pw: usize, ph: usize| {
-        let mut out = vec![0u8; pw * ph];
-        for row in 0..ph {
-            let src_row = &src[row.min(h - 1) * w..][..w];
-            let dst = &mut out[row * pw..][..pw];
-            dst[..w].copy_from_slice(src_row);
-            dst[w..].fill(src_row[w - 1]);
-        }
-        out
-    };
-    (
-        plane(y, width, height, padded_w, padded_h),
-        plane(u, width / 2, height / 2, padded_w / 2, padded_h / 2),
-        plane(v, width / 2, height / 2, padded_w / 2, padded_h / 2),
-    )
-}
-
 /// The quantiser an intra HEVC export codes at, mapped from the *bitrate* row a
 /// user picked -- the card has no QP control and this codec has no rate control,
 /// so the two are joined by measurement rather than promised to each other.
@@ -4357,14 +4333,14 @@ fn hevc_qp(meta: &VideoMeta, settings: &ExportSettings) -> i32 {
 /// which renders BT.601 -- a visible shift on a 709 export that a player reads
 /// from the wrong matrix. Every export is limited range, which is what
 /// `video_full_range_flag = false` says here.
-fn video_signal_type(height: u32) -> oxideav_h265::vui::VideoSignalType {
+fn video_signal_type(height: u32) -> HevcVideoSignalType {
     let (primaries, transfer, matrix) = ColorDescription::output(height).codes();
-    oxideav_h265::vui::VideoSignalType {
+    HevcVideoSignalType {
         // "Unspecified", which is what every encoder here writes: the field is
         // the analogue system a picture came off, and none of these did.
         video_format: 5,
         video_full_range_flag: false,
-        colour_description: Some(oxideav_h265::vui::ColourDescription {
+        colour_description: Some(HevcColourDescription {
             colour_primaries: primaries as u8,
             transfer_characteristics: transfer as u8,
             matrix_coeffs: matrix as u8,
@@ -5319,31 +5295,6 @@ mod tests {
         // everywhere -- the honest end of "intra-only, large files": the file
         // will be bigger than the row says, and the row buys quality.
         assert_eq!(at(1920, 1080, None), at(1280, 720, None));
-    }
-
-    /// The padding a non-%16 picture is coded with replicates the edge instead
-    /// of filling black: the coded rows past the picture carry its last row, so
-    /// nothing bleeds into the last real line through the intra prediction.
-    #[test]
-    fn the_ctb_padding_replicates_the_edge() {
-        // 6x2 luma, values 1..=12, padded to 8x4 (CTB is 16, so this checks the
-        // copy itself with numbers small enough to read).
-        let y: Vec<u8> = (1..=12).collect();
-        let u: Vec<u8> = vec![40, 41, 42];
-        let v: Vec<u8> = vec![50, 51, 52];
-        let (py, pu, pv) = pad_to_ctb(&y, &u, &v, 6, 2, 8, 4);
-        assert_eq!(
-            py,
-            vec![
-                1, 2, 3, 4, 5, 6, 6, 6, // the row, then its last sample twice
-                7, 8, 9, 10, 11, 12, 12, 12, //
-                7, 8, 9, 10, 11, 12, 12, 12, // the last row, replicated
-                7, 8, 9, 10, 11, 12, 12, 12,
-            ]
-        );
-        // Chroma is half of everything, padded the same way.
-        assert_eq!(pu, vec![40, 41, 42, 42, 40, 41, 42, 42]);
-        assert_eq!(pv, vec![50, 51, 52, 52, 50, 51, 52, 52]);
     }
 
     /// An odd picture cannot be cropped back to itself in 4:2:0 -- the

@@ -78,9 +78,9 @@ pub(crate) fn sample_rate_choices(current: Option<u32>) -> Vec<ChoiceRow> {
 /// `None` is exactly that kind of row, and there are two left. MP3 stopped
 /// being one when `rusty_mp3` gave this project an Apache-2.0 encoder (the LGPL
 /// `shine-rs` was the licence question, and it is not the only encoder any
-/// more), and HEVC stopped being one when OxideAV's pure-Rust H.265 gave it an
-/// encoder — an *intra-only* one, which the rows say rather than let a user
-/// find out from the size of the file. VP9 and VP8 are the ones this program
+/// more), and HEVC stopped being one when this project gained a pure-Rust
+/// H.265 encoder — an *intra-only* one, which the rows say rather than let a
+/// user find out from the size of the file. VP9 and VP8 are the ones this program
 /// still only *reads*: the plugin decodes them and there is no encoder for
 /// either here, so they are rows for the reason the refusals are rows at all —
 /// a codec that opens but never comes back out is exactly the gap a user
