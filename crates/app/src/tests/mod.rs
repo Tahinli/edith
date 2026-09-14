@@ -25,7 +25,7 @@ use super::{
     clipboard_after_remove, color_snap, containers, destructive, enable, enable_lane, envelope, eq_card_w,
     eq_freq, eq_freq_label, eq_graph_h, eq_spectrum, eq_x, eq_y, estimated_bytes, export_path,
     export_settings, format_refusal, fps_choices, fps_label, frac_along, frac_down,
-    frame_at, frame_rate_ladder, histogram, inserted_band, is_project, keymap, keys_rows, lanes_h,
+    frame_at, frame_rate_ladder, histogram, inserted_band, is_project, keymap, keys_rows, keys_rows_matching, lanes_h,
     lane_items, marked, menu_at, menu_items, menu_rows_h, next_container, normalise, nothing_to_play,
     notice_tone, panel_h, parse_budget, project_path, range_word, proxies_to_start, push_notice, px_below, retarget,
     row_enable, row_items, scrub_due, secs_label, should_resync, silence_rate, size_label,

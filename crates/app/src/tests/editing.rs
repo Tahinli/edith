@@ -335,11 +335,13 @@ fn a_caption_is_deleted_by_the_same_row_and_stroke_every_box_is() {
         menu_items(cap),
         vec![
             ActionId::Paste,
+            ActionId::Group,
+            ActionId::Detach,
             // Below the rule line the render draws before it, like every
             // other row that takes something away (DESIGN §9).
             ActionId::Delete,
         ],
-        "the caption's menu is its removal and the one global row left",
+        "the caption's menu is its removal, the group pair, and paste",
     );
     // ...and the same reading with a clip under it is the clip menu, untouched:
     // the flag is off wherever a `Clip` was clicked.
@@ -628,6 +630,7 @@ fn the_clip_menu_dims_what_the_playhead_is_not_on_and_stays_in_the_window() {
         fade_in: 0,
         fade_out: 0,
         transition_out: 0,
+        visualizer: 0,
         start: 30,
         in_frame: 0,
         out_frame: 60,
@@ -759,7 +762,7 @@ fn the_clip_menu_dims_what_the_playhead_is_not_on_and_stays_in_the_window() {
     // silence scan is, because it opens on the half it is grouped with.
     let picture = menu(v1, false, 60);
     assert!(!picture.contains(&ActionId::Equalizer), "{picture:?}");
-    assert!(!picture.contains(&ActionId::Visualizer), "{picture:?}");
+    assert!(picture.contains(&ActionId::Visualizer), "{picture:?}");
     assert!(picture.contains(&ActionId::Color));
     assert!(picture.contains(&ActionId::Fit));
     assert!(picture.contains(&ActionId::Silence));
@@ -1062,6 +1065,7 @@ fn a_menu_offers_only_what_applies_and_is_drawn_inside_the_window() {
         fade_in: 0,
         fade_out: 0,
         transition_out: 0,
+        visualizer: 0,
         start: 30,
         in_frame: 0,
         out_frame: 60,
@@ -1793,6 +1797,7 @@ fn a_copied_clip_is_renumbered_or_dropped_when_a_row_leaves_the_library() {
         fade_in: 0,
         fade_out: 0,
         transition_out: 0,
+        visualizer: 0,
         start: 0,
         in_frame: 0,
         out_frame: 30,
@@ -1945,6 +1950,7 @@ fn trim_to_playhead_needs_a_subject_cut_with_the_playhead_on_it() {
         fade_in: 0,
         fade_out: 0,
         transition_out: 0,
+        visualizer: 0,
         start: 100,
         in_frame: 0,
         out_frame: 60,

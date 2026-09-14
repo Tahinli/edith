@@ -2760,7 +2760,8 @@ fn run(
                 let want = untouched.then(|| encoder.dma_want(meta)).flatten();
                 // Opened at the file's own frame, which is the only place the
                 // file's numbering is used -- the span's are the timeline's.
-                let pictures = if crate::is_audio(&entry.path) {
+                let flags = project.composite_visualizer_at(span.start);
+                let pictures = if crate::is_audio(&entry.path) || flags & 1 != 0 {
                     ClipDecoder::visualizer(
                         &entry.path,
                         entry.audio_stream,
@@ -2768,6 +2769,7 @@ fn run(
                         meta.width,
                         meta.height,
                         meta.frame_rate,
+                        flags,
                     )?
                 } else {
                     ClipDecoder::open(&entry.path, rate.source_at(in_frame), want)?
@@ -2826,7 +2828,9 @@ fn run(
                 Ok(Dissolve {
                     window,
                     tail_start: span.len - window,
-                    decoder: if crate::is_audio(&entry.path) {
+                    decoder: if crate::is_audio(&entry.path)
+                        || project.composite_visualizer_at(b_start) & 1 != 0
+                    {
                         ClipDecoder::visualizer(
                             &entry.path,
                             entry.audio_stream,
@@ -2834,6 +2838,7 @@ fn run(
                             meta.width,
                             meta.height,
                             meta.frame_rate,
+                            project.composite_visualizer_at(b_start),
                         )?
                     } else {
                         ClipDecoder::open(&entry.path, b_rate.source_at(b_in_frame), None)?
@@ -4418,6 +4423,7 @@ enum ClipDecoder {
         height: u32,
         fps: f64,
         next: u32,
+        flags: u8,
         y: Vec<u8>,
         u: Vec<u8>,
         v: Vec<u8>,
@@ -4530,6 +4536,7 @@ impl ClipDecoder {
         width: u32,
         height: u32,
         fps: f64,
+        flags: u8,
     ) -> crate::Result<Self> {
         let peaks = crate::waveform::peaks(path, stream, crate::decode::VIZ_BUCKETS_PER_SEC)
             .ok()
@@ -4542,6 +4549,7 @@ impl ClipDecoder {
             height,
             fps,
             next: start_frame,
+            flags,
             y: Vec::new(),
             u: Vec::new(),
             v: Vec::new(),
@@ -4562,12 +4570,13 @@ impl ClipDecoder {
                 height,
                 fps,
                 next,
+                flags,
                 y,
                 u,
                 v,
             } => {
                 let (yy, uu, vv) =
-                    crate::decode::visualizer_i420(peaks, f64::from(*next) / *fps, *width, *height);
+                    crate::decode::visualizer_i420(peaks, f64::from(*next) / *fps, *width, *height, *flags);
                 *y = yy;
                 *u = uu;
                 *v = vv;

@@ -707,6 +707,7 @@ impl PlaybackSession {
             fade_in: 0,
             fade_out: 0,
             transition_out: 0,
+            visualizer: 0,
             start: 0,
             in_frame: 0,
             out_frame: meta.frame_count,
@@ -797,6 +798,7 @@ impl PlaybackSession {
             fade_in: 0,
             fade_out: 0,
             transition_out: 0,
+            visualizer: 0,
             start: 0,
             in_frame: 0,
             out_frame: place_frames(meta.frame_count, IMAGE_ONLY_RATE),
@@ -1835,7 +1837,9 @@ impl PlaybackSession {
                 start,
                 from: Some((source, in_frame)),
                 ..
-            }) if crate::is_audio(&self.project.sources()[source].path) => {
+            }) if crate::is_audio(&self.project.sources()[source].path)
+                || self.project.composite_visualizer_at(start) & 1 != 0 =>
+            {
                 let (path, stream) = {
                     let src = &self.project.sources()[source];
                     (src.path.clone(), src.audio_stream)
@@ -1859,6 +1863,7 @@ impl PlaybackSession {
                         self.meta.height,
                         self.project.composite_fit_at(start),
                     ),
+                    self.project.composite_visualizer_at(start),
                 )
                 .inspect_err(|e| {
                     eprintln!("timeline frame {start}: visualizer open failed: {e}")
@@ -2970,6 +2975,12 @@ impl PlaybackSession {
         self.edit(Dirty::Picture, |p| p.set_fit(lane, idx, fit))
     }
 
+    /// Waveform flags on a visualizer clip. Reseeks like a grade: the
+    /// painter reads them on the next picture.
+    pub fn set_visualizer(&mut self, lane: Lane, idx: usize, flags: u8) -> bool {
+        self.edit(Dirty::Picture, |p| p.set_visualizer(lane, idx, flags))
+    }
+
     /// Timeline frames of ramp-up from silence at the start of the clip at
     /// `idx` of `lane`. `0` for an index that is not there.
     pub fn fade_in_of(&self, lane: Lane, idx: usize) -> u32 {
@@ -3101,6 +3112,7 @@ impl PlaybackSession {
             fade_in: 0,
             fade_out: 0,
             transition_out: 0,
+            visualizer: 0,
             start: 0,
             in_frame: 0,
             out_frame: match image {
@@ -3270,13 +3282,6 @@ impl PlaybackSession {
         out_frame: u32,
         onto: Option<Lane>,
     ) -> crate::Result<bool> {
-        if !crate::is_audio(path) {
-            return Err(format!(
-                "{} is not audio: a visualizer needs a sound file",
-                path.display()
-            )
-            .into());
-        }
         if out_frame <= in_frame {
             return Err("visualizer clip is empty".into());
         }
@@ -3301,6 +3306,7 @@ impl PlaybackSession {
             fade_in: 0,
             fade_out: 0,
             transition_out: 0,
+            visualizer: 1,
             start: 0,
             in_frame,
             out_frame,

@@ -628,6 +628,7 @@ impl DecodeSession {
         color: ColorParams,
         transform: TransformParams,
         canvas: Composer,
+        flags: u8,
     ) -> crate::Result<FrameStream> {
         let (tx, rx) = sync_channel(2);
         let cancel = Arc::new(AtomicBool::new(false));
@@ -678,7 +679,7 @@ impl DecodeSession {
                         return;
                     }
                     let t = f64::from(start_frame + index) / fps;
-                    let (y, u, v) = visualizer_i420(&peaks, t, width, height);
+                    let (y, u, v) = visualizer_i420(&peaks, t, width, height, flags);
                     let frame = render.frame(start_frame + index, &y, &u, &v, width, height);
                     if tx.send(frame).is_err() {
                         return; // caller moved on
@@ -1408,6 +1409,10 @@ fn rgb_to_i420(rgb: &[u8], width: usize, height: usize) -> (Vec<u8>, Vec<u8>, Ve
 /// caller that decodes them ([`DecodeSession::open_visualizer`], preview and
 /// export both) and the painter that reads them.
 pub(crate) const VIZ_BUCKETS_PER_SEC: u32 = 60;
+pub const VIZ_OUTLINE: u8 = 1 << 1;
+pub const VIZ_SMOOTH: u8 = 1 << 2;
+pub const VIZ_FAST: u8 = 1 << 3;
+pub const VIZ_TINT: u8 = 1 << 4;
 
 /// How much sound one visualizer frame shows, centered on the frame's own
 /// time: two seconds, so a glance reads the shape of the around-now rather
@@ -1430,6 +1435,7 @@ pub(crate) fn visualizer_i420(
     t_secs: f64,
     width: u32,
     height: u32,
+    flags: u8,
 ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     // Even dims, like every canvas this engine composes at: an odd caller is
     // shaved rather than handed chroma math it did not ask about.
@@ -1438,8 +1444,8 @@ pub(crate) fn visualizer_i420(
     let (w, h) = (width as usize, height as usize);
     let (cw, ch) = crate::scale::chroma_dims(w, h);
     let mut y = vec![16u8; w * h];
-    let u = vec![128u8; cw * ch];
-    let v = vec![128u8; cw * ch];
+    let mut u = vec![128u8; cw * ch];
+    let mut v = vec![128u8; cw * ch];
     let center = h / 2;
     let duration = peaks.len() as f64 / f64::from(VIZ_BUCKETS_PER_SEC);
     if peaks.is_empty() || !t_secs.is_finite() || !(0.0..=duration).contains(&t_secs) {
@@ -1449,16 +1455,19 @@ pub(crate) fn visualizer_i420(
         return (y, u, v);
     }
     let per_sec = f64::from(VIZ_BUCKETS_PER_SEC);
+    let window = if flags & VIZ_FAST != 0 { 0.4 } else { VIZ_WINDOW_SECS };
     // The window, clamped to the peaks that exist: a frame near either end
     // looks past the file's edge, and draws the part of the window that is
     // real rather than padding it out.
-    let first = (((t_secs - VIZ_WINDOW_SECS / 2.0).max(0.0) * per_sec).floor() as usize)
+    let first = (((t_secs - window / 2.0).max(0.0) * per_sec).floor() as usize)
         .min(peaks.len() - 1);
-    let last = ((((t_secs + VIZ_WINDOW_SECS / 2.0).min(duration) * per_sec).ceil() as usize)
+    let last = ((((t_secs + window / 2.0).min(duration) * per_sec).ceil() as usize)
         .clamp(first + 1, peaks.len()))
     .min(peaks.len());
     let span = (last - first) as f64;
     let scale = center as f32;
+    let smooth = flags & VIZ_SMOOTH != 0;
+    let outline = flags & VIZ_OUTLINE != 0;
     for col in 0..w {
         // The buckets this column draws: at least one, whatever the window's
         // width is against the picture's -- a short clip stretches, a long
@@ -1467,8 +1476,13 @@ pub(crate) fn visualizer_i420(
         let b1 = first
             + (((col + 1) as f64 * span / w as f64).ceil() as usize)
                 .clamp(b0 - first + 1, last - first);
+        let (s0, s1) = if smooth {
+            (b0.saturating_sub(1), (b1 + 1).min(peaks.len()))
+        } else {
+            (b0, b1)
+        };
         let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
-        for &(min, max) in &peaks[b0..b1] {
+        for &(min, max) in &peaks[s0..s1] {
             lo = lo.min(min);
             hi = hi.max(max);
         }
@@ -1477,8 +1491,28 @@ pub(crate) fn visualizer_i420(
         let bottom = (scale - lo * scale).round();
         let top = (top as isize).clamp(0, h as isize - 1) as usize;
         let bottom = (bottom as isize).clamp(top as isize, h as isize - 1) as usize;
-        for row in top..=bottom {
-            y[row * w + col] = 220;
+        if outline {
+            y[top * w + col] = 220;
+            y[bottom * w + col] = 220;
+        } else {
+            for row in top..=bottom {
+                y[row * w + col] = 220;
+            }
+        }
+    }
+    if flags & VIZ_TINT != 0 {
+        // Cyan on the ink, black stays black: chroma follows luma so a
+        // grade still reaches the bars around it.
+        for cy in 0..ch {
+            for cx in 0..cw {
+                let ink = y[cy * 2 * w + cx * 2] > 16
+                    || y[cy * 2 * w + cx * 2 + 1] > 16
+                    || y[(cy * 2 + 1).min(h - 1) * w + cx * 2] > 16;
+                if ink {
+                    u[cy * cw + cx] = 80;
+                    v[cy * cw + cx] = 80;
+                }
+            }
         }
     }
     (y, u, v)

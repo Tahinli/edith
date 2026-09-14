@@ -140,7 +140,7 @@ impl Player {
             return;
         }
         let Some((lane, idx)) = self.selected.anchor() else {
-            self.notify_user("NO VISUALIZER — select an audio clip".into());
+            self.notify_user("NO VISUALIZER — select a clip with sound".into());
             cx.notify();
             return;
         };
@@ -151,13 +151,8 @@ impl Player {
                 return;
             }
             Some(session) => {
-                if lane.kind != LaneKind::Audio {
-                    self.notify_user("NO VISUALIZER — select an audio clip".into());
-                    cx.notify();
-                    return;
-                }
                 let Some(clip) = session.lane_clips(lane).get(idx).copied() else {
-                    self.notify_user("NO VISUALIZER — select an audio clip".into());
+                    self.notify_user("NO VISUALIZER — select a clip with sound".into());
                     cx.notify();
                     return;
                 };
@@ -166,11 +161,6 @@ impl Player {
                     cx.notify();
                     return;
                 };
-                if !engine::is_audio(&src.path) {
-                    self.notify_user("NO VISUALIZER — this clip is not a sound file".into());
-                    cx.notify();
-                    return;
-                }
                 session.place_visualizer(
                     clip.start,
                     &src.path,
@@ -190,6 +180,25 @@ impl Player {
             Ok(false) => {
                 self.notify_user("NO VISUALIZER — that clip could not be placed".into())
             }
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_viz_flag(&mut self, bit: u8, cx: &mut Context<Self>) {
+        let Some((lane, idx)) = self.selected.anchor() else {
+            return;
+        };
+        let Some(session) = &mut self.session else {
+            return;
+        };
+        let Some(clip) = session.lane_clips(lane).get(idx).copied() else {
+            return;
+        };
+        if clip.visualizer & 1 == 0 {
+            return;
+        }
+        if session.set_visualizer(lane, idx, clip.visualizer ^ bit) {
+            self.reset_after_reseek();
         }
         cx.notify();
     }

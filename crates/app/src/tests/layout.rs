@@ -746,6 +746,7 @@ fn a_drop_moves_the_clip_that_was_picked_up_not_its_old_index() {
         fade_in: 0,
         fade_out: 0,
         transition_out: 0,
+        visualizer: 0,
         start,
         in_frame: 0,
         out_frame: 30,
@@ -2584,23 +2585,6 @@ fn every_action_has_a_darkroom_widget_home_or_explicit_owner() {
              accelerator for cycling that existing selection, not a new door -- legacy had no \
              toolbar button for it either",
         ),
-        // The group trio: a group is *made* with the pointer already --
-        // ctrl-click the halves and the grammar is the selection itself
-        // (DESIGN §9) -- so a row per verb in the clip menu was three rows
-        // saying what the click had already said. Chords and KEYS rows keep
-        // them reachable.
-        (
-            ActionId::Group,
-            "made by ctrl-clicking the halves: the selection is the grammar",
-        ),
-        (
-            ActionId::Detach,
-            "made by ctrl-clicking the halves: the selection is the grammar",
-        ),
-        (
-            ActionId::Regroup,
-            "made by ctrl-clicking the halves: the selection is the grammar",
-        ),
         // The keyboard's own trim: `^[` and `^]` do with a stroke what the
         // pointer does by dragging the clip edge to the spot it wants, and
         // that drag is the door -- a menu row for it would be a second name
@@ -3271,7 +3255,7 @@ fn the_keys_list_is_dock_body_state_not_a_tab() {
         "the keys list draws no KEYS head in the dock body"
     );
     assert!(
-        dock.contains("fn keys_tab(") && dock.contains("keys_rows()"),
+        dock.contains("fn keys_tab(") && dock.contains("keys_rows_matching("),
         "the KEYS tab draws something other than the action registry"
     );
     assert!(
@@ -3580,6 +3564,7 @@ fn the_cut_readout_counts_from_the_playhead() {
         fade_in: 0,
         fade_out: 0,
         transition_out: 0,
+        visualizer: 0,
         start,
         in_frame: 0,
         out_frame: len,

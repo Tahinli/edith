@@ -559,6 +559,7 @@ fn started(
         fade_in: 0,
         fade_out: 0,
         transition_out: 0,
+        visualizer: 0,
         start: 0,
         in_frame: 0,
         out_frame: meta.frame_count.max(1),
