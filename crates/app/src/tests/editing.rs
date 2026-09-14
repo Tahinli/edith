@@ -753,11 +753,13 @@ fn the_clip_menu_dims_what_the_playhead_is_not_on_and_stays_in_the_window() {
     assert!(!sound.contains(&ActionId::Fit), "{sound:?}");
     assert!(sound.contains(&ActionId::Equalizer));
     assert!(sound.contains(&ActionId::Silence));
+    assert!(sound.contains(&ActionId::Visualizer));
     // Picture: the mirror of it. The sound of a take is the audio lane's,
     // clip for clip, so the equalizer is not this clip's business -- but the
     // silence scan is, because it opens on the half it is grouped with.
     let picture = menu(v1, false, 60);
     assert!(!picture.contains(&ActionId::Equalizer), "{picture:?}");
+    assert!(!picture.contains(&ActionId::Visualizer), "{picture:?}");
     assert!(picture.contains(&ActionId::Color));
     assert!(picture.contains(&ActionId::Fit));
     assert!(picture.contains(&ActionId::Silence));
@@ -766,6 +768,7 @@ fn the_clip_menu_dims_what_the_playhead_is_not_on_and_stays_in_the_window() {
     // rewrite), scanned like none.
     let still = menu(v1, true, 60);
     assert!(!still.contains(&ActionId::Silence), "{still:?}");
+    assert!(!still.contains(&ActionId::Visualizer), "{still:?}");
     assert!(!still.contains(&ActionId::Equalizer), "{still:?}");
     assert!(still.contains(&ActionId::Color));
     assert!(still.contains(&ActionId::Fit));

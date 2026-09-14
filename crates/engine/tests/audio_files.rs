@@ -1,8 +1,8 @@
 //! Standalone audio files as sources: every container we claim to read decodes
 //! to the same tone, a song joins a timeline of video on the audio lane, a song
 //! *is* a timeline on its own (canvas scaffolded, picture black, sound exported)
-//! and the two things it cannot do -- play on the video lane, be copied into an
-//! mp4 -- are refusals that say so.
+//! and a visualizer clip is how that song gets a picture on a video lane.
+//! Paste still never lands a song on V1 by accident.
 //!
 //! ```text
 //! cargo test -p engine --release --test audio_files
@@ -125,7 +125,10 @@ fn an_ac3_track_with_no_picture_opens_out_of_an_mka() {
     let (rate, channels, samples) = decode(&asset("test_ac3.mka"));
     assert_eq!((rate, channels), (44100, 2), "test_ac3.mka");
     let secs = samples.len() as f64 / f64::from(rate) / f64::from(channels);
-    assert!((secs - 2.0).abs() < 0.2, "test_ac3.mka: {secs:.3} s, want 2.0");
+    assert!(
+        (secs - 2.0).abs() < 0.2,
+        "test_ac3.mka: {secs:.3} s, want 2.0"
+    );
     let mid = samples.len() / 2;
     let peak = samples[mid..][..channels as usize * 64]
         .iter()
@@ -167,11 +170,9 @@ fn a_song_joins_a_video_timeline_on_the_audio_lane() {
     assert_eq!(session.timeline_duration(), before);
     assert_eq!(session.file_frames(&asset("test_tone.mp3")), 90);
     let end = session.timeline_duration();
-    assert!(
-        session
-            .place_stream_at(end, &asset("test_tone.mp3"), 0, None)
-            .expect("a song just imported is on this timeline")
-    );
+    assert!(session
+        .place_stream_at(end, &asset("test_tone.mp3"), 0, None)
+        .expect("a song just imported is on this timeline"));
 
     // 3 s at 30 fps, placed at the end: the audio lane runs 90 frames past the
     // video.
@@ -220,8 +221,9 @@ fn a_rate_the_device_cannot_mix_is_converted_at_the_door() {
     // ...and the samples themselves, straight out of the worker the session
     // feeds from: one second of the 48k file, resampled onto a 44.1k timeline.
     let sources = [(asset("test_av.mp4"), 0), (asset("test_tone_48k.wav"), 0)];
-    let (meta, rx) =
-        AudioSession::open_multi_streams(&sources, &[(Some(1), 0.25, 1.25)]).expect("open").expect("the timeline has sound");
+    let (meta, rx) = AudioSession::open_multi_streams(&sources, &[(Some(1), 0.25, 1.25)])
+        .expect("open")
+        .expect("the timeline has sound");
     assert_eq!(
         (meta.sample_rate, meta.channels),
         (44100, 2),
@@ -239,7 +241,10 @@ fn a_rate_the_device_cannot_mix_is_converted_at_the_door() {
     for (name, channel, hz) in [("left", 0, 440.0), ("right", 1, 880.0)] {
         let side: Vec<f32> = samples[channel..].iter().step_by(2).copied().collect();
         let secs = side.len() as f64 / 44100.0;
-        let crossings = side.windows(2).filter(|p| (p[0] < 0.0) != (p[1] < 0.0)).count() as f64;
+        let crossings = side
+            .windows(2)
+            .filter(|p| (p[0] < 0.0) != (p[1] < 0.0))
+            .count() as f64;
         let got = crossings / 2.0 / secs;
         assert!(
             (got - hz).abs() <= 0.02 * hz,
@@ -497,11 +502,9 @@ fn the_first_import_of_a_song_opens_a_library_over_an_empty_timeline() {
     );
 
     // The drag: onto the audio lane and nowhere else, at the song's own length.
-    assert!(
-        session
-            .place_stream_at(0.0, &mp3, 0, None)
-            .expect("its own file is on this timeline")
-    );
+    assert!(session
+        .place_stream_at(0.0, &mp3, 0, None)
+        .expect("its own file is on this timeline"));
     assert!(!session.is_empty());
     assert!((session.timeline_duration() - 3.0).abs() < 0.05);
     assert_eq!(session.lane_clips(Lane::A1).len(), 1);
@@ -571,11 +574,9 @@ fn an_export_refuses_audio_it_cannot_copy() {
     );
     // A timeline of nothing but mp4 still exports, which is the invariant this
     // refusal must not have cost.
-    assert!(
-        AudioSession::copy_multi_segments(&sources[..1], &segs[..1])
-            .expect("mp4 audio still copies")
-            .is_some()
-    );
+    assert!(AudioSession::copy_multi_segments(&sources[..1], &segs[..1])
+        .expect("mp4 audio still copies")
+        .is_some());
 }
 
 #[test]
@@ -623,21 +624,67 @@ fn a_song_survives_a_save_and_a_reload() {
         before
     );
 
-    // The one thing only a hand-edited project can ask for: a file with no
-    // picture on the video lane. Written by hand, because no door in the engine
-    // will produce it.
-    let broken = dir.join("broken.edith");
-    std::fs::write(
-        &broken,
-        "edith 2\nplayhead 0\nsource test_av.mp4\nsource test_tone.flac\n\
-         video 0 0 90 1 -\naudio 0 0 90 1 -\n",
-    )
-    .expect("write");
-    let e = refusal(PlaybackSession::open_project(&broken));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn place_visualizer_puts_a_waveform_on_a_video_lane() {
+    let dir = Scratch::dir("ve_audio_viz");
+    let song = {
+        let to = dir.join("test_tone.mp3");
+        std::fs::copy(asset("test_tone.mp3"), &to).expect("copy");
+        to
+    };
+    let mut session = open(&song);
+    let audio = session.lane_clips(Lane::A1)[0];
+    assert!(session.lane_clips(Lane::V1).is_empty());
     assert!(
-        e.ends_with("has no picture: it can only play on an audio lane"),
-        "{e}"
+        session
+            .place_visualizer(0, &song, 0, audio.in_frame, audio.out_frame, None)
+            .expect("place visualizer"),
+        "placed"
     );
+    assert_eq!(
+        session.lane_clips(Lane::A1).len(),
+        1,
+        "audio lane unchanged"
+    );
+    let video = session.lane_clips(Lane::V1);
+    assert_eq!(video.len(), 1);
+    assert_eq!(video[0].source, audio.source);
+    assert_eq!(
+        (video[0].in_frame, video[0].out_frame),
+        (audio.in_frame, audio.out_frame)
+    );
+
+    session.seek(1.0);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let mut saw = false;
+    let mut frames = 0u32;
+    while std::time::Instant::now() < deadline && frames < 45 {
+        if let Some(frame) = session.try_frame() {
+            frames += 1;
+            if frame
+                .bgra
+                .chunks_exact(4)
+                .any(|p| p[0] > 32 || p[1] > 32 || p[2] > 32)
+            {
+                saw = true;
+                break;
+            }
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+    assert!(saw, "visualizer frame stayed black after {frames} pictures");
+
+    let project = dir.join("viz.edith");
+    session.save_project(&project).expect("save");
+    drop(session);
+    let reloaded = PlaybackSession::open_project(&project).expect("reload visualizer project");
+    assert_eq!(reloaded.lane_clips(Lane::V1).len(), 1);
+    assert_eq!(reloaded.lane_clips(Lane::A1).len(), 1);
+    drop(reloaded);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -691,7 +738,10 @@ fn a_pasted_song_never_lands_on_the_video_lane() {
 #[test]
 fn an_audio_only_file_wearing_an_mp4_extension_still_opens() {
     let session = open(asset("test_audio_only.mp4"));
-    assert!(session.lane_clips(Lane::V1).is_empty(), "no picture anywhere");
+    assert!(
+        session.lane_clips(Lane::V1).is_empty(),
+        "no picture anywhere"
+    );
     assert_eq!(session.lane_clips(Lane::A1).len(), 1);
     assert!((session.timeline_duration() - 3.0).abs() < 0.1);
 }
@@ -731,7 +781,7 @@ fn a_project_scaffolded_from_an_audio_only_mp4_reloads() {
 fn a_mono_source_up_mixes_onto_a_stereo_timeline() {
     let dir = Scratch::dir("ve_audio_upmix");
     let mut session = open(asset("test_tone.mp3")); // a 3 s stereo timeline
-    // 44100 Hz, 1 ch AAC -- no rate to resample, only the layout in question.
+                                                    // 44100 Hz, 1 ch AAC -- no rate to resample, only the layout in question.
     import_and_place(&mut session, &asset("test_audio_only.mp4"));
     assert_eq!(session.lane_clips(Lane::A1).len(), 2);
     assert!((session.timeline_duration() - 6.0).abs() < 0.1);

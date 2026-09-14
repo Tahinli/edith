@@ -55,6 +55,9 @@ pub enum Backend {
     Still,
     /// A gap: black frames, nothing decoded at all.
     Gap,
+    /// A waveform visualizer: the picture is painted from the audio's peaks
+    /// ([`visualizer_i420`]), no decoder seat and no stream of pictures at all.
+    Visualizer,
 }
 
 impl Backend {
@@ -66,6 +69,7 @@ impl Backend {
             Self::Software => "SW",
             Self::Still => "still",
             Self::Gap => "gap",
+            Self::Visualizer => "viz",
         }
     }
 
@@ -76,6 +80,7 @@ impl Backend {
             Self::Software => 2,
             Self::Still => 3,
             Self::Gap => 4,
+            Self::Visualizer => 5,
         }
     }
 
@@ -85,6 +90,7 @@ impl Backend {
             2 => Self::Software,
             3 => Self::Still,
             4 => Self::Gap,
+            5 => Self::Visualizer,
             _ => Self::Opening,
         }
     }
@@ -598,6 +604,96 @@ impl DecodeSession {
                 reuse: None,
             },
             backend: BackendCell::new(Backend::Still),
+        })
+    }
+
+    /// A worker for an audio file played as a *picture* ([`crate::is_audio`]):
+    /// the file's peaks are decoded **once** on the worker, and every picture
+    /// after that is painted -- a sliding mirrored waveform
+    /// ([`visualizer_i420`]) at the canvas's own size, then graded, placed and
+    /// converted exactly like a decoded picture, so a grade, a transform and a
+    /// fit policy reach it the way they reach anything else on the timeline.
+    ///
+    /// `start_frame` and `len` are the file's own frames at `fps` -- which for
+    /// an audio source are also the timeline's
+    /// ([`crate::project::Rate::REAL_TIME`]) -- so `Frame::index` runs
+    /// `start_frame ..` like a decoder's output and a speed reaches it through
+    /// the same rewrite as any other clip.
+    pub(crate) fn open_visualizer(
+        path: &Path,
+        stream: usize,
+        start_frame: u32,
+        len: u32,
+        fps: f64,
+        color: ColorParams,
+        transform: TransformParams,
+        canvas: Composer,
+    ) -> crate::Result<FrameStream> {
+        let (tx, rx) = sync_channel(2);
+        let cancel = Arc::new(AtomicBool::new(false));
+        if len == 0 {
+            return Ok(FrameStream {
+                frames: rx,
+                worker: Worker {
+                    cancel,
+                    handle: None,
+                    reuse: None,
+                },
+                backend: BackendCell::new(Backend::Visualizer),
+            });
+        }
+        // Painted at the canvas's own size, so the composite places nothing:
+        // the picture *is* the canvas, and whatever transform the clip
+        // carries still reaches it through the render below.
+        let (width, height) = canvas.dims();
+        let worker_cancel = Arc::clone(&cancel);
+        let path = path.to_path_buf();
+        let handle = thread::Builder::new()
+            .name("viz".into())
+            .spawn(move || {
+                // The one decode this seat ever does: the whole envelope,
+                // off the render thread, and abandoned at once if the caller
+                // is already gone. A file that will not open -- and one with
+                // no track at all -- paints the flat line, which is what its
+                // silence looks like anyway: a visualizer frame always
+                // exists, and is never worth failing a span over.
+                let peaks = crate::waveform::peaks(&path, stream, VIZ_BUCKETS_PER_SEC)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                if worker_cancel.load(Ordering::Relaxed) {
+                    return;
+                }
+                let fps = if fps.is_finite() && fps > 0.0 { fps } else { 30.0 };
+                let mut render = Render::new(
+                    color,
+                    transform,
+                    ColorDescription::default(),
+                    canvas,
+                    tonemap::Preset::default(),
+                    None,
+                );
+                for index in 0..len {
+                    if worker_cancel.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let t = f64::from(start_frame + index) / fps;
+                    let (y, u, v) = visualizer_i420(&peaks, t, width, height);
+                    let frame = render.frame(start_frame + index, &y, &u, &v, width, height);
+                    if tx.send(frame).is_err() {
+                        return; // caller moved on
+                    }
+                }
+            })
+            .ok();
+        Ok(FrameStream {
+            frames: rx,
+            worker: Worker {
+                cancel,
+                handle,
+                reuse: None,
+            },
+            backend: BackendCell::new(Backend::Visualizer),
         })
     }
 
@@ -1303,6 +1399,86 @@ fn rgb_to_i420(rgb: &[u8], width: usize, height: usize) -> (Vec<u8>, Vec<u8>, Ve
             let (r, g, b) = (sr / n, sg / n, sb / n);
             u[crow * cw + ccol] = (((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128) as u8;
             v[crow * cw + ccol] = (((112 * r - 94 * g - 18 * b + 128) >> 8) + 128) as u8;
+        }
+    }
+    (y, u, v)
+}
+
+/// Peak buckets per second the visualizer paints from, shared by the one
+/// caller that decodes them ([`DecodeSession::open_visualizer`], preview and
+/// export both) and the painter that reads them.
+pub(crate) const VIZ_BUCKETS_PER_SEC: u32 = 60;
+
+/// How much sound one visualizer frame shows, centered on the frame's own
+/// time: two seconds, so a glance reads the shape of the around-now rather
+/// than the whole file squeezed into one picture.
+const VIZ_WINDOW_SECS: f64 = 2.0;
+
+/// One visualizer picture, painted straight into tightly packed I420 in the
+/// BT.601 limited range [`rgb_to_i420`] writes: dark (`16`, neutral chroma)
+/// with the waveform bright (`220`), so what turns it into pixels on a screen
+/// is the same conversion a still goes through.
+///
+/// The columns are a **sliding** window of [`VIZ_WINDOW_SECS`] centered on
+/// `t_secs`, mirrored around the vertical middle: the buckets' maxima reach
+/// up from the center line and their minima down, the standard symmetric
+/// envelope. `t_secs` outside the peaks -- and an empty envelope, silence
+/// included, whose buckets are `(0.0, 0.0)` -- paints the one-pixel center
+/// line: a visualizer frame always exists, whatever the sound did.
+pub(crate) fn visualizer_i420(
+    peaks: &[(f32, f32)],
+    t_secs: f64,
+    width: u32,
+    height: u32,
+) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    // Even dims, like every canvas this engine composes at: an odd caller is
+    // shaved rather than handed chroma math it did not ask about.
+    let width = width & !1;
+    let height = height & !1;
+    let (w, h) = (width as usize, height as usize);
+    let (cw, ch) = crate::scale::chroma_dims(w, h);
+    let mut y = vec![16u8; w * h];
+    let u = vec![128u8; cw * ch];
+    let v = vec![128u8; cw * ch];
+    let center = h / 2;
+    let duration = peaks.len() as f64 / f64::from(VIZ_BUCKETS_PER_SEC);
+    if peaks.is_empty() || !t_secs.is_finite() || !(0.0..=duration).contains(&t_secs) {
+        for col in 0..w {
+            y[center * w + col] = 220;
+        }
+        return (y, u, v);
+    }
+    let per_sec = f64::from(VIZ_BUCKETS_PER_SEC);
+    // The window, clamped to the peaks that exist: a frame near either end
+    // looks past the file's edge, and draws the part of the window that is
+    // real rather than padding it out.
+    let first = (((t_secs - VIZ_WINDOW_SECS / 2.0).max(0.0) * per_sec).floor() as usize)
+        .min(peaks.len() - 1);
+    let last = ((((t_secs + VIZ_WINDOW_SECS / 2.0).min(duration) * per_sec).ceil() as usize)
+        .clamp(first + 1, peaks.len()))
+    .min(peaks.len());
+    let span = (last - first) as f64;
+    let scale = center as f32;
+    for col in 0..w {
+        // The buckets this column draws: at least one, whatever the window's
+        // width is against the picture's -- a short clip stretches, a long
+        // one condenses, and neither leaves a column with nothing.
+        let b0 = first + (col as f64 * span / w as f64).floor() as usize;
+        let b1 = first
+            + (((col + 1) as f64 * span / w as f64).ceil() as usize)
+                .clamp(b0 - first + 1, last - first);
+        let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+        for &(min, max) in &peaks[b0..b1] {
+            lo = lo.min(min);
+            hi = hi.max(max);
+        }
+        // Mirrored around the center: maxima up, minima down, silence a line.
+        let top = (scale - hi * scale).round();
+        let bottom = (scale - lo * scale).round();
+        let top = (top as isize).clamp(0, h as isize - 1) as usize;
+        let bottom = (bottom as isize).clamp(top as isize, h as isize - 1) as usize;
+        for row in top..=bottom {
+            y[row * w + col] = 220;
         }
     }
     (y, u, v)

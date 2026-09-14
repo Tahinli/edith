@@ -211,7 +211,7 @@ impl RowItem {
 /// action a stroke already reaches -- the menu is a second way *to* the actions
 /// and never a second version of them -- so both the label and the hint come
 /// out of the keymap registry and the two can never disagree.
-pub(crate) const MENU_ITEMS: [ActionId; 16] = [
+pub(crate) const MENU_ITEMS: [ActionId; 17] = [
     ActionId::Cut,
     // The cut machinery (DESIGN.md §6) on the very clip it is about: the
     // trims and the loop-trim were strokes the spine rail listed and nothing
@@ -239,6 +239,7 @@ pub(crate) const MENU_ITEMS: [ActionId; 16] = [
     // ...and the sound ones, the same class refusal the other way round.
     ActionId::Equalizer,
     ActionId::Silence,
+    ActionId::Visualizer,
     ActionId::Speed,
     ActionId::Fit,
     // Last, under the rule line the render draws before the first of them
@@ -310,7 +311,6 @@ pub(crate) fn destructive(action: ActionId) -> bool {
             | ActionId::RemoveSubtitleLane
     )
 }
-
 
 /// One row of the actions card, in the order it lists them: a heading, then
 /// every action the registry files under it, then the strokes the modal cards

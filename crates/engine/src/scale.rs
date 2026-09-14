@@ -588,6 +588,14 @@ impl Composer {
         self.width == 0 || self.height == 0
     }
 
+    /// The canvas this composer places onto, for the painter that fills it
+    /// directly at this size -- a picture authored at the canvas's own
+    /// dimensions takes the pass-through path [`is_passthrough`](Self::is_passthrough)
+    /// answers for, and it needs the numbers before there is a picture.
+    pub(crate) fn dims(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
     /// How many decoded pictures a worker over this canvas may keep ahead of
     /// its consumer: a budget in *bytes*, so a 4K project runs a shallower queue
     /// than a 1080p one instead of the same number of far bigger frames.

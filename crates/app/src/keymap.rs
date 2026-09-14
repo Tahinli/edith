@@ -159,6 +159,9 @@ actions! {
     Equalizer,
     Speed,
     Silence,
+    /// Paints a sliding waveform of this audio clip onto a video lane, so the
+    /// sound is a picture on the same timeline — preview and export both.
+    Visualizer,
     /// Crossfades the selected audio clip into its neighbour ([`Project::crossfade`]):
     /// two adjacent clips picked on one lane, or a single pick faded into the
     /// clip right after it.
@@ -302,6 +305,7 @@ impl ActionId {
             ActionId::Equalizer => "Equalizer",
             ActionId::Speed => "Speed…",
             ActionId::Silence => "Silences…",
+            ActionId::Visualizer => "Create visualizer",
             ActionId::Crossfade => "Crossfade to next",
             ActionId::TrimIn => "Trim in",
             ActionId::TrimOut => "Trim out",
@@ -385,6 +389,7 @@ impl ActionId {
             ActionId::Equalizer => "equalizer",
             ActionId::Speed => "speed",
             ActionId::Silence => "silence",
+            ActionId::Visualizer => "visualizer",
             ActionId::Crossfade => "crossfade",
             ActionId::TrimIn => "trim-in",
             ActionId::TrimOut => "trim-out",
@@ -454,6 +459,7 @@ impl ActionId {
             // timeline the clip is on -- it is a clip card like the three
             // above it, opened on whichever half was picked.
             | ActionId::Silence
+            | ActionId::Visualizer
             | ActionId::Crossfade
             | ActionId::TrimIn
             | ActionId::TrimOut
@@ -1112,6 +1118,8 @@ impl Keymap {
                 // delete (x and delete) -- what it opens is a card that can cut
                 // forty places at once.
                 b(ActionId::Silence, "u", false),
+                // Waveform-as-video: `h` was free (Theme is ctrl+h, Screenshot is w).
+                b(ActionId::Visualizer, "h", false),
                 // Crossfade takes ctrl+f: the mnemonic letter for "fade", with
                 // ctrl its own room now that plain "f" is the mix card's own
                 // (below) -- the same letter, the modifier telling them apart.
@@ -1425,7 +1433,7 @@ fn parse(text: &str) -> Result<(Keymap, Vec<String>), String> {
 mod tests {
     use engine::scratch::Scratch;
 
-    use super::{ActionId, Chord, Keymap, config_path_in, emit, parse};
+    use super::{config_path_in, emit, parse, ActionId, Chord, Keymap};
 
     fn chord(key: &str, ctrl: bool) -> Chord {
         Chord {
@@ -1445,7 +1453,7 @@ mod tests {
     #[test]
     fn every_default_stroke_reaches_its_action() {
         let k = Keymap::defaults();
-        assert_eq!(k.entries().len(), 78);
+        assert_eq!(k.entries().len(), 79);
         // The cut odometer: bare walks one, `<`/`>` (what shift+,/shift+.
         // actually type) strides ten.
         assert_eq!(k.lookup(".", false), Some(ActionId::WalkCutNext));
@@ -1468,6 +1476,7 @@ mod tests {
         assert_eq!(k.lookup("l", true), Some(ActionId::PasteFilePath));
         assert_eq!(k.lookup("?", false), Some(ActionId::ShowActions));
         assert_eq!(k.lookup("h", true), Some(ActionId::Theme));
+        assert_eq!(k.lookup("h", false), Some(ActionId::Visualizer));
         assert_eq!(k.lookup("space", false), Some(ActionId::Play));
         // The seek keys: bare arrows a frame, ctrl arrows a second, and the two
         // ends of the timeline.
@@ -1699,7 +1708,10 @@ mod tests {
             let label = action.label();
             let words = label.split_whitespace().count();
             assert!(words <= 4, "{action:?}: {words} words -- {label:?}");
-            assert!(!label.contains('('), "{action:?}: a parenthesis -- {label:?}");
+            assert!(
+                !label.contains('('),
+                "{action:?}: a parenthesis -- {label:?}"
+            );
             assert!(
                 !label.to_lowercase().starts_with("the "),
                 "{action:?}: leads with an article -- {label:?}"

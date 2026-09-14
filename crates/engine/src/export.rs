@@ -2760,7 +2760,18 @@ fn run(
                 let want = untouched.then(|| encoder.dma_want(meta)).flatten();
                 // Opened at the file's own frame, which is the only place the
                 // file's numbering is used -- the span's are the timeline's.
-                let pictures = ClipDecoder::open(&entry.path, rate.source_at(in_frame), want)?;
+                let pictures = if crate::is_audio(&entry.path) {
+                    ClipDecoder::visualizer(
+                        &entry.path,
+                        entry.audio_stream,
+                        rate.source_at(in_frame),
+                        meta.width,
+                        meta.height,
+                        meta.frame_rate,
+                    )?
+                } else {
+                    ClipDecoder::open(&entry.path, rate.source_at(in_frame), want)?
+                };
                 (Some(pictures), rate, in_frame, Some(color), mapper)
             }
             // A gap's black is 16/128/128, which is black in every matrix here
@@ -2815,7 +2826,18 @@ fn run(
                 Ok(Dissolve {
                     window,
                     tail_start: span.len - window,
-                    decoder: ClipDecoder::open(&entry.path, b_rate.source_at(b_in_frame), None)?,
+                    decoder: if crate::is_audio(&entry.path) {
+                        ClipDecoder::visualizer(
+                            &entry.path,
+                            entry.audio_stream,
+                            b_rate.source_at(b_in_frame),
+                            meta.width,
+                            meta.height,
+                            meta.frame_rate,
+                        )?
+                    } else {
+                        ClipDecoder::open(&entry.path, b_rate.source_at(b_in_frame), None)?
+                    },
                     mapper: b_mapper,
                     remap: b_remap,
                     grade: project.composite_color_at(b_start).copied(),
@@ -4388,6 +4410,18 @@ enum ClipDecoder {
     /// other two are opened there -- the span's pictures come from one place,
     /// and no thread can make one picture arrive sooner.
     Still(crate::decode::Still),
+    /// An audio file playing as a picture: each `next` paints one visualizer
+    /// frame from peaks already decoded ([`crate::decode::visualizer_i420`]).
+    Visualizer {
+        peaks: Vec<(f32, f32)>,
+        width: u32,
+        height: u32,
+        fps: f64,
+        next: u32,
+        y: Vec<u8>,
+        u: Vec<u8>,
+        v: Vec<u8>,
+    },
 }
 
 /// The receiving half of a decode thread, plus the picture it last handed out
@@ -4489,6 +4523,31 @@ impl ClipDecoder {
         }))
     }
 
+    fn visualizer(
+        path: &Path,
+        stream: usize,
+        start_frame: u32,
+        width: u32,
+        height: u32,
+        fps: f64,
+    ) -> crate::Result<Self> {
+        let peaks = crate::waveform::peaks(path, stream, crate::decode::VIZ_BUCKETS_PER_SEC)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let fps = if fps.is_finite() && fps > 0.0 { fps } else { 30.0 };
+        Ok(Self::Visualizer {
+            peaks,
+            width,
+            height,
+            fps,
+            next: start_frame,
+            y: Vec::new(),
+            u: Vec::new(),
+            v: Vec::new(),
+        })
+    }
+
     /// The next picture, borrowed until the call after -- as tightly packed
     /// I420, or as the GPU buffer the decoder wrote it into.
     fn next(&mut self) -> crate::Result<Option<Frame<'_>>> {
@@ -4496,6 +4555,24 @@ impl ClipDecoder {
             Self::Still(still) => {
                 let (y, u, v, width, height) = still.picture();
                 Ok(Some(Frame::Pixels(y, u, v, width, height)))
+            }
+            Self::Visualizer {
+                peaks,
+                width,
+                height,
+                fps,
+                next,
+                y,
+                u,
+                v,
+            } => {
+                let (yy, uu, vv) =
+                    crate::decode::visualizer_i420(peaks, f64::from(*next) / *fps, *width, *height);
+                *y = yy;
+                *u = uu;
+                *v = vv;
+                *next += 1;
+                Ok(Some(Frame::Pixels(y, u, v, *width & !1, *height & !1)))
             }
             Self::Streamed(stream) if stream.ended => Ok(None),
             Self::Streamed(stream) => match stream.frames.recv() {
@@ -4509,20 +4586,11 @@ impl ClipDecoder {
                     } => Frame::Pixels(y, u, v, *width, *height),
                     Yuv::Dma(dma) => Frame::Dma(dma),
                 })),
-                // The decoder said end of stream in as many words -- a source
-                // shorter than the clip that names it, which the span loop ends
-                // gracefully on.
                 Ok(Ok(None)) => {
                     stream.ended = true;
                     Ok(None)
                 }
                 Ok(Err(e)) => Err(e),
-                // The channel went quiet without either: the thread panicked.
-                // Read as end of stream that would truncate the export at this
-                // frame and *report success*, which is the one outcome an
-                // export must never have -- before the decode moved onto a
-                // thread the same panic took the whole export down, and it
-                // still does.
                 Err(_) => Err("the decoder stopped without a picture or a reason".into()),
             },
         }
