@@ -55,6 +55,7 @@ impl Player {
                 | ActionId::ImportSubtitles
                 | ActionId::Crossfade
                 | ActionId::Dissolve
+                | ActionId::Visualizer
         ) {
             self.mark_dirty();
         }
@@ -144,6 +145,7 @@ impl Player {
             ActionId::Equalizer => self.open_eq(cx),
             ActionId::Speed => self.open_speed(cx),
             ActionId::Silence => self.open_silence(cx),
+            ActionId::Visualizer => self.create_visualizer(cx),
             ActionId::Mix => self.open_mix(None, cx),
             ActionId::SubtitleStyle => self.open_subtitle_style(cx),
             ActionId::ToggleSnap => self.toggle_snap(cx),

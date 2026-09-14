@@ -222,11 +222,14 @@ pub(crate) fn enable(action: ActionId, ctx: Ctx) -> Enable {
         // policy is a picture setting for the same reason.
         // The dissolve is the picture join and the crossfade's mirror: two
         // pictures cross, and there is no picture on a waveform to cross.
-        ActionId::Color | ActionId::Fit | ActionId::Transform | ActionId::Dissolve => match ctx.clip
-        {
-            Some((_, lane)) if lane.kind != LaneKind::Video => Enable::Hidden("this clip is sound"),
-            _ => Enable::Yes,
-        },
+        ActionId::Color | ActionId::Fit | ActionId::Transform | ActionId::Dissolve => {
+            match ctx.clip {
+                Some((_, lane)) if lane.kind != LaneKind::Video => {
+                    Enable::Hidden("this clip is sound")
+                }
+                _ => Enable::Yes,
+            }
+        }
         // The scan reads samples, and a still has none -- ever, unlike a video
         // clip whose sound may be one lane down or simply silent. Exactly what
         // `unscannable` says after the fact, said before the row is drawn so
@@ -234,6 +237,13 @@ pub(crate) fn enable(action: ActionId, ctx: Ctx) -> Enable {
         // same class refusal over the same clip: nothing to mix for a picture
         // with no sound at all.
         ActionId::Silence | ActionId::Mix if ctx.image => Enable::Hidden("this clip is a still"),
+        ActionId::Visualizer if ctx.image => Enable::Hidden("this clip is a still"),
+        ActionId::Visualizer if ctx.no_sound => Enable::Hidden("this clip has no sound"),
+        ActionId::Visualizer => match ctx.clip {
+            Some((_, lane)) if lane.kind == LaneKind::Audio => Enable::Yes,
+            Some(_) => Enable::Hidden("this clip is picture"),
+            None => Enable::No("select an audio clip"),
+        },
         ActionId::Silence | ActionId::Mix if ctx.no_sound => {
             Enable::Hidden("this clip has no sound")
         }
@@ -339,9 +349,7 @@ pub(crate) fn enable(action: ActionId, ctx: Ctx) -> Enable {
         // A clock started against an empty timeline is a clock counting
         // nothing: the transport says so by being dim, which is what its own
         // ad-hoc boolean used to say before the oracle knew the question.
-        ActionId::Play | ActionId::Loop if !ctx.playable => {
-            Enable::No("the timeline is empty")
-        }
+        ActionId::Play | ActionId::Loop if !ctx.playable => Enable::No("the timeline is empty"),
         // A rate applies to a clip of either kind and to its whole group, so
         // there is no lane it means nothing on, and the engine words the one
         // refusal there is (no room). Everything else is the editor's own and

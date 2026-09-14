@@ -133,6 +133,67 @@ impl Player {
         cx.notify();
     }
 
+    /// Paints a sliding waveform of the marked audio clip onto a video lane.
+    /// Same implementation the clip menu and the `h` stroke both reach.
+    pub(crate) fn create_visualizer(&mut self, cx: &mut Context<Self>) {
+        if self.exporting().is_some() {
+            return;
+        }
+        let Some((lane, idx)) = self.selected.anchor() else {
+            self.notify_user("NO VISUALIZER — select an audio clip".into());
+            cx.notify();
+            return;
+        };
+        let placed = match &mut self.session {
+            None => {
+                self.notify_user("NO VISUALIZER — no file open".into());
+                cx.notify();
+                return;
+            }
+            Some(session) => {
+                if lane.kind != LaneKind::Audio {
+                    self.notify_user("NO VISUALIZER — select an audio clip".into());
+                    cx.notify();
+                    return;
+                }
+                let Some(clip) = session.lane_clips(lane).get(idx).copied() else {
+                    self.notify_user("NO VISUALIZER — select an audio clip".into());
+                    cx.notify();
+                    return;
+                };
+                let Some(src) = session.sources().get(clip.source).cloned() else {
+                    self.notify_user("NO VISUALIZER — that clip has no source".into());
+                    cx.notify();
+                    return;
+                };
+                if !engine::is_audio(&src.path) {
+                    self.notify_user("NO VISUALIZER — this clip is not a sound file".into());
+                    cx.notify();
+                    return;
+                }
+                session.place_visualizer(
+                    clip.start,
+                    &src.path,
+                    src.audio_stream,
+                    clip.in_frame,
+                    clip.out_frame,
+                    None,
+                )
+            }
+        };
+        match placed {
+            Ok(true) => {
+                self.notify_user("VISUALIZER ADDED".into());
+                self.reset_after_reseek();
+            }
+            Err(e) => self.notify_user(format!("NO VISUALIZER — {e}").into()),
+            Ok(false) => {
+                self.notify_user("NO VISUALIZER — that clip could not be placed".into())
+            }
+        }
+        cx.notify();
+    }
+
     /// Takes a library row's file out of the list, which is the one thing a row
     /// can lose. Refused in the engine's own words while clips still play from
     /// it -- and those words name the lanes holding them, so the refusal says

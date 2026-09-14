@@ -1096,27 +1096,18 @@ impl PlaybackSession {
             counts.push(rate.timeline_at(other.frame_count));
             rates.push(rate);
         }
-        // The video lane can only play files that have pictures. Hand-written
-        // (or hand-edited) project files are the one door this can come in
-        // through, so it is refused by name here rather than becoming a clip
-        // that decodes to nothing.
+        // A still is silent, so a clip playing one on an audio lane is a
+        // segment the audio worker would open a PNG for. Refused by name
+        // here, which is the one door it can arrive through
+        // (`place_stream_at` never puts one there). An audio file on a
+        // *video* lane used to be refused the same way; it plays as a
+        // waveform visualizer now ([`DecodeSession::open_visualizer`]).
         for (kind, clip) in doc
             .lanes
             .iter()
             .flat_map(|(kind, clips)| clips.iter().map(move |clip| (*kind, clip)))
         {
             let path = &doc.sources[clip.source].path;
-            if kind == LaneKind::Video && crate::is_audio(path) {
-                return Err(format!(
-                    "{} has no picture: it can only play on an audio lane",
-                    path.display()
-                )
-                .into());
-            }
-            // ...and the mirror of it: a still is silent, so a clip playing one
-            // on an audio lane is a segment the audio worker would open a PNG
-            // for. Refused by name here, which is the one door it can arrive
-            // through (`place_stream_at` never puts one there).
             if kind == LaneKind::Audio && crate::is_image(path) {
                 return Err(format!(
                     "{} is a still image: it can only play on a video lane",
@@ -1839,6 +1830,39 @@ impl PlaybackSession {
                     ),
                 )
                 .inspect_err(|e| eprintln!("timeline frame {start}: image open failed: {e}"))
+            }
+            Some(Span {
+                start,
+                from: Some((source, in_frame)),
+                ..
+            }) if crate::is_audio(&self.project.sources()[source].path) => {
+                let (path, stream) = {
+                    let src = &self.project.sources()[source];
+                    (src.path.clone(), src.audio_stream)
+                };
+                DecodeSession::open_visualizer(
+                    &path,
+                    stream,
+                    in_frame,
+                    span.expect("matched above").source_len(),
+                    self.meta.frame_rate,
+                    self.project
+                        .composite_color_at(start)
+                        .copied()
+                        .unwrap_or_default(),
+                    self.project
+                        .composite_transform_at(start)
+                        .copied()
+                        .unwrap_or_default(),
+                    Composer::new(
+                        self.meta.width,
+                        self.meta.height,
+                        self.project.composite_fit_at(start),
+                    ),
+                )
+                .inspect_err(|e| {
+                    eprintln!("timeline frame {start}: visualizer open failed: {e}")
+                })
             }
             Some(Span {
                 start,
@@ -3232,6 +3256,80 @@ impl PlaybackSession {
     pub fn place_at(&mut self, lane: Lane, timeline_secs: f64, clip: Clip) -> bool {
         let at = secs_to_frame(timeline_secs, self.meta.frame_rate);
         self.edit(Dirty::Both, |p| p.place(lane, at, clip))
+    }
+
+    /// Places a waveform-visualizer clip of `path`'s audio on a video lane.
+    /// The picture is painted from the sound ([`DecodeSession::open_visualizer`]);
+    /// this does not also put a copy on an audio lane.
+    pub fn place_visualizer(
+        &mut self,
+        start: u32,
+        path: &Path,
+        stream: usize,
+        in_frame: u32,
+        out_frame: u32,
+        onto: Option<Lane>,
+    ) -> crate::Result<bool> {
+        if !crate::is_audio(path) {
+            return Err(format!(
+                "{} is not audio: a visualizer needs a sound file",
+                path.display()
+            )
+            .into());
+        }
+        if out_frame <= in_frame {
+            return Err("visualizer clip is empty".into());
+        }
+        let wanted = Source::new(path, stream);
+        let first = self.first_audio()?;
+        self.audio_matches_cached(&wanted, &first)?;
+        let frames = match self.file_frames(&wanted.path) {
+            0 => {
+                let n = audio_frames(path, self.meta.frame_rate)?;
+                let source = self.project.import(path, stream);
+                self.note_frames(source, n, Rate::REAL_TIME);
+                n
+            }
+            n => n,
+        };
+        let out_frame = out_frame.min(frames);
+        if out_frame <= in_frame {
+            return Err("visualizer clip is empty".into());
+        }
+        let source = self.project.import(path, stream);
+        let clip = Clip {
+            fade_in: 0,
+            fade_out: 0,
+            transition_out: 0,
+            start: 0,
+            in_frame,
+            out_frame,
+            source,
+            link: None,
+            eq: None,
+            color: None,
+            transform: None,
+            fit: FitPolicy::default(),
+            speed: Speed::NORMAL,
+        };
+        let end = start + clip.frames();
+        let overlaps = |lane: Lane| {
+            self.project
+                .lane(lane)
+                .iter()
+                .any(|c| c.start < end && start < c.end())
+        };
+        let lane = match onto {
+            Some(lane) if lane.kind == LaneKind::Video && !overlaps(lane) => lane,
+            _ => self
+                .project
+                .lanes()
+                .into_iter()
+                .filter(|l| l.kind == LaneKind::Video)
+                .find(|&l| !overlaps(l))
+                .unwrap_or_else(|| self.add_lane(LaneKind::Video)),
+        };
+        Ok(self.edit(Dirty::Both, |p| p.place(lane, start, clip)))
     }
 
     /// Removes `lane`'s clip at `idx` and everything under it, closing the gap
