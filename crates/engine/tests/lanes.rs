@@ -237,6 +237,7 @@ fn the_mp4_copy_follows_the_lane_that_holds_the_sound() {
     let clip = Clip {
         fade_in: 0,
         transition_out: 0,
+        visualizer: 0,
         fade_out: 0,
         start: 0,
         in_frame: 0,
@@ -304,6 +305,7 @@ fn two_audio_lanes_are_summed() {
         fade_in: 0,
         fade_out: 0,
         transition_out: 0,
+        visualizer: 0,
         start: TOP_IN,
         in_frame: TOP_IN,
         out_frame: TOP_OUT,

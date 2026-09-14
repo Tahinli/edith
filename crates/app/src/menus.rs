@@ -211,7 +211,7 @@ impl RowItem {
 /// action a stroke already reaches -- the menu is a second way *to* the actions
 /// and never a second version of them -- so both the label and the hint come
 /// out of the keymap registry and the two can never disagree.
-pub(crate) const MENU_ITEMS: [ActionId; 17] = [
+pub(crate) const MENU_ITEMS: [ActionId; 20] = [
     ActionId::Cut,
     // The cut machinery (DESIGN.md §6) on the very clip it is about: the
     // trims and the loop-trim were strokes the spine rail listed and nothing
@@ -242,18 +242,20 @@ pub(crate) const MENU_ITEMS: [ActionId; 17] = [
     ActionId::Visualizer,
     ActionId::Speed,
     ActionId::Fit,
+    // The group trio used to live only on chords + ctrl-click. A right-click
+    // that cannot group is a missing pointer door (the same class Fit and
+    // Redo shipped as). Dimmed in place when the selection cannot.
+    ActionId::Group,
+    ActionId::Detach,
+    ActionId::Regroup,
     // Last, under the rule line the render draws before the first of them
     // (DESIGN §9): the two that take the clip off the lane.
     ActionId::Delete,
     ActionId::Lift,
 ];
 
-// Not rows, and deliberately: the group trio (`Group`, `Detach`, `Regroup`)
-// is the ctrl-click grammar plus its chords -- a group is made by picking the
-// halves and taking it apart the same way -- and the mute is the *mix's*,
-// which the transport already carries a button for. A clip menu is what this
-// clip can be told (DESIGN §9, "Never a junk drawer"); those are told to the
-// selection and to the project.
+// Mute stays off this list: it is the mix's, which the transport already
+// carries a button for.
 
 /// What a right-click on the bench itself offers -- the ruler and the empty
 /// stretch under the lanes. The verbs of the *timeline*: walking its cuts at
@@ -319,6 +321,7 @@ pub(crate) fn destructive(action: ActionId) -> bool {
 /// A list rather than a loop inside the render, so the card and
 /// `every_action_is_on_the_actions_card` read the *same* order: an action that
 /// reaches no row fails a test instead of quietly becoming pointer-unreachable.
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum KeyRow {
     Head(keymap::Category),
     /// Click its label to do it, click its stroke to change that stroke.
@@ -351,6 +354,53 @@ pub(crate) fn keys_rows() -> Vec<KeyRow> {
         );
     }
     rows
+}
+
+/// The KEYS tab's type-to-filter: keep a heading only when one of its rows
+/// still matches, match a row on its label or its chord.
+pub(crate) fn keys_rows_matching(query: &str, keymap: &keymap::Keymap) -> Vec<KeyRow> {
+    let q = query.trim().to_ascii_lowercase();
+    if q.is_empty() {
+        return keys_rows();
+    }
+    let rows = keys_rows();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < rows.len() {
+        match rows[i] {
+            KeyRow::Head(cat) => {
+                let mut kids = Vec::new();
+                i += 1;
+                while i < rows.len() && !matches!(rows[i], KeyRow::Head(_)) {
+                    if key_row_hits(&rows[i], &q, keymap) {
+                        kids.push(rows[i]);
+                    }
+                    i += 1;
+                }
+                if !kids.is_empty() {
+                    out.push(KeyRow::Head(cat));
+                    out.extend(kids);
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    out
+}
+
+fn key_row_hits(row: &KeyRow, q: &str, keymap: &keymap::Keymap) -> bool {
+    match *row {
+        KeyRow::Head(c) => c.label().to_ascii_lowercase().contains(q),
+        KeyRow::Act(a) => {
+            a.label().to_ascii_lowercase().contains(q)
+                || keymap.display(a).to_ascii_lowercase().contains(q)
+        }
+        KeyRow::Fixed(i) => {
+            let f = &keymap::FIXED[i];
+            f.label.to_ascii_lowercase().contains(q)
+                || f.chord.to_ascii_lowercase().contains(q)
+        }
+    }
 }
 
 /// The character a stroke types into the actions card's search box, if it types

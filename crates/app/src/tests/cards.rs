@@ -173,7 +173,7 @@ fn the_stances_key_guard_does_not_swallow_a_bare_export_before_the_oracle_is_ask
 /// fails, which is the only way that stays true as the editor grows.
 #[test]
 fn every_action_is_on_the_actions_card() {
-    use keymap::{ActionId, Category, Keymap};
+    use keymap::{ActionId, Category};
     let rows = keys_rows();
     let listed: Vec<ActionId> = rows
         .iter()
@@ -214,7 +214,7 @@ fn every_action_is_on_the_actions_card() {
     );
     // Both columns say something: the label does the action, the stroke
     // beside it changes that stroke, and neither may read blank.
-    let keymap = Keymap::defaults();
+    let keymap = keymap::Keymap::defaults();
     for action in ActionId::ALL {
         assert!(!action.label().is_empty(), "{action:?}");
         assert_ne!(keymap.display(action), "unbound", "{action:?}");
@@ -236,6 +236,16 @@ fn only_a_printable_stroke_types_into_the_search() {
     for word in ["left", "escape", "f1", "backspace", "tab", "delete", "home"] {
         assert_eq!(typed(word), None, "{word}");
     }
+}
+
+#[test]
+fn keys_search_keeps_matching_rows_and_drops_empty_heads() {
+    let km = keymap::Keymap::defaults();
+    let cut = keys_rows_matching("cut", &km);
+    assert!(cut.iter().any(|r| matches!(r, KeyRow::Act(ActionId::Cut))));
+    assert!(!cut.iter().any(|r| matches!(r, KeyRow::Act(ActionId::Play))));
+    assert!(cut.iter().any(|r| matches!(r, KeyRow::Head(_))));
+    assert!(keys_rows_matching("xyzzy-no-such", &km).is_empty());
 }
 
 #[test]
@@ -1372,6 +1382,7 @@ fn a_duration_row_shows_only_for_a_transition_and_its_room_is_the_successors() {
             fade_in,
             fade_out,
             transition_out,
+            visualizer: 0,
         }
     }
     // A plain cut carries neither field, so the row has nothing to show.

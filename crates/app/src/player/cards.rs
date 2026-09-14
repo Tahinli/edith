@@ -1372,6 +1372,7 @@ impl Player {
     /// "the" card and closing all of them are the same act.
     pub(crate) fn close_card(&mut self) {
         self.keys_open = false;
+        self.keys_filter.clear();
         self.settings_open = false;
         self.export_open = false;
         // The two things typed *into* the export moment go with it: a field

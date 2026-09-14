@@ -220,6 +220,11 @@ struct Player {
     /// focused, and does nothing to the keymap once it is not.
     pub(crate) dock_filter: String,
     pub(crate) dock_filter_edit: bool,
+    /// Type-to-filter on the KEYS tab. Owned the same way the Sources filter
+    /// is, except KEYS captures letters the moment the tab is showing -- the
+    /// list is a lookup, and a letter that still fired a spine action while
+    /// it was up is why search felt missing.
+    pub(crate) keys_filter: String,
     /// Which of the four sort chips is showing (MOCK-SPEC "Dock" §3).
     /// What is known about each source's audio, taken once and kept. Keyed on
     /// the path *and stream* -- two streams of one file are two envelopes -- and
@@ -961,6 +966,7 @@ fn main() {
                     dock_src_active: ui::dock_stance::load(),
                     dock_filter: String::new(),
                     dock_filter_edit: false,
+                    keys_filter: String::new(),
                     waves: HashMap::new(),
                     thumbs: HashMap::new(),
                     proxies: HashMap::new(),

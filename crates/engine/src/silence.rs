@@ -322,6 +322,7 @@ mod tests {
             fade_in: 0,
             fade_out: 0,
             transition_out: 0,
+            visualizer: 0,
             start,
             in_frame,
             out_frame,

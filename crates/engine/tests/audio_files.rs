@@ -420,6 +420,7 @@ fn a_silent_first_source_does_not_stop_the_scan_for_one_with_sound() {
         fade_in: 0,
         fade_out: 0,
         transition_out: 0,
+        visualizer: 0,
         start: 0,
         in_frame: 0,
         out_frame: meta1.frame_count,
@@ -651,6 +652,7 @@ fn place_visualizer_puts_a_waveform_on_a_video_lane() {
     );
     let video = session.lane_clips(Lane::V1);
     assert_eq!(video.len(), 1);
+    assert_eq!(video[0].visualizer & 1, 1, "the clip is marked a waveform");
     assert_eq!(video[0].source, audio.source);
     assert_eq!(
         (video[0].in_frame, video[0].out_frame),
@@ -683,8 +685,50 @@ fn place_visualizer_puts_a_waveform_on_a_video_lane() {
     drop(session);
     let reloaded = PlaybackSession::open_project(&project).expect("reload visualizer project");
     assert_eq!(reloaded.lane_clips(Lane::V1).len(), 1);
+    assert_eq!(reloaded.lane_clips(Lane::V1)[0].visualizer & 1, 1);
     assert_eq!(reloaded.lane_clips(Lane::A1).len(), 1);
     drop(reloaded);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn place_visualizer_paints_a_video_file_soundtrack() {
+    let dir = Scratch::dir("ve_av_viz");
+    let film = {
+        let to = dir.join("test_av.mp4");
+        std::fs::copy(asset("test_av.mp4"), &to).expect("copy");
+        to
+    };
+    let mut session = open(&film);
+    let picture = session.lane_clips(Lane::V1)[0];
+    let before = session.lane_clips(Lane::V1).len();
+    assert!(
+        session
+            .place_visualizer(picture.end(), &film, 0, picture.in_frame, picture.out_frame, None)
+            .expect("place visualizer of a film"),
+        "placed"
+    );
+    let video = session.lane_clips(Lane::V1);
+    assert_eq!(video.len(), before + 1);
+    let viz = *video.last().unwrap();
+    assert_eq!(viz.visualizer & 1, 1);
+    assert_eq!((viz.in_frame, viz.out_frame), (picture.in_frame, picture.out_frame));
+    session.seek(f64::from(viz.start) / 30.0 + 0.5);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let mut saw = false;
+    let mut frames = 0u32;
+    while std::time::Instant::now() < deadline && frames < 45 {
+        if let Some(frame) = session.try_frame() {
+            frames += 1;
+            if frame.bgra.chunks_exact(4).any(|p| p[0] > 32 || p[1] > 32 || p[2] > 32) {
+                saw = true;
+                break;
+            }
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+    assert!(saw, "film soundtrack visualizer stayed black after {frames} pictures");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

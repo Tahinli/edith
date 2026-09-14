@@ -1012,10 +1012,26 @@ pub(crate) fn render(
             // the third): only when no card is up, so escape still shuts a
             // card first -- the KEYS tab is a dock tab now, not an overlay,
             // and nothing about it owns the keyboard.
-            if key == "escape" && this.keys_open && !this.card_open() {
-                this.keys_open = false;
-                cx.notify();
-                return;
+            if this.keys_open && !this.card_open() {
+                if key == "escape" {
+                    if this.keys_filter.is_empty() {
+                        this.keys_open = false;
+                    } else {
+                        this.keys_filter.clear();
+                    }
+                    cx.notify();
+                    return;
+                }
+                if key == "backspace" {
+                    this.keys_filter.pop();
+                    cx.notify();
+                    return;
+                }
+                if let Some(c) = typed(key) {
+                    this.keys_filter.push(c);
+                    cx.notify();
+                    return;
+                }
             }
             // The dock's Sources filter (MOCK-SPEC "Dock" §2), the same door
             // legacy `render.rs` gives it: owns the keyboard only while it

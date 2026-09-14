@@ -456,6 +456,11 @@ pub struct Clip {
     /// trusting this field alone, exactly as a stored fade is trusted only
     /// because a clip's own length is checked beside it.
     pub transition_out: u32,
+    /// Non-zero: this clip is a waveform of its source's sound, painted
+    /// onto a video lane. Bit 0 is the flag itself; 1 outline, 2 smooth,
+    /// 3 fast window, 4 tint. Zero is an ordinary picture. Older project
+    /// files have no field and mean zero.
+    pub visualizer: u8,
 }
 
 impl Clip {
@@ -941,6 +946,7 @@ impl Project {
             fade_in: 0,
             fade_out: 0,
             transition_out: 0,
+            visualizer: 0,
             start: 0,
             in_frame: 0,
             out_frame: frame_count.max(1),
@@ -1340,6 +1346,7 @@ impl Project {
             fade_in: 0,
             fade_out: 0,
             transition_out: 0,
+            visualizer: 0,
             start,
             in_frame: 0,
             out_frame: frame_count.max(1),
@@ -2628,6 +2635,18 @@ impl Project {
         true
     }
 
+    /// Waveform style flags on the clip at `idx` of `lane`. Bit 0 marks it
+    /// a visualizer; the rest are outline/smooth/fast/tint. `false` (no
+    /// history) for an index that is not there.
+    pub fn set_visualizer(&mut self, lane: Lane, idx: usize, flags: u8) -> bool {
+        if idx >= self.lane(lane).len() {
+            return false;
+        }
+        self.snapshot();
+        self.lane_mut(lane).expect("checked above")[idx].visualizer = flags;
+        true
+    }
+
     /// Timeline frames of ramp-up from silence at the start of the clip at
     /// `idx` of `lane`. `0` for an index that is not there, same as a clip
     /// that has none.
@@ -3005,6 +3024,14 @@ impl Project {
     pub fn composite_fit_at(&self, timeline_frame: u32) -> FitPolicy {
         self.composite_clip_at(timeline_frame)
             .map_or(FitPolicy::default(), |(lane, idx)| self.fit_of(lane, idx))
+    }
+
+    /// Waveform flags of the topmost video clip at `timeline_frame`, or 0
+    /// over a gap / a picture that is not a visualizer.
+    pub fn composite_visualizer_at(&self, timeline_frame: u32) -> u8 {
+        self.composite_clip_at(timeline_frame)
+            .map(|(lane, idx)| self.lane(lane)[idx].visualizer)
+            .unwrap_or(0)
     }
 
     /// [`spans_from`](Project::spans_from) over the composite: every stretch the
@@ -5683,6 +5710,7 @@ mod tests {
             fade_in: 0,
             fade_out: 0,
             transition_out: 0,
+            visualizer: 0,
             start,
             in_frame,
             out_frame,
@@ -7193,6 +7221,7 @@ mod tests {
         fade_in: 0,
         fade_out: 0,
         transition_out: 0,
+        visualizer: 0,
         start: 0,
         in_frame: 100,
         out_frame: 102,
@@ -7269,6 +7298,7 @@ mod tests {
             fade_in: 0,
             fade_out: 0,
             transition_out: 0,
+            visualizer: 0,
             source: wav,
             ..PASTED
         };
@@ -7983,6 +8013,7 @@ mod tests {
             fade_in: 0,
             fade_out: 0,
             transition_out: 0,
+            visualizer: 0,
             start,
             in_frame,
             out_frame,
@@ -9091,6 +9122,7 @@ mod tests {
                 fade_in: 0,
                 fade_out: 0,
                 transition_out: 0,
+                visualizer: 0,
                 eq: Some(i),
                 ..video[0]
             }]
@@ -9133,6 +9165,7 @@ mod tests {
                 fade_in: 0,
                 fade_out: 0,
                 transition_out: 0,
+                visualizer: 0,
                 color: Some(i),
                 fit: FitPolicy::default(),
                 speed: Speed::NORMAL,
@@ -9197,6 +9230,7 @@ mod tests {
             fade_in: 0,
             fade_out: 0,
             transition_out: 0,
+            visualizer: 0,
             start,
             in_frame,
             out_frame,
@@ -9995,6 +10029,7 @@ mod tests {
             fade_in: 0,
             fade_out: 0,
             transition_out: 0,
+            visualizer: 0,
             start,
             in_frame: start,
             out_frame: end,

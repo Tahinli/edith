@@ -1187,6 +1187,71 @@ fn transition_row(player: &Player, cx: &mut Context<Player>) -> Option<impl Into
 /// these onto. Drag-while-playing and every other gesture on a row is
 /// whatever that card already does; nothing about the gesture is reimplemented
 /// here.
+fn viz_style_verbs(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
+    let flags = player.selected.anchor().and_then(|(lane, idx)| {
+        let session = player.session.as_ref()?;
+        let clip = session.lane_clips(lane).get(idx)?;
+        (clip.visualizer & 1 != 0).then_some(clip.visualizer)
+    });
+    let Some(flags) = flags else {
+        return div().id("dock-viz-styles");
+    };
+    let bit = |id: &'static str, label_text: &'static str, bit: u8, on: bool| {
+        let style = label(type_scale::LABEL_ROW_PX, FontWeight::MEDIUM);
+        div()
+            .id(id)
+            .flex_none()
+            .h(px(CONTROL_H))
+            .px(px(8.))
+            .flex()
+            .items_center()
+            .cursor_pointer()
+            .text_color(rgb(if on { INK1() } else { INK3() }))
+            .font(style.font)
+            .text_size(style.size)
+            .children(hitmap::control(id, label_text, true))
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                this.toggle_viz_flag(bit, cx);
+            }))
+            .child(if on {
+                format!("· {label_text}")
+            } else {
+                label_text.to_string()
+            })
+            .into_any_element()
+    };
+    div()
+        .id("dock-viz-styles")
+        .flex_none()
+        .flex()
+        .flex_col()
+        .gap(px(2.))
+        .child(bit(
+            "dock-viz-outline",
+            "Outline",
+            engine::decode::VIZ_OUTLINE,
+            flags & engine::decode::VIZ_OUTLINE != 0,
+        ))
+        .child(bit(
+            "dock-viz-smooth",
+            "Smooth",
+            engine::decode::VIZ_SMOOTH,
+            flags & engine::decode::VIZ_SMOOTH != 0,
+        ))
+        .child(bit(
+            "dock-viz-fast",
+            "Fast",
+            engine::decode::VIZ_FAST,
+            flags & engine::decode::VIZ_FAST != 0,
+        ))
+        .child(bit(
+            "dock-viz-tint",
+            "Colour",
+            engine::decode::VIZ_TINT,
+            flags & engine::decode::VIZ_TINT != 0,
+        ))
+}
+
 fn clip_tab(
     player: &Player,
     width: f32,
@@ -1301,7 +1366,8 @@ fn clip_tab(
                     false,
                     player,
                     cx.listener(|this, _: &ClickEvent, _, cx| this.cycle_fit(cx)),
-                )),
+                ))
+                .child(viz_style_verbs(player, cx)),
         )
         .children(transition_row(player, cx))
         .child(
@@ -1416,7 +1482,23 @@ fn keys_tab(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
         // The list no longer wears a tab, so it says its own name the way
         // every other dock body section does -- MEDIA / IMPORT's head.
         .child(section_head("KEYS"))
-        .children(keys_rows().into_iter().map(|row| match row {
+        .child({
+            let style = mono(type_scale::CHORD_METADATA_MAX_PX, FontWeight::MEDIUM);
+            let filter_text: SharedString = player.keys_filter.clone().into();
+            div()
+                .id("dock-keys-filter")
+                .flex_none()
+                .cursor_text()
+                .font(style.font)
+                .text_size(style.size)
+                .text_color(rgb(INK1()))
+                .children(hitmap::control("dock.keys-filter", "Filter keys", true))
+                .child(match player.keys_filter.is_empty() {
+                    true => "⌕".to_string(),
+                    false => format!("⌕ {filter_text}"),
+                })
+        })
+        .children(keys_rows_matching(&player.keys_filter, &player.keymap).into_iter().map(|row| match row {
             KeyRow::Head(category) => div()
                 .flex_none()
                 .pt(px(4.))

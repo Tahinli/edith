@@ -240,9 +240,8 @@ pub(crate) fn enable(action: ActionId, ctx: Ctx) -> Enable {
         ActionId::Visualizer if ctx.image => Enable::Hidden("this clip is a still"),
         ActionId::Visualizer if ctx.no_sound => Enable::Hidden("this clip has no sound"),
         ActionId::Visualizer => match ctx.clip {
-            Some((_, lane)) if lane.kind == LaneKind::Audio => Enable::Yes,
-            Some(_) => Enable::Hidden("this clip is picture"),
-            None => Enable::No("select an audio clip"),
+            Some(_) => Enable::Yes,
+            None => Enable::No("select a clip with sound"),
         },
         ActionId::Silence | ActionId::Mix if ctx.no_sound => {
             Enable::Hidden("this clip has no sound")
