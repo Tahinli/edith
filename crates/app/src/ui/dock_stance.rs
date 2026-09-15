@@ -1282,7 +1282,7 @@ fn viz_style_verbs(player: &Player, cx: &mut Context<Player>) -> impl IntoElemen
             engine::decode::VIZ_FAST,
             flags & engine::decode::VIZ_FAST != 0,
         ))
-        .child(viz_paint_knobs(paint, cx))
+        .child(viz_paint_knobs(player, paint, cx))
 }
 
 fn viz_step(
@@ -1306,9 +1306,7 @@ fn viz_step(
         .child(glyph)
 }
 
-fn viz_color_wheel(paint: u32, cx: &mut Context<Player>) -> impl IntoElement {
-    let hit = std::rc::Rc::new(std::cell::Cell::new(Bounds::default()));
-    let hit_click = hit.clone();
+fn viz_color_wheel(player: &Player, paint: u32, cx: &mut Context<Player>) -> impl IntoElement {
     div()
         .id("dock-viz-hs")
         .w(px(112.))
@@ -1316,7 +1314,7 @@ fn viz_color_wheel(paint: u32, cx: &mut Context<Player>) -> impl IntoElement {
         .relative()
         .cursor_pointer()
         .children(hitmap::control("dock-viz-hs", "Colour wheel", true))
-        .child(bounds_probe(hit))
+        .child(bounds_probe(player.viz_wheel.clone()))
         .child(
             canvas(
                 |_, _, _| (),
@@ -1375,26 +1373,13 @@ fn viz_color_wheel(paint: u32, cx: &mut Context<Player>) -> impl IntoElement {
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                let b = hit_click.get();
-                let w = f32::from(b.size.width).max(1.);
-                let h = f32::from(b.size.height).max(1.);
-                let dx = f32::from(event.position.x - b.origin.x) - w / 2.;
-                let dy = h / 2. - f32::from(event.position.y - b.origin.y);
-                let radius = w.min(h) / 2.;
-                let r = (dx * dx + dy * dy).sqrt() / radius;
-                if r > 1.08 {
-                    return;
-                }
-                let sat = (r.clamp(0., 1.) * 255.).round() as u8;
-                let ang = dx.atan2(dy).to_degrees();
-                let hue_deg = (ang + 360.) % 360.;
-                let hue = (hue_deg / 360. * 256.).round() as u16 as u8;
-                this.set_viz_hs(hue, sat, cx);
+                this.viz_hs_dragging = true;
+                this.drag_viz_hs(event.position, cx);
             }),
         )
 }
 
-fn viz_paint_knobs(paint: u32, cx: &mut Context<Player>) -> impl IntoElement {
+fn viz_paint_knobs(player: &Player, paint: u32, cx: &mut Context<Player>) -> impl IntoElement {
     let strands = engine::decode::viz_strands_of(paint);
     let glow = engine::decode::viz_glow_of(paint);
     let style = label(type_scale::LABEL_ROW_PX, FontWeight::MEDIUM);
@@ -1416,7 +1401,7 @@ fn viz_paint_knobs(paint: u32, cx: &mut Context<Player>) -> impl IntoElement {
                         .text_color(rgb(INK2()))
                         .child("Colour"),
                 )
-                .child(viz_color_wheel(paint, cx)),
+                .child(viz_color_wheel(player, paint, cx)),
         )
         .child(
             div()

@@ -756,6 +756,11 @@ struct Player {
     /// equalizer's drag, for the same reason: a 4 px bar is left by the pointer
     /// on the first move and its own listeners then stop firing.
     color_dragging: bool,
+    /// HSV wheel on CLIP: same 4 px reason as `color_dragging` — the pointer
+    /// leaves the disk on the first move, so samples live on the root.
+    viz_hs_dragging: bool,
+    /// The wheel's box, recorded at prepaint for a drag's window position.
+    viz_wheel: Rc<Cell<Bounds<Pixels>>>,
     /// Each slider's box, recorded at prepaint: a mouse listener is handed the
     /// window position only, so this is what a press and a drag are read against
     /// ([`frac_along`]). One per band, because the press picks the row it landed
@@ -1064,6 +1069,8 @@ fn main() {
                     color_open: None,
                     color_band: 0,
                     color_dragging: false,
+                    viz_hs_dragging: false,
+                    viz_wheel: Rc::default(),
                     color_bars: std::array::from_fn(|_| Rc::default()),
                     pending_color: None,
                     transform_open: None,
