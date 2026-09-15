@@ -1270,10 +1270,10 @@ fn viz_style_verbs(player: &Player, cx: &mut Context<Player>) -> impl IntoElemen
         .flex_col()
         .gap(px(2.))
         .child(pick(
-            "dock-viz-wave",
-            "Waveform",
-            engine::decode::VIZ_STYLE_WAVE,
-            engine::decode::viz_style(flags) == engine::decode::VIZ_STYLE_WAVE,
+            "dock-viz-fill",
+            "Fill",
+            engine::decode::VIZ_STYLE_FILL,
+            engine::decode::viz_style(flags) == engine::decode::VIZ_STYLE_FILL,
         ))
         .child(pick(
             "dock-viz-ribbon",
@@ -1282,10 +1282,16 @@ fn viz_style_verbs(player: &Player, cx: &mut Context<Player>) -> impl IntoElemen
             engine::decode::viz_style(flags) == engine::decode::VIZ_STYLE_RIBBON,
         ))
         .child(pick(
-            "dock-viz-fill",
-            "Fill",
-            engine::decode::VIZ_STYLE_FILL,
-            engine::decode::viz_style(flags) == engine::decode::VIZ_STYLE_FILL,
+            "dock-viz-ring",
+            "Ring",
+            engine::decode::VIZ_STYLE_RING,
+            engine::decode::viz_style(flags) == engine::decode::VIZ_STYLE_RING,
+        ))
+        .child(pick(
+            "dock-viz-wave",
+            "Waveform",
+            engine::decode::VIZ_STYLE_WAVE,
+            engine::decode::viz_style(flags) == engine::decode::VIZ_STYLE_WAVE,
         ))
         .child(bit(
             "dock-viz-fast",
