@@ -15,7 +15,7 @@ use crate::ui::hitmap;
 use crate::ui::stance::{Surface, is_focus_cycle_key, is_focus_exit_key, next_surface};
 use crate::ui::type_scale::{self, Typeset, head, label, mono};
 use crate::*;
-use gpui::FontWeight;
+use gpui::{FontWeight, PathBuilder, point};
 
 /// Where the dock tab pick lives: one word beside the theme and the
 /// keybindings (`ui::theme::config_path`/`save`/`load` is the exact pattern
@@ -1306,8 +1306,95 @@ fn viz_step(
         .child(glyph)
 }
 
+fn viz_color_wheel(paint: u32, cx: &mut Context<Player>) -> impl IntoElement {
+    let hit = std::rc::Rc::new(std::cell::Cell::new(Bounds::default()));
+    let hit_click = hit.clone();
+    div()
+        .id("dock-viz-hs")
+        .w(px(112.))
+        .h(px(112.))
+        .relative()
+        .cursor_pointer()
+        .children(hitmap::control("dock-viz-hs", "Colour wheel", true))
+        .child(bounds_probe(hit))
+        .child(
+            canvas(
+                |_, _, _| (),
+                move |bounds, _, window, _| {
+                    let o = bounds.origin;
+                    let (w, h) = (f32::from(bounds.size.width), f32::from(bounds.size.height));
+                    let cx = f32::from(o.x) + w / 2.;
+                    let cy = f32::from(o.y) + h / 2.;
+                    let radius = w.min(h) / 2. - 1.;
+                    let wedges = 48;
+                    for i in 0..wedges {
+                        let a0 = (i as f32 / wedges as f32) * std::f32::consts::TAU;
+                        let a1 = ((i + 1) as f32 / wedges as f32) * std::f32::consts::TAU;
+                        // 0 at top, clockwise: screen y down, so angle 0 is -Y.
+                        let hue = i as f32 / wedges as f32 * 360.;
+                        let (r, g, b) = engine::decode::viz_hsv_rgb(hue, 1., 0.84);
+                        let color = (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b);
+                        let p0 = point(px(cx), px(cy));
+                        let p1 = point(
+                            px(cx + radius * a0.sin()),
+                            px(cy - radius * a0.cos()),
+                        );
+                        let p2 = point(
+                            px(cx + radius * a1.sin()),
+                            px(cy - radius * a1.cos()),
+                        );
+                        let mut path = PathBuilder::fill();
+                        path.add_polygon(&[p0, p1, p2], false);
+                        if let Ok(path) = path.build() {
+                            window.paint_path(path, rgb(color));
+                        }
+                    }
+                    // Selection mark.
+                    let hue = f32::from(engine::decode::viz_hue_ui(paint)) / 256. * std::f32::consts::TAU;
+                    let sat = f32::from(engine::decode::viz_sat_ui(paint)) / 255.;
+                    let mx = cx + radius * sat * hue.sin();
+                    let my = cy - radius * sat * hue.cos();
+                    let mut mark = PathBuilder::stroke(px(2.));
+                    let r = 4.;
+                    mark.add_polygon(
+                        &[
+                            point(px(mx - r), px(my)),
+                            point(px(mx), px(my - r)),
+                            point(px(mx + r), px(my)),
+                            point(px(mx), px(my + r)),
+                        ],
+                        true,
+                    );
+                    if let Ok(path) = mark.build() {
+                        window.paint_path(path, rgb(INK1()));
+                    }
+                },
+            )
+            .size_full(),
+        )
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                let b = hit_click.get();
+                let w = f32::from(b.size.width).max(1.);
+                let h = f32::from(b.size.height).max(1.);
+                let dx = f32::from(event.position.x - b.origin.x) - w / 2.;
+                let dy = h / 2. - f32::from(event.position.y - b.origin.y);
+                let radius = w.min(h) / 2.;
+                let r = (dx * dx + dy * dy).sqrt() / radius;
+                if r > 1.08 {
+                    return;
+                }
+                let sat = (r.clamp(0., 1.) * 255.).round() as u8;
+                let ang = dx.atan2(dy).to_degrees();
+                let hue_deg = (ang + 360.) % 360.;
+                let hue = (hue_deg / 360. * 256.).round() as u16 as u8;
+                this.set_viz_hs(hue, sat.max(1), cx);
+            }),
+        )
+}
+
 fn viz_paint_knobs(paint: u32, cx: &mut Context<Player>) -> impl IntoElement {
-    let hue = engine::decode::viz_hue_ui(paint);
     let sat = engine::decode::viz_sat_ui(paint);
     let strands = engine::decode::viz_strands_of(paint);
     let glow = engine::decode::viz_glow_of(paint);
@@ -1319,11 +1406,10 @@ fn viz_paint_knobs(paint: u32, cx: &mut Context<Player>) -> impl IntoElement {
         .px(px(8.))
         .child(
             div()
-                .id("dock-viz-hue")
+                .id("dock-viz-wheel")
                 .flex()
-                .items_center()
+                .flex_col()
                 .gap(px(4.))
-                .h(px(CONTROL_H))
                 .child(
                     div()
                         .font(style.font.clone())
@@ -1331,37 +1417,7 @@ fn viz_paint_knobs(paint: u32, cx: &mut Context<Player>) -> impl IntoElement {
                         .text_color(rgb(INK2()))
                         .child("Colour"),
                 )
-                .child(viz_step("dock-viz-hue-minus", "−", cx, |this, cx| {
-                    this.set_viz_hue(engine::decode::viz_hue_ui(this.viz_paint()).wrapping_sub(4), cx);
-                }))
-                .child(
-                    div()
-                        .id("dock-viz-hue-bar")
-                        .flex_1()
-                        .flex()
-                        .h(px(14.))
-                        .children((0u8..64).map(|i| {
-                            let h = i.saturating_mul(4);
-                            let (r, g, b) = engine::decode::viz_ink_from_paint(
-                                engine::decode::with_viz_paint_hue(paint, h),
-                            );
-                            let color = (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b);
-                            div()
-                                .id(("dock-viz-hue", u64::from(i)))
-                                .flex_1()
-                                .h_full()
-                                .bg(rgb(color))
-                                .when(hue.abs_diff(h) < 3, |d| d.border_1().border_color(rgb(INK1())))
-                                .cursor_pointer()
-                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                    this.set_viz_hue(h, cx);
-                                }))
-                                .into_any_element()
-                        })),
-                )
-                .child(viz_step("dock-viz-hue-plus", "+", cx, |this, cx| {
-                    this.set_viz_hue(engine::decode::viz_hue_ui(this.viz_paint()).wrapping_add(4), cx);
-                })),
+                .child(viz_color_wheel(paint, cx)),
         )
         .child(
             div()

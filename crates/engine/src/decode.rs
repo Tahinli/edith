@@ -1505,6 +1505,10 @@ pub fn viz_sat_ui(paint: u32) -> u8 {
     }
 }
 
+pub fn viz_hsv_rgb(h: f32, s: f32, v: f32) -> (u8, u8, u8) {
+    hsv_to_rgb(h, s, v)
+}
+
 fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (u8, u8, u8) {
     let h = ((h % 360.0) + 360.0) % 360.0;
     let c = v * s;
@@ -1595,28 +1599,6 @@ fn viz_span(
     }
 }
 
-fn viz_smooth(lo: &mut [f32], hi: &mut [f32]) {
-    let n = lo.len();
-    if n < 5 {
-        return;
-    }
-    let (src_lo, src_hi) = (lo.to_vec(), hi.to_vec());
-    for i in 2..n - 2 {
-        lo[i] = (src_lo[i - 2]
-            + src_lo[i - 1] * 2.0
-            + src_lo[i] * 3.0
-            + src_lo[i + 1] * 2.0
-            + src_lo[i + 2])
-            / 9.0;
-        hi[i] = (src_hi[i - 2]
-            + src_hi[i - 1] * 2.0
-            + src_hi[i] * 3.0
-            + src_hi[i + 1] * 2.0
-            + src_hi[i + 2])
-            / 9.0;
-    }
-}
-
 fn viz_line(
     y: &mut [u8],
     u: &mut [u8],
@@ -1700,36 +1682,43 @@ pub(crate) fn visualizer_i420(
         } else {
             VIZ_WINDOW_SECS
         };
-        let first = (((t_secs - window / 2.0).max(0.0) * per_sec).floor() as usize)
-            .min(peaks.len() - 1);
-        let last = ((((t_secs + window / 2.0).min(duration) * per_sec).ceil() as usize)
-            .clamp(first + 1, peaks.len()))
-        .min(peaks.len());
-        let span = (last - first) as f64;
-        let pair = |i: usize| peaks[i.min(peaks.len() - 1)];
-        let signed = |i: usize| {
-            let (a, b) = pair(i);
-            if b.abs() >= a.abs() {
-                b
-            } else {
-                a
+        // Fixed window length, silence outside the file: shrinking the span
+        // to the samples that exist stretched a bump as it entered (2s) and
+        // Fast (0.2s) rarely hit the edge. Column x always maps to
+        // t - window/2 + x/w * window.
+        let origin = t_secs - window / 2.0;
+        let pair_at = |t: f64| -> (f32, f32) {
+            if !t.is_finite() || t < 0.0 || t > duration {
+                return (0.0, 0.0);
             }
+            let pos = (t * per_sec).clamp(0.0, (peaks.len() - 1) as f64);
+            let i = pos.floor() as usize;
+            let f = (pos - i as f64) as f32;
+            let (lo0, hi0) = peaks[i];
+            let (lo1, hi1) = peaks[(i + 1).min(peaks.len() - 1)];
+            (
+                (lo0 + (lo1 - lo0) * f).clamp(-1.0, 0.0),
+                (hi0 + (hi1 - hi0) * f).clamp(0.0, 1.0),
+            )
+        };
+        let signed_at = |t: f64| {
+            let (a, b) = pair_at(t);
+            if b.abs() >= a.abs() { b } else { a }
         };
         for col in 0..w {
-            let a = first + (col as f64 * span / w as f64).floor() as usize;
-            let b = (first + (((col + 1) as f64 * span / w as f64).ceil() as usize)).min(peaks.len());
-            let b = b.max(a + 1);
+            let t0 = origin + col as f64 / w as f64 * window;
+            let t1 = origin + (col + 1) as f64 / w as f64 * window;
             let (mut mn, mut mx) = (0.0f32, 0.0f32);
-            for &(l, h) in &peaks[a.min(peaks.len() - 1)..b.min(peaks.len()).max(a.min(peaks.len() - 1) + 1)] {
+            let samples = 4;
+            for k in 0..samples {
+                let t = t0 + (t1 - t0) * (k as f64 + 0.5) / samples as f64;
+                let (l, h) = pair_at(t);
                 mn = mn.min(l);
                 mx = mx.max(h);
             }
-            lo[col] = mn.clamp(-1.0, 0.0);
-            hi[col] = mx.clamp(0.0, 1.0);
-            let pos = first as f64 + (col as f64 + 0.5) * span / w as f64;
-            let i = pos.floor() as usize;
-            let f = (pos - i as f64) as f32;
-            sig[col] = signed(i) + (signed(i.saturating_add(1)) - signed(i)) * f;
+            lo[col] = mn;
+            hi[col] = mx;
+            sig[col] = signed_at(origin + (col as f64 + 0.5) / w as f64 * window);
         }
         // Whole-file peak, not the window's: a 2s window that gains or loses
         // a loud hit used to rescale every column, so the same bump changed
@@ -1745,8 +1734,6 @@ pub(crate) fn visualizer_i420(
                 sig[i] /= peak;
             }
         }
-        viz_smooth(&mut lo, &mut hi);
-        viz_smooth(&mut lo, &mut hi);
     }
 
     match viz_style(flags) {
@@ -1761,18 +1748,22 @@ pub(crate) fn visualizer_i420(
                     let scale = 0.28 + 0.72 * frac;
                     let wave = (x_phase + travel + s as f64 * 0.05).sin() as f32;
                     let row = (center + half * env * scale * wave).round() as i32;
+                    let glow = i32::from(viz_glow_of(paint)).max(1);
                     viz_stamp(
                         &mut y, &mut u, &mut v, w, h, cw, ch, col as i32, row, 1.0, bg_y, ink_y,
                         ink_u, ink_v,
                     );
-                    viz_stamp(
-                        &mut y, &mut u, &mut v, w, h, cw, ch, col as i32, row - 1, 0.35, bg_y,
-                        ink_y, ink_u, ink_v,
-                    );
-                    viz_stamp(
-                        &mut y, &mut u, &mut v, w, h, cw, ch, col as i32, row + 1, 0.35, bg_y,
-                        ink_y, ink_u, ink_v,
-                    );
+                    for dy in 1..=glow {
+                        let fall = 0.5 / dy as f32;
+                        viz_stamp(
+                            &mut y, &mut u, &mut v, w, h, cw, ch, col as i32, row - dy, fall, bg_y,
+                            ink_y, ink_u, ink_v,
+                        );
+                        viz_stamp(
+                            &mut y, &mut u, &mut v, w, h, cw, ch, col as i32, row + dy, fall, bg_y,
+                            ink_y, ink_u, ink_v,
+                        );
+                    }
                 }
             }
         }
@@ -1828,6 +1819,7 @@ pub(crate) fn visualizer_i420(
         _ => {
             // Timeline envelope: one filled body, tops then bottoms, after
             // the fold+smooth above. Default look.
+            let glow = i32::from(viz_glow_of(paint)).max(1);
             for col in 0..w {
                 let top = (center - hi[col] * half).round() as i32;
                 let bot = (center - lo[col] * half).round() as i32;
@@ -1835,14 +1827,17 @@ pub(crate) fn visualizer_i420(
                     &mut y, &mut u, &mut v, w, h, cw, ch, col as i32, top, bot, bg_y, ink_y, ink_u,
                     ink_v,
                 );
-                viz_stamp(
-                    &mut y, &mut u, &mut v, w, h, cw, ch, col as i32, top - 1, 0.4, bg_y, ink_y,
-                    ink_u, ink_v,
-                );
-                viz_stamp(
-                    &mut y, &mut u, &mut v, w, h, cw, ch, col as i32, bot + 1, 0.4, bg_y, ink_y,
-                    ink_u, ink_v,
-                );
+                for dy in 1..=glow {
+                    let fall = 0.55 / dy as f32;
+                    viz_stamp(
+                        &mut y, &mut u, &mut v, w, h, cw, ch, col as i32, top - dy, fall, bg_y,
+                        ink_y, ink_u, ink_v,
+                    );
+                    viz_stamp(
+                        &mut y, &mut u, &mut v, w, h, cw, ch, col as i32, bot + dy, fall, bg_y,
+                        ink_y, ink_u, ink_v,
+                    );
+                }
             }
         }
     }

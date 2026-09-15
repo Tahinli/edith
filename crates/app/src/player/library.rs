@@ -236,8 +236,10 @@ impl Player {
             .unwrap_or(0)
     }
 
-    pub(crate) fn set_viz_hue(&mut self, hue: u8, cx: &mut Context<Self>) {
-        self.set_viz_paint_with(cx, |p| engine::decode::with_viz_paint_hue(p, hue));
+    pub(crate) fn set_viz_hs(&mut self, hue: u8, sat: u8, cx: &mut Context<Self>) {
+        self.set_viz_paint_with(cx, |p| {
+            engine::decode::with_viz_paint_sat(engine::decode::with_viz_paint_hue(p, hue), sat)
+        });
     }
 
     pub(crate) fn set_viz_sat(&mut self, sat: u8, cx: &mut Context<Self>) {
