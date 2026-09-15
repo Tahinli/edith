@@ -1187,6 +1187,25 @@ fn transition_row(player: &Player, cx: &mut Context<Player>) -> Option<impl Into
 /// these onto. Drag-while-playing and every other gesture on a row is
 /// whatever that card already does; nothing about the gesture is reimplemented
 /// here.
+const VIZ_HUE_IDS: [&str; 16] = [
+    "dock-viz-hue-0",
+    "dock-viz-hue-1",
+    "dock-viz-hue-2",
+    "dock-viz-hue-3",
+    "dock-viz-hue-4",
+    "dock-viz-hue-5",
+    "dock-viz-hue-6",
+    "dock-viz-hue-7",
+    "dock-viz-hue-8",
+    "dock-viz-hue-9",
+    "dock-viz-hue-10",
+    "dock-viz-hue-11",
+    "dock-viz-hue-12",
+    "dock-viz-hue-13",
+    "dock-viz-hue-14",
+    "dock-viz-hue-15",
+];
+
 fn viz_style_verbs(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
     let flags = player.selected.anchor().and_then(|(lane, idx)| {
         let session = player.session.as_ref()?;
@@ -1195,6 +1214,30 @@ fn viz_style_verbs(player: &Player, cx: &mut Context<Player>) -> impl IntoElemen
     });
     let Some(flags) = flags else {
         return div().id("dock-viz-styles");
+    };
+    let pick = |id: &'static str, label_text: &'static str, style: u8, on: bool| {
+        let row = label(type_scale::LABEL_ROW_PX, FontWeight::MEDIUM);
+        div()
+            .id(id)
+            .flex_none()
+            .h(px(CONTROL_H))
+            .px(px(8.))
+            .flex()
+            .items_center()
+            .cursor_pointer()
+            .text_color(rgb(if on { INK1() } else { INK3() }))
+            .font(row.font)
+            .text_size(row.size)
+            .children(hitmap::control(id, label_text, true))
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                this.set_viz_style(style, cx);
+            }))
+            .child(if on {
+                format!("· {label_text}")
+            } else {
+                label_text.to_string()
+            })
+            .into_any_element()
     };
     let bit = |id: &'static str, label_text: &'static str, bit: u8, on: bool| {
         let style = label(type_scale::LABEL_ROW_PX, FontWeight::MEDIUM);
@@ -1226,17 +1269,23 @@ fn viz_style_verbs(player: &Player, cx: &mut Context<Player>) -> impl IntoElemen
         .flex()
         .flex_col()
         .gap(px(2.))
-        .child(bit(
-            "dock-viz-outline",
-            "Outline",
-            engine::decode::VIZ_OUTLINE,
-            flags & engine::decode::VIZ_OUTLINE != 0,
+        .child(pick(
+            "dock-viz-wave",
+            "Waveform",
+            engine::decode::VIZ_STYLE_WAVE,
+            engine::decode::viz_style(flags) == engine::decode::VIZ_STYLE_WAVE,
         ))
-        .child(bit(
-            "dock-viz-smooth",
-            "Smooth",
-            engine::decode::VIZ_SMOOTH,
-            flags & engine::decode::VIZ_SMOOTH != 0,
+        .child(pick(
+            "dock-viz-ribbon",
+            "Ribbon",
+            engine::decode::VIZ_STYLE_RIBBON,
+            engine::decode::viz_style(flags) == engine::decode::VIZ_STYLE_RIBBON,
+        ))
+        .child(pick(
+            "dock-viz-fill",
+            "Fill",
+            engine::decode::VIZ_STYLE_FILL,
+            engine::decode::viz_style(flags) == engine::decode::VIZ_STYLE_FILL,
         ))
         .child(bit(
             "dock-viz-fast",
@@ -1244,12 +1293,82 @@ fn viz_style_verbs(player: &Player, cx: &mut Context<Player>) -> impl IntoElemen
             engine::decode::VIZ_FAST,
             flags & engine::decode::VIZ_FAST != 0,
         ))
-        .child(bit(
-            "dock-viz-tint",
-            "Colour",
-            engine::decode::VIZ_TINT,
-            flags & engine::decode::VIZ_TINT != 0,
-        ))
+        .child(viz_hue_row(flags, cx))
+}
+
+fn viz_hue_row(flags: u8, cx: &mut Context<Player>) -> impl IntoElement {
+    let hue = engine::decode::viz_hue(flags);
+    let style = label(type_scale::LABEL_ROW_PX, FontWeight::MEDIUM);
+    let step = |id: &'static str, glyph: &'static str, by: i8, cx: &mut Context<Player>| {
+        div()
+            .id(id)
+            .flex()
+            .w(px(HIT_MIN))
+            .h(px(HIT_MIN))
+            .items_center()
+            .justify_center()
+            .rounded(px(3.))
+            .bg(rgb(DARK_RAISED()))
+            .cursor_pointer()
+            .children(hitmap::control(id, "Colour", true))
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                let cur = this
+                    .selected
+                    .anchor()
+                    .and_then(|(lane, idx)| {
+                        this.session
+                            .as_ref()?
+                            .lane_clips(lane)
+                            .get(idx)
+                            .map(|c| engine::decode::viz_hue(c.visualizer))
+                    })
+                    .unwrap_or(0);
+                this.set_viz_hue((cur as i16 + i16::from(by)).rem_euclid(16) as u8, cx);
+            }))
+            .child(glyph)
+    };
+    div()
+        .id("dock-viz-hue")
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap(px(4.))
+        .h(px(CONTROL_H))
+        .px(px(8.))
+        .child(
+            div()
+                .font(style.font)
+                .text_size(style.size)
+                .text_color(rgb(INK2()))
+                .child("Colour"),
+        )
+        .child(step("dock-viz-hue-minus", "−", -1, cx))
+        .child(
+            div()
+                .id("dock-viz-hue-swatches")
+                .flex_1()
+                .flex()
+                .gap(px(2.))
+                .children((0u8..16).map(|i| {
+                    let (r, g, b) = engine::decode::viz_ink_rgb(i);
+                    let color = (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b);
+                    div()
+                        .id(("dock-viz-hue", u64::from(i)))
+                        .flex_1()
+                        .h(px(14.))
+                        .min_w(px(8.))
+                        .rounded(px(2.))
+                        .bg(rgb(color))
+                        .when(i == hue, |d| d.border_1().border_color(rgb(INK1())))
+                        .cursor_pointer()
+                        .children(hitmap::control(VIZ_HUE_IDS[i as usize], "Colour", true))
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.set_viz_hue(i, cx);
+                        }))
+                        .into_any_element()
+                })),
+        )
+        .child(step("dock-viz-hue-plus", "+", 1, cx))
 }
 
 fn clip_tab(

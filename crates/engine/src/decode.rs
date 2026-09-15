@@ -609,7 +609,7 @@ impl DecodeSession {
 
     /// A worker for an audio file played as a *picture* ([`crate::is_audio`]):
     /// the file's peaks are decoded **once** on the worker, and every picture
-    /// after that is painted -- a sliding mirrored waveform
+    /// after that is painted -- a sliding visualizer
     /// ([`visualizer_i420`]) at the canvas's own size, then graded, placed and
     /// converted exactly like a decoded picture, so a grade, a transform and a
     /// fit policy reach it the way they reach anything else on the timeline.
@@ -1408,28 +1408,154 @@ fn rgb_to_i420(rgb: &[u8], width: usize, height: usize) -> (Vec<u8>, Vec<u8>, Ve
 /// Peak buckets per second the visualizer paints from, shared by the one
 /// caller that decodes them ([`DecodeSession::open_visualizer`], preview and
 /// export both) and the painter that reads them.
-pub(crate) const VIZ_BUCKETS_PER_SEC: u32 = 60;
-pub const VIZ_OUTLINE: u8 = 1 << 1;
-pub const VIZ_SMOOTH: u8 = 1 << 2;
+pub(crate) const VIZ_BUCKETS_PER_SEC: u32 = 4000;
+/// Bits 1-2: which picture this visualizer paints. Mutually exclusive —
+/// a picker, not independent toggles.
+pub const VIZ_STYLE_WAVE: u8 = 0;
+pub const VIZ_STYLE_RIBBON: u8 = 1;
+pub const VIZ_STYLE_FILL: u8 = 2;
 pub const VIZ_FAST: u8 = 1 << 3;
-pub const VIZ_TINT: u8 = 1 << 4;
+/// High nibble of [`crate::project::Clip::visualizer`]: 16 inks. Zero is gold, then around
+/// the wheel in 22.5° steps so a picker — not a click-cycle — chooses the
+/// strand colour.
+pub const VIZ_HUE_SHIFT: u8 = 4;
+
+/// The ink nibble stored in `flags`.
+pub fn viz_hue(flags: u8) -> u8 {
+    flags >> VIZ_HUE_SHIFT
+}
+
+/// Keep style bits, replace the ink nibble.
+pub fn with_viz_hue(flags: u8, hue: u8) -> u8 {
+    (flags & 0x0F) | ((hue & 15) << VIZ_HUE_SHIFT)
+}
+
+pub fn viz_style(flags: u8) -> u8 {
+    (flags >> 1) & 3
+}
+
+pub fn with_viz_style(flags: u8, style: u8) -> u8 {
+    (flags & !0b0110) | ((style & 3) << 1)
+}
+
+/// Ink colour for the CLIP swatches and the painter. Hue 0 is gold.
+pub fn viz_ink_rgb(hue: u8) -> (u8, u8, u8) {
+    hsv_to_rgb(48.0 + f32::from(hue & 15) * 22.5, 0.68, 0.92)
+}
+
+fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (u8, u8, u8) {
+    let h = ((h % 360.0) + 360.0) % 360.0;
+    let c = v * s;
+    let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
+    let m = v - c;
+    let (r, g, b) = match (h / 60.0) as i32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    (
+        ((r + m) * 255.0).round() as u8,
+        ((g + m) * 255.0).round() as u8,
+        ((b + m) * 255.0).round() as u8,
+    )
+}
+
+fn rgb_yuv(r: i32, g: i32, b: i32) -> (u8, u8, u8) {
+    let y = (((66 * r + 129 * g + 25 * b + 128) >> 8) + 16) as u8;
+    let u = (((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128) as u8;
+    let v = (((112 * r - 94 * g - 18 * b + 128) >> 8) + 128) as u8;
+    (y, u, v)
+}
 
 /// How much sound one visualizer frame shows, centered on the frame's own
-/// time: two seconds, so a glance reads the shape of the around-now rather
-/// than the whole file squeezed into one picture.
+/// time. Two seconds by default; [`VIZ_FAST`] is a fifth of a second, the
+/// zoom that makes an Audacity-style trace readable as a line.
 const VIZ_WINDOW_SECS: f64 = 2.0;
+const VIZ_FAST_SECS: f64 = 0.2;
 
-/// One visualizer picture, painted straight into tightly packed I420 in the
-/// BT.601 limited range [`rgb_to_i420`] writes: dark (`16`, neutral chroma)
-/// with the waveform bright (`220`), so what turns it into pixels on a screen
-/// is the same conversion a still goes through.
-///
-/// The columns are a **sliding** window of [`VIZ_WINDOW_SECS`] centered on
-/// `t_secs`, mirrored around the vertical middle: the buckets' maxima reach
-/// up from the center line and their minima down, the standard symmetric
-/// envelope. `t_secs` outside the peaks -- and an empty envelope, silence
-/// included, whose buckets are `(0.0, 0.0)` -- paints the one-pixel center
-/// line: a visualizer frame always exists, whatever the sound did.
+fn viz_stamp(
+    y: &mut [u8],
+    u: &mut [u8],
+    v: &mut [u8],
+    w: usize,
+    h: usize,
+    cw: usize,
+    ch: usize,
+    x: i32,
+    row: i32,
+    fall: f32,
+    bg_y: u8,
+    ink_y: u8,
+    ink_u: u8,
+    ink_v: u8,
+) {
+    if x < 0 || row < 0 || x >= w as i32 || row >= h as i32 {
+        return;
+    }
+    let lum =
+        (f32::from(bg_y) + (f32::from(ink_y) - f32::from(bg_y)) * fall.clamp(0.0, 1.0)) as u8;
+    let idx = row as usize * w + x as usize;
+    if lum > y[idx] {
+        y[idx] = lum;
+    }
+    if fall > 0.6 {
+        let cx = x as usize / 2;
+        let cy = row as usize / 2;
+        if cy < ch && cx < cw {
+            u[cy * cw + cx] = ink_u;
+            v[cy * cw + cx] = ink_v;
+        }
+    }
+}
+
+fn viz_line(
+    y: &mut [u8],
+    u: &mut [u8],
+    v: &mut [u8],
+    w: usize,
+    h: usize,
+    cw: usize,
+    ch: usize,
+    mut x0: i32,
+    mut y0: i32,
+    x1: i32,
+    y1: i32,
+    bg_y: u8,
+    ink_y: u8,
+    ink_u: u8,
+    ink_v: u8,
+) {
+    let dx = (x1 - x0).abs();
+    let dy = -(y1 - y0).abs();
+    let sx = if x0 < x1 { 1 } else { -1 };
+    let sy = if y0 < y1 { 1 } else { -1 };
+    let mut err = dx + dy;
+    loop {
+        viz_stamp(y, u, v, w, h, cw, ch, x0, y0, 1.0, bg_y, ink_y, ink_u, ink_v);
+        viz_stamp(y, u, v, w, h, cw, ch, x0, y0 - 1, 0.45, bg_y, ink_y, ink_u, ink_v);
+        viz_stamp(y, u, v, w, h, cw, ch, x0, y0 + 1, 0.45, bg_y, ink_y, ink_u, ink_v);
+        if x0 == x1 && y0 == y1 {
+            break;
+        }
+        let e2 = 2 * err;
+        if e2 >= dy {
+            err += dy;
+            x0 += sx;
+        }
+        if e2 <= dx {
+            err += dx;
+            y0 += sy;
+        }
+    }
+}
+
+/// One visualizer picture in tightly packed I420. Three looks, picked by
+/// [`viz_style`]: a bipolar sample trace (Audacity), a filled min/max
+/// envelope at pixel resolution, or a multi-strand ribbon. Ink is
+/// [`viz_ink_rgb`]. A frame always exists; silence is the zero line.
 pub(crate) fn visualizer_i420(
     peaks: &[(f32, f32)],
     t_secs: f64,
@@ -1437,81 +1563,114 @@ pub(crate) fn visualizer_i420(
     height: u32,
     flags: u8,
 ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
-    // Even dims, like every canvas this engine composes at: an odd caller is
-    // shaved rather than handed chroma math it did not ask about.
     let width = width & !1;
     let height = height & !1;
     let (w, h) = (width as usize, height as usize);
     let (cw, ch) = crate::scale::chroma_dims(w, h);
-    let mut y = vec![16u8; w * h];
-    let mut u = vec![128u8; cw * ch];
-    let mut v = vec![128u8; cw * ch];
-    let center = h / 2;
-    let duration = peaks.len() as f64 / f64::from(VIZ_BUCKETS_PER_SEC);
-    if peaks.is_empty() || !t_secs.is_finite() || !(0.0..=duration).contains(&t_secs) {
-        for col in 0..w {
-            y[center * w + col] = 220;
-        }
-        return (y, u, v);
-    }
-    let per_sec = f64::from(VIZ_BUCKETS_PER_SEC);
-    let window = if flags & VIZ_FAST != 0 { 0.4 } else { VIZ_WINDOW_SECS };
-    // The window, clamped to the peaks that exist: a frame near either end
-    // looks past the file's edge, and draws the part of the window that is
-    // real rather than padding it out.
-    let first = (((t_secs - window / 2.0).max(0.0) * per_sec).floor() as usize)
-        .min(peaks.len() - 1);
-    let last = ((((t_secs + window / 2.0).min(duration) * per_sec).ceil() as usize)
-        .clamp(first + 1, peaks.len()))
-    .min(peaks.len());
-    let span = (last - first) as f64;
-    let scale = center as f32;
-    let smooth = flags & VIZ_SMOOTH != 0;
-    let outline = flags & VIZ_OUTLINE != 0;
+    let (bg_y, bg_u, bg_v) = rgb_yuv(8, 12, 22);
+    let mut y = vec![bg_y; w * h];
+    let mut u = vec![bg_u; cw * ch];
+    let mut v = vec![bg_v; cw * ch];
+    let (ink_r, ink_g, ink_b) = viz_ink_rgb(viz_hue(flags));
+    let (ink_y, ink_u, ink_v) = rgb_yuv(ink_r as i32, ink_g as i32, ink_b as i32);
+    let center = h as f32 / 2.0;
+    let half = h as f32 * 0.42;
+    let t_secs = if t_secs.is_finite() { t_secs } else { 0.0 };
+
+    let z = (center.round() as isize).clamp(0, h as isize - 1) as usize;
     for col in 0..w {
-        // The buckets this column draws: at least one, whatever the window's
-        // width is against the picture's -- a short clip stretches, a long
-        // one condenses, and neither leaves a column with nothing.
-        let b0 = first + (col as f64 * span / w as f64).floor() as usize;
-        let b1 = first
-            + (((col + 1) as f64 * span / w as f64).ceil() as usize)
-                .clamp(b0 - first + 1, last - first);
-        let (s0, s1) = if smooth {
-            (b0.saturating_sub(1), (b1 + 1).min(peaks.len()))
+        y[z * w + col] = y[z * w + col].max(bg_y.saturating_add(18));
+    }
+
+    let mut lo = vec![0.0f32; w];
+    let mut hi = vec![0.0f32; w];
+    let mut sig = vec![0.0f32; w];
+    if !peaks.is_empty() {
+        let duration = peaks.len() as f64 / f64::from(VIZ_BUCKETS_PER_SEC);
+        let per_sec = f64::from(VIZ_BUCKETS_PER_SEC);
+        let window = if flags & VIZ_FAST != 0 {
+            VIZ_FAST_SECS
         } else {
-            (b0, b1)
+            VIZ_WINDOW_SECS
         };
-        let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
-        for &(min, max) in &peaks[s0..s1] {
-            lo = lo.min(min);
-            hi = hi.max(max);
+        let first = (((t_secs - window / 2.0).max(0.0) * per_sec).floor() as usize)
+            .min(peaks.len() - 1);
+        let last = ((((t_secs + window / 2.0).min(duration) * per_sec).ceil() as usize)
+            .clamp(first + 1, peaks.len()))
+        .min(peaks.len());
+        let span = (last - first) as f64;
+        let pair = |i: usize| peaks[i.min(peaks.len() - 1)];
+        let signed = |i: usize| {
+            let (a, b) = pair(i);
+            if b.abs() >= a.abs() {
+                b
+            } else {
+                a
+            }
+        };
+        for col in 0..w {
+            let pos = first as f64 + (col as f64 + 0.5) * span / w as f64;
+            let i = pos.floor() as usize;
+            let f = (pos - i as f64) as f32;
+            let (lo0, hi0) = pair(i);
+            let (lo1, hi1) = pair(i.saturating_add(1));
+            lo[col] = (lo0 + (lo1 - lo0) * f).clamp(-1.0, 0.0);
+            hi[col] = (hi0 + (hi1 - hi0) * f).clamp(0.0, 1.0);
+            sig[col] = signed(i) + (signed(i.saturating_add(1)) - signed(i)) * f;
         }
-        // Mirrored around the center: maxima up, minima down, silence a line.
-        let top = (scale - hi * scale).round();
-        let bottom = (scale - lo * scale).round();
-        let top = (top as isize).clamp(0, h as isize - 1) as usize;
-        let bottom = (bottom as isize).clamp(top as isize, h as isize - 1) as usize;
-        if outline {
-            y[top * w + col] = 220;
-            y[bottom * w + col] = 220;
-        } else {
-            for row in top..=bottom {
-                y[row * w + col] = 220;
+    }
+
+    match viz_style(flags) {
+        VIZ_STYLE_RIBBON => {
+            let tau = std::f64::consts::TAU;
+            let travel = t_secs * 1.35;
+            for col in 0..w {
+                let env = lo[col].abs().max(hi[col]).max(0.08);
+                let x_phase = (col as f64 / w.max(1) as f64) * 2.15 * tau;
+                for s in 0..16 {
+                    let frac = s as f32 / 15.0;
+                    let scale = 0.32 + 0.68 * frac;
+                    let wave = (x_phase + travel + s as f64 * 0.07).sin() as f32;
+                    let row = (center + half * env * scale * wave).round() as i32;
+                    viz_stamp(
+                        &mut y, &mut u, &mut v, w, h, cw, ch, col as i32, row, 1.0, bg_y, ink_y,
+                        ink_u, ink_v,
+                    );
+                    viz_stamp(
+                        &mut y, &mut u, &mut v, w, h, cw, ch, col as i32, row - 1, 0.4, bg_y,
+                        ink_y, ink_u, ink_v,
+                    );
+                    viz_stamp(
+                        &mut y, &mut u, &mut v, w, h, cw, ch, col as i32, row + 1, 0.4, bg_y,
+                        ink_y, ink_u, ink_v,
+                    );
+                }
             }
         }
-    }
-    if flags & VIZ_TINT != 0 {
-        // Cyan on the ink, black stays black: chroma follows luma so a
-        // grade still reaches the bars around it.
-        for cy in 0..ch {
-            for cx in 0..cw {
-                let ink = y[cy * 2 * w + cx * 2] > 16
-                    || y[cy * 2 * w + cx * 2 + 1] > 16
-                    || y[(cy * 2 + 1).min(h - 1) * w + cx * 2] > 16;
-                if ink {
-                    u[cy * cw + cx] = 80;
-                    v[cy * cw + cx] = 80;
+        VIZ_STYLE_FILL => {
+            for col in 0..w {
+                let top = (center - hi[col] * half).round() as i32;
+                let bot = (center - lo[col] * half).round() as i32;
+                viz_line(
+                    &mut y, &mut u, &mut v, w, h, cw, ch, col as i32, top, col as i32, bot, bg_y,
+                    ink_y, ink_u, ink_v,
+                );
+            }
+        }
+        _ => {
+            // Signed peak of each column, connected: the Audacity trace.
+            // Min/max bars are Fill; this is the sample path.
+            let mut prev: Option<(i32, i32)> = None;
+            for col in 0..w {
+                let y_pt = (center - sig[col] * half).round() as i32;
+                let x = col as i32;
+                if let Some((px, py)) = prev {
+                    viz_line(
+                        &mut y, &mut u, &mut v, w, h, cw, ch, px, py, x, y_pt, bg_y, ink_y, ink_u,
+                        ink_v,
+                    );
                 }
+                prev = Some((x, y_pt));
             }
         }
     }
@@ -1832,6 +1991,48 @@ mod tests {
             "dropping a parked stream deadlocked: it joined a decode thread \
              while still holding the receiver that thread is waiting on"
         );
+    }
+
+    #[test]
+    fn visualizer_paints_a_trace_not_a_filled_block() {
+        // 4000 buckets/sec * 2s window around t=1.
+        let mut peaks = vec![(0.0, 0.0); 12_000];
+        for (i, p) in peaks.iter_mut().enumerate() {
+            let a = ((i as f32 / 9.0) * std::f32::consts::TAU).sin() * 0.8;
+            *p = (a.min(0.0), a.max(0.0));
+        }
+        let wave = 1u8;
+        let (y, u, v) = visualizer_i420(&peaks, 1.0, 320, 180, wave);
+        let ink = y.iter().filter(|&&p| p > 40).count();
+        assert!(ink > 80, "trace missing: {ink} ink pixels");
+        assert!(
+            ink < y.len() / 4,
+            "filled block, not a trace: {ink}/{}",
+            y.len()
+        );
+        let mut gold = 0usize;
+        for i in 0..u.len() {
+            if u[i] < 110 && v[i] > 135 {
+                gold += 1;
+            }
+        }
+        assert!(gold > 10, "default ink was not gold: {gold}");
+
+        let fill = with_viz_style(wave, VIZ_STYLE_FILL);
+        let (yf, _, _) = visualizer_i420(&peaks, 1.0, 320, 180, fill);
+        let fill_ink = yf.iter().filter(|&&p| p > 40).count();
+        assert!(fill_ink > 80, "fill missing: {fill_ink}");
+
+        let hue = with_viz_hue(wave, 8);
+        let (_, u2, v2) = visualizer_i420(&peaks, 1.0, 64, 32, hue);
+        let mut shifted = 0usize;
+        for i in 0..u2.len() {
+            if u2[i] > 130 && v2[i] < 120 {
+                shifted += 1;
+            }
+        }
+        assert!(shifted > 2, "hue 8 did not move off gold");
+
     }
 }
 

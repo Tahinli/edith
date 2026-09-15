@@ -203,6 +203,46 @@ impl Player {
         cx.notify();
     }
 
+    pub(crate) fn set_viz_style(&mut self, style: u8, cx: &mut Context<Self>) {
+        let Some((lane, idx)) = self.selected.anchor() else {
+            return;
+        };
+        let Some(session) = &mut self.session else {
+            return;
+        };
+        let Some(clip) = session.lane_clips(lane).get(idx).copied() else {
+            return;
+        };
+        if clip.visualizer & 1 == 0 {
+            return;
+        }
+        let next = engine::decode::with_viz_style(clip.visualizer, style);
+        if next != clip.visualizer && session.set_visualizer(lane, idx, next) {
+            self.reset_after_reseek();
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn set_viz_hue(&mut self, hue: u8, cx: &mut Context<Self>) {
+        let Some((lane, idx)) = self.selected.anchor() else {
+            return;
+        };
+        let Some(session) = &mut self.session else {
+            return;
+        };
+        let Some(clip) = session.lane_clips(lane).get(idx).copied() else {
+            return;
+        };
+        if clip.visualizer & 1 == 0 {
+            return;
+        }
+        let next = engine::decode::with_viz_hue(clip.visualizer, hue);
+        if next != clip.visualizer && session.set_visualizer(lane, idx, next) {
+            self.reset_after_reseek();
+        }
+        cx.notify();
+    }
+
     /// Takes a library row's file out of the list, which is the one thing a row
     /// can lose. Refused in the engine's own words while clips still play from
     /// it -- and those words name the lanes holding them, so the refusal says
