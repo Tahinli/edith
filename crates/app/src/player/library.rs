@@ -242,6 +242,21 @@ impl Player {
         });
     }
 
+    pub(crate) fn drag_viz_hs(&mut self, at: gpui::Point<Pixels>, cx: &mut Context<Self>) {
+        let b = self.viz_wheel.get();
+        let w = f32::from(b.size.width).max(1.);
+        let h = f32::from(b.size.height).max(1.);
+        let dx = f32::from(at.x - b.origin.x) - w / 2.;
+        let dy = h / 2. - f32::from(at.y - b.origin.y);
+        let radius = w.min(h) / 2.;
+        let r = (dx * dx + dy * dy).sqrt() / radius;
+        let sat = (r.clamp(0., 1.) * 255.).round() as u8;
+        let ang = dx.atan2(dy).to_degrees();
+        let hue_deg = (ang + 360.) % 360.;
+        let hue = (hue_deg / 360. * 256.).round() as u16 as u8;
+        self.set_viz_hs(hue, sat, cx);
+    }
+
     pub(crate) fn set_viz_strands(&mut self, n: u8, cx: &mut Context<Self>) {
         self.set_viz_paint_with(cx, |p| engine::decode::with_viz_paint_strands(p, n));
     }
@@ -484,6 +499,7 @@ impl Player {
         self.eq_dragging = false;
         self.speed_dragging = false;
         self.color_dragging = false;
+        self.viz_hs_dragging = false;
         self.pending_color = None;
         self.transform_dragging = false;
         self.pending_transform = None;

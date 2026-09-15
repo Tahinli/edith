@@ -2103,6 +2103,14 @@ impl Player {
             }
             return;
         }
+        if self.viz_hs_dragging {
+            if event.pressed_button == Some(MouseButton::Left) {
+                self.drag_viz_hs(event.position, cx);
+            } else {
+                self.viz_hs_dragging = false;
+            }
+            return;
+        }
         // The transform card's sliders, [`Self::color_dragging`]'s own reason.
         if self.transform_dragging {
             if event.pressed_button == Some(MouseButton::Left) {
@@ -2217,6 +2225,10 @@ impl Player {
             // still busy -- the sample above would only be held.
             self.drag_color(event.position.x, false, cx);
             self.flush_drag(cx);
+            return;
+        }
+        if std::mem::take(&mut self.viz_hs_dragging) {
+            self.drag_viz_hs(event.position, cx);
             return;
         }
         if std::mem::take(&mut self.transform_dragging) {
