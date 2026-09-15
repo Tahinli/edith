@@ -223,7 +223,36 @@ impl Player {
         cx.notify();
     }
 
+    pub(crate) fn viz_paint(&self) -> u32 {
+        self.selected
+            .anchor()
+            .and_then(|(lane, idx)| {
+                self.session
+                    .as_ref()?
+                    .lane_clips(lane)
+                    .get(idx)
+                    .map(|c| c.viz_paint)
+            })
+            .unwrap_or(0)
+    }
+
     pub(crate) fn set_viz_hue(&mut self, hue: u8, cx: &mut Context<Self>) {
+        self.set_viz_paint_with(cx, |p| engine::decode::with_viz_paint_hue(p, hue));
+    }
+
+    pub(crate) fn set_viz_sat(&mut self, sat: u8, cx: &mut Context<Self>) {
+        self.set_viz_paint_with(cx, |p| engine::decode::with_viz_paint_sat(p, sat));
+    }
+
+    pub(crate) fn set_viz_strands(&mut self, n: u8, cx: &mut Context<Self>) {
+        self.set_viz_paint_with(cx, |p| engine::decode::with_viz_paint_strands(p, n));
+    }
+
+    pub(crate) fn set_viz_glow(&mut self, n: u8, cx: &mut Context<Self>) {
+        self.set_viz_paint_with(cx, |p| engine::decode::with_viz_paint_glow(p, n));
+    }
+
+    fn set_viz_paint_with(&mut self, cx: &mut Context<Self>, f: impl FnOnce(u32) -> u32) {
         let Some((lane, idx)) = self.selected.anchor() else {
             return;
         };
@@ -236,8 +265,8 @@ impl Player {
         if clip.visualizer & 1 == 0 {
             return;
         }
-        let next = engine::decode::with_viz_hue(clip.visualizer, hue);
-        if next != clip.visualizer && session.set_visualizer(lane, idx, next) {
+        let next = f(clip.viz_paint);
+        if next != clip.viz_paint && session.set_viz_paint(lane, idx, next) {
             self.reset_after_reseek();
         }
         cx.notify();

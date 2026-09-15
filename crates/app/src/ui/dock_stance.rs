@@ -189,7 +189,7 @@ fn dock_tab(
         .children(hitmap::control(id, label_text, true))
         .child(
             div()
-                .font(style.font)
+                .font(style.font.clone())
                 .text_size(style.size)
                 .text_color(rgb(if active { INK1() } else { INK3() }))
                 .child(label_text),
@@ -201,7 +201,7 @@ fn section_head(text: impl Into<SharedString>) -> impl IntoElement {
     let style = head();
     div()
         .flex_none()
-        .font(style.font)
+        .font(style.font.clone())
         .text_size(style.size)
         .text_color(rgb(INK3()))
         .child(text.into())
@@ -449,7 +449,7 @@ fn source_row(
                         // usage moved down to the metadata line.
                         .min_w(relative(0.6))
                         .truncate()
-                        .font(style.font)
+                        .font(style.font.clone())
                         .text_size(style.size)
                         .text_color(rgb(INK1()))
                         .child(name)
@@ -526,7 +526,7 @@ fn source_row(
             div()
                 .pl(px(14.))
                 .truncate()
-                .font(style.font)
+                .font(style.font.clone())
                 .text_size(style.size)
                 .text_color(rgb(INK3()))
                 .child(under)
@@ -1022,7 +1022,7 @@ fn sources_tab(
                 .id("dock-filter")
                 .flex_none()
                 .cursor_text()
-                .font(style.font)
+                .font(style.font.clone())
                 .text_size(style.size)
                 .text_color(rgb(if player.dock_filter_edit {
                     INK1()
@@ -1059,7 +1059,7 @@ fn sources_tab(
                     let style = label(type_scale::LABEL_ROW_PX, FontWeight::MEDIUM);
                     d.child(
                         div()
-                            .font(style.font)
+                            .font(style.font.clone())
                             .text_size(style.size)
                             .text_color(rgb(INK3()))
                             // One noun for both empties -- nothing imported and
@@ -1187,34 +1187,17 @@ fn transition_row(player: &Player, cx: &mut Context<Player>) -> Option<impl Into
 /// these onto. Drag-while-playing and every other gesture on a row is
 /// whatever that card already does; nothing about the gesture is reimplemented
 /// here.
-const VIZ_HUE_IDS: [&str; 16] = [
-    "dock-viz-hue-0",
-    "dock-viz-hue-1",
-    "dock-viz-hue-2",
-    "dock-viz-hue-3",
-    "dock-viz-hue-4",
-    "dock-viz-hue-5",
-    "dock-viz-hue-6",
-    "dock-viz-hue-7",
-    "dock-viz-hue-8",
-    "dock-viz-hue-9",
-    "dock-viz-hue-10",
-    "dock-viz-hue-11",
-    "dock-viz-hue-12",
-    "dock-viz-hue-13",
-    "dock-viz-hue-14",
-    "dock-viz-hue-15",
-];
-
 fn viz_style_verbs(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
-    let flags = player.selected.anchor().and_then(|(lane, idx)| {
+    let clip = player.selected.anchor().and_then(|(lane, idx)| {
         let session = player.session.as_ref()?;
         let clip = session.lane_clips(lane).get(idx)?;
-        (clip.visualizer & 1 != 0).then_some(clip.visualizer)
+        (clip.visualizer & 1 != 0).then_some(*clip)
     });
-    let Some(flags) = flags else {
+    let Some(clip) = clip else {
         return div().id("dock-viz-styles");
     };
+    let flags = clip.visualizer;
+    let paint = clip.viz_paint;
     let pick = |id: &'static str, label_text: &'static str, style: u8, on: bool| {
         let row = label(type_scale::LABEL_ROW_PX, FontWeight::MEDIUM);
         div()
@@ -1250,7 +1233,7 @@ fn viz_style_verbs(player: &Player, cx: &mut Context<Player>) -> impl IntoElemen
             .items_center()
             .cursor_pointer()
             .text_color(rgb(if on { INK1() } else { INK3() }))
-            .font(style.font)
+            .font(style.font.clone())
             .text_size(style.size)
             .children(hitmap::control(id, label_text, true))
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
@@ -1299,82 +1282,168 @@ fn viz_style_verbs(player: &Player, cx: &mut Context<Player>) -> impl IntoElemen
             engine::decode::VIZ_FAST,
             flags & engine::decode::VIZ_FAST != 0,
         ))
-        .child(viz_hue_row(flags, cx))
+        .child(viz_paint_knobs(paint, cx))
 }
 
-fn viz_hue_row(flags: u8, cx: &mut Context<Player>) -> impl IntoElement {
-    let hue = engine::decode::viz_hue(flags);
-    let style = label(type_scale::LABEL_ROW_PX, FontWeight::MEDIUM);
-    let step = |id: &'static str, glyph: &'static str, by: i8, cx: &mut Context<Player>| {
-        div()
-            .id(id)
-            .flex()
-            .w(px(HIT_MIN))
-            .h(px(HIT_MIN))
-            .items_center()
-            .justify_center()
-            .rounded(px(3.))
-            .bg(rgb(DARK_RAISED()))
-            .cursor_pointer()
-            .children(hitmap::control(id, "Colour", true))
-            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                let cur = this
-                    .selected
-                    .anchor()
-                    .and_then(|(lane, idx)| {
-                        this.session
-                            .as_ref()?
-                            .lane_clips(lane)
-                            .get(idx)
-                            .map(|c| engine::decode::viz_hue(c.visualizer))
-                    })
-                    .unwrap_or(0);
-                this.set_viz_hue((cur as i16 + i16::from(by)).rem_euclid(16) as u8, cx);
-            }))
-            .child(glyph)
-    };
+fn viz_step(
+    id: &'static str,
+    glyph: &'static str,
+    cx: &mut Context<Player>,
+    f: impl Fn(&mut Player, &mut Context<Player>) + 'static + Copy,
+) -> impl IntoElement {
     div()
-        .id("dock-viz-hue")
-        .flex_none()
+        .id(id)
         .flex()
+        .w(px(HIT_MIN))
+        .h(px(HIT_MIN))
         .items_center()
+        .justify_center()
+        .rounded(px(3.))
+        .bg(rgb(DARK_RAISED()))
+        .cursor_pointer()
+        .children(hitmap::control(id, glyph, true))
+        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| f(this, cx)))
+        .child(glyph)
+}
+
+fn viz_paint_knobs(paint: u32, cx: &mut Context<Player>) -> impl IntoElement {
+    let hue = engine::decode::viz_hue_ui(paint);
+    let sat = engine::decode::viz_sat_ui(paint);
+    let strands = engine::decode::viz_strands_of(paint);
+    let glow = engine::decode::viz_glow_of(paint);
+    let style = label(type_scale::LABEL_ROW_PX, FontWeight::MEDIUM);
+    div()
+        .flex()
+        .flex_col()
         .gap(px(4.))
-        .h(px(CONTROL_H))
         .px(px(8.))
         .child(
             div()
-                .font(style.font)
-                .text_size(style.size)
-                .text_color(rgb(INK2()))
-                .child("Colour"),
-        )
-        .child(step("dock-viz-hue-minus", "−", -1, cx))
-        .child(
-            div()
-                .id("dock-viz-hue-swatches")
-                .flex_1()
+                .id("dock-viz-hue")
                 .flex()
-                .gap(px(2.))
-                .children((0u8..16).map(|i| {
-                    let (r, g, b) = engine::decode::viz_ink_rgb(i);
-                    let color = (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b);
+                .items_center()
+                .gap(px(4.))
+                .h(px(CONTROL_H))
+                .child(
                     div()
-                        .id(("dock-viz-hue", u64::from(i)))
+                        .font(style.font.clone())
+                        .text_size(style.size)
+                        .text_color(rgb(INK2()))
+                        .child("Colour"),
+                )
+                .child(viz_step("dock-viz-hue-minus", "−", cx, |this, cx| {
+                    this.set_viz_hue(engine::decode::viz_hue_ui(this.viz_paint()).wrapping_sub(4), cx);
+                }))
+                .child(
+                    div()
+                        .id("dock-viz-hue-bar")
                         .flex_1()
+                        .flex()
                         .h(px(14.))
-                        .min_w(px(8.))
-                        .rounded(px(2.))
-                        .bg(rgb(color))
-                        .when(i == hue, |d| d.border_1().border_color(rgb(INK1())))
-                        .cursor_pointer()
-                        .children(hitmap::control(VIZ_HUE_IDS[i as usize], "Colour", true))
-                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                            this.set_viz_hue(i, cx);
-                        }))
-                        .into_any_element()
+                        .children((0u8..64).map(|i| {
+                            let h = i.saturating_mul(4);
+                            let (r, g, b) = engine::decode::viz_ink_from_paint(
+                                engine::decode::with_viz_paint_hue(paint, h),
+                            );
+                            let color = (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b);
+                            div()
+                                .id(("dock-viz-hue", u64::from(i)))
+                                .flex_1()
+                                .h_full()
+                                .bg(rgb(color))
+                                .when(hue.abs_diff(h) < 3, |d| d.border_1().border_color(rgb(INK1())))
+                                .cursor_pointer()
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    this.set_viz_hue(h, cx);
+                                }))
+                                .into_any_element()
+                        })),
+                )
+                .child(viz_step("dock-viz-hue-plus", "+", cx, |this, cx| {
+                    this.set_viz_hue(engine::decode::viz_hue_ui(this.viz_paint()).wrapping_add(4), cx);
                 })),
         )
-        .child(step("dock-viz-hue-plus", "+", 1, cx))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(4.))
+                .h(px(CONTROL_H))
+                .child(
+                    div()
+                        .font(style.font.clone())
+                        .text_size(style.size)
+                        .text_color(rgb(INK2()))
+                        .child("Sat"),
+                )
+                .child(viz_step("dock-viz-sat-minus", "−", cx, |this, cx| {
+                    this.set_viz_sat(engine::decode::viz_sat_ui(this.viz_paint()).saturating_sub(16), cx);
+                }))
+                .child(
+                    div()
+                        .font(style.font.clone())
+                        .text_size(style.size)
+                        .text_color(rgb(INK1()))
+                        .child(format!("{sat}")),
+                )
+                .child(viz_step("dock-viz-sat-plus", "+", cx, |this, cx| {
+                    this.set_viz_sat(engine::decode::viz_sat_ui(this.viz_paint()).saturating_add(16).min(255), cx);
+                })),
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(4.))
+                .h(px(CONTROL_H))
+                .child(
+                    div()
+                        .font(style.font.clone())
+                        .text_size(style.size)
+                        .text_color(rgb(INK2()))
+                        .child("Strands"),
+                )
+                .child(viz_step("dock-viz-strands-minus", "−", cx, |this, cx| {
+                    this.set_viz_strands(engine::decode::viz_strands_of(this.viz_paint()).saturating_sub(1).max(1), cx);
+                }))
+                .child(
+                    div()
+                        .font(style.font.clone())
+                        .text_size(style.size)
+                        .text_color(rgb(INK1()))
+                        .child(format!("{strands}")),
+                )
+                .child(viz_step("dock-viz-strands-plus", "+", cx, |this, cx| {
+                    this.set_viz_strands(engine::decode::viz_strands_of(this.viz_paint()).saturating_add(1).min(32), cx);
+                })),
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(4.))
+                .h(px(CONTROL_H))
+                .child(
+                    div()
+                        .font(style.font.clone())
+                        .text_size(style.size)
+                        .text_color(rgb(INK2()))
+                        .child("Glow"),
+                )
+                .child(viz_step("dock-viz-glow-minus", "−", cx, |this, cx| {
+                    this.set_viz_glow(engine::decode::viz_glow_of(this.viz_paint()).saturating_sub(1), cx);
+                }))
+                .child(
+                    div()
+                        .font(style.font.clone())
+                        .text_size(style.size)
+                        .text_color(rgb(INK1()))
+                        .child(format!("{glow}")),
+                )
+                .child(viz_step("dock-viz-glow-plus", "+", cx, |this, cx| {
+                    this.set_viz_glow(engine::decode::viz_glow_of(this.viz_paint()).saturating_add(1).min(16), cx);
+                })),
+        )
 }
 
 fn clip_tab(
@@ -1614,7 +1683,7 @@ fn keys_tab(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
                 .id("dock-keys-filter")
                 .flex_none()
                 .cursor_text()
-                .font(style.font)
+                .font(style.font.clone())
                 .text_size(style.size)
                 .text_color(rgb(INK1()))
                 .children(hitmap::control("dock.keys-filter", "Filter keys", true))

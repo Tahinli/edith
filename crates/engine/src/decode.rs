@@ -56,6 +56,7 @@ pub enum Backend {
     /// A gap: black frames, nothing decoded at all.
     Gap,
     /// A waveform visualizer: the picture is painted from the audio's peaks
+    /// A waveform viz_paint: 0,
     /// ([`visualizer_i420`]), no decoder seat and no stream of pictures at all.
     Visualizer,
 }
@@ -629,6 +630,7 @@ impl DecodeSession {
         transform: TransformParams,
         canvas: Composer,
         flags: u8,
+        paint: u32,
     ) -> crate::Result<FrameStream> {
         let (tx, rx) = sync_channel(2);
         let cancel = Arc::new(AtomicBool::new(false));
@@ -679,7 +681,7 @@ impl DecodeSession {
                         return;
                     }
                     let t = f64::from(start_frame + index) / fps;
-                    let (y, u, v) = visualizer_i420(&peaks, t, width, height, flags);
+                    let (y, u, v) = visualizer_i420(&peaks, t, width, height, flags, paint);
                     let frame = render.frame(start_frame + index, &y, &u, &v, width, height);
                     if tx.send(frame).is_err() {
                         return; // caller moved on
@@ -1444,6 +1446,65 @@ pub fn viz_ink_rgb(hue: u8) -> (u8, u8, u8) {
     hsv_to_rgb(212.0 + f32::from(hue & 15) * 22.5, 0.63, 0.84)
 }
 
+pub fn viz_ink_from_paint(paint: u32) -> (u8, u8, u8) {
+    if paint == 0 {
+        return hsv_to_rgb(212.0, 0.63, 0.84);
+    }
+    let hue = (paint & 0xFF) as f32 * 360.0 / 256.0;
+    let sat_b = ((paint >> 8) & 0xFF) as u8;
+    let sat = if sat_b == 0 { 0.63 } else { f32::from(sat_b) / 255.0 };
+    hsv_to_rgb(hue, sat, 0.84)
+}
+
+pub fn viz_strands_of(paint: u32) -> u8 {
+    match ((paint >> 16) & 0xFF) as u8 {
+        0 => 8,
+        n => n.clamp(1, 32),
+    }
+}
+
+pub fn viz_glow_of(paint: u32) -> u8 {
+    match ((paint >> 24) & 0xFF) as u8 {
+        0 => 2,
+        n => n.min(16),
+    }
+}
+
+pub fn with_viz_paint_hue(paint: u32, hue: u8) -> u32 {
+    let sat = match (paint >> 8) & 0xFF {
+        0 => 255,
+        s => s,
+    };
+    (paint & !0xFF) | u32::from(hue) | (sat << 8)
+}
+
+pub fn with_viz_paint_sat(paint: u32, sat: u8) -> u32 {
+    (paint & !(0xFF << 8)) | (u32::from(sat.max(1)) << 8)
+}
+
+pub fn with_viz_paint_strands(paint: u32, n: u8) -> u32 {
+    (paint & !(0xFF << 16)) | (u32::from(n.clamp(1, 32)) << 16)
+}
+
+pub fn with_viz_paint_glow(paint: u32, n: u8) -> u32 {
+    (paint & !(0xFF << 24)) | (u32::from(n.min(16)) << 24)
+}
+
+pub fn viz_hue_ui(paint: u32) -> u8 {
+    if paint == 0 { 150 } else { (paint & 0xFF) as u8 }
+}
+
+pub fn viz_sat_ui(paint: u32) -> u8 {
+    if paint == 0 {
+        160
+    } else {
+        match ((paint >> 8) & 0xFF) as u8 {
+            0 => 160,
+            s => s,
+        }
+    }
+}
+
 fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (u8, u8, u8) {
     let h = ((h % 360.0) + 360.0) % 360.0;
     let c = v * s;
@@ -1607,6 +1668,7 @@ pub(crate) fn visualizer_i420(
     width: u32,
     height: u32,
     flags: u8,
+    paint: u32,
 ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     let width = width & !1;
     let height = height & !1;
@@ -1616,7 +1678,7 @@ pub(crate) fn visualizer_i420(
     let mut y = vec![bg_y; w * h];
     let mut u = vec![bg_u; cw * ch];
     let mut v = vec![bg_v; cw * ch];
-    let (ink_r, ink_g, ink_b) = viz_ink_rgb(viz_hue(flags));
+    let (ink_r, ink_g, ink_b) = viz_ink_from_paint(paint);
     let (ink_y, ink_u, ink_v) = rgb_yuv(ink_r as i32, ink_g as i32, ink_b as i32);
     let center = h as f32 / 2.0;
     let half = h as f32 * 0.42;
@@ -1669,15 +1731,18 @@ pub(crate) fn visualizer_i420(
             let f = (pos - i as f64) as f32;
             sig[col] = signed(i) + (signed(i.saturating_add(1)) - signed(i)) * f;
         }
-        let peak = lo
+        // Whole-file peak, not the window's: a 2s window that gains or loses
+        // a loud hit used to rescale every column, so the same bump changed
+        // height as it entered and left the picture.
+        let peak = peaks
             .iter()
-            .zip(&hi)
-            .map(|(l, h)| l.abs().max(h.abs()))
+            .map(|&(l, h)| l.abs().max(h.abs()))
             .fold(0.0f32, f32::max);
         if peak > 1e-4 {
             for i in 0..w {
                 lo[i] /= peak;
                 hi[i] /= peak;
+                sig[i] /= peak;
             }
         }
         viz_smooth(&mut lo, &mut hi);
@@ -1691,8 +1756,8 @@ pub(crate) fn visualizer_i420(
             for col in 0..w {
                 let env = lo[col].abs().max(hi[col]).max(0.06);
                 let x_phase = (col as f64 / w.max(1) as f64) * 2.15 * tau;
-                for s in 0..24 {
-                    let frac = s as f32 / 23.0;
+                for s in 0..u32::from(viz_strands_of(paint)).max(1) {
+                    let frac = s as f32 / (viz_strands_of(paint).max(2) as f32 - 1.0);
                     let scale = 0.28 + 0.72 * frac;
                     let wave = (x_phase + travel + s as f64 * 0.05).sin() as f32;
                     let row = (center + half * env * scale * wave).round() as i32;
@@ -1718,8 +1783,12 @@ pub(crate) fn visualizer_i420(
             let amp = (w.min(h) as f32) * 0.18;
             let tau = std::f32::consts::TAU;
             let steps = w.max(h) * 4;
-            for strand in 0..8u8 {
-                let (ir, ig, ib) = viz_ink_rgb(viz_hue(flags).wrapping_add(if strand < 4 { 0 } else { 8 }));
+            for strand in 0..viz_strands_of(paint) {
+                let (ir, ig, ib) = viz_ink_from_paint(if strand < viz_strands_of(paint) / 2 {
+                    paint
+                } else {
+                    with_viz_paint_hue(paint, viz_hue_ui(paint).wrapping_add(128))
+                });
                 let (iy, iu, iv) = rgb_yuv(ir as i32, ig as i32, ib as i32);
                 let scale = 0.65 + 0.35 * f32::from(strand % 4) / 3.0;
                 let phase = f32::from(strand) * 0.35;
@@ -2104,7 +2173,7 @@ mod tests {
             *p = (-a.abs(), a.abs());
         }
         let flags = 1u8;
-        let (y, u, v) = visualizer_i420(&peaks, 1.0, 320, 180, flags);
+        let (y, u, v) = visualizer_i420(&peaks, 1.0, 320, 180, flags, 0);
         let ink = y.iter().filter(|&&p| p > 40).count();
         assert!(ink > 200, "envelope missing: {ink}");
         assert!(ink < y.len() * 9 / 10, "solid frame, not an envelope: {ink}");
@@ -2117,13 +2186,13 @@ mod tests {
         assert!(blue > 10, "default ink was not timeline blue: {blue}");
 
         let ring = with_viz_style(flags, VIZ_STYLE_RING);
-        let (yr, _, _) = visualizer_i420(&peaks, 1.0, 320, 180, ring);
+        let (yr, _, _) = visualizer_i420(&peaks, 1.0, 320, 180, ring, 0);
         let ring_ink = yr.iter().filter(|&&p| p > 40).count();
         assert!(ring_ink > 80, "ring missing: {ring_ink}");
         assert!(ring_ink < ink, "ring should be a stroke, not a fill");
 
-        let hue = with_viz_hue(flags, 8);
-        let (_, u2, v2) = visualizer_i420(&peaks, 1.0, 64, 32, hue);
+        let hue_paint = with_viz_paint_hue(0, 40);
+        let (_, u2, v2) = visualizer_i420(&peaks, 1.0, 64, 32, flags, hue_paint);
         let mut shifted = 0usize;
         for i in 0..u2.len() {
             if u2[i] < 120 && v2[i] > 130 {

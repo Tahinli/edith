@@ -864,6 +864,7 @@ fn export_bench(path: &Path, seat: &str, out_dir: &Path) {
         fade_out: 0,
         transition_out: 0,
         visualizer: 0,
+        viz_paint: 0,
         start: 0,
         in_frame,
         out_frame: in_frame + span,

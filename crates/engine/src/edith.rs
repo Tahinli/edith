@@ -118,7 +118,7 @@
 //! its fit policy already placed.
 //!
 //! A lane line is `<kind> <lane> <start> <in> <out> <source> <link> <eq>
-//! <color> <fit> <speed> <fade_in> <fade_out> <transition_out> <transform> <visualizer>`:
+//! <color> <fit> <speed> <fade_in> <fade_out> <transition_out> <transform> <visualizer> <viz_paint>`:
 //! which lane the clip is on -- its kind and its 1-based number
 //! among the lanes of that kind, the [`crate::project::Lane::label`] a header
 //! column shows -- then where the clip sits on the timeline, the half-open
@@ -205,7 +205,7 @@
 //! nothing, and an older one plays everything at real time, and an older one
 //! mixes flat, and an older one shows no subtitles, and an older one is shown
 //! in the reference rendition, and an older one places none of the words it
-//! names -- and saving any of them writes v21. An older
+//! names -- and saving any of them writes v22. An older
 //! reader refuses a newer file by name.
 //!
 //! Text because an edit list is a few integers and a path, and a path is
@@ -242,7 +242,8 @@ use crate::transform::TransformParams;
 
 /// What [`save`] writes. Read support goes back to `edith 1`; see the module
 /// docs for what those dialects looked like.
-const MAGIC: &[u8] = b"edith 21";
+const MAGIC: &[u8] = b"edith 22";
+const MAGIC_V21: &[u8] = b"edith 21";
 const MAGIC_V20: &[u8] = b"edith 20";
 const MAGIC_V19: &[u8] = b"edith 19";
 const MAGIC_V18: &[u8] = b"edith 18";
@@ -595,7 +596,7 @@ fn emit(
             let transform = c.transform.map_or("-".to_string(), |e| e.to_string());
             out.extend_from_slice(
                 format!(
-                    "{keyword} {ord} {} {} {} {} {link} {eq} {color} {} {} {} {} {} {transform} {}\n",
+                    "{keyword} {ord} {} {} {} {} {link} {eq} {color} {} {} {} {} {} {transform} {} {}\n",
                     c.start,
                     c.in_frame,
                     c.out_frame,
@@ -606,6 +607,7 @@ fn emit(
                     c.fade_out,
                     c.transition_out,
                     c.visualizer,
+                    c.viz_paint,
                 )
                 .as_bytes(),
             );
@@ -648,8 +650,10 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
     // The dialects that wrote a source line without its stream field. Reading
     // one is the whole of what "an old project still opens" means here.
     let streamless = v1 || first == MAGIC_V2;
+    // The one that carries packed visualizer paint (hue/sat/strands/glow)...
+    let v22 = first == MAGIC;
     // The one that carries per-clip visualizer flags...
-    let v21 = first == MAGIC;
+    let v21 = v22 || first == MAGIC_V21;
     // The one that carries a per-clip transform (position/scale/rotate/crop)...
     let v20 = v21 || first == MAGIC_V20;
     // ...the one that carries a per-clip cross-dissolve into its successor...
@@ -1053,6 +1057,7 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
                         fade_out: 0,
                         transition_out: 0,
                         visualizer: 0,
+                        viz_paint: 0,
                         start: queued,
                         in_frame: number(f[0], n)?,
                         out_frame: number(f[1], n)?,
@@ -1184,7 +1189,8 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
                     + 2 * usize::from(v18)
                     + usize::from(v19)
                     + usize::from(v20)
-                    + usize::from(v21);
+                    + usize::from(v21)
+                    + usize::from(v22);
                 let f = fields(rest, want, "clip", n)?;
                 let in_frame = number(f[1], n)?;
                 let out_frame = number(f[2], n)?;
@@ -1200,6 +1206,7 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
                         fade_out: number(f.get(10).copied().unwrap_or(b"0"), n)?.min(frames),
                         transition_out: number(f.get(11).copied().unwrap_or(b"0"), n)?.min(frames),
                         visualizer: number(f.get(13).copied().unwrap_or(b"0"), n)? as u8,
+                        viz_paint: number(f.get(14).copied().unwrap_or(b"0"), n)? as u32,
                         start: number(f[0], n)?,
                         in_frame,
                         out_frame,
@@ -1629,7 +1636,7 @@ mod tests {
                    video 1 0 0 30 0 - - - fit 1000\n";
         let old = parse(v9, &dir).expect("v9 still loads");
         assert_eq!(old.subtitles, Vec::new());
-        assert!(flat(&dir, &old.sources, &old.lanes, old.playhead).starts_with(b"edith 21\n"));
+        assert!(flat(&dir, &old.sources, &old.lanes, old.playhead).starts_with(b"edith 22\n"));
         // ...and the line itself is not a v9 line: a dialect may not be mixed.
         let mixed = parse(b"edith 9\nsource 0 a.mp4\nsubtitle - subs.srt\n", &dir)
             .unwrap_err()
@@ -2049,6 +2056,7 @@ mod tests {
             fade_out: 0,
             transition_out: 0,
             visualizer: 0,
+            viz_paint: 0,
             start,
             in_frame,
             out_frame,
@@ -2108,10 +2116,10 @@ mod tests {
         let bytes = flat(&dir, &sources, &lanes, 12);
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 21\nplayhead 12\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 22\nplayhead 12\nresolution 1280 720\nsource 0 a.mp4\n\
              source 2 /elsewhere/b.mp4\n\
-             video 1 0 0 30 0 0 - - fit 1000 0 0 0 - 0\nvideo 1 30 10 20 1 1 - - fit 1000 0 0 0 - 0\n\
-             audio 1 0 0 30 0 0 - - fit 1000 0 0 0 - 0\n",
+             video 1 0 0 30 0 0 - - fit 1000 0 0 0 - 0 0\nvideo 1 30 10 20 1 1 - - fit 1000 0 0 0 - 0 0\n\
+             audio 1 0 0 30 0 0 - - fit 1000 0 0 0 - 0 0\n",
             "the file under the project directory is written relative to it, \
              each with the audio stream it plays"
         );
@@ -2145,9 +2153,9 @@ mod tests {
         let bytes = flat(&dir, &sources, &lanes, 7);
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 21\nplayhead 7\nresolution 1280 720\nsource 0 a.mp4\n\
-             video 1 0 0 30 0 4 - - fit 1000 0 0 0 - 0\naudio 1\n\
-             video 2 40 0 10 0 - - - fit 1000 0 0 0 - 0\naudio 2 0 0 30 0 4 - - fit 1000 0 0 0 - 0\n",
+            "edith 22\nplayhead 7\nresolution 1280 720\nsource 0 a.mp4\n\
+             video 1 0 0 30 0 4 - - fit 1000 0 0 0 - 0 0\naudio 1\n\
+             video 2 40 0 10 0 - - - fit 1000 0 0 0 - 0 0\naudio 2 0 0 30 0 4 - - fit 1000 0 0 0 - 0 0\n",
             "an empty lane is a line of its own; everything else is its clips"
         );
         let back = parse(&bytes, &dir).expect("parse");
@@ -2235,6 +2243,7 @@ mod tests {
                     fade_out: 0,
                     transition_out: 0,
                     visualizer: 0,
+                    viz_paint: 0,
                     eq: Some(0),
                     ..clip(0, 0, 30, 0, Some(0))
                 },
@@ -2243,6 +2252,7 @@ mod tests {
                     fade_out: 0,
                     transition_out: 0,
                     visualizer: 0,
+                    viz_paint: 0,
                     eq: Some(1),
                     ..clip(30, 10, 20, 0, None)
                 },
@@ -2253,6 +2263,7 @@ mod tests {
                     fade_out: 0,
                     transition_out: 0,
                     visualizer: 0,
+                    viz_paint: 0,
                     eq: Some(0),
                     ..clip(0, 0, 30, 0, Some(0))
                 },
@@ -2261,6 +2272,7 @@ mod tests {
                     fade_out: 0,
                     transition_out: 0,
                     visualizer: 0,
+                    viz_paint: 0,
                     eq: Some(2),
                     ..clip(30, 0, 10, 0, None)
                 },
@@ -2269,12 +2281,12 @@ mod tests {
         let bytes = emit(&dir, &sources, &lanes, &eq, &[], (1280, 720), 0);
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 21\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 22\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
              eq 80.0:-3.0:0.707:ls 1000.0:4.5:1.0:pk\n\
              eq 16777215.0:-0.1:3.918315e-39:hs\n\
              eq\n\
-             video 1 0 0 30 0 0 0 - fit 1000 0 0 0 - 0\nvideo 1 30 10 20 0 - 1 - fit 1000 0 0 0 - 0\n\
-             audio 1 0 0 30 0 0 0 - fit 1000 0 0 0 - 0\naudio 1 30 0 10 0 - 2 - fit 1000 0 0 0 - 0\n",
+             video 1 0 0 30 0 0 0 - fit 1000 0 0 0 - 0 0\nvideo 1 30 10 20 0 - 1 - fit 1000 0 0 0 - 0 0\n\
+             audio 1 0 0 30 0 0 0 - fit 1000 0 0 0 - 0 0\naudio 1 30 0 10 0 - 2 - fit 1000 0 0 0 - 0 0\n",
             "the table comes before the clips, and a clip names a line of it"
         );
 
@@ -2347,6 +2359,7 @@ mod tests {
                     fade_out: 0,
                     transition_out: 0,
                     visualizer: 0,
+                    viz_paint: 0,
                     color: Some(0),
                     fit: FitPolicy::default(),
                     speed: Speed::NORMAL,
@@ -2357,6 +2370,7 @@ mod tests {
                     fade_out: 0,
                     transition_out: 0,
                     visualizer: 0,
+                    viz_paint: 0,
                     color: Some(1),
                     fit: FitPolicy::default(),
                     speed: Speed::NORMAL,
@@ -2369,6 +2383,7 @@ mod tests {
                     fade_out: 0,
                     transition_out: 0,
                     visualizer: 0,
+                    viz_paint: 0,
                     color: Some(0),
                     fit: FitPolicy::default(),
                     speed: Speed::NORMAL,
@@ -2379,6 +2394,7 @@ mod tests {
                     fade_out: 0,
                     transition_out: 0,
                     visualizer: 0,
+                    viz_paint: 0,
                     color: Some(2),
                     fit: FitPolicy::default(),
                     speed: Speed::NORMAL,
@@ -2389,12 +2405,12 @@ mod tests {
         let bytes = emit(&dir, &sources, &lanes, &[], &color, (1280, 720), 0);
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 21\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 22\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
              color 0.1:1.2:0.9:-0.3\n\
              color -1e-7:16777215.0:3.918315e-39:-0.0\n\
              color 0.0:1.0:1.0:0.0\n\
-             video 1 0 0 30 0 0 - 0 fit 1000 0 0 0 - 0\nvideo 1 30 10 20 0 - - 1 fit 1000 0 0 0 - 0\n\
-             audio 1 0 0 30 0 0 - 0 fit 1000 0 0 0 - 0\naudio 1 30 0 10 0 - - 2 fit 1000 0 0 0 - 0\n",
+             video 1 0 0 30 0 0 - 0 fit 1000 0 0 0 - 0 0\nvideo 1 30 10 20 0 - - 1 fit 1000 0 0 0 - 0 0\n\
+             audio 1 0 0 30 0 0 - 0 fit 1000 0 0 0 - 0 0\naudio 1 30 0 10 0 - - 2 fit 1000 0 0 0 - 0 0\n",
             "the table comes before the clips, and a clip names a line of it"
         );
 
@@ -2454,9 +2470,9 @@ mod tests {
                 (1280, 720),
                 old.playhead
             )),
-            "edith 21\nplayhead 3\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 22\nplayhead 3\nresolution 1280 720\nsource 0 a.mp4\n\
              eq 80.0:-3.0:0.707:ls\n\
-             video 1 0 0 30 0 0 0 - fit 1000 0 0 0 - 0\naudio 1 0 0 30 0 0 - - fit 1000 0 0 0 - 0\n"
+             video 1 0 0 30 0 0 0 - fit 1000 0 0 0 - 0 0\naudio 1 0 0 30 0 0 - - fit 1000 0 0 0 - 0 0\n"
         );
     }
 
@@ -2473,6 +2489,7 @@ mod tests {
             fade_out: 0,
             transition_out: 0,
             visualizer: 0,
+            viz_paint: 0,
             start,
             in_frame,
             out_frame,
@@ -2497,9 +2514,9 @@ mod tests {
         let bytes = emit(&dir, &sources, &lanes, &[], &[], (1280, 720), 0);
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 21\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
-             video 1 0 0 30 0 - - - fit 2000 0 0 0 - 0\nvideo 1 15 30 40 0 - - - fit 250 0 0 0 - 0\n\
-             audio 1 0 0 30 0 - - - fit 2000 0 0 0 - 0\n",
+            "edith 22\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
+             video 1 0 0 30 0 - - - fit 2000 0 0 0 - 0 0\nvideo 1 15 30 40 0 - - - fit 250 0 0 0 - 0 0\n\
+             audio 1 0 0 30 0 - - - fit 2000 0 0 0 - 0 0\n",
             "the rate is the clip line's last field, in thousandths"
         );
         let back = parse(&bytes, &dir).expect("parse");
@@ -2526,8 +2543,8 @@ mod tests {
                 (1280, 720),
                 old.playhead
             )),
-            "edith 21\nplayhead 3\nresolution 1280 720\nsource 0 a.mp4\n\
-             video 1 0 0 30 0 0 - - fit 1000 0 0 0 - 0\naudio 1 0 0 30 0 0 - - fit 1000 0 0 0 - 0\n"
+            "edith 22\nplayhead 3\nresolution 1280 720\nsource 0 a.mp4\n\
+             video 1 0 0 30 0 0 - - fit 1000 0 0 0 - 0 0\naudio 1 0 0 30 0 0 - - fit 1000 0 0 0 - 0 0\n"
         );
         // A rate outside what the editor can set is a corrupt line, by name.
         let bad = b"edith 8\nsource 0 a.mp4\nvideo 1 0 0 30 0 - - - fit 9000\n";
@@ -2561,6 +2578,7 @@ mod tests {
             fade_out: 7,
             transition_out: 0,
             visualizer: 0,
+            viz_paint: 0,
             start: 0,
             in_frame: 0,
             out_frame: 30,
@@ -2576,8 +2594,8 @@ mod tests {
         let bytes = emit(&dir, &sources, &lanes, &[], &[], (1280, 720), 0);
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 21\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
-             video 1 0 0 30 0 - - - fit 1000 5 7 0 - 0\n",
+            "edith 22\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
+             video 1 0 0 30 0 - - - fit 1000 5 7 0 - 0 0\n",
             "the fades are the clip line's last two fields"
         );
         let back = parse(&bytes, &dir).expect("parse");
@@ -2613,6 +2631,7 @@ mod tests {
             fade_out: 0,
             transition_out: 9,
             visualizer: 0,
+            viz_paint: 0,
             start: 0,
             in_frame: 0,
             out_frame: 30,
@@ -2628,8 +2647,8 @@ mod tests {
         let bytes = emit(&dir, &sources, &lanes, &[], &[], (1280, 720), 0);
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 21\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
-             video 1 0 0 30 0 - - - fit 1000 0 0 9 - 0\n",
+            "edith 22\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
+             video 1 0 0 30 0 - - - fit 1000 0 0 9 - 0 0\n",
             "the dissolve is the clip line's own last field"
         );
         let back = parse(&bytes, &dir).expect("parse");
@@ -2701,6 +2720,7 @@ mod tests {
                     fade_out: 0,
                     transition_out: 0,
                     visualizer: 0,
+                    viz_paint: 0,
                     transform: Some(0),
                     fit: FitPolicy::default(),
                     speed: Speed::NORMAL,
@@ -2711,6 +2731,7 @@ mod tests {
                     fade_out: 0,
                     transition_out: 0,
                     visualizer: 0,
+                    viz_paint: 0,
                     transform: Some(1),
                     fit: FitPolicy::default(),
                     speed: Speed::NORMAL,
@@ -2723,6 +2744,7 @@ mod tests {
                     fade_out: 0,
                     transition_out: 0,
                     visualizer: 0,
+                    viz_paint: 0,
                     transform: Some(0),
                     fit: FitPolicy::default(),
                     speed: Speed::NORMAL,
@@ -2733,6 +2755,7 @@ mod tests {
                     fade_out: 0,
                     transition_out: 0,
                     visualizer: 0,
+                    viz_paint: 0,
                     transform: Some(2),
                     fit: FitPolicy::default(),
                     speed: Speed::NORMAL,
@@ -2762,12 +2785,12 @@ mod tests {
         );
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 21\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 22\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
              transform 0.1:-0.2:1.5:90.0:0.1:0.0:0.0:0.05\n\
              transform -1e-7:16777215.0:3.918315e-39:-0.0:0.0:0.0:0.0:0.0\n\
              transform 0.0:0.0:1.0:0.0:0.0:0.0:0.0:0.0\n\
-             video 1 0 0 30 0 0 - - fit 1000 0 0 0 0 0\nvideo 1 30 10 20 0 - - - fit 1000 0 0 0 1 0\n\
-             audio 1 0 0 30 0 0 - - fit 1000 0 0 0 0 0\naudio 1 30 0 10 0 - - - fit 1000 0 0 0 2 0\n",
+             video 1 0 0 30 0 0 - - fit 1000 0 0 0 0 0 0\nvideo 1 30 10 20 0 - - - fit 1000 0 0 0 1 0 0\n\
+             audio 1 0 0 30 0 0 - - fit 1000 0 0 0 0 0 0\naudio 1 30 0 10 0 - - - fit 1000 0 0 0 2 0 0\n",
             "the table comes before the clips, and a clip names a line of it"
         );
 
@@ -2842,10 +2865,10 @@ mod tests {
         );
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 21\nplayhead 0\nresolution 1280 720\nfps 23.976023976023978\n\
+            "edith 22\nplayhead 0\nresolution 1280 720\nfps 23.976023976023978\n\
              limiter -1.5 on\nsource 0 a.mp4\n\
-             video 1 0 0 30 0 - - - fit 1000 0 0 0 - 0\naudio 1 0 0 30 0 - - - fit 1000 0 0 0 - 0\n\
-             audio 2 0 0 30 0 - - - fit 1000 0 0 0 - 0\n\
+             video 1 0 0 30 0 - - - fit 1000 0 0 0 - 0 0\naudio 1 0 0 30 0 - - - fit 1000 0 0 0 - 0 0\n\
+             audio 2 0 0 30 0 - - - fit 1000 0 0 0 - 0 0\n\
              gain audio 1 3.0\ngain audio 2 -6.5\n",
             "the mix is lines of its own, the gains after the lanes they name"
         );
@@ -2874,8 +2897,8 @@ mod tests {
                 (1280, 720),
                 old.playhead
             )),
-            "edith 21\nplayhead 3\nresolution 1280 720\nsource 0 a.mp4\n\
-             video 1 0 0 30 0 - - - fit 1000 0 0 0 - 0\naudio 1 0 0 30 0 - - - fit 1000 0 0 0 - 0\n"
+            "edith 22\nplayhead 3\nresolution 1280 720\nsource 0 a.mp4\n\
+             video 1 0 0 30 0 - - - fit 1000 0 0 0 - 0 0\naudio 1 0 0 30 0 - - - fit 1000 0 0 0 - 0 0\n"
         );
 
         // Each of the three refuses by name, on its own line.
@@ -3038,10 +3061,10 @@ mod tests {
         assert!(old.eq.is_empty(), "nothing before v5 equalizes anything");
         assert_eq!(
             String::from_utf8_lossy(&flat(&dir, &old.sources, &old.lanes, old.playhead)),
-            "edith 21\nplayhead 12\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 22\nplayhead 12\nresolution 1280 720\nsource 0 a.mp4\n\
              source 2 /elsewhere/b.mp4\n\
-             video 1 0 0 30 0 0 - - fit 1000 0 0 0 - 0\nvideo 1 30 10 20 1 1 - - fit 1000 0 0 0 - 0\n\
-             audio 1 0 0 30 0 0 - - fit 1000 0 0 0 - 0\n"
+             video 1 0 0 30 0 0 - - fit 1000 0 0 0 - 0 0\nvideo 1 30 10 20 1 1 - - fit 1000 0 0 0 - 0 0\n\
+             audio 1 0 0 30 0 0 - - fit 1000 0 0 0 - 0 0\n"
         );
         // An empty lane's line is still the whole of that lane, eq or no eq.
         let empty = parse(
@@ -3091,10 +3114,10 @@ mod tests {
         let v5 = flat(&dir, &back.sources, &back.lanes, back.playhead);
         assert_eq!(
             String::from_utf8_lossy(&v5),
-            "edith 21\nplayhead 12\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 22\nplayhead 12\nresolution 1280 720\nsource 0 a.mp4\n\
              source 0 /elsewhere/b.mp4\n\
-             video 1 0 0 30 0 0 - - fit 1000 0 0 0 - 0\nvideo 1 30 10 20 1 1 - - fit 1000 0 0 0 - 0\n\
-             audio 1 0 0 30 0 0 - - fit 1000 0 0 0 - 0\n",
+             video 1 0 0 30 0 0 - - fit 1000 0 0 0 - 0 0\nvideo 1 30 10 20 1 1 - - fit 1000 0 0 0 - 0 0\n\
+             audio 1 0 0 30 0 0 - - fit 1000 0 0 0 - 0 0\n",
             "a re-saved v2 project differs only by its version, the lane \
              numbers, the streams it always meant and an equalizer it has none of"
         );
@@ -3123,7 +3146,7 @@ mod tests {
         // Saved again it is the current version, which round-trips to the
         // same document.
         let v5 = flat(&dir, &back.sources, &back.lanes, back.playhead);
-        assert!(v5.starts_with(b"edith 21\n"));
+        assert!(v5.starts_with(b"edith 22\n"));
         let again = parse(&v5, &dir).expect("v5 parses");
         assert_eq!(again.lanes, back.lanes);
         // A dialect may not be mixed: lane lines under v1, `clip` under v2.
@@ -3234,8 +3257,8 @@ mod tests {
         let bytes = std::fs::read(&path).expect("read back");
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 21\nplayhead 0\nresolution 1280 720\nsource 1 a.mp4\n\
-             video 1 0 0 30 0 - - - fit 1000 0 0 0 - 0\naudio 1 0 0 30 0 - - - fit 1000 0 0 0 - 0\n"
+            "edith 22\nplayhead 0\nresolution 1280 720\nsource 1 a.mp4\n\
+             video 1 0 0 30 0 - - - fit 1000 0 0 0 - 0 0\naudio 1 0 0 30 0 - - - fit 1000 0 0 0 - 0 0\n"
         );
         // Loading rejoins the *given* directory, so the file is reached by the
         // way the project was opened -- the same file, through the link, still
@@ -3279,10 +3302,10 @@ mod tests {
     #[test]
     fn a_wrong_first_line_is_refused_by_name() {
         let dir = PathBuf::from("/proj");
-        let err = parse(b"edith 22\nsource 0 a.mp4\nvideo 0 0 5 0 -\n", &dir)
+        let err = parse(b"edith 23\nsource 0 a.mp4\nvideo 0 0 5 0 -\n", &dir)
             .unwrap_err()
             .to_string();
-        assert_eq!(err, "line 1: unsupported version 22");
+        assert_eq!(err, "line 1: unsupported version 23");
         for junk in [&b""[..], b"{}\n", b"source a.mp4\n"] {
             assert_eq!(
                 parse(junk, &dir).unwrap_err().to_string(),
