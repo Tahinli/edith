@@ -242,10 +242,6 @@ impl Player {
         });
     }
 
-    pub(crate) fn set_viz_sat(&mut self, sat: u8, cx: &mut Context<Self>) {
-        self.set_viz_paint_with(cx, |p| engine::decode::with_viz_paint_sat(p, sat));
-    }
-
     pub(crate) fn set_viz_strands(&mut self, n: u8, cx: &mut Context<Self>) {
         self.set_viz_paint_with(cx, |p| engine::decode::with_viz_paint_strands(p, n));
     }

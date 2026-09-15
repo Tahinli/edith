@@ -1326,27 +1326,27 @@ fn viz_color_wheel(paint: u32, cx: &mut Context<Player>) -> impl IntoElement {
                     let cx = f32::from(o.x) + w / 2.;
                     let cy = f32::from(o.y) + h / 2.;
                     let radius = w.min(h) / 2. - 1.;
-                    let wedges = 48;
-                    for i in 0..wedges {
-                        let a0 = (i as f32 / wedges as f32) * std::f32::consts::TAU;
-                        let a1 = ((i + 1) as f32 / wedges as f32) * std::f32::consts::TAU;
-                        // 0 at top, clockwise: screen y down, so angle 0 is -Y.
-                        let hue = i as f32 / wedges as f32 * 360.;
-                        let (r, g, b) = engine::decode::viz_hsv_rgb(hue, 1., 0.84);
-                        let color = (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b);
-                        let p0 = point(px(cx), px(cy));
-                        let p1 = point(
-                            px(cx + radius * a0.sin()),
-                            px(cy - radius * a0.cos()),
-                        );
-                        let p2 = point(
-                            px(cx + radius * a1.sin()),
-                            px(cy - radius * a1.cos()),
-                        );
-                        let mut path = PathBuilder::fill();
-                        path.add_polygon(&[p0, p1, p2], false);
-                        if let Ok(path) = path.build() {
-                            window.paint_path(path, rgb(color));
+                    let wedges = 72;
+                    let rings = 10;
+                    for ring in 0..rings {
+                        let s0 = ring as f32 / rings as f32;
+                        let s1 = (ring + 1) as f32 / rings as f32;
+                        let sat = (s0 + s1) / 2.;
+                        for i in 0..wedges {
+                            let a0 = (i as f32 / wedges as f32) * std::f32::consts::TAU;
+                            let a1 = ((i + 1) as f32 / wedges as f32) * std::f32::consts::TAU;
+                            let hue = i as f32 / wedges as f32 * 360.;
+                            let (r, g, b) = engine::decode::viz_hsv_rgb(hue, sat, 0.84);
+                            let color = (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b);
+                            let p00 = point(px(cx + radius * s0 * a0.sin()), px(cy - radius * s0 * a0.cos()));
+                            let p01 = point(px(cx + radius * s0 * a1.sin()), px(cy - radius * s0 * a1.cos()));
+                            let p11 = point(px(cx + radius * s1 * a1.sin()), px(cy - radius * s1 * a1.cos()));
+                            let p10 = point(px(cx + radius * s1 * a0.sin()), px(cy - radius * s1 * a0.cos()));
+                            let mut path = PathBuilder::fill();
+                            path.add_polygon(&[p00, p01, p11, p10], false);
+                            if let Ok(path) = path.build() {
+                                window.paint_path(path, rgb(color));
+                            }
                         }
                     }
                     // Selection mark.
@@ -1389,13 +1389,12 @@ fn viz_color_wheel(paint: u32, cx: &mut Context<Player>) -> impl IntoElement {
                 let ang = dx.atan2(dy).to_degrees();
                 let hue_deg = (ang + 360.) % 360.;
                 let hue = (hue_deg / 360. * 256.).round() as u16 as u8;
-                this.set_viz_hs(hue, sat.max(1), cx);
+                this.set_viz_hs(hue, sat, cx);
             }),
         )
 }
 
 fn viz_paint_knobs(paint: u32, cx: &mut Context<Player>) -> impl IntoElement {
-    let sat = engine::decode::viz_sat_ui(paint);
     let strands = engine::decode::viz_strands_of(paint);
     let glow = engine::decode::viz_glow_of(paint);
     let style = label(type_scale::LABEL_ROW_PX, FontWeight::MEDIUM);
@@ -1418,33 +1417,6 @@ fn viz_paint_knobs(paint: u32, cx: &mut Context<Player>) -> impl IntoElement {
                         .child("Colour"),
                 )
                 .child(viz_color_wheel(paint, cx)),
-        )
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap(px(4.))
-                .h(px(CONTROL_H))
-                .child(
-                    div()
-                        .font(style.font.clone())
-                        .text_size(style.size)
-                        .text_color(rgb(INK2()))
-                        .child("Sat"),
-                )
-                .child(viz_step("dock-viz-sat-minus", "−", cx, |this, cx| {
-                    this.set_viz_sat(engine::decode::viz_sat_ui(this.viz_paint()).saturating_sub(16), cx);
-                }))
-                .child(
-                    div()
-                        .font(style.font.clone())
-                        .text_size(style.size)
-                        .text_color(rgb(INK1()))
-                        .child(format!("{sat}")),
-                )
-                .child(viz_step("dock-viz-sat-plus", "+", cx, |this, cx| {
-                    this.set_viz_sat(engine::decode::viz_sat_ui(this.viz_paint()).saturating_add(16).min(255), cx);
-                })),
         )
         .child(
             div()
