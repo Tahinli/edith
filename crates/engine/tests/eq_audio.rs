@@ -58,6 +58,7 @@ fn clip(start: u32, source: usize, frames: u32) -> Clip {
         fade_out: 0,
         transition_out: 0,
         visualizer: 0,
+        viz_paint: 0,
         start,
         in_frame: 0,
         out_frame: frames,

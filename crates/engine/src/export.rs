@@ -2770,6 +2770,7 @@ fn run(
                         meta.height,
                         meta.frame_rate,
                         flags,
+                        project.composite_viz_paint_at(span.start),
                     )?
                 } else {
                     ClipDecoder::open(&entry.path, rate.source_at(in_frame), want)?
@@ -2839,6 +2840,7 @@ fn run(
                             meta.height,
                             meta.frame_rate,
                             project.composite_visualizer_at(b_start),
+                            project.composite_viz_paint_at(b_start),
                         )?
                     } else {
                         ClipDecoder::open(&entry.path, b_rate.source_at(b_in_frame), None)?
@@ -4424,6 +4426,7 @@ enum ClipDecoder {
         fps: f64,
         next: u32,
         flags: u8,
+        paint: u32,
         y: Vec<u8>,
         u: Vec<u8>,
         v: Vec<u8>,
@@ -4537,6 +4540,7 @@ impl ClipDecoder {
         height: u32,
         fps: f64,
         flags: u8,
+        paint: u32,
     ) -> crate::Result<Self> {
         let peaks = crate::waveform::peaks(path, stream, crate::decode::VIZ_BUCKETS_PER_SEC)
             .ok()
@@ -4550,6 +4554,7 @@ impl ClipDecoder {
             fps,
             next: start_frame,
             flags,
+            paint,
             y: Vec::new(),
             u: Vec::new(),
             v: Vec::new(),
@@ -4571,12 +4576,13 @@ impl ClipDecoder {
                 fps,
                 next,
                 flags,
+                paint,
                 y,
                 u,
                 v,
             } => {
                 let (yy, uu, vv) =
-                    crate::decode::visualizer_i420(peaks, f64::from(*next) / *fps, *width, *height, *flags);
+                    crate::decode::visualizer_i420(peaks, f64::from(*next) / *fps, *width, *height, *flags, *paint);
                 *y = yy;
                 *u = uu;
                 *v = vv;

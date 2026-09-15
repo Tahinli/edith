@@ -708,6 +708,7 @@ impl PlaybackSession {
             fade_out: 0,
             transition_out: 0,
             visualizer: 0,
+            viz_paint: 0,
             start: 0,
             in_frame: 0,
             out_frame: meta.frame_count,
@@ -799,6 +800,7 @@ impl PlaybackSession {
             fade_out: 0,
             transition_out: 0,
             visualizer: 0,
+            viz_paint: 0,
             start: 0,
             in_frame: 0,
             out_frame: place_frames(meta.frame_count, IMAGE_ONLY_RATE),
@@ -1864,6 +1866,7 @@ impl PlaybackSession {
                         self.project.composite_fit_at(start),
                     ),
                     self.project.composite_visualizer_at(start),
+                    self.project.composite_viz_paint_at(start),
                 )
                 .inspect_err(|e| {
                     eprintln!("timeline frame {start}: visualizer open failed: {e}")
@@ -2981,6 +2984,10 @@ impl PlaybackSession {
         self.edit(Dirty::Picture, |p| p.set_visualizer(lane, idx, flags))
     }
 
+    pub fn set_viz_paint(&mut self, lane: Lane, idx: usize, paint: u32) -> bool {
+        self.edit(Dirty::Picture, |p| p.set_viz_paint(lane, idx, paint))
+    }
+
     /// Timeline frames of ramp-up from silence at the start of the clip at
     /// `idx` of `lane`. `0` for an index that is not there.
     pub fn fade_in_of(&self, lane: Lane, idx: usize) -> u32 {
@@ -3113,6 +3120,7 @@ impl PlaybackSession {
             fade_out: 0,
             transition_out: 0,
             visualizer: 0,
+            viz_paint: 0,
             start: 0,
             in_frame: 0,
             out_frame: match image {
@@ -3307,6 +3315,7 @@ impl PlaybackSession {
             fade_out: 0,
             transition_out: 0,
             visualizer: 1,
+            viz_paint: 0,
             start: 0,
             in_frame,
             out_frame,

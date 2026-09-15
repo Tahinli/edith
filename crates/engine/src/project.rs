@@ -457,10 +457,14 @@ pub struct Clip {
     /// because a clip's own length is checked beside it.
     pub transition_out: u32,
     /// Non-zero: this clip is a waveform of its source's sound, painted
-    /// onto a video lane. Bit 0 is the flag itself; 1 outline, 2 smooth,
-    /// 3 fast window, 4 tint. Zero is an ordinary picture. Older project
-    /// files have no field and mean zero.
+    /// onto a video lane. Bit 0 is the flag; bits 1-2 style; bit 3 fast.
+    /// Zero is an ordinary picture. Older project files have no field and
+    /// mean zero.
     pub visualizer: u8,
+    /// Packed look: hue 0-255, sat 0-255, strands 0-255, glow 0-255.
+    /// All-zero is the default (timeline azure, full sat, 8 strands, glow 2).
+    /// Older files have no field and mean zero.
+    pub viz_paint: u32,
 }
 
 impl Clip {
@@ -947,6 +951,7 @@ impl Project {
             fade_out: 0,
             transition_out: 0,
             visualizer: 0,
+            viz_paint: 0,
             start: 0,
             in_frame: 0,
             out_frame: frame_count.max(1),
@@ -1347,6 +1352,7 @@ impl Project {
             fade_out: 0,
             transition_out: 0,
             visualizer: 0,
+            viz_paint: 0,
             start,
             in_frame: 0,
             out_frame: frame_count.max(1),
@@ -2647,6 +2653,15 @@ impl Project {
         true
     }
 
+    pub fn set_viz_paint(&mut self, lane: Lane, idx: usize, paint: u32) -> bool {
+        if idx >= self.lane(lane).len() {
+            return false;
+        }
+        self.snapshot();
+        self.lane_mut(lane).expect("checked above")[idx].viz_paint = paint;
+        true
+    }
+
     /// Timeline frames of ramp-up from silence at the start of the clip at
     /// `idx` of `lane`. `0` for an index that is not there, same as a clip
     /// that has none.
@@ -3031,6 +3046,12 @@ impl Project {
     pub fn composite_visualizer_at(&self, timeline_frame: u32) -> u8 {
         self.composite_clip_at(timeline_frame)
             .map(|(lane, idx)| self.lane(lane)[idx].visualizer)
+            .unwrap_or(0)
+    }
+
+    pub fn composite_viz_paint_at(&self, timeline_frame: u32) -> u32 {
+        self.composite_clip_at(timeline_frame)
+            .map(|(lane, idx)| self.lane(lane)[idx].viz_paint)
             .unwrap_or(0)
     }
 
@@ -5711,6 +5732,7 @@ mod tests {
             fade_out: 0,
             transition_out: 0,
             visualizer: 0,
+            viz_paint: 0,
             start,
             in_frame,
             out_frame,
@@ -7222,6 +7244,7 @@ mod tests {
         fade_out: 0,
         transition_out: 0,
         visualizer: 0,
+        viz_paint: 0,
         start: 0,
         in_frame: 100,
         out_frame: 102,
@@ -7299,6 +7322,7 @@ mod tests {
             fade_out: 0,
             transition_out: 0,
             visualizer: 0,
+            viz_paint: 0,
             source: wav,
             ..PASTED
         };
@@ -8014,6 +8038,7 @@ mod tests {
             fade_out: 0,
             transition_out: 0,
             visualizer: 0,
+            viz_paint: 0,
             start,
             in_frame,
             out_frame,
@@ -9123,6 +9148,7 @@ mod tests {
                 fade_out: 0,
                 transition_out: 0,
                 visualizer: 0,
+                viz_paint: 0,
                 eq: Some(i),
                 ..video[0]
             }]
@@ -9166,6 +9192,7 @@ mod tests {
                 fade_out: 0,
                 transition_out: 0,
                 visualizer: 0,
+                viz_paint: 0,
                 color: Some(i),
                 fit: FitPolicy::default(),
                 speed: Speed::NORMAL,
@@ -9231,6 +9258,7 @@ mod tests {
             fade_out: 0,
             transition_out: 0,
             visualizer: 0,
+            viz_paint: 0,
             start,
             in_frame,
             out_frame,
@@ -10030,6 +10058,7 @@ mod tests {
             fade_out: 0,
             transition_out: 0,
             visualizer: 0,
+            viz_paint: 0,
             start,
             in_frame: start,
             out_frame: end,

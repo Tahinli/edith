@@ -421,6 +421,7 @@ fn a_silent_first_source_does_not_stop_the_scan_for_one_with_sound() {
         fade_out: 0,
         transition_out: 0,
         visualizer: 0,
+        viz_paint: 0,
         start: 0,
         in_frame: 0,
         out_frame: meta1.frame_count,

@@ -1383,6 +1383,7 @@ fn a_duration_row_shows_only_for_a_transition_and_its_room_is_the_successors() {
             fade_out,
             transition_out,
             visualizer: 0,
+            viz_paint: 0,
         }
     }
     // A plain cut carries neither field, so the row has nothing to show.
