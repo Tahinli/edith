@@ -1411,13 +1411,13 @@ fn rgb_to_i420(rgb: &[u8], width: usize, height: usize) -> (Vec<u8>, Vec<u8>, Ve
 pub(crate) const VIZ_BUCKETS_PER_SEC: u32 = 4000;
 /// Bits 1-2: which picture this visualizer paints. Mutually exclusive —
 /// a picker, not independent toggles.
-pub const VIZ_STYLE_WAVE: u8 = 0;
+pub const VIZ_STYLE_FILL: u8 = 0;
 pub const VIZ_STYLE_RIBBON: u8 = 1;
-pub const VIZ_STYLE_FILL: u8 = 2;
+pub const VIZ_STYLE_RING: u8 = 2;
+pub const VIZ_STYLE_WAVE: u8 = 3;
 pub const VIZ_FAST: u8 = 1 << 3;
-/// High nibble of [`crate::project::Clip::visualizer`]: 16 inks. Zero is gold, then around
-/// the wheel in 22.5° steps so a picker — not a click-cycle — chooses the
-/// strand colour.
+/// High nibble of [`crate::project::Clip::visualizer`]: 16 inks. Zero is the
+/// timeline azure, then around the wheel in 22.5° steps.
 pub const VIZ_HUE_SHIFT: u8 = 4;
 
 /// The ink nibble stored in `flags`.
@@ -1438,9 +1438,10 @@ pub fn with_viz_style(flags: u8, style: u8) -> u8 {
     (flags & !0b0110) | ((style & 3) << 1)
 }
 
-/// Ink colour for the CLIP swatches and the painter. Hue 0 is gold.
+/// Ink colour for the CLIP swatches and the painter. Hue 0 is the timeline
+/// azure (`0x4F8FD6`), then around the wheel.
 pub fn viz_ink_rgb(hue: u8) -> (u8, u8, u8) {
-    hsv_to_rgb(48.0 + f32::from(hue & 15) * 22.5, 0.68, 0.92)
+    hsv_to_rgb(212.0 + f32::from(hue & 15) * 22.5, 0.63, 0.84)
 }
 
 fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (u8, u8, u8) {
@@ -1508,6 +1509,50 @@ fn viz_stamp(
             u[cy * cw + cx] = ink_u;
             v[cy * cw + cx] = ink_v;
         }
+    }
+}
+
+fn viz_span(
+    y: &mut [u8],
+    u: &mut [u8],
+    v: &mut [u8],
+    w: usize,
+    h: usize,
+    cw: usize,
+    ch: usize,
+    x: i32,
+    top: i32,
+    bot: i32,
+    bg_y: u8,
+    ink_y: u8,
+    ink_u: u8,
+    ink_v: u8,
+) {
+    let (a, b) = if top <= bot { (top, bot) } else { (bot, top) };
+    for row in a..=b {
+        viz_stamp(y, u, v, w, h, cw, ch, x, row, 1.0, bg_y, ink_y, ink_u, ink_v);
+    }
+}
+
+fn viz_smooth(lo: &mut [f32], hi: &mut [f32]) {
+    let n = lo.len();
+    if n < 5 {
+        return;
+    }
+    let (src_lo, src_hi) = (lo.to_vec(), hi.to_vec());
+    for i in 2..n - 2 {
+        lo[i] = (src_lo[i - 2]
+            + src_lo[i - 1] * 2.0
+            + src_lo[i] * 3.0
+            + src_lo[i + 1] * 2.0
+            + src_lo[i + 2])
+            / 9.0;
+        hi[i] = (src_hi[i - 2]
+            + src_hi[i - 1] * 2.0
+            + src_hi[i] * 3.0
+            + src_hi[i + 1] * 2.0
+            + src_hi[i + 2])
+            / 9.0;
     }
 }
 
@@ -1609,15 +1654,34 @@ pub(crate) fn visualizer_i420(
             }
         };
         for col in 0..w {
+            let a = first + (col as f64 * span / w as f64).floor() as usize;
+            let b = (first + (((col + 1) as f64 * span / w as f64).ceil() as usize)).min(peaks.len());
+            let b = b.max(a + 1);
+            let (mut mn, mut mx) = (0.0f32, 0.0f32);
+            for &(l, h) in &peaks[a.min(peaks.len() - 1)..b.min(peaks.len()).max(a.min(peaks.len() - 1) + 1)] {
+                mn = mn.min(l);
+                mx = mx.max(h);
+            }
+            lo[col] = mn.clamp(-1.0, 0.0);
+            hi[col] = mx.clamp(0.0, 1.0);
             let pos = first as f64 + (col as f64 + 0.5) * span / w as f64;
             let i = pos.floor() as usize;
             let f = (pos - i as f64) as f32;
-            let (lo0, hi0) = pair(i);
-            let (lo1, hi1) = pair(i.saturating_add(1));
-            lo[col] = (lo0 + (lo1 - lo0) * f).clamp(-1.0, 0.0);
-            hi[col] = (hi0 + (hi1 - hi0) * f).clamp(0.0, 1.0);
             sig[col] = signed(i) + (signed(i.saturating_add(1)) - signed(i)) * f;
         }
+        let peak = lo
+            .iter()
+            .zip(&hi)
+            .map(|(l, h)| l.abs().max(h.abs()))
+            .fold(0.0f32, f32::max);
+        if peak > 1e-4 {
+            for i in 0..w {
+                lo[i] /= peak;
+                hi[i] /= peak;
+            }
+        }
+        viz_smooth(&mut lo, &mut hi);
+        viz_smooth(&mut lo, &mut hi);
     }
 
     match viz_style(flags) {
@@ -1625,41 +1689,60 @@ pub(crate) fn visualizer_i420(
             let tau = std::f64::consts::TAU;
             let travel = t_secs * 1.35;
             for col in 0..w {
-                let env = lo[col].abs().max(hi[col]).max(0.08);
+                let env = lo[col].abs().max(hi[col]).max(0.06);
                 let x_phase = (col as f64 / w.max(1) as f64) * 2.15 * tau;
-                for s in 0..16 {
-                    let frac = s as f32 / 15.0;
-                    let scale = 0.32 + 0.68 * frac;
-                    let wave = (x_phase + travel + s as f64 * 0.07).sin() as f32;
+                for s in 0..24 {
+                    let frac = s as f32 / 23.0;
+                    let scale = 0.28 + 0.72 * frac;
+                    let wave = (x_phase + travel + s as f64 * 0.05).sin() as f32;
                     let row = (center + half * env * scale * wave).round() as i32;
                     viz_stamp(
                         &mut y, &mut u, &mut v, w, h, cw, ch, col as i32, row, 1.0, bg_y, ink_y,
                         ink_u, ink_v,
                     );
                     viz_stamp(
-                        &mut y, &mut u, &mut v, w, h, cw, ch, col as i32, row - 1, 0.4, bg_y,
+                        &mut y, &mut u, &mut v, w, h, cw, ch, col as i32, row - 1, 0.35, bg_y,
                         ink_y, ink_u, ink_v,
                     );
                     viz_stamp(
-                        &mut y, &mut u, &mut v, w, h, cw, ch, col as i32, row + 1, 0.4, bg_y,
+                        &mut y, &mut u, &mut v, w, h, cw, ch, col as i32, row + 1, 0.35, bg_y,
                         ink_y, ink_u, ink_v,
                     );
                 }
             }
         }
-        VIZ_STYLE_FILL => {
-            for col in 0..w {
-                let top = (center - hi[col] * half).round() as i32;
-                let bot = (center - lo[col] * half).round() as i32;
-                viz_line(
-                    &mut y, &mut u, &mut v, w, h, cw, ch, col as i32, top, col as i32, bot, bg_y,
-                    ink_y, ink_u, ink_v,
-                );
+        VIZ_STYLE_RING => {
+            let cx = w as f32 / 2.0;
+            let cy = h as f32 / 2.0;
+            let r0 = (w.min(h) as f32) * 0.28;
+            let amp = (w.min(h) as f32) * 0.18;
+            let tau = std::f32::consts::TAU;
+            let steps = w.max(h) * 4;
+            for strand in 0..8u8 {
+                let (ir, ig, ib) = viz_ink_rgb(viz_hue(flags).wrapping_add(if strand < 4 { 0 } else { 8 }));
+                let (iy, iu, iv) = rgb_yuv(ir as i32, ig as i32, ib as i32);
+                let scale = 0.65 + 0.35 * f32::from(strand % 4) / 3.0;
+                let phase = f32::from(strand) * 0.35;
+                let mut prev: Option<(i32, i32)> = None;
+                for i in 0..=steps {
+                    let t = i as f32 / steps as f32;
+                    let theta = t * tau + t_secs as f32 * 1.1 + phase;
+                    let col = ((t * w as f32) as usize).min(w.saturating_sub(1));
+                    let env = lo[col].abs().max(hi[col]);
+                    let wobble = (theta * 3.0 + phase).sin() * 0.12 * env;
+                    let r = r0 + amp * env * scale + amp * wobble;
+                    let x = (cx + r * theta.cos()).round() as i32;
+                    let row = (cy + r * theta.sin()).round() as i32;
+                    if let Some((px, py)) = prev {
+                        viz_line(
+                            &mut y, &mut u, &mut v, w, h, cw, ch, px, py, x, row, bg_y, iy, iu, iv,
+                        );
+                    }
+                    prev = Some((x, row));
+                }
             }
         }
-        _ => {
-            // Signed peak of each column, connected: the Audacity trace.
-            // Min/max bars are Fill; this is the sample path.
+        VIZ_STYLE_WAVE => {
             let mut prev: Option<(i32, i32)> = None;
             for col in 0..w {
                 let y_pt = (center - sig[col] * half).round() as i32;
@@ -1671,6 +1754,26 @@ pub(crate) fn visualizer_i420(
                     );
                 }
                 prev = Some((x, y_pt));
+            }
+        }
+        _ => {
+            // Timeline envelope: one filled body, tops then bottoms, after
+            // the fold+smooth above. Default look.
+            for col in 0..w {
+                let top = (center - hi[col] * half).round() as i32;
+                let bot = (center - lo[col] * half).round() as i32;
+                viz_span(
+                    &mut y, &mut u, &mut v, w, h, cw, ch, col as i32, top, bot, bg_y, ink_y, ink_u,
+                    ink_v,
+                );
+                viz_stamp(
+                    &mut y, &mut u, &mut v, w, h, cw, ch, col as i32, top - 1, 0.4, bg_y, ink_y,
+                    ink_u, ink_v,
+                );
+                viz_stamp(
+                    &mut y, &mut u, &mut v, w, h, cw, ch, col as i32, bot + 1, 0.4, bg_y, ink_y,
+                    ink_u, ink_v,
+                );
             }
         }
     }
@@ -1994,45 +2097,40 @@ mod tests {
     }
 
     #[test]
-    fn visualizer_paints_a_trace_not_a_filled_block() {
-        // 4000 buckets/sec * 2s window around t=1.
+    fn visualizer_default_is_a_blue_envelope() {
         let mut peaks = vec![(0.0, 0.0); 12_000];
         for (i, p) in peaks.iter_mut().enumerate() {
-            let a = ((i as f32 / 9.0) * std::f32::consts::TAU).sin() * 0.8;
-            *p = (a.min(0.0), a.max(0.0));
+            let a = ((i as f32 / 400.0) * std::f32::consts::TAU).sin() * 0.8;
+            *p = (-a.abs(), a.abs());
         }
-        let wave = 1u8;
-        let (y, u, v) = visualizer_i420(&peaks, 1.0, 320, 180, wave);
+        let flags = 1u8;
+        let (y, u, v) = visualizer_i420(&peaks, 1.0, 320, 180, flags);
         let ink = y.iter().filter(|&&p| p > 40).count();
-        assert!(ink > 80, "trace missing: {ink} ink pixels");
-        assert!(
-            ink < y.len() / 4,
-            "filled block, not a trace: {ink}/{}",
-            y.len()
-        );
-        let mut gold = 0usize;
+        assert!(ink > 200, "envelope missing: {ink}");
+        assert!(ink < y.len() * 9 / 10, "solid frame, not an envelope: {ink}");
+        let mut blue = 0usize;
         for i in 0..u.len() {
-            if u[i] < 110 && v[i] > 135 {
-                gold += 1;
+            if u[i] > 145 && v[i] < 120 {
+                blue += 1;
             }
         }
-        assert!(gold > 10, "default ink was not gold: {gold}");
+        assert!(blue > 10, "default ink was not timeline blue: {blue}");
 
-        let fill = with_viz_style(wave, VIZ_STYLE_FILL);
-        let (yf, _, _) = visualizer_i420(&peaks, 1.0, 320, 180, fill);
-        let fill_ink = yf.iter().filter(|&&p| p > 40).count();
-        assert!(fill_ink > 80, "fill missing: {fill_ink}");
+        let ring = with_viz_style(flags, VIZ_STYLE_RING);
+        let (yr, _, _) = visualizer_i420(&peaks, 1.0, 320, 180, ring);
+        let ring_ink = yr.iter().filter(|&&p| p > 40).count();
+        assert!(ring_ink > 80, "ring missing: {ring_ink}");
+        assert!(ring_ink < ink, "ring should be a stroke, not a fill");
 
-        let hue = with_viz_hue(wave, 8);
+        let hue = with_viz_hue(flags, 8);
         let (_, u2, v2) = visualizer_i420(&peaks, 1.0, 64, 32, hue);
         let mut shifted = 0usize;
         for i in 0..u2.len() {
-            if u2[i] > 130 && v2[i] < 120 {
+            if u2[i] < 120 && v2[i] > 130 {
                 shifted += 1;
             }
         }
-        assert!(shifted > 2, "hue 8 did not move off gold");
-
+        assert!(shifted > 2, "hue 8 did not leave blue");
     }
 }
 
