@@ -1446,48 +1446,46 @@ pub fn viz_ink_rgb(hue: u8) -> (u8, u8, u8) {
     hsv_to_rgb(212.0 + f32::from(hue & 15) * 22.5, 0.63, 0.84)
 }
 
-pub fn viz_ink_from_paint(paint: u32) -> (u8, u8, u8) {
+/// Azure + sat 160 + 8 strands + glow 2. What `viz_paint == 0` means.
+pub const VIZ_PAINT_AZURE: u32 = 150 | (160 << 8) | (8 << 16) | (2 << 24);
+
+pub fn viz_materialize(paint: u32) -> u32 {
     if paint == 0 {
-        return hsv_to_rgb(212.0, 0.63, 0.84);
+        VIZ_PAINT_AZURE
+    } else {
+        paint
     }
-    let hue = (paint & 0xFF) as f32 * 360.0 / 256.0;
-    let sat_b = ((paint >> 8) & 0xFF) as u8;
-    let sat = if sat_b == 0 { 0.63 } else { f32::from(sat_b) / 255.0 };
+}
+
+pub fn viz_ink_from_paint(paint: u32) -> (u8, u8, u8) {
+    let p = viz_materialize(paint);
+    let hue = (p & 0xFF) as f32 * 360.0 / 256.0;
+    let sat = f32::from(((p >> 8) & 0xFF) as u8) / 255.0;
     hsv_to_rgb(hue, sat, 0.84)
 }
 
 pub fn viz_strands_of(paint: u32) -> u8 {
-    match ((paint >> 16) & 0xFF) as u8 {
-        0 => 8,
-        n => n.clamp(1, 32),
-    }
+    (((viz_materialize(paint) >> 16) & 0xFF) as u8).clamp(1, 32)
 }
 
 pub fn viz_glow_of(paint: u32) -> u8 {
-    match ((paint >> 24) & 0xFF) as u8 {
-        0 => 2,
-        n => n.min(16),
-    }
+    ((viz_materialize(paint) >> 24) & 0xFF) as u8
 }
 
 pub fn with_viz_paint_hue(paint: u32, hue: u8) -> u32 {
-    let sat = match (paint >> 8) & 0xFF {
-        0 => 255,
-        s => s,
-    };
-    (paint & !0xFF) | u32::from(hue) | (sat << 8)
+    (viz_materialize(paint) & !0xFF) | u32::from(hue)
 }
 
 pub fn with_viz_paint_sat(paint: u32, sat: u8) -> u32 {
-    (paint & !(0xFF << 8)) | (u32::from(sat.max(1)) << 8)
+    (viz_materialize(paint) & !(0xFF << 8)) | (u32::from(sat) << 8)
 }
 
 pub fn with_viz_paint_strands(paint: u32, n: u8) -> u32 {
-    (paint & !(0xFF << 16)) | (u32::from(n.clamp(1, 32)) << 16)
+    (viz_materialize(paint) & !(0xFF << 16)) | (u32::from(n.clamp(1, 32)) << 16)
 }
 
 pub fn with_viz_paint_glow(paint: u32, n: u8) -> u32 {
-    (paint & !(0xFF << 24)) | (u32::from(n.min(16)) << 24)
+    (viz_materialize(paint) & !(0xFF << 24)) | (u32::from(n.min(16)) << 24)
 }
 
 pub fn viz_hue_ui(paint: u32) -> u8 {
@@ -1615,16 +1613,29 @@ fn viz_line(
     ink_y: u8,
     ink_u: u8,
     ink_v: u8,
+    glow: u8,
 ) {
     let dx = (x1 - x0).abs();
     let dy = -(y1 - y0).abs();
     let sx = if x0 < x1 { 1 } else { -1 };
     let sy = if y0 < y1 { 1 } else { -1 };
     let mut err = dx + dy;
+    let g = i32::from(glow);
     loop {
-        viz_stamp(y, u, v, w, h, cw, ch, x0, y0, 1.0, bg_y, ink_y, ink_u, ink_v);
-        viz_stamp(y, u, v, w, h, cw, ch, x0, y0 - 1, 0.45, bg_y, ink_y, ink_u, ink_v);
-        viz_stamp(y, u, v, w, h, cw, ch, x0, y0 + 1, 0.45, bg_y, ink_y, ink_u, ink_v);
+        for oy in -g..=g {
+            for ox in -g..=g {
+                if ox * ox + oy * oy > g * g {
+                    continue;
+                }
+                let fall = if ox == 0 && oy == 0 {
+                    1.0
+                } else {
+                    let d2 = (ox * ox + oy * oy) as f32;
+                    (-0.45 * d2 / (g * g).max(1) as f32).exp()
+                };
+                viz_stamp(y, u, v, w, h, cw, ch, x0 + ox, y0 + oy, fall, bg_y, ink_y, ink_u, ink_v);
+            }
+        }
         if x0 == x1 && y0 == y1 {
             break;
         }
@@ -1748,7 +1759,7 @@ pub(crate) fn visualizer_i420(
                     let scale = 0.28 + 0.72 * frac;
                     let wave = (x_phase + travel + s as f64 * 0.05).sin() as f32;
                     let row = (center + half * env * scale * wave).round() as i32;
-                    let glow = i32::from(viz_glow_of(paint)).max(1);
+                    let glow = i32::from(viz_glow_of(paint));
                     viz_stamp(
                         &mut y, &mut u, &mut v, w, h, cw, ch, col as i32, row, 1.0, bg_y, ink_y,
                         ink_u, ink_v,
@@ -1774,11 +1785,14 @@ pub(crate) fn visualizer_i420(
             let amp = (w.min(h) as f32) * 0.18;
             let tau = std::f32::consts::TAU;
             let steps = w.max(h) * 4;
-            for strand in 0..viz_strands_of(paint) {
-                let (ir, ig, ib) = viz_ink_from_paint(if strand < viz_strands_of(paint) / 2 {
-                    paint
-                } else {
+            let strands = viz_strands_of(paint);
+            let glow = viz_glow_of(paint);
+            for strand in 0..strands {
+                let dual = strands >= 2 && strand >= strands / 2;
+                let (ir, ig, ib) = viz_ink_from_paint(if dual {
                     with_viz_paint_hue(paint, viz_hue_ui(paint).wrapping_add(128))
+                } else {
+                    paint
                 });
                 let (iy, iu, iv) = rgb_yuv(ir as i32, ig as i32, ib as i32);
                 let scale = 0.65 + 0.35 * f32::from(strand % 4) / 3.0;
@@ -1796,6 +1810,7 @@ pub(crate) fn visualizer_i420(
                     if let Some((px, py)) = prev {
                         viz_line(
                             &mut y, &mut u, &mut v, w, h, cw, ch, px, py, x, row, bg_y, iy, iu, iv,
+                            glow,
                         );
                     }
                     prev = Some((x, row));
@@ -1810,7 +1825,7 @@ pub(crate) fn visualizer_i420(
                 if let Some((px, py)) = prev {
                     viz_line(
                         &mut y, &mut u, &mut v, w, h, cw, ch, px, py, x, y_pt, bg_y, ink_y, ink_u,
-                        ink_v,
+                        ink_v, viz_glow_of(paint),
                     );
                 }
                 prev = Some((x, y_pt));
@@ -1819,7 +1834,7 @@ pub(crate) fn visualizer_i420(
         _ => {
             // Timeline envelope: one filled body, tops then bottoms, after
             // the fold+smooth above. Default look.
-            let glow = i32::from(viz_glow_of(paint)).max(1);
+            let glow = i32::from(viz_glow_of(paint));
             for col in 0..w {
                 let top = (center - hi[col] * half).round() as i32;
                 let bot = (center - lo[col] * half).round() as i32;
