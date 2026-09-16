@@ -183,10 +183,21 @@ impl Player {
         fit: FitPolicy,
         cx: &mut Context<Self>,
     ) {
+        // The policy has to have moved before this is an edit: `set_fit`
+        // answers "the index existed", not "the value changed" (the engine
+        // snapshot-and-rewrites the same policy and still says true), and the
+        // list keeps the row already in force clickable -- so the engine's
+        // own bool would light the ledger's `unsaved` ghost over a project
+        // nobody touched.
         if let Some(session) = &mut self.session
+            && session.fit_of(lane, idx) != fit
             && session.set_fit(lane, idx, fit)
         {
             let (w, h) = session.resolution();
+            // A clip's own fit policy, written from a click: arms autosave
+            // and the close gate itself ([`Player::act`]'s list is the action
+            // doors only).
+            self.mark_dirty();
             self.notify_user(format!("FIT POLICY: {} on {w}x{h}", fit_label(fit)).into());
             self.reset_after_reseek();
         }

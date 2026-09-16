@@ -1820,6 +1820,9 @@ impl Player {
     /// offers a number a step could not also land on.
     pub(crate) fn edit_transition(&mut self, frames: u32, cap: u32) {
         let digits = cap.to_string().chars().count() + 1;
+        // The Clip tab's colour field is given up: one inline editor at a
+        // time, since both are driven by the one key branch that finds them.
+        self.viz_hex_edit = None;
         self.transition_edit = Some(NumberEdit::new(frames, 0, cap, digits, "frames"));
     }
 

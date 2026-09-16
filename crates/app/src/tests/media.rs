@@ -214,12 +214,12 @@ fn the_wheel_draws_the_sample_a_drag_is_holding() {
     assert_eq!(viz_held_paint(0, None), 0);
     assert_eq!(viz_held_paint(0x0208_d2fd, None), 0x0208_d2fd);
     // Held: that hue and saturation over what the clip already carries.
-    let held = viz_held_paint(0, Some((253, 210)));
+    let held = viz_held_paint(0, Some((VizSlot::Main, 253, 210)));
     assert_eq!(engine::decode::viz_hue_ui(held), 253);
     assert_eq!(engine::decode::viz_sat_ui(held), 210);
     // ...in that order, never the other way round: a mark drawn at the wrong
     // angle is the whole gesture showing the wrong colour.
-    let flipped = viz_held_paint(0, Some((210, 253)));
+    let flipped = viz_held_paint(0, Some((VizSlot::Main, 210, 253)));
     assert_ne!(held, flipped);
     assert_eq!(engine::decode::viz_hue_ui(flipped), 210);
     assert_eq!(engine::decode::viz_sat_ui(flipped), 253);
@@ -229,9 +229,81 @@ fn the_wheel_draws_the_sample_a_drag_is_holding() {
     assert_eq!(engine::decode::viz_glow_of(held), 2);
     let pen = engine::decode::with_viz_paint_glow(0x0208_d2fd, 9);
     assert_eq!(
-        engine::decode::viz_glow_of(viz_held_paint(pen, Some((253, 210)))),
+        engine::decode::viz_glow_of(viz_held_paint(pen, Some((VizSlot::Main, 253, 210)))),
         9
     );
+}
+
+/// The strand's half of the same gesture, and the two things a second ink on
+/// the one wheel may not get wrong. A strand the clip has not chosen starts at
+/// the automatic complement the painter draws there -- the clip's hue half a
+/// turn round, at the clip's own saturation -- so the mark is on a colour the
+/// picture already has and the first write only says "this one, then". And the
+/// clip's own ink is not touched by any of it: the whole point of a second ink
+/// is that one slot's writes leave the other alone.
+#[test]
+fn the_strand_slot_starts_at_the_complement_and_the_write_chooses_it() {
+    use engine::decode::{
+        viz_hue_ui, viz_sat_ui, viz_strand_hue_ui, viz_strand_sat_ui, viz_strand_set,
+        with_viz_paint_hue, with_viz_paint_strands, VIZ_PAINT_AZURE,
+    };
+
+    let paint = with_viz_paint_strands(VIZ_PAINT_AZURE, 2);
+    assert!(!viz_strand_set(paint), "no strand colour chosen yet");
+    assert_eq!(
+        VizSlot::Strand.hue_sat(paint),
+        (viz_hue_ui(paint).wrapping_add(128), viz_sat_ui(paint)),
+        "the unset strand stands where the painter draws its complement"
+    );
+    // ...half a turn round, wrapping: hue 200's complement is 72, not 328.
+    let late = with_viz_paint_hue(paint, 200);
+    assert_eq!(VizSlot::Strand.hue_sat(late).0, 200u8.wrapping_add(128));
+    assert_eq!(VizSlot::Strand.hue_sat(late).0, 72);
+
+    // The write is what chooses it, and reads back as what was written.
+    let picked = VizSlot::Strand.set_hue_sat(paint, 0, 255);
+    assert!(viz_strand_set(picked));
+    assert_eq!(viz_strand_hue_ui(picked), 0);
+    assert_eq!(viz_strand_sat_ui(picked), 255);
+    assert_eq!(VizSlot::Strand.hue_sat(picked), (0, 255));
+    // The clip's own colour survives the strand's writes untouched.
+    assert_eq!(viz_hue_ui(picked), viz_hue_ui(paint));
+    assert_eq!(viz_sat_ui(picked), viz_sat_ui(paint));
+    // A held strand sample draws the strand, not the clip's colour: the slot
+    // rides with the sample.
+    let held = viz_held_paint(paint, Some((VizSlot::Strand, 0, 255)));
+    assert_eq!(VizSlot::Strand.hue_sat(held), (0, 255));
+    assert_eq!(viz_strand_set(held), true);
+    // And the wheel's own slot writes only its own bytes.
+    let main = VizSlot::Main.set_hue_sat(picked, 33, 44);
+    assert_eq!((viz_hue_ui(main), viz_sat_ui(main)), (33, 44));
+    assert_eq!((viz_strand_hue_ui(main), viz_strand_sat_ui(main)), (0, 255));
+}
+
+/// One strand has no dual half, so the strand slot falls back to the clip's own
+/// colour: a write there lands on the ink the picture actually paints instead
+/// of choosing a strand colour nothing wears. Two strands put it back -- the
+/// same reading the Strand chip is enabled by.
+#[test]
+fn a_strand_slot_on_a_single_strand_clip_is_the_clip_s_own_colour() {
+    use engine::decode::{
+        viz_hue_ui, viz_sat_ui, viz_strand_set, viz_strands_of, with_viz_paint_hue,
+        with_viz_paint_sat, with_viz_paint_strands, VIZ_PAINT_AZURE,
+    };
+
+    let one = with_viz_paint_strands(
+        with_viz_paint_sat(with_viz_paint_hue(VIZ_PAINT_AZURE, 64), 200),
+        1,
+    );
+    assert_eq!(viz_strands_of(one), 1);
+    assert_eq!(VizSlot::Strand.picked(one), VizSlot::Main);
+    let hit = VizSlot::Strand.picked(one).set_hue_sat(one, 0, 255);
+    assert!(!viz_strand_set(hit), "one strand chooses no strand colour");
+    assert_eq!((viz_hue_ui(hit), viz_sat_ui(hit)), (0, 255));
+    // The clip's own slot is never redirected -- it is what the fallback
+    // lands on.
+    assert_eq!(VizSlot::Main.picked(one), VizSlot::Main);
+    assert_eq!(VizSlot::Strand.picked(with_viz_paint_strands(one, 2)), VizSlot::Strand);
 }
 
 /// A seek says nothing until it has stood: an ordinary one is a flicker and

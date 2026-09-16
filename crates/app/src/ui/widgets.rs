@@ -470,6 +470,88 @@ impl NumberEdit {
     }
 }
 
+/// How much text the colour field will hold: `rgba(255, 255, 255, 255)` with
+/// room to spare. Every legal colour is far inside it; the cap is there so a
+/// held key cannot grow the buffer without bound.
+const COLOR_EDIT_CHARS: usize = 32;
+
+/// A colour being typed into a row that has no text field of its own: the
+/// free-text sibling of [`NumberEdit`], for the same reason it exists -- these
+/// rows take no gpui focus, so the text is held as state and driven by the
+/// root's key handler. One caller, the Clip tab's colour field
+/// ([`Player::edit_viz_hex`]): typing, backspace, enter that commits and
+/// escape that gives up, and a refusal in words when what is there is not a
+/// colour.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ColorEdit {
+    pub(crate) text: String,
+    pub(crate) refusal: Option<String>,
+}
+
+impl ColorEdit {
+    /// Starts on the colour the row already shows, so backspace edits it
+    /// rather than the field opening empty over a colour still in force
+    /// ([`NumberEdit::new`]'s own rule).
+    pub(crate) fn new(seed: &str) -> Self {
+        ColorEdit {
+            text: seed.to_string(),
+            refusal: None,
+        }
+    }
+
+    /// One printable stroke. The one past the cap is refused *out loud*: a
+    /// keystroke dropped in silence is what leaves a field showing something
+    /// the user did not type ([`NumberEdit::digit`]'s own reason).
+    pub(crate) fn typed(&mut self, c: char) {
+        if self.text.chars().count() >= COLOR_EDIT_CHARS {
+            self.refusal = Some(format!("{COLOR_EDIT_CHARS} characters is already past the field"));
+            return;
+        }
+        self.text.push(c);
+        self.refusal = None;
+    }
+
+    /// Erases the last character, and the refusal with it: the text on screen
+    /// has changed, so the reason the old one was refused no longer describes
+    /// it.
+    pub(crate) fn backspace(&mut self) {
+        self.text.pop();
+        self.refusal = None;
+    }
+
+    /// The colour, or `None` with the reason recorded where the row will read
+    /// it. Only the shapes the paint field can carry are read at all
+    /// (`engine::decode::viz_color_from_text`); anything else is refused
+    /// rather than guessed at, and the refusal says what a colour looks like
+    /// so the next try is a backspace away.
+    pub(crate) fn commit(&mut self) -> Option<(u8, u8)> {
+        match engine::decode::viz_color_from_text(&self.text) {
+            Some(hue_sat) => {
+                self.refusal = None;
+                Some(hue_sat)
+            }
+            None => {
+                self.refusal = Some("type a colour — #RRGGBB or rgb(r,g,b)".to_string());
+                None
+            }
+        }
+    }
+
+    /// What the row shows while it is being typed into: the text, the caret
+    /// that says it is landing *here*, and either the refusal or the two keys
+    /// that end the edit.
+    pub(crate) fn detail(&self) -> String {
+        format!(
+            "{}▏ {}",
+            self.text,
+            match &self.refusal {
+                Some(why) => why.as_str(),
+                None => "enter commits · esc cancels",
+            }
+        )
+    }
+}
+
 /// What a window with no file open shows: DESIGN §8 wants a noun, not a
 /// sentence -- both ways in (window drop target, Import in the media list)
 /// are taught by their own geography, not by this label.
