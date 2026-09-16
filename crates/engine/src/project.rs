@@ -461,10 +461,15 @@ pub struct Clip {
     /// Zero is an ordinary picture. Older project files have no field and
     /// mean zero.
     pub visualizer: u8,
-    /// Packed look: hue 0-255, sat 0-255, strands 0-255, glow 0-255.
-    /// All-zero is the default (timeline azure, full sat, 8 strands, glow 2).
-    /// Older files have no field and mean zero.
-    pub viz_paint: u32,
+    /// Packed look: hue 0-255, sat 0-255, strands 0-255, glow 0-255 in the
+    /// low four bytes as they have been since v22, then the strand colour's
+    /// own bytes above them -- its hue at 32 and sat at 40
+    /// ([`crate::decode::viz_strand_hue_ui`]) -- with the top bit as
+    /// [`crate::decode::viz_strand_set`]. All-zero is the default (timeline
+    /// azure, full sat, 8 strands, glow 2, no strand colour of its own).
+    /// Older files have no field and mean zero; a v22 file's 32-bit value
+    /// is the low half of this one, byte for byte.
+    pub viz_paint: u64,
 }
 
 impl Clip {
@@ -2653,11 +2658,28 @@ impl Project {
         true
     }
 
-    pub fn set_viz_paint(&mut self, lane: Lane, idx: usize, paint: u32) -> bool {
+    /// Give the clip at `idx` of `lane` this packed look: one undo step, and
+    /// `false` (with no history) for an index that is not there, the way every
+    /// other setter refuses.
+    pub fn set_viz_paint(&mut self, lane: Lane, idx: usize, paint: u64) -> bool {
+        self.write_viz_paint(lane, idx, paint, true)
+    }
+
+    /// [`set_viz_paint`](Self::set_viz_paint) without the undo step: the
+    /// samples *inside* one pointer drag across the colour wheel, whose first
+    /// write (a plain `set_viz_paint`) already took the snapshot the gesture
+    /// rolls back to. One drag is one undo, not one per sample.
+    pub fn set_viz_paint_live(&mut self, lane: Lane, idx: usize, paint: u64) -> bool {
+        self.write_viz_paint(lane, idx, paint, false)
+    }
+
+    fn write_viz_paint(&mut self, lane: Lane, idx: usize, paint: u64, snapshot: bool) -> bool {
         if idx >= self.lane(lane).len() {
             return false;
         }
-        self.snapshot();
+        if snapshot {
+            self.snapshot();
+        }
         self.lane_mut(lane).expect("checked above")[idx].viz_paint = paint;
         true
     }
@@ -3049,7 +3071,10 @@ impl Project {
             .unwrap_or(0)
     }
 
-    pub fn composite_viz_paint_at(&self, timeline_frame: u32) -> u32 {
+    /// Packed look ([`Clip::viz_paint`]) of the topmost video clip at
+    /// `timeline_frame`, or zero over a gap / a picture that is not a
+    /// visualizer.
+    pub fn composite_viz_paint_at(&self, timeline_frame: u32) -> u64 {
         self.composite_clip_at(timeline_frame)
             .map(|(lane, idx)| self.lane(lane)[idx].viz_paint)
             .unwrap_or(0)
@@ -7225,13 +7250,17 @@ mod tests {
     /// The transform index is a third `Option<u16>`, same reason as the eq and
     /// colour ones before it -- it lands in bytes already spent on padding, so
     /// the struct still costs 56.
+    /// The visualizer look is the first field whose own width outgrows the
+    /// padding it lands in: it is a `u64` (a strand colour needs bytes above
+    /// the clip's own four), so the words after it come to 60 and the
+    /// alignment rounds them to 64 -- one word more than a clip used to cost.
     /// This is the assert that says so: a clip that grows a word grows every
     /// undo snapshot and every clipboard copy with it.
     #[test]
     fn a_fit_policy_costs_the_clip_no_word() {
         assert_eq!(
             std::mem::size_of::<Clip>(),
-            56,
+            64,
             "Clip changed size: {} bytes",
             std::mem::size_of::<Clip>()
         );
@@ -8893,6 +8922,40 @@ mod tests {
         );
     }
 
+    /// A drag across the colour wheel is one gesture -- the look's twin of
+    /// [`a_whole_colour_drag_undoes_in_one_step`]: the press snapshots, every
+    /// sample after it only repaints, and the single undo lands on the look
+    /// the clip had *before* the hand touched it. The committing setter is
+    /// still exactly one step, refusals included.
+    #[test]
+    fn a_whole_look_drag_undoes_in_one_step() {
+        let look = |hue: u8| crate::decode::with_viz_paint_hue(crate::decode::VIZ_PAINT_AZURE, hue);
+        let mut p = three();
+        assert!(p.set_viz_paint(Lane::V1, 0, look(1)), "the press");
+        for hue in 2..=8u8 {
+            assert!(p.set_viz_paint_live(Lane::V1, 0, look(hue)), "a sample");
+        }
+        assert_eq!(p.lane(Lane::V1)[0].viz_paint, look(8));
+        assert!(p.undo());
+        assert_eq!(
+            p.lane(Lane::V1)[0].viz_paint,
+            0,
+            "one undo is the whole gesture, back to the default look"
+        );
+
+        // The live write refuses an index that is not there -- and a refusal
+        // costs no history -- while one committing write is one step back.
+        assert!(!p.set_viz_paint_live(Lane::V1, 99, look(1)));
+        assert!(p.set_viz_paint(Lane::V1, 0, look(1)), "a click, not a drag");
+        assert_eq!(p.lane(Lane::V1)[0].viz_paint, look(1));
+        assert!(p.undo());
+        assert_eq!(
+            p.lane(Lane::V1)[0].viz_paint,
+            0,
+            "the committing setter is one undo step, no more"
+        );
+    }
+
     /// The colour table is append-only within a session, exactly as the eq one
     /// is -- and a save is where an undone grade goes.
     #[test]
@@ -9052,12 +9115,15 @@ mod tests {
     /// colour one did not, and the struct grew a word. The transform index is
     /// a third `Option<u16>`, and it fits the padding the fit policy and the
     /// transition byte already left behind, so the struct did not grow again.
+    /// The packed visualizer look is a `u64` -- the strand colour has bytes
+    /// above the clip's own four -- and nothing left in the struct is wide
+    /// enough to hold it, so it grew a word again.
     #[test]
     fn a_clip_is_still_a_small_copy() {
         assert_eq!(
             std::mem::size_of::<Clip>(),
-            56,
-            "Clip changed size -- 32 before the colour index, 40 before the fades, 48 after, 56 with the transition, still 56 with the transform index"
+            64,
+            "Clip changed size -- 32 before the colour index, 40 before the fades, 48 after, 56 with the transition, still 56 with the transform index, 64 once the look was a u64"
         );
     }
 

@@ -2984,8 +2984,16 @@ impl PlaybackSession {
         self.edit(Dirty::Picture, |p| p.set_visualizer(lane, idx, flags))
     }
 
-    pub fn set_viz_paint(&mut self, lane: Lane, idx: usize, paint: u32) -> bool {
+    pub fn set_viz_paint(&mut self, lane: Lane, idx: usize, paint: u64) -> bool {
         self.edit(Dirty::Picture, |p| p.set_viz_paint(lane, idx, paint))
+    }
+
+    /// The same look and the same repaint without the undo step
+    /// ([`Project::set_viz_paint_live`]): what the samples inside one drag
+    /// across the colour wheel go through, so the picture follows the hand and
+    /// the whole gesture is still a single `z`.
+    pub fn set_viz_paint_live(&mut self, lane: Lane, idx: usize, paint: u64) -> bool {
+        self.edit(Dirty::Picture, |p| p.set_viz_paint_live(lane, idx, paint))
     }
 
     /// Timeline frames of ramp-up from silence at the start of the clip at
@@ -4794,6 +4802,28 @@ mod tests {
 
         assert_eq!(before, s.restarts(), "a live transform edit must reuse the worker");
         assert_eq!(next.index, first.index, "paused: same timeline position before and after");
+    }
+
+    /// The session's live look samples leave its history exactly where the
+    /// press left it -- the colour-wheel drag's twin for the packed look, and
+    /// what lets the app drive one from a pointer: `z` after a drag lands
+    /// before the press, not one sample back down the drag.
+    #[test]
+    fn a_live_look_drag_is_one_step_of_the_sessions_history() {
+        let mut s = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+        let (lane, idx) = s.video_clip_at(s.now()).expect("a clip under the playhead");
+        let look = |hue: u8| crate::decode::with_viz_paint_hue(crate::decode::VIZ_PAINT_AZURE, hue);
+        assert!(s.set_viz_paint(lane, idx, look(1)), "the press");
+        for hue in 2..=6u8 {
+            assert!(s.set_viz_paint_live(lane, idx, look(hue)), "a sample");
+        }
+        assert_eq!(s.project.lane(lane)[idx].viz_paint, look(6));
+        assert!(s.undo(), "the drag's own step");
+        assert_eq!(
+            s.project.lane(lane)[idx].viz_paint,
+            0,
+            "one undo is the whole drag"
+        );
     }
 }
 
