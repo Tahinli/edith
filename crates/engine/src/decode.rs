@@ -1735,6 +1735,10 @@ fn viz_span(
     }
 }
 
+/// One segment's glow as its own disc, stamped at every Bresenham cell: what
+/// a chain was painted by before [`viz_chain`], and still the cheaper of the
+/// two when the chain is long ([`viz_discs_are_cheaper`]).
+#[allow(clippy::too_many_arguments)]
 fn viz_line(
     y: &mut [u8],
     u: &mut [u8],
@@ -1785,6 +1789,218 @@ fn viz_line(
         if e2 <= dx {
             err += dx;
             y0 += sy;
+        }
+    }
+}
+
+/// Which of the two passes paints a chain, by what each of them visits. Both
+/// paint the same bytes, and the tests hold them to it; they are not alike in
+/// what they cost. The discs visit `samples * pi * glow^2` cells whatever the
+/// envelope is doing, while the chain visits each of its own cells once per
+/// row of its band -- `cells * (2 * glow + 1)`. So a *smooth* trace (a chain
+/// cell per sample, near enough) is the chain's by a wide margin, and a
+/// *jagged* one, whose samples are Bresenham runs of dozens of cells, is the
+/// discs' while the glow is small. A song's own ring at 1080p crossed between
+/// glow 3 and 4 (31 ms against 44 ms there, and 60 against 52 at glow 4),
+/// which is exactly what this comparison says.
+fn viz_discs_are_cheaper(samples: usize, cells: usize, glow: u8) -> bool {
+    (samples as u64) * (2 * u64::from(glow) + 1) < cells as u64
+}
+
+/// The Bresenham cells of one segment, collected rather than stamped: the same
+/// walk [`viz_line`] used to rasterise, kept for [`viz_chain`] to paint the
+/// whole chain from.
+fn viz_walk(mut x0: i32, mut y0: i32, x1: i32, y1: i32, chain: &mut Vec<(i32, i32)>) {
+    let dx = (x1 - x0).abs();
+    let dy = -(y1 - y0).abs();
+    let sx = if x0 < x1 { 1 } else { -1 };
+    let sy = if y0 < y1 { 1 } else { -1 };
+    let mut err = dx + dy;
+    loop {
+        chain.push((x0, y0));
+        if x0 == x1 && y0 == y1 {
+            break;
+        }
+        let e2 = 2 * err;
+        if e2 >= dy {
+            err += dy;
+            x0 += sx;
+        }
+        if e2 <= dx {
+            err += dx;
+            y0 += sy;
+        }
+    }
+}
+
+/// Paints a whole chain in one pass: every cell within `glow` of a chain cell
+/// takes the falloff of the **nearest** one, and the ink with it.
+///
+/// Byte-for-byte what the per-point discs left behind, and the reason is in the
+/// write: luma is a `max`, so of every disc covering a cell only the closest one
+/// can decide it, and a glow disc's chroma is written at *every* step of it --
+/// [`viz_stamp`]`s threshold (0.6) is under the falloff of the rim
+/// (`exp(-0.45) = 0.64`), which is what makes the whole disc the ink's own.
+/// What changes is the cost: discs visit `steps * pi * glow^2` cells
+/// (`VIZ_STYLE_RING`'s 7680 steps measured 296 ms for one 1080p frame at glow
+/// 16, eight strands), while this visits each covered cell once and finds its
+/// nearest chain cell by walking outward from it through the chain cells of its
+/// own row band.
+#[allow(clippy::too_many_arguments)]
+fn viz_chain(
+    y: &mut [u8],
+    u: &mut [u8],
+    v: &mut [u8],
+    w: usize,
+    h: usize,
+    cw: usize,
+    ch: usize,
+    chain: &mut Vec<(i32, i32)>,
+    bg_y: u8,
+    ink_y: u8,
+    ink_u: u8,
+    ink_v: u8,
+    glow: u8,
+) {
+    if chain.is_empty() {
+        return;
+    }
+    if glow == 0 {
+        // Nothing to decide: with no glow the cells are the chain itself, at
+        // full ink -- which is exactly what the row/by/band machinery below
+        // works out, one sort later.
+        for &(x, row) in chain.iter() {
+            viz_stamp(y, u, v, w, h, cw, ch, x, row, 1.0, bg_y, ink_y, ink_u, ink_v);
+        }
+        return;
+    }
+    let g = i32::from(glow);
+    // By (row, x) -- the tuple is (x, row) -- so a row's band is a contiguous
+    // slice of this: a chain revisits cells (the ring is sampled several times
+    // a pixel) and a repeat is the same candidate.
+    chain.sort_unstable_by_key(|&(x, row)| (row, x));
+    chain.dedup();
+    let mut rows: Vec<(i32, usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < chain.len() {
+        let row = chain[i].1;
+        let start = i;
+        while i < chain.len() && chain[i].1 == row {
+            i += 1;
+        }
+        rows.push((row, start, i));
+    }
+    let first = (rows[0].0 - g).max(0);
+    let last = (rows[rows.len() - 1].0 + g).min(h as i32 - 1);
+    let mut band = 0usize;
+    // `(x, dy^2)` -- a candidate's horizontal offset is left to the cell that
+    // asks, its vertical one is its own.
+    let mut cand: Vec<(i32, i32)> = Vec::new();
+    // The candidates a run's cells are decided by, once the ones that can never
+    // be nearest are off ([`viz_chain`]'s own note).
+    let mut hull: Vec<usize> = Vec::new();
+    for row in first..=last {
+        while band < rows.len() && rows[band].0 < row - g {
+            band += 1;
+        }
+        cand.clear();
+        let mut k = band;
+        while k < rows.len() && rows[k].0 <= row + g {
+            let dy = rows[k].0 - row;
+            let dy2 = dy * dy;
+            for &(x, _) in &chain[rows[k].1..rows[k].2] {
+                cand.push((x, dy2));
+            }
+            k += 1;
+        }
+        if cand.is_empty() {
+            continue;
+        }
+        cand.sort_unstable_by_key(|&(x, _)| x);
+        // One candidate per column: the nearest in y is the only one that can
+        // decide a cell -- the others are further on both axes.
+        let mut kept = 0usize;
+        for j in 0..cand.len() {
+            if kept > 0 && cand[kept - 1].0 == cand[j].0 {
+                if cand[j].1 < cand[kept - 1].1 {
+                    cand[kept - 1] = cand[j];
+                }
+            } else {
+                cand[kept] = cand[j];
+                kept += 1;
+            }
+        }
+        cand.truncate(kept);
+        // The stretches of x the discs reach, one run at a time: the hole in
+        // the middle of a ring is not walked at all.
+        let mut j = 0usize;
+        while j < cand.len() {
+            let run_lo = cand[j].0 - g;
+            let mut run_hi = cand[j].0 + g;
+            let first = j;
+            while j + 1 < cand.len() && cand[j + 1].0 - g <= run_hi + 1 {
+                j += 1;
+                run_hi = run_hi.max(cand[j].0 + g);
+            }
+            let end = j + 1; // exclusive
+            j += 1;
+            let x_lo = run_lo.max(0);
+            let x_hi = run_hi.min(w as i32 - 1);
+            if x_lo > x_hi {
+                continue;
+            }
+            // What is left of a candidate at cell `x` is
+            // `x^2 - 2*cx*x + (cx^2 + dy^2)`: the `x^2` is common to every
+            // candidate, so the nearest one is the lowest line of the rest --
+            // and only the lower hull of those lines is ever the lowest, at any
+            // x. On the hull the nearest one only ever moves forward as x
+            // does, which is what makes this a walk over the cells instead of a
+            // search per cell.
+            let line = |c: usize| {
+                let (cx, dy2) = cand[c];
+                let cx = i64::from(cx);
+                (-2 * cx, cx * cx + i64::from(dy2))
+            };
+            let value = |c: usize, x: i32| {
+                let (m, b) = line(c);
+                m * i64::from(x) + b
+            };
+            hull.clear();
+            for c in first..end {
+                let (m, b) = line(c);
+                while hull.len() >= 2 {
+                    let (m1, b1) = line(hull[hull.len() - 2]);
+                    let (m2, b2) = line(hull[hull.len() - 1]);
+                    // The middle line is never the lowest: its two crossings
+                    // are the wrong way round.
+                    if (b2 - b1) * (m2 - m) >= (b - b2) * (m1 - m2) {
+                        hull.pop();
+                    } else {
+                        break;
+                    }
+                }
+                hull.push(c);
+            }
+            let mut hp = 0usize;
+            for x in x_lo..=x_hi {
+                while hp + 1 < hull.len()
+                    && value(hull[hp + 1], x) <= value(hull[hp], x)
+                {
+                    hp += 1;
+                }
+                let (cx, dy2) = cand[hull[hp]];
+                let d = x - cx;
+                let d2 = d * d + dy2;
+                if d2 > g * g {
+                    continue;
+                }
+                let fall = if d2 == 0 {
+                    1.0
+                } else {
+                    (-0.45 * d2 as f32 / (g * g).max(1) as f32).exp()
+                };
+                viz_stamp(y, u, v, w, h, cw, ch, x, row, fall, bg_y, ink_y, ink_u, ink_v);
+            }
         }
     }
 }
@@ -1925,6 +2141,8 @@ pub(crate) fn visualizer_i420(
             let steps = w.max(h) * 4;
             let strands = viz_strands_of(paint);
             let glow = viz_glow_of(paint);
+            let mut chain: Vec<(i32, i32)> = Vec::new();
+            let mut pts: Vec<(i32, i32)> = Vec::new();
             for strand in 0..strands {
                 let dual = strands >= 2 && strand >= strands / 2;
                 // The dual half takes the clip's own strand colour when it
@@ -1946,7 +2164,7 @@ pub(crate) fn visualizer_i420(
                 let (iy, iu, iv) = rgb_yuv(ir as i32, ig as i32, ib as i32);
                 let scale = 0.65 + 0.35 * f32::from(strand % 4) / 3.0;
                 let phase = f32::from(strand) * 0.35;
-                let mut prev: Option<(i32, i32)> = None;
+                pts.clear();
                 for i in 0..=steps {
                     let t = i as f32 / steps as f32;
                     let theta = t * tau + t_secs as f32 * 1.1 + phase;
@@ -1956,28 +2174,48 @@ pub(crate) fn visualizer_i420(
                     let r = r0 + amp * env * scale + amp * wobble;
                     let x = (cx + r * theta.cos()).round() as i32;
                     let row = (cy + r * theta.sin()).round() as i32;
-                    if let Some((px, py)) = prev {
+                    pts.push((x, row));
+                }
+                chain.clear();
+                for pair in pts.windows(2) {
+                    viz_walk(pair[0].0, pair[0].1, pair[1].0, pair[1].1, &mut chain);
+                }
+                if viz_discs_are_cheaper(pts.len(), chain.len(), glow) {
+                    for pair in pts.windows(2) {
                         viz_line(
-                            &mut y, &mut u, &mut v, w, h, cw, ch, px, py, x, row, bg_y, iy, iu, iv,
-                            glow,
+                            &mut y, &mut u, &mut v, w, h, cw, ch, pair[0].0, pair[0].1, pair[1].0,
+                            pair[1].1, bg_y, iy, iu, iv, glow,
                         );
                     }
-                    prev = Some((x, row));
+                } else {
+                    viz_chain(
+                        &mut y, &mut u, &mut v, w, h, cw, ch, &mut chain, bg_y, iy, iu, iv, glow,
+                    );
                 }
             }
         }
         VIZ_STYLE_WAVE => {
-            let mut prev: Option<(i32, i32)> = None;
+            let mut chain: Vec<(i32, i32)> = Vec::new();
+            let mut pts: Vec<(i32, i32)> = Vec::new();
             for col in 0..w {
-                let y_pt = (center - sig[col] * half).round() as i32;
-                let x = col as i32;
-                if let Some((px, py)) = prev {
+                pts.push((col as i32, (center - sig[col] * half).round() as i32));
+            }
+            for pair in pts.windows(2) {
+                viz_walk(pair[0].0, pair[0].1, pair[1].0, pair[1].1, &mut chain);
+            }
+            let glow = viz_glow_of(paint);
+            if viz_discs_are_cheaper(pts.len(), chain.len(), glow) {
+                for pair in pts.windows(2) {
                     viz_line(
-                        &mut y, &mut u, &mut v, w, h, cw, ch, px, py, x, y_pt, bg_y, ink_y, ink_u,
-                        ink_v, viz_glow_of(paint),
+                        &mut y, &mut u, &mut v, w, h, cw, ch, pair[0].0, pair[0].1, pair[1].0,
+                        pair[1].1, bg_y, ink_y, ink_u, ink_v, glow,
                     );
                 }
-                prev = Some((x, y_pt));
+            } else {
+                viz_chain(
+                    &mut y, &mut u, &mut v, w, h, cw, ch, &mut chain, bg_y, ink_y, ink_u, ink_v,
+                    glow,
+                );
             }
         }
         _ => {
@@ -2480,6 +2718,76 @@ mod tests {
         assert_eq!(ut, u0);
         assert_eq!(vt, v0);
     }
+    /// The look of a frame the glow pass was rewritten for, pinned byte for
+    /// byte: [`viz_chain`] replaced the per-point discs under
+    /// [`VIZ_STYLE_RING`] and [`VIZ_STYLE_WAVE`], whose glow cost `steps * pi *
+    /// glow^2` cells per frame (295 ms of one 1080p ring frame at glow 16
+    /// against 18 ms after), and this is what says the pictures did not move
+    /// with it. FNV-1a over `y`, then `u`, then `v`, taken from the disc
+    /// implementation that shipped before the rewrite; `fill` and `ribbon` are
+    /// in the table because their planes share the frame with a chain's, and
+    /// the row/run walk could still have reached them through a shared helper.
+    ///
+    /// Scope: eight strands (what [`VIZ_PAINT_AZURE`] carries) at four gloss
+    /// including both ends. A strand count changes a chain's scale and phase,
+    /// not the pass over it.
+    #[test]
+    fn the_glow_pass_paints_the_bytes_it_always_did() {
+        const GOLDEN: &[(&str, u8, u64)] = &[
+            ("fill", 0, 0xe141_5e51_fcc1_7ea1),
+            ("fill", 2, 0x3842_fef4_d4ec_4239),
+            ("fill", 8, 0xfaea_3e6f_9718_1d31),
+            ("fill", 16, 0x6a09_31fe_e9f1_3069),
+            ("ribbon", 0, 0x91fa_9b49_48d8_bcfe),
+            ("ribbon", 2, 0xd4d2_bcce_3c32_14d8),
+            ("ribbon", 8, 0xd23a_d502_17ac_697c),
+            ("ribbon", 16, 0xd7de_425a_6737_11c3),
+            ("ring", 0, 0xcfbe_55da_b222_0a1b),
+            ("ring", 2, 0x5468_01eb_522e_21dc),
+            ("ring", 8, 0xc08f_994e_4a19_c9f4),
+            ("ring", 16, 0x8cee_6dcd_256c_d484),
+            ("wave", 0, 0x2266_ba70_ab2a_06bd),
+            ("wave", 2, 0xd05f_0a31_9264_b377),
+            ("wave", 8, 0x2e50_7536_c5dd_6035),
+            ("wave", 16, 0xf888_b09c_dae2_dd36),
+        ];
+        let peaks = benchmark_peaks((149.6 * f64::from(VIZ_BUCKETS_PER_SEC)) as usize);
+        for &(name, glow, want) in GOLDEN {
+            let style = match name {
+                "fill" => VIZ_STYLE_FILL,
+                "ribbon" => VIZ_STYLE_RIBBON,
+                "ring" => VIZ_STYLE_RING,
+                _ => VIZ_STYLE_WAVE,
+            };
+            let flags = with_viz_style(1, style);
+            let paint = with_viz_paint_glow(VIZ_PAINT_AZURE, glow);
+            let (y, u, v) = visualizer_i420(&peaks, 37.5, 1920, 1080, flags, paint);
+            let mut hash = 0xcbf2_9ce4_8422_2325u64;
+            for buf in [&y, &u, &v] {
+                for &b in buf.iter() {
+                    hash ^= u64::from(b);
+                    hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+                }
+            }
+            assert_eq!(
+                hash, want,
+                "{name} at glow {glow} paints different bytes than it always did ({hash:016x})"
+            );
+        }
+    }
+
+    /// The envelope both of the tests above paint: loud enough that every
+    /// column carries ink, and shaped so a ring's radii and a wave's trace
+    /// differ from column to column.
+    fn benchmark_peaks(n: usize) -> Vec<(f32, f32)> {
+        let mut peaks = vec![(0.0f32, 0.0f32); n];
+        for (i, p) in peaks.iter_mut().enumerate() {
+            let t = i as f64 / f64::from(VIZ_BUCKETS_PER_SEC);
+            let a = ((t * 0.7).sin() * 0.6 + (t * 5.3).sin() * 0.25 + 0.1) as f32;
+            *p = (-a.abs(), a.abs());
+        }
+        peaks
+    }
 }
 
 fn run(
@@ -2769,6 +3077,7 @@ fn run_av1(
             }
         }
     }
+
 }
 
 /// Converts one decoded picture and queues it. `true` when the consumer went
