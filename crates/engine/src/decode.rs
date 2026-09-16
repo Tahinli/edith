@@ -630,7 +630,7 @@ impl DecodeSession {
         transform: TransformParams,
         canvas: Composer,
         flags: u8,
-        paint: u32,
+        paint: u64,
     ) -> crate::Result<FrameStream> {
         let (tx, rx) = sync_channel(2);
         let cancel = Arc::new(AtomicBool::new(false));
@@ -1447,9 +1447,18 @@ pub fn viz_ink_rgb(hue: u8) -> (u8, u8, u8) {
 }
 
 /// Azure + sat 160 + 8 strands + glow 2. What `viz_paint == 0` means.
-pub const VIZ_PAINT_AZURE: u32 = 150 | (160 << 8) | (8 << 16) | (2 << 24);
+pub const VIZ_PAINT_AZURE: u64 = 150 | (160 << 8) | (8 << 16) | (2 << 24);
 
-pub fn viz_materialize(paint: u32) -> u32 {
+/// Where the strand colour sits above the clip's own four bytes: hue at 32
+/// and sat at 40, with bit 63 as the flag that says a clip chose one
+/// ([`viz_strand_set`]). A clear flag means the automatic complement the
+/// ring has always painted -- so a v22 value, whose top half is empty, is
+/// nothing new.
+const VIZ_STRAND_HUE_SHIFT: u32 = 32;
+const VIZ_STRAND_SAT_SHIFT: u32 = 40;
+const VIZ_STRAND_CHOSEN: u64 = 1 << 63;
+
+pub fn viz_materialize(paint: u64) -> u64 {
     if paint == 0 {
         VIZ_PAINT_AZURE
     } else {
@@ -1457,42 +1466,42 @@ pub fn viz_materialize(paint: u32) -> u32 {
     }
 }
 
-pub fn viz_ink_from_paint(paint: u32) -> (u8, u8, u8) {
+pub fn viz_ink_from_paint(paint: u64) -> (u8, u8, u8) {
     let p = viz_materialize(paint);
     let hue = (p & 0xFF) as f32 * 360.0 / 256.0;
     let sat = f32::from(((p >> 8) & 0xFF) as u8) / 255.0;
     hsv_to_rgb(hue, sat, 0.84)
 }
 
-pub fn viz_strands_of(paint: u32) -> u8 {
+pub fn viz_strands_of(paint: u64) -> u8 {
     (((viz_materialize(paint) >> 16) & 0xFF) as u8).clamp(1, 32)
 }
 
-pub fn viz_glow_of(paint: u32) -> u8 {
+pub fn viz_glow_of(paint: u64) -> u8 {
     ((viz_materialize(paint) >> 24) & 0xFF) as u8
 }
 
-pub fn with_viz_paint_hue(paint: u32, hue: u8) -> u32 {
-    (viz_materialize(paint) & !0xFF) | u32::from(hue)
+pub fn with_viz_paint_hue(paint: u64, hue: u8) -> u64 {
+    (viz_materialize(paint) & !0xFF) | u64::from(hue)
 }
 
-pub fn with_viz_paint_sat(paint: u32, sat: u8) -> u32 {
-    (viz_materialize(paint) & !(0xFF << 8)) | (u32::from(sat) << 8)
+pub fn with_viz_paint_sat(paint: u64, sat: u8) -> u64 {
+    (viz_materialize(paint) & !(0xFF << 8)) | (u64::from(sat) << 8)
 }
 
-pub fn with_viz_paint_strands(paint: u32, n: u8) -> u32 {
-    (viz_materialize(paint) & !(0xFF << 16)) | (u32::from(n.clamp(1, 32)) << 16)
+pub fn with_viz_paint_strands(paint: u64, n: u8) -> u64 {
+    (viz_materialize(paint) & !(0xFF << 16)) | (u64::from(n.clamp(1, 32)) << 16)
 }
 
-pub fn with_viz_paint_glow(paint: u32, n: u8) -> u32 {
-    (viz_materialize(paint) & !(0xFF << 24)) | (u32::from(n.min(16)) << 24)
+pub fn with_viz_paint_glow(paint: u64, n: u8) -> u64 {
+    (viz_materialize(paint) & !(0xFF << 24)) | (u64::from(n.min(16)) << 24)
 }
 
-pub fn viz_hue_ui(paint: u32) -> u8 {
+pub fn viz_hue_ui(paint: u64) -> u8 {
     if paint == 0 { 150 } else { (paint & 0xFF) as u8 }
 }
 
-pub fn viz_sat_ui(paint: u32) -> u8 {
+pub fn viz_sat_ui(paint: u64) -> u8 {
     if paint == 0 {
         160
     } else {
@@ -1501,6 +1510,135 @@ pub fn viz_sat_ui(paint: u32) -> u8 {
             s => s,
         }
     }
+}
+
+/// Whether the clip chose a strand colour of its own (the top bit), rather
+/// than taking the automatic complement a ring's dual half has always
+/// painted.
+pub fn viz_strand_set(paint: u64) -> bool {
+    paint & VIZ_STRAND_CHOSEN != 0
+}
+
+/// The chosen strand hue, 0-255 on the wheel [`viz_hue_ui`] reads.
+pub fn viz_strand_hue_ui(paint: u64) -> u8 {
+    ((paint >> VIZ_STRAND_HUE_SHIFT) & 0xFF) as u8
+}
+
+/// The chosen strand sat, 0-255. A stored zero stays zero here, unlike
+/// [`viz_sat_ui`]'s: a grey strand is a colour someone picked, and the flag
+/// -- not the byte -- is what says whether there is one.
+pub fn viz_strand_sat_ui(paint: u64) -> u8 {
+    ((paint >> VIZ_STRAND_SAT_SHIFT) & 0xFF) as u8
+}
+
+/// Set the strand hue and mark the colour chosen, so a ring's dual half
+/// inks it instead of the automatic complement.
+pub fn with_viz_paint_strand_hue(paint: u64, hue: u8) -> u64 {
+    let p = viz_materialize(paint) & !(0xFF_u64 << VIZ_STRAND_HUE_SHIFT);
+    (p | (u64::from(hue) << VIZ_STRAND_HUE_SHIFT)) | VIZ_STRAND_CHOSEN
+}
+
+/// Set the strand sat and mark the colour chosen, as
+/// [`with_viz_paint_strand_hue`] does.
+pub fn with_viz_paint_strand_sat(paint: u64, sat: u8) -> u64 {
+    let p = viz_materialize(paint) & !(0xFF_u64 << VIZ_STRAND_SAT_SHIFT);
+    (p | (u64::from(sat) << VIZ_STRAND_SAT_SHIFT)) | VIZ_STRAND_CHOSEN
+}
+
+/// Drop the chosen strand colour: the dual half of a ring goes back to the
+/// automatic complement, and both strand bytes go with the flag.
+pub fn viz_strand_clear(paint: u64) -> u64 {
+    paint & !(VIZ_STRAND_CHOSEN
+        | (0xFF_u64 << VIZ_STRAND_HUE_SHIFT)
+        | (0xFF_u64 << VIZ_STRAND_SAT_SHIFT))
+}
+
+/// `#RRGGBB` for an ink, at the same fixed value the painter draws at, so
+/// the swatch a front-end shows is the colour that reaches the picture.
+/// The inverse of [`viz_color_from_text`] for the colours a round trip
+/// through bytes can carry back.
+pub fn viz_color_hex(hue: u8, sat: u8) -> String {
+    let (r, g, b) = hsv_to_rgb(f32::from(hue) * 360.0 / 256.0, f32::from(sat) / 255.0, 0.84);
+    format!("#{r:02X}{g:02X}{b:02X}")
+}
+
+/// A colour someone typed -- `#4F8FD6`, `4f8fd6`, `rgb(79,143,214)` or
+/// `rgba(79,143,214,255)`, any case, commas or `/` between the channels,
+/// alpha ignored -- as the `(hue, sat)` pair the sliders and the paint
+/// field speak. `None` for everything else rather than a guess: the wrong
+/// number of digits, a channel outside 0-255, parentheses missing.
+///
+/// Brightness is dropped, not carried: the painter draws every ink at its
+/// own fixed value, so a typed colour is kept by its hue and saturation.
+pub fn viz_color_from_text(text: &str) -> Option<(u8, u8)> {
+    let t = text.trim();
+    let (r, g, b) = if let Some(inner) = t.strip_suffix(')') {
+        let body = if starts_ci(inner, b"rgb(") {
+            &inner[4..]
+        } else if starts_ci(inner, b"rgba(") {
+            &inner[5..]
+        } else {
+            return None;
+        };
+        let mut channels = body.split(['/', ',']).map(str::trim);
+        let r = channel(channels.next()?)?;
+        let g = channel(channels.next()?)?;
+        let b = channel(channels.next()?)?;
+        // Alpha, when it is spelled: read so a bad one is refused like a
+        // channel is, and dropped -- the paint field has no room for it.
+        if let Some(a) = channels.next() {
+            channel(a)?;
+        }
+        if channels.next().is_some() {
+            return None;
+        }
+        (r, g, b)
+    } else {
+        let hex = t.strip_prefix('#').unwrap_or(t);
+        if hex.len() != 6 || !hex.bytes().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        (
+            u8::from_str_radix(&hex[0..2], 16).ok()?,
+            u8::from_str_radix(&hex[2..4], 16).ok()?,
+            u8::from_str_radix(&hex[4..6], 16).ok()?,
+        )
+    };
+    Some(rgb_to_hue_sat(r, g, b))
+}
+
+fn starts_ci(text: &str, prefix: &[u8]) -> bool {
+    text.len() >= prefix.len() && text.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix)
+}
+
+/// One 0-255 channel of a typed colour: digits only, so neither a sign nor
+/// an exponent slips in the way `u8`'s own parse would take them.
+fn channel(text: &str) -> Option<u8> {
+    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    text.parse().ok()
+}
+
+/// What a byte RGB is on the paint field's wheel: hue on [`viz_hue_ui`]'s
+/// 0-255 scale, sat 0-255, brightness dropped for the same reason
+/// [`viz_color_from_text`] drops the typed one.
+fn rgb_to_hue_sat(r: u8, g: u8, b: u8) -> (u8, u8) {
+    let (r, g, b) = (f32::from(r), f32::from(g), f32::from(b));
+    let (max, min) = (r.max(g).max(b), r.min(g).min(b));
+    let delta = max - min;
+    let hue = if delta == 0.0 {
+        0.0
+    } else if max == r {
+        60.0 * ((g - b) / delta).rem_euclid(6.0)
+    } else if max == g {
+        60.0 * ((b - r) / delta + 2.0)
+    } else {
+        60.0 * ((r - g) / delta + 4.0)
+    };
+    let hue = ((hue * 256.0 / 360.0).round() as i64).rem_euclid(256) as u8;
+    let sat = if max == 0.0 { 0.0 } else { delta / max };
+    (hue, (sat * 255.0).round() as u8)
 }
 
 pub fn viz_hsv_rgb(h: f32, s: f32, v: f32) -> (u8, u8, u8) {
@@ -1654,14 +1792,14 @@ fn viz_line(
 /// One visualizer picture in tightly packed I420. Three looks, picked by
 /// [`viz_style`]: a bipolar sample trace (Audacity), a filled min/max
 /// envelope at pixel resolution, or a multi-strand ribbon. Ink is
-/// [`viz_ink_rgb`]. A frame always exists; silence is the zero line.
+/// [`viz_ink_from_paint`]. A frame always exists; silence is the zero line.
 pub(crate) fn visualizer_i420(
     peaks: &[(f32, f32)],
     t_secs: f64,
     width: u32,
     height: u32,
     flags: u8,
-    paint: u32,
+    paint: u64,
 ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     let width = width & !1;
     let height = height & !1;
@@ -1789,11 +1927,22 @@ pub(crate) fn visualizer_i420(
             let glow = viz_glow_of(paint);
             for strand in 0..strands {
                 let dual = strands >= 2 && strand >= strands / 2;
-                let (ir, ig, ib) = viz_ink_from_paint(if dual {
-                    with_viz_paint_hue(paint, viz_hue_ui(paint).wrapping_add(128))
+                // The dual half takes the clip's own strand colour when it
+                // chose one; without one it is the wheel half a turn from
+                // the clip's hue, at the clip's own saturation, which is
+                // the complement every earlier project paints.
+                let (ir, ig, ib) = if dual && viz_strand_set(paint) {
+                    let hue = f32::from(viz_strand_hue_ui(paint)) * 360.0 / 256.0;
+                    let sat = f32::from(viz_strand_sat_ui(paint)) / 255.0;
+                    hsv_to_rgb(hue, sat, 0.84)
+                } else if dual {
+                    viz_ink_from_paint(with_viz_paint_hue(
+                        paint,
+                        viz_hue_ui(paint).wrapping_add(128),
+                    ))
                 } else {
-                    paint
-                });
+                    viz_ink_from_paint(paint)
+                };
                 let (iy, iu, iv) = rgb_yuv(ir as i32, ig as i32, ib as i32);
                 let scale = 0.65 + 0.35 * f32::from(strand % 4) / 3.0;
                 let phase = f32::from(strand) * 0.35;
@@ -2210,6 +2359,126 @@ mod tests {
             }
         }
         assert!(shifted > 2, "hue 8 did not leave blue");
+    }
+
+    /// The paint's byte layout: the strand colour lives above the clip's own
+    /// four bytes and the top bit is the flag, so either strand setter marks
+    /// the colour chosen and clearing drops both bytes with the flag.
+    #[test]
+    fn the_paint_packs_the_strand_colour_above_the_v22_halves() {
+        let p = with_viz_paint_strand_sat(with_viz_paint_strand_hue(VIZ_PAINT_AZURE, 0xAB), 0xCD);
+        assert_eq!(p & 0xFFFF_FFFF, VIZ_PAINT_AZURE, "the low half never moves");
+        assert_eq!((p >> 32) & 0xFF, 0xAB);
+        assert_eq!((p >> 40) & 0xFF, 0xCD);
+        assert!(viz_strand_set(p));
+        assert_eq!(viz_strand_hue_ui(p), 0xAB);
+        assert_eq!(viz_strand_sat_ui(p), 0xCD);
+        assert_eq!(viz_strand_clear(p), VIZ_PAINT_AZURE);
+        assert!(!viz_strand_set(viz_strand_clear(p)));
+    }
+
+    /// The shapes a colour is typed in all mean the same ink, and everything
+    /// else is refused rather than guessed at.
+    #[test]
+    fn typed_colours_read_as_hex_rgb_and_rgba() {
+        let want = viz_color_from_text("#4F8FD6").expect("a hex colour");
+        assert_eq!(want, (150, 161), "hue and sat on the field's own scales");
+        for text in [
+            "#4F8FD6",
+            "4f8fd6",
+            "  #4f8fd6 ",
+            "rgb(79,143,214)",
+            "rgb(79/143/214)",
+            "RGBA(79, 143, 214, 255)",
+        ] {
+            assert_eq!(viz_color_from_text(text), Some(want), "{text}");
+        }
+        for text in [
+            "#12345",
+            "zz",
+            "rgb(300,0,0)",
+            "rgb(1,2)",
+            "",
+            "rgb 79,143,214)",
+            "rgb(79,143,214",
+            "#4F8FD",
+            "#4F8FD67",
+            "#GGGGGG",
+            "rgb(79,143,214,255,0)",
+            "rgb(79;143;214)",
+        ] {
+            assert_eq!(viz_color_from_text(text), None, "{text}");
+        }
+    }
+
+    /// A colour's hex is the ink the painter draws, and reading it back
+    /// gives the sliders their own value again -- for the 47053 of the 65536
+    /// hues and saturations a trip through bytes can carry. The rest land on
+    /// a neighbour: their smallest channel rounds to a byte whose ratio is
+    /// not the one that was asked for. Full saturation is where that channel
+    /// is the one the value sets exactly, and it survives at every hue.
+    #[test]
+    fn a_sampled_palette_round_trips_through_its_hex() {
+        for hue in (0..=255u8).step_by(8) {
+            let hex = viz_color_hex(hue, 255);
+            assert_eq!(viz_color_from_text(&hex), Some((hue, 255)), "{hex}");
+        }
+        // The achromatic end, where hue is not a colour at all.
+        assert_eq!(viz_color_from_text(&viz_color_hex(0, 0)), Some((0, 0)));
+        assert_eq!(viz_color_from_text(&viz_color_hex(200, 0)), Some((0, 0)));
+        // ...and the whole grid, so a change that quietly shrinks what the
+        // trip can carry cannot pass by leaving the sample above green.
+        let exact = (0..=255u8)
+            .flat_map(|hue| (0..=255u8).map(move |sat| (hue, sat)))
+            .filter(|&(hue, sat)| viz_color_from_text(&viz_color_hex(hue, sat)) == Some((hue, sat)))
+            .count();
+        assert_eq!(exact, 47_053, "the colours a hex round trip keeps");
+    }
+
+    /// The dual half of a ring takes the clip's own strand colour when it has
+    /// one: a choice that names the automatic complement paints the same
+    /// frame, another repaints the dual strands in it, and a paint whose flag
+    /// is clear is the picture it has always been -- strand bytes or no.
+    #[test]
+    fn a_chosen_strand_colour_repaints_only_the_dual_half_of_a_ring() {
+        let mut peaks = vec![(0.0, 0.0); 12_000];
+        for (i, p) in peaks.iter_mut().enumerate() {
+            let a = ((i as f32 / 400.0) * std::f32::consts::TAU).sin() * 0.8;
+            *p = (-a.abs(), a.abs());
+        }
+        let ring = with_viz_style(1, VIZ_STYLE_RING);
+        let auto = VIZ_PAINT_AZURE;
+        let (y0, u0, v0) = visualizer_i420(&peaks, 1.0, 320, 180, ring, auto);
+
+        // The automatic dual is half a wheel from the clip's hue at the
+        // clip's own saturation; choosing exactly that colour changes
+        // nothing at all.
+        let same = with_viz_paint_strand_sat(
+            with_viz_paint_strand_hue(auto, viz_hue_ui(auto).wrapping_add(128)),
+            viz_sat_ui(auto),
+        );
+        assert!(viz_strand_set(same));
+        let (ys, us, vs) = visualizer_i420(&peaks, 1.0, 320, 180, ring, same);
+        assert_eq!(ys, y0, "the automatic complement, spelled out, is the same frame");
+        assert_eq!(us, u0);
+        assert_eq!(vs, v0);
+
+        // A colour of its own repaints the dual strands in it.
+        let red = with_viz_paint_strand_sat(with_viz_paint_strand_hue(auto, 0), 255);
+        let (_, u1, v1) = visualizer_i420(&peaks, 1.0, 320, 180, ring, red);
+        let red_px = (0..u1.len()).filter(|&i| u1[i] < 110 && v1[i] > 200).count();
+        let auto_px = (0..u0.len()).filter(|&i| u0[i] < 110 && v0[i] > 200).count();
+        assert!(red_px > 20, "the chosen colour did not reach the frame: {red_px}");
+        assert_eq!(auto_px, 0, "the automatic ring already painted red: {auto_px}");
+
+        // ...and the flag is what decides: strand bytes with it clear are
+        // the unset picture, byte for byte.
+        let stale = auto | (77u64 << 32) | (9u64 << 40);
+        assert!(!viz_strand_set(stale));
+        let (yt, ut, vt) = visualizer_i420(&peaks, 1.0, 320, 180, ring, stale);
+        assert_eq!(yt, y0, "an unset strand colour is the frame it always was");
+        assert_eq!(ut, u0);
+        assert_eq!(vt, v0);
     }
 }
 

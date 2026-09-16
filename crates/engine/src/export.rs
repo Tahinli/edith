@@ -4426,7 +4426,7 @@ enum ClipDecoder {
         fps: f64,
         next: u32,
         flags: u8,
-        paint: u32,
+        paint: u64,
         y: Vec<u8>,
         u: Vec<u8>,
         v: Vec<u8>,
@@ -4540,7 +4540,7 @@ impl ClipDecoder {
         height: u32,
         fps: f64,
         flags: u8,
-        paint: u32,
+        paint: u64,
     ) -> crate::Result<Self> {
         let peaks = crate::waveform::peaks(path, stream, crate::decode::VIZ_BUCKETS_PER_SEC)
             .ok()

@@ -292,7 +292,7 @@ fn a_version_1_project_loads_fully_grouped_and_saves_as_version_7() {
     let v2 = dir.join("new.edith");
     loaded.save_project(&v2).expect("save");
     let text = std::fs::read_to_string(&v2).expect("read back");
-    assert!(text.starts_with("edith 20\n"), "{text}");
+    assert!(text.starts_with("edith 23\n"), "{text}");
     assert!(
         text.contains("\nresolution 1280 720\n"),
         "a project with no resolution of its own is saved at source 0's: {text}"
@@ -380,9 +380,9 @@ fn a_version_4_project_holds_more_than_two_lanes() {
     loaded.save_project(&again).expect("save");
     assert_eq!(
         std::fs::read_to_string(&again).expect("read back"),
-        "edith 20\nplayhead 0\nresolution 1280 720\nfps 30.0\nsource 0 test_av.mp4\n\
-         video 1 0 0 30 0 3 - - fit 1000 0 0 0 -\naudio 1\n\
-         video 2 40 0 20 0 - - - fit 1000 0 0 0 -\naudio 2 0 0 30 0 3 - - fit 1000 0 0 0 -\n",
+        "edith 23\nplayhead 0\nresolution 1280 720\nfps 30.0\nsource 0 test_av.mp4\n\
+         video 1 0 0 30 0 3 - - fit 1000 0 0 0 - 0 0\naudio 1\n\
+         video 2 40 0 20 0 - - - fit 1000 0 0 0 - 0 0\naudio 2 0 0 30 0 3 - - fit 1000 0 0 0 - 0 0\n",
         "a four-lane project is written as it was read, three versions on"
     );
 }
@@ -410,11 +410,11 @@ fn a_version_5_project_carries_per_clip_equalizers() {
     loaded.save_project(&again).expect("save");
     assert_eq!(
         std::fs::read_to_string(&again).expect("read back"),
-        "edith 20\nplayhead 0\nresolution 1280 720\nfps 30.0\nsource 0 test_av.mp4\n\
+        "edith 23\nplayhead 0\nresolution 1280 720\nfps 30.0\nsource 0 test_av.mp4\n\
          eq 80.0:-3.0:0.707:ls 1000.0:4.5:1.0:pk\n\
          eq 12000.0:6.25:0.5:hs\n\
-         video 1 0 0 30 0 - 0 - fit 1000 0 0 0 -\nvideo 1 30 30 60 0 - 1 - fit 1000 0 0 0 -\n\
-         audio 1 0 0 30 0 - 0 - fit 1000 0 0 0 -\naudio 1 30 30 60 0 - - - fit 1000 0 0 0 -\n",
+         video 1 0 0 30 0 - 0 - fit 1000 0 0 0 - 0 0\nvideo 1 30 30 60 0 - 1 - fit 1000 0 0 0 - 0 0\n\
+         audio 1 0 0 30 0 - 0 - fit 1000 0 0 0 - 0 0\naudio 1 30 30 60 0 - - - fit 1000 0 0 0 - 0 0\n",
         "the equalizer table and every clip's index survive a round trip"
     );
 }
@@ -445,12 +445,12 @@ fn a_version_6_project_carries_per_clip_colours() {
     loaded.save_project(&again).expect("save");
     assert_eq!(
         std::fs::read_to_string(&again).expect("read back"),
-        "edith 20\nplayhead 0\nresolution 1280 720\nfps 30.0\nsource 0 test_av.mp4\n\
+        "edith 23\nplayhead 0\nresolution 1280 720\nfps 30.0\nsource 0 test_av.mp4\n\
          eq 80.0:-3.0:0.707:ls\n\
          color 0.1:1.2:0.9:-0.3\n\
          color -0.25:1.0:0.0:0.5\n\
-         video 1 0 0 30 0 - 0 0 fit 1000 0 0 0 -\nvideo 1 30 30 60 0 - - 1 fit 1000 0 0 0 -\n\
-         audio 1 0 0 30 0 - - 0 fit 1000 0 0 0 -\naudio 1 30 30 60 0 - - - fit 1000 0 0 0 -\n",
+         video 1 0 0 30 0 - 0 0 fit 1000 0 0 0 - 0 0\nvideo 1 30 30 60 0 - - 1 fit 1000 0 0 0 - 0 0\n\
+         audio 1 0 0 30 0 - - 0 fit 1000 0 0 0 - 0 0\naudio 1 30 30 60 0 - - - fit 1000 0 0 0 - 0 0\n",
         "the colour table and every clip's index survive a round trip"
     );
     // A dialect that could not say either one means the defaults, and those are
@@ -495,9 +495,9 @@ fn a_version_7_project_carries_a_resolution_and_fit_policies() {
     loaded.save_project(&again).expect("save");
     assert_eq!(
         std::fs::read_to_string(&again).expect("read back"),
-        "edith 20\nplayhead 0\nresolution 960 720\nfps 30.0\nsource 0 test_av.mp4\n\
-         video 1 0 0 30 0 - - - fill 1000 0 0 0 -\nvideo 1 30 30 60 0 - - - center 1000 0 0 0 -\n\
-         audio 1 0 0 60 0 - - - fit 1000 0 0 0 -\n",
+        "edith 23\nplayhead 0\nresolution 960 720\nfps 30.0\nsource 0 test_av.mp4\n\
+         video 1 0 0 30 0 - - - fill 1000 0 0 0 - 0 0\nvideo 1 30 30 60 0 - - - center 1000 0 0 0 - 0 0\n\
+         audio 1 0 0 60 0 - - - fit 1000 0 0 0 - 0 0\n",
         "a v7 project is written back as the v8 it now is: the same clips, each \
          saying it plays at real time, which is what it always played at"
     );
