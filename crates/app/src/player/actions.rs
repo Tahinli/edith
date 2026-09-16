@@ -35,6 +35,16 @@ impl Player {
         // an autosave a beat early over a refusal (nothing to regroup, say)
         // costs nothing a real edit would not have earned anyway, and one list
         // here is the whole answer instead of fifteen scattered calls.
+        //
+        // This list is the *action* doors only, and that is the class to mind
+        // when adding an edit: a control that reaches the session from a
+        // *click* -- the Clip tab's look chips and wheel, the settings rows,
+        // the library row's own menu -- is behind no action, so nothing here
+        // arms it. Such a door has to call `Player::mark_dirty` itself, on its
+        // own "the write took" gate, or the edit is invisible to autosave, to
+        // the ledger's `unsaved` ghost and to `Player::close_needs_answer`,
+        // which all read that one flag: the work is silently lost on close,
+        // with no prompt to answer.
         if matches!(
             action,
             ActionId::Paste

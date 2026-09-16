@@ -1214,6 +1214,7 @@ fn viz_style_verbs(player: &Player, cx: &mut Context<Player>) -> impl IntoElemen
             .text_color(rgb(if on { INK1() } else { INK3() }))
             .font(row.font)
             .text_size(row.size)
+            .tooltip(crate::ui::widgets::tip_hover(label_text, "", None))
             .children(hitmap::control(id, label_text, true))
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                 this.set_viz_style(style, cx);
@@ -1238,6 +1239,7 @@ fn viz_style_verbs(player: &Player, cx: &mut Context<Player>) -> impl IntoElemen
             .text_color(rgb(if on { INK1() } else { INK3() }))
             .font(style.font.clone())
             .text_size(style.size)
+            .tooltip(crate::ui::widgets::tip_hover(label_text, "", None))
             .children(hitmap::control(id, label_text, true))
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                 this.toggle_viz_flag(bit, cx);
@@ -1290,6 +1292,9 @@ fn viz_style_verbs(player: &Player, cx: &mut Context<Player>) -> impl IntoElemen
 
 fn viz_step(
     id: &'static str,
+    // What the button is called on hover and in the hitmap: the glyph alone
+    // names nothing.
+    name: &'static str,
     glyph: &'static str,
     cx: &mut Context<Player>,
     f: impl Fn(&mut Player, &mut Context<Player>) + 'static + Copy,
@@ -1304,18 +1309,115 @@ fn viz_step(
         .rounded(px(3.))
         .bg(rgb(DARK_RAISED()))
         .cursor_pointer()
-        .children(hitmap::control(id, glyph, true))
+        .tooltip(crate::ui::widgets::tip_hover(name, "", None))
+        .children(hitmap::control(id, name, true))
         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| f(this, cx)))
         .child(glyph)
 }
 
-fn viz_color_wheel(player: &Player, paint: u32, cx: &mut Context<Player>) -> impl IntoElement {
+/// Which of the clip's two inks the wheel and the colour field are on. The
+/// picked chip wears the solid ink and the other the quiet one -- the style
+/// chips' own shape (`viz_style_verbs`'s `pick`, one row up the same column).
+///
+/// The Strand chip is dead while the clip has one strand: a strand colour is
+/// painted on the ring's *dual* half and a one-strand ring has none, so the
+/// chip would be wired to nothing -- and it says so on hover rather than doing
+/// nothing in silence (`widgets::control`'s own rule for a button with no
+/// action).
+fn viz_slot_chips(player: &Player, paint: u64, cx: &mut Context<Player>) -> impl IntoElement {
+    let picked = player.viz_slot.picked(paint);
+    let strand_live = engine::decode::viz_strands_of(paint) >= 2;
+    let chip = |id: &'static str, label_text: &'static str, slot: VizSlot, live: bool| {
+        let row = label(type_scale::LABEL_ROW_PX, FontWeight::MEDIUM);
+        let on = picked == slot;
+        div()
+            .id(id)
+            .flex_none()
+            .h(px(CONTROL_H))
+            .px(px(8.))
+            .flex()
+            .items_center()
+            .font(row.font)
+            .text_size(row.size)
+            .text_color(rgb(if on { INK1() } else { INK3() }))
+            .tooltip(crate::ui::widgets::tip_hover(
+                label_text,
+                "",
+                match live {
+                    true => None,
+                    false => Some("needs two strands"),
+                },
+            ))
+            .children(hitmap::control(id, label_text, live))
+            .when(!live, |d| d.opacity(0.4).cursor_not_allowed())
+            .when(live, |d| {
+                d.cursor_pointer()
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.set_viz_slot(slot, cx);
+                    }))
+            })
+            .child(label_text.to_string())
+            .into_any_element()
+    };
+    div()
+        .id("dock-viz-slots")
+        .flex()
+        .items_center()
+        .child(chip("dock-viz-colour", "Colour", VizSlot::Main, true))
+        .child(chip("dock-viz-strand", "Strand", VizSlot::Strand, strand_live))
+}
+
+/// The picked slot's colour as text, and the way in: a click opens the type-in
+/// seeded with exactly what the row is showing
+/// ([`Player::edit_viz_hex`]). While the field is open the row is the buffer
+/// and its refusal instead -- `transition_row`'s own rule for its own field.
+fn viz_hex_row(player: &Player, paint: u64, cx: &mut Context<Player>) -> impl IntoElement {
+    let (hue, sat) = player.viz_slot.picked(paint).hue_sat(paint);
+    let hex = engine::decode::viz_color_hex(hue, sat);
+    // The seed the click opens on is the line the row is showing, so a click
+    // that lands while the field is open cannot seed it with something else.
+    let seed = hex.clone();
+    let field = player.viz_hex_edit.as_ref();
+    let row = label(type_scale::LABEL_ROW_PX, FontWeight::MEDIUM);
+    div()
+        .id("dock-viz-hex-field")
+        .h(px(CONTROL_H))
+        .flex()
+        .items_center()
+        .font(row.font)
+        .text_size(row.size)
+        .text_color(rgb(INK2()))
+        .cursor_pointer()
+        .tooltip(crate::ui::widgets::tip_hover("Colour", "click to type", None))
+        .children(hitmap::control(
+            "dock-viz-hex-field",
+            "Colour hex, type-in",
+            true,
+        ))
+        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+            this.edit_viz_hex(&seed);
+            cx.notify();
+        }))
+        .child(match field {
+            Some(edit) => edit.detail(),
+            None => hex,
+        })
+}
+
+fn viz_color_wheel(player: &Player, paint: u64, cx: &mut Context<Player>) -> impl IntoElement {
+    // What the mark is on, read out here because the canvas closure paints and
+    // so cannot borrow the player: the picked slot's ink
+    // ([`VizSlot::hue_sat`]) -- the clip's own colour, or, for a strand the
+    // clip has not chosen, the automatic complement, so the hand starts where
+    // the picture already is.
+    let (mark_hue, mark_sat) = player.viz_slot.picked(paint).hue_sat(paint);
     div()
         .id("dock-viz-hs")
         .w(px(112.))
         .h(px(112.))
         .relative()
         .cursor_pointer()
+        .tooltip(crate::ui::widgets::tip_hover("Colour wheel", "drag to pick", None))
         .children(hitmap::control("dock-viz-hs", "Colour wheel", true))
         .child(bounds_probe(player.viz_wheel.clone()))
         .child(
@@ -1351,8 +1453,8 @@ fn viz_color_wheel(player: &Player, paint: u32, cx: &mut Context<Player>) -> imp
                         }
                     }
                     // Selection mark.
-                    let hue = f32::from(engine::decode::viz_hue_ui(paint)) / 256. * std::f32::consts::TAU;
-                    let sat = f32::from(engine::decode::viz_sat_ui(paint)) / 255.;
+                    let hue = f32::from(mark_hue) / 256. * std::f32::consts::TAU;
+                    let sat = f32::from(mark_sat) / 255.;
                     let mx = cx + radius * sat * hue.sin();
                     let my = cy - radius * sat * hue.cos();
                     let mut mark = PathBuilder::stroke(px(2.));
@@ -1382,7 +1484,7 @@ fn viz_color_wheel(player: &Player, paint: u32, cx: &mut Context<Player>) -> imp
         )
 }
 
-fn viz_paint_knobs(player: &Player, paint: u32, cx: &mut Context<Player>) -> impl IntoElement {
+fn viz_paint_knobs(player: &Player, paint: u64, cx: &mut Context<Player>) -> impl IntoElement {
     let strands = engine::decode::viz_strands_of(paint);
     let glow = engine::decode::viz_glow_of(paint);
     let style = label(type_scale::LABEL_ROW_PX, FontWeight::MEDIUM);
@@ -1397,14 +1499,9 @@ fn viz_paint_knobs(player: &Player, paint: u32, cx: &mut Context<Player>) -> imp
                 .flex()
                 .flex_col()
                 .gap(px(4.))
-                .child(
-                    div()
-                        .font(style.font.clone())
-                        .text_size(style.size)
-                        .text_color(rgb(INK2()))
-                        .child("Colour"),
-                )
-                .child(viz_color_wheel(player, paint, cx)),
+                .child(viz_slot_chips(player, paint, cx))
+                .child(viz_color_wheel(player, paint, cx))
+                .child(viz_hex_row(player, paint, cx)),
         )
         .child(
             div()
@@ -1419,7 +1516,7 @@ fn viz_paint_knobs(player: &Player, paint: u32, cx: &mut Context<Player>) -> imp
                         .text_color(rgb(INK2()))
                         .child("Strands"),
                 )
-                .child(viz_step("dock-viz-strands-minus", "−", cx, |this, cx| {
+                .child(viz_step("dock-viz-strands-minus", "Fewer strands", "−", cx, |this, cx| {
                     this.set_viz_strands(engine::decode::viz_strands_of(this.viz_paint()).saturating_sub(1).max(1), cx);
                 }))
                 .child(
@@ -1429,7 +1526,7 @@ fn viz_paint_knobs(player: &Player, paint: u32, cx: &mut Context<Player>) -> imp
                         .text_color(rgb(INK1()))
                         .child(format!("{strands}")),
                 )
-                .child(viz_step("dock-viz-strands-plus", "+", cx, |this, cx| {
+                .child(viz_step("dock-viz-strands-plus", "More strands", "+", cx, |this, cx| {
                     this.set_viz_strands(engine::decode::viz_strands_of(this.viz_paint()).saturating_add(1).min(32), cx);
                 })),
         )
@@ -1446,7 +1543,7 @@ fn viz_paint_knobs(player: &Player, paint: u32, cx: &mut Context<Player>) -> imp
                         .text_color(rgb(INK2()))
                         .child("Glow"),
                 )
-                .child(viz_step("dock-viz-glow-minus", "−", cx, |this, cx| {
+                .child(viz_step("dock-viz-glow-minus", "Less glow", "−", cx, |this, cx| {
                     this.set_viz_glow(engine::decode::viz_glow_of(this.viz_paint()).saturating_sub(1), cx);
                 }))
                 .child(
@@ -1456,7 +1553,7 @@ fn viz_paint_knobs(player: &Player, paint: u32, cx: &mut Context<Player>) -> imp
                         .text_color(rgb(INK1()))
                         .child(format!("{glow}")),
                 )
-                .child(viz_step("dock-viz-glow-plus", "+", cx, |this, cx| {
+                .child(viz_step("dock-viz-glow-plus", "More glow", "+", cx, |this, cx| {
                     this.set_viz_glow(engine::decode::viz_glow_of(this.viz_paint()).saturating_add(1).min(16), cx);
                 })),
         )
@@ -1702,6 +1799,7 @@ fn keys_tab(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
                 .font(style.font.clone())
                 .text_size(style.size)
                 .text_color(rgb(INK1()))
+                .tooltip(crate::ui::widgets::tip_hover("Filter keys", "click to type", None))
                 .children(hitmap::control("dock.keys-filter", "Filter keys", true))
                 .child(match player.keys_filter.is_empty() {
                     true => "⌕".to_string(),

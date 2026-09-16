@@ -204,18 +204,86 @@ pub(crate) fn stash_or_write<T: Copy>(
     }
 }
 
+/// Which of a visualizer's two inks a look control acts on: the clip's own
+/// colour, or the second half of a dual-strand ring. Zero -- the clip's own --
+/// is what every control meant before there was a second, so it is also what
+/// the Clip tab opens on ([`Player::viz_slot`]).
+///
+/// Both inks are read and written through the same three methods, so the
+/// wheel, the hex field and the drag that holds a sample between them cannot
+/// disagree about which one a gesture is on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum VizSlot {
+    /// The clip's own hue and saturation -- the paint field's low bytes.
+    Main,
+    /// The ring's dual half. Only a clip that chose one wears it; otherwise
+    /// the painter draws the automatic complement (`visualizer_i420`).
+    Strand,
+}
+
+impl VizSlot {
+    /// The ink with a picture behind it. A one-strand ring has no dual half,
+    /// so a wheel on the strand colour there would move a mark and nothing
+    /// else: every control reads the slot through here and lands on the clip's
+    /// own colour instead while that is the case -- which is also why the
+    /// Strand chip is dead then.
+    pub(crate) fn picked(self, paint: u64) -> VizSlot {
+        match self {
+            VizSlot::Strand if engine::decode::viz_strands_of(paint) < 2 => VizSlot::Main,
+            slot => slot,
+        }
+    }
+
+    /// What this ink is showing: the clip's hue and saturation, or -- for a
+    /// strand the clip has not chosen -- the automatic complement the painter
+    /// draws there, so a hand picking the strand up starts where the picture
+    /// already is and the first write only says "this one, then".
+    pub(crate) fn hue_sat(self, paint: u64) -> (u8, u8) {
+        match self {
+            VizSlot::Main => (
+                engine::decode::viz_hue_ui(paint),
+                engine::decode::viz_sat_ui(paint),
+            ),
+            VizSlot::Strand if engine::decode::viz_strand_set(paint) => (
+                engine::decode::viz_strand_hue_ui(paint),
+                engine::decode::viz_strand_sat_ui(paint),
+            ),
+            VizSlot::Strand => (
+                engine::decode::viz_hue_ui(paint).wrapping_add(128),
+                engine::decode::viz_sat_ui(paint),
+            ),
+        }
+    }
+
+    /// Sets this ink's hue and saturation, raising the strand's chosen flag on
+    /// the way -- the engine's strand setters do that, which is what makes the
+    /// wheel's first sample on the slot the write that chooses it.
+    pub(crate) fn set_hue_sat(self, paint: u64, hue: u8, sat: u8) -> u64 {
+        match self {
+            VizSlot::Main => engine::decode::with_viz_paint_sat(
+                engine::decode::with_viz_paint_hue(paint, hue),
+                sat,
+            ),
+            VizSlot::Strand => engine::decode::with_viz_paint_strand_sat(
+                engine::decode::with_viz_paint_strand_hue(paint, hue),
+                sat,
+            ),
+        }
+    }
+}
+
 /// What the wheel draws: the clip's own ink, or the sample a drag is holding
 /// while the worker is still behind ([`stash_or_write`]). The wheel is a
 /// picker with no table of its own, so a held sample would otherwise be
 /// invisible -- the clip carries the sample *before* it until the holding
 /// frame lands -- and the mark would sit still under a moving hand.
 /// [`Player::color_params`] holds exactly this rule for the card's sliders.
-pub(crate) fn viz_held_paint(paint: u32, held: Option<(u8, u8)>) -> u32 {
+///
+/// The held sample carries its slot, so a drag on the strand colour draws the
+/// strand colour even before the clip has one of its own.
+pub(crate) fn viz_held_paint(paint: u64, held: Option<(VizSlot, u8, u8)>) -> u64 {
     match held {
-        Some((hue, sat)) => engine::decode::with_viz_paint_sat(
-            engine::decode::with_viz_paint_hue(paint, hue),
-            sat,
-        ),
+        Some((slot, hue, sat)) => slot.set_hue_sat(paint, hue, sat),
         None => paint,
     }
 }

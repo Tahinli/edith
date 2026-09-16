@@ -11,7 +11,8 @@ mod view;
 
 use super::{
     ACCENT_PRIMARY, AUDIO_KBPS, BG_RAISED, COLOR_BANDS, COLOR_BAR_W, COLOR_STEP, COLOR_W,
-    CONTROL_H, Clip, Ctx, DEFAULT_AUDIO_KBPS, EQ_BANDS_MAX, EQ_CURVE_STEPS, EQ_FFT, EQ_FREQ_HIGH,
+    ColorEdit, CONTROL_H, Clip, Ctx, DEFAULT_AUDIO_KBPS, EQ_BANDS_MAX, EQ_CURVE_STEPS, EQ_FFT,
+    EQ_FREQ_HIGH,
     EQ_FREQ_LOW, EQ_FREQ_STEP, EQ_GAIN_LIMIT, EQ_GRAPH_H, EQ_HANDLE, EQ_Q_HIGH, EQ_Q_LOW,
     EQ_Q_STEP, EQ_SPECTRUM_DB, EQ_TICKS, EQ_W_MAX, ESCAPE, EXPORT_DONE, Enable,
     BPS_COARSE, BPS_FINE, BPS_MAX, BPS_MIN, EXPORT_MOMENT_H, EncoderSeat, FORMATS, Format, HEADER_H, HIST_BINS, HIST_H, HIST_SAMPLES, HIT_MIN,
@@ -31,7 +32,8 @@ use super::{
     row_enable, row_items, scrub_due, secs_label, should_resync, silence_rate, size_label,
     rate_label, snap_cue, snap_marks, snapped, source_tint, span_partner, speed_at, sub_pick_after_removal,
     subtitle_plan, timecode, timeline_fixed_h, tip_may_paint,
-    transport, typed, unseen_paths, unseen_sources, viz_held_paint, whole_take, window_title,
+    transport, typed, unseen_paths, unseen_sources, viz_held_paint, VizSlot, whole_take,
+    window_title,
 };
 
 use super::{

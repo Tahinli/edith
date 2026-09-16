@@ -761,13 +761,21 @@ struct Player {
     viz_hs_dragging: bool,
     /// The wheel's box, recorded at prepaint for a drag's window position.
     viz_wheel: Rc<Cell<Bounds<Pixels>>>,
+    /// Which of the clip's two inks the look section's wheel and colour field
+    /// act on ([`VizSlot`]): the clip's own colour, or the ring's dual half.
+    /// The pick stays picked across clips, the way the dock tab's does.
+    viz_slot: VizSlot,
+    /// The colour field's text, while the Clip tab's colour row is being typed
+    /// into ([`Player::edit_viz_hex`]). `None` is the row showing the colour
+    /// itself; `Some` is the buffer, its refusal, and the caret on screen.
+    viz_hex_edit: Option<ColorEdit>,
     /// The ink the hand is on, held back because the worker still owes a frame
     /// ([`Self::pending_color`]'s own reason, and a wheel sample is heavier
     /// than a grade's: it is not a table entry but the painter's own input, so
     /// the write is what rebuilds the picture). What the wheel draws while it
     /// stands, and never lost -- the frame that lands writes it, and so does
-    /// the release.
-    pending_viz: Option<(u8, u8)>,
+    /// the release. The slot the sample was taken on rides with it.
+    pending_viz: Option<(VizSlot, u8, u8)>,
     /// Each slider's box, recorded at prepaint: a mouse listener is handed the
     /// window position only, so this is what a press and a drag are read against
     /// ([`frac_along`]). One per band, because the press picks the row it landed
@@ -1078,6 +1086,8 @@ fn main() {
                     color_dragging: false,
                     viz_hs_dragging: false,
                     viz_wheel: Rc::default(),
+                    viz_slot: VizSlot::Main,
+                    viz_hex_edit: None,
                     pending_viz: None,
                     color_bars: std::array::from_fn(|_| Rc::default()),
                     pending_color: None,

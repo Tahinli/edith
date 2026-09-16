@@ -198,6 +198,11 @@ impl Player {
             return;
         }
         if session.set_visualizer(lane, idx, clip.visualizer ^ bit) {
+            // A look is a project field, so the write arms autosave and the
+            // close prompt the same way a grade or a trim does -- these chips
+            // are clicked, not dispatched through `act`, so nothing upstream
+            // has armed it for them.
+            self.mark_dirty();
             self.reset_after_reseek();
         }
         cx.notify();
@@ -218,12 +223,15 @@ impl Player {
         }
         let next = engine::decode::with_viz_style(clip.visualizer, style);
         if next != clip.visualizer && session.set_visualizer(lane, idx, next) {
+            // [`Self::toggle_viz_flag`]'s own reason: a clicked look arms
+            // autosave here, because nothing upstream has.
+            self.mark_dirty();
             self.reset_after_reseek();
         }
         cx.notify();
     }
 
-    pub(crate) fn viz_paint(&self) -> u32 {
+    pub(crate) fn viz_paint(&self) -> u64 {
         self.selected
             .anchor()
             .and_then(|(lane, idx)| {
@@ -236,13 +244,71 @@ impl Player {
             .unwrap_or(0)
     }
 
-    pub(crate) fn set_viz_hs(&mut self, hue: u8, sat: u8, cx: &mut Context<Self>) {
+    /// Which of the two inks the look section's wheel and colour field act on
+    /// ([`VizSlot`]). An open colour field is given up with the change: it is
+    /// seeded with the picked slot's colour, so it would otherwise edit a
+    /// colour the row is no longer showing.
+    pub(crate) fn set_viz_slot(&mut self, slot: VizSlot, cx: &mut Context<Self>) {
+        self.viz_slot = slot;
+        self.viz_hex_edit = None;
+        cx.notify();
+    }
+
+    /// Opens the colour type-in on `seed`, the picked slot's colour as the row
+    /// already shows it, so a backspace edits that rather than a field opening
+    /// empty over a colour still in force ([`NumberEdit::new`]'s own rule). The
+    /// transition row's field is given up: one inline editor at a time.
+    pub(crate) fn edit_viz_hex(&mut self, seed: &str) {
+        self.transition_edit = None;
+        self.viz_hex_edit = Some(ColorEdit::new(seed));
+    }
+
+    /// The colour field's enter. A colour it can read is written on the picked
+    /// slot -- one undo step, a typed colour being one edit -- and the field
+    /// closes. Anything else is refused *in words* with the field left open and
+    /// the colour where it was, so the next try is a backspace away.
+    pub(crate) fn commit_viz_hex(&mut self, cx: &mut Context<Self>) {
+        let Some((hue, sat)) = self.viz_hex_edit.as_mut().and_then(|edit| edit.commit()) else {
+            // Refused in words: the field stays open holding what it could
+            // not read.
+            cx.notify();
+            return;
+        };
+        self.viz_hex_edit = None;
+        // Nothing changed is not an edit. The field opens seeded with the
+        // row's own `viz_color_hex`, and that hex reads back as a *different*
+        // (hue, sat) for a large share of inks (the engine's round-trip
+        // canary counts 47 053 of 65 536 exact), so a commit that wrote
+        // whatever it parsed would take an undo step -- and arm autosave --
+        // for the colour the row was already showing, on an enter that
+        // changed nothing.
+        let paint = self.viz_paint();
+        let slot = self.viz_slot.picked(paint);
+        if slot.hue_sat(paint) == (hue, sat) {
+            cx.notify();
+            return;
+        }
+        self.write_viz_hs(hue, sat, false, cx);
+    }
+
+    /// Puts hue and saturation on the picked slot ([`VizSlot::picked`]): the
+    /// wheel's sample and the colour field's commit both land here, so the two
+    /// doors cannot disagree about which ink they write.
+    ///
+    /// `live` is [`Player::write_color`]'s own flag, for the colour card's
+    /// reason: the false one takes the undo step the whole gesture rolls back
+    /// to, the true one is every sample *inside* a drag
+    /// (`PlaybackSession::set_viz_paint_live`). A wheel sample is not a table
+    /// entry but the painter's own input, and it is the write that rebuilds the
+    /// picture at the playhead -- so one committed entry per pointer sample
+    /// would stamp a sixty-entry gesture into a hundred-step history and leave
+    /// the user a hundred-step history of one drag.
+    pub(crate) fn write_viz_hs(&mut self, hue: u8, sat: u8, live: bool, cx: &mut Context<Self>) {
         // A write supersedes whatever a drag was holding
         // ([`Player::write_color`]'s rule).
         self.pending_viz = None;
-        self.set_viz_paint_with(cx, |p| {
-            engine::decode::with_viz_paint_sat(engine::decode::with_viz_paint_hue(p, hue), sat)
-        });
+        let slot = self.viz_slot;
+        self.set_viz_paint_with(live, move |p| slot.picked(p).set_hue_sat(p, hue, sat), cx);
     }
 
     /// One pointer sample on the wheel, as the hue and saturation under it.
@@ -270,9 +336,13 @@ impl Player {
         let ang = dx.atan2(dy).to_degrees();
         let hue_deg = (ang + 360.) % 360.;
         let hue = (hue_deg / 360. * 256.).round() as u16 as u8;
+        // The slot is read once, at the sample that carries it: whichever ink
+        // the hand picked up is the one the whole gesture writes, and the slot
+        // is what the held sample draws with while the worker catches up.
+        let slot = self.viz_slot.picked(self.viz_paint());
         let busy = self.seek_since.is_some();
-        match stash_or_write(&mut self.pending_viz, (hue, sat), first, busy) {
-            Some((hue, sat)) => self.set_viz_hs(hue, sat, cx),
+        match stash_or_write(&mut self.pending_viz, (slot, hue, sat), first, busy) {
+            Some((_, hue, sat)) => self.write_viz_hs(hue, sat, !first, cx),
             // The wheel draws off the held sample, so the mark goes on
             // following the hand while the picture catches up.
             None => cx.notify(),
@@ -280,14 +350,23 @@ impl Player {
     }
 
     pub(crate) fn set_viz_strands(&mut self, n: u8, cx: &mut Context<Self>) {
-        self.set_viz_paint_with(cx, |p| engine::decode::with_viz_paint_strands(p, n));
+        self.set_viz_paint_with(false, |p| engine::decode::with_viz_paint_strands(p, n), cx);
     }
 
     pub(crate) fn set_viz_glow(&mut self, n: u8, cx: &mut Context<Self>) {
-        self.set_viz_paint_with(cx, |p| engine::decode::with_viz_paint_glow(p, n));
+        self.set_viz_paint_with(false, |p| engine::decode::with_viz_paint_glow(p, n), cx);
     }
 
-    fn set_viz_paint_with(&mut self, cx: &mut Context<Self>, f: impl FnOnce(u32) -> u32) {
+    /// `live` picks the door, as [`Player::write_viz_hs`] does: the strands and
+    /// glow steppers are presses and take their own undo step, and the two are
+    /// on the packed bytes rather than on either ink, so they are unaffected by
+    /// which slot the wheel is on.
+    fn set_viz_paint_with(
+        &mut self,
+        live: bool,
+        f: impl FnOnce(u64) -> u64,
+        cx: &mut Context<Self>,
+    ) {
         let Some((lane, idx)) = self.selected.anchor() else {
             return;
         };
@@ -301,8 +380,24 @@ impl Player {
             return;
         }
         let next = f(clip.viz_paint);
-        if next != clip.viz_paint && session.set_viz_paint(lane, idx, next) {
-            self.reset_after_reseek();
+        if next != clip.viz_paint {
+            let took = match live {
+                true => session.set_viz_paint_live(lane, idx, next),
+                false => session.set_viz_paint(lane, idx, next),
+            };
+            if took {
+                // Every look write arms autosave and the close gate
+                // (`write_color`'s own rule, and these doors have no keymap
+                // action behind them to arm it the way `act` does for the
+                // verbs): the wheel's press, a strands/glow stepper and a
+                // typed colour all land here. The drag's live samples land
+                // here too, which is why the arm is on the write and not on
+                // the gesture -- `mark_dirty` is idempotent, so the press, the
+                // samples and the release are one armed edit rather than
+                // sixty.
+                self.mark_dirty();
+                self.reset_after_reseek();
+            }
         }
         cx.notify();
     }
@@ -339,6 +434,11 @@ impl Player {
                 // past the one that went has just moved down: without this the
                 // next paste puts some other file on the timeline.
                 self.clipboard = clipboard_after_remove(std::mem::take(&mut self.clipboard), idx);
+                // The library is project state, and this door is the row's
+                // own menu click -- nothing in [`Player::act`]'s list arms
+                // it. Behind the `Ok`, so a refusal (the engine's own words
+                // while clips still play the file) is not an edit.
+                self.mark_dirty();
                 self.reset_after_reseek();
                 // The last row leaves a session naming no file: nothing to
                 // play, nothing to save and nothing to show, which is the empty
@@ -1020,6 +1120,12 @@ impl Player {
     pub(crate) fn apply_proxies(&mut self) {
         let (on, auto) = (self.proxies_on, self.auto_proxies_on);
         if let Some(session) = &mut self.session {
+            // Deliberately not armed: the only caller is
+            // [`Self::install_media`], the import/load path, where arming is
+            // the one thing the `autosave_armed` rule forbids -- a project
+            // nobody has written must not start asking to be saved. The
+            // user's own door is the switch ([`Self::toggle_proxies`] /
+            // [`Self::toggle_auto_proxies`]), and that is where the arm is.
             session.set_proxies(on);
             session.set_auto_proxies(auto);
         }
@@ -1062,7 +1168,11 @@ impl Player {
         let on = !self.proxies_on;
         self.proxies_on = on;
         if let Some(session) = &mut self.session {
+            let changed = session.proxies() != on;
             session.set_proxies(on);
+            if changed {
+                self.mark_dirty();
+            }
         }
         // What is really under the switch, said in the same breath: a project
         // whose films have no stand-in yet would otherwise read as a switch
@@ -1124,7 +1234,13 @@ impl Player {
         let on = !self.auto_proxies_on;
         self.auto_proxies_on = on;
         if let Some(session) = &mut self.session {
+            // [`Self::toggle_proxies`]'s own gate: the switch is a click and
+            // the session is where the project hears it.
+            let changed = session.auto_proxies() != on;
             session.set_auto_proxies(on);
+            if changed {
+                self.mark_dirty();
+            }
         }
         let text = match on {
             true => "AUTO PROXIES ON — every import gets a stand-in",

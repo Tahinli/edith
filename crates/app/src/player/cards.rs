@@ -38,6 +38,10 @@ impl Player {
     pub(crate) fn apply_resolution(&mut self, width: u32, height: u32, cx: &mut Context<Self>) {
         if let Some(session) = &mut self.session {
             if session.set_resolution(width, height) {
+                // A project field written from a click, with no keymap action
+                // behind it to arm it ([`Player::act`]'s list is the action
+                // doors only).
+                self.mark_dirty();
                 self.notify_user(format!("PROJECT: {width}x{height}").into());
                 self.reset_after_reseek();
             }
@@ -60,6 +64,9 @@ impl Player {
         if let Some(session) = &mut self.session {
             if session.set_frame_rate(fps) {
                 self.fps = session.meta().frame_rate;
+                // [`Self::apply_resolution`]'s own reason. Armed after the
+                // session's own reads, since the borrow outlives nothing.
+                self.mark_dirty();
                 self.notify_user(format!("PROJECT: {} fps", fps_label(fps)).into());
                 self.reset_after_reseek();
             }
@@ -91,7 +98,15 @@ impl Player {
             rate.map_or("the source's own rate".to_string(), |r| format!("{r} Hz"))
         };
         if let Some(session) = &mut self.session {
+            let was = session.sample_rate();
             session.set_sample_rate(rate);
+            // The engine's setter takes no answer back, so the arm is gated
+            // on the setting having moved: picking the rate already in force
+            // is not an edit.
+            let changed = session.sample_rate() != was;
+            if changed {
+                self.mark_dirty();
+            }
             self.notify_user(
                 format!(
                     "PROJECT SOUND: {} — takes effect on the next seek, edit or reopen",
@@ -122,6 +137,8 @@ impl Player {
         if let Some(session) = &mut self.session
             && session.set_tone(preset)
         {
+            // [`Self::apply_resolution`]'s own reason.
+            self.mark_dirty();
             self.notify_user(format!("HDR: {} — affects HDR media", tone_label(preset)).into());
             self.reset_after_reseek();
         }
@@ -673,8 +690,10 @@ impl Player {
         if let Some(speed) = self.pending_speed.take() {
             self.write_speed(speed, true, cx);
         }
-        if let Some((hue, sat)) = self.pending_viz.take() {
-            self.set_viz_hs(hue, sat, cx);
+        if let Some((_, hue, sat)) = self.pending_viz.take() {
+            // Live, as the two above are: the press is the one step this
+            // gesture rolls back to (`Player::write_viz_hs`).
+            self.write_viz_hs(hue, sat, true, cx);
         }
     }
 
@@ -1835,6 +1854,32 @@ impl Player {
             } else if key == "enter" && self.subtitle_style_field > 1 {
                 let family = self.subtitle_fonts[self.subtitle_style_field - 2].clone();
                 self.set_sub_family(Some(family), cx);
+            }
+            return true;
+        }
+        // The Clip tab's colour field (`Player::edit_viz_hex`): the
+        // transition row's own keyboard door, and its free-text half --
+        // checked here, beside it, for its reason (the Clip tab is always on
+        // screen, not modal). Every printable stroke lands in the buffer, so
+        // a letter that is also a room chord types into the field while it is
+        // open, exactly as the dock's source filter does.
+        if self.viz_hex_edit.is_some() {
+            match key {
+                ESCAPE => self.viz_hex_edit = None,
+                "enter" => self.commit_viz_hex(cx),
+                "backspace" => {
+                    if let Some(edit) = self.viz_hex_edit.as_mut() {
+                        edit.backspace();
+                    }
+                }
+                _ => match typed(key) {
+                    Some(c) => {
+                        if let Some(edit) = self.viz_hex_edit.as_mut() {
+                            edit.typed(c);
+                        }
+                    }
+                    None => return false,
+                },
             }
             return true;
         }

@@ -504,7 +504,15 @@ impl Player {
     /// ([`Self::cache_export_seat`]).
     pub(crate) fn apply_encoder(&mut self, seat: EncoderSeat, cx: &mut Context<Self>) {
         if let Some(session) = &mut self.session {
+            let was = session.encoder_seat();
             session.set_encoder_seat(seat);
+            // The seat is written by a settings-row click, so nothing in
+            // [`Player::act`]'s list arms it -- and the engine's setter takes
+            // no answer back, so the arm rides the seat having moved.
+            let changed = session.encoder_seat() != was;
+            if changed {
+                self.mark_dirty();
+            }
             self.notify_user(format!("ENCODER: {}", encoder_label(seat)).into());
         }
         cx.notify();

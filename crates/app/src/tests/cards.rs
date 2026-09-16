@@ -1356,6 +1356,211 @@ fn a_typed_transition_duration_clamps_like_its_own_stepper() {
     assert_eq!(edit.commit_clamped(), 0);
 }
 
+/// The colour field (`ColorEdit`), the transition field's free-text sibling:
+/// every spelling of one colour lands on the same pair, the pair is what the
+/// row shows back as a hex, and text that is not a colour is refused in words
+/// while the field goes on holding it -- never dropped in silence, never
+/// guessed at, and never cleared by the refusal itself.
+#[test]
+fn a_typed_colour_is_read_in_every_spelling_and_anything_else_is_refused() {
+    use engine::decode::{viz_color_from_text, viz_color_hex};
+
+    // One colour in every spelling the field takes: red as `#RRGGBB`, as bare
+    // digits, as `rgb(..)`, and as `rgba(..)` with the alpha dropped. Two
+    // spellings of one colour landing on different pairs would be a field
+    // whose colour depends on how it was written.
+    let red = viz_color_from_text("#FF0000").expect("red is a colour");
+    for text in ["#FF0000", "FF0000", "rgb(255,0,0)", "rgba(255,0,0,255)"] {
+        let mut edit = ColorEdit::new("");
+        for c in text.chars() {
+            edit.typed(c);
+        }
+        assert_eq!(edit.commit(), Some(red), "{text}");
+        assert_eq!(edit.refusal, None, "{text} is a colour, not a refusal");
+    }
+
+    // The round trip through what the row displays: the hex the row shows
+    // reads back as the same pair, so opening the field on it and pressing
+    // enter changes nothing. A seed taken from anywhere else -- or a hex
+    // spelled by something other than the field's own reader -- shows up here.
+    let hex = viz_color_hex(red.0, red.1);
+    let mut edit = ColorEdit::new(&hex);
+    assert_eq!(edit.text, hex, "the field opens on the row's own line");
+    assert!(edit.detail().contains("enter commits"));
+    assert_eq!(edit.commit(), Some(red));
+    assert_eq!(edit.refusal, None);
+
+    // Text that is not a colour: refused in words that say what a colour
+    // looks like, and the text survives the refusal -- a refusal that ate what
+    // was typed would make the next try retype all of it.
+    let mut edit = ColorEdit::new("");
+    edit.typed('z');
+    edit.typed('z');
+    assert_eq!(edit.commit(), None);
+    let why = edit.refusal.clone().expect("a refusal, not a silence");
+    assert!(why.contains("#RRGGBB"), "the refusal says what a colour is: {why}");
+    assert_eq!(edit.text, "zz", "the refusal keeps the text it refused");
+    assert!(edit.detail().contains("zz▏"), "the caret stays in the buffer");
+    // ...and the next stroke clears it: that reason described the text that is
+    // no longer there.
+    edit.typed('0');
+    assert_eq!(edit.refusal, None);
+    assert_eq!(edit.text, "zz0");
+
+    // Backspace erases the last character and the refusal with it, and the
+    // buffer is capped out loud rather than growing without bound off a held
+    // key.
+    let mut edit = ColorEdit::new(&hex);
+    edit.backspace();
+    assert_eq!(edit.text.chars().count(), hex.chars().count() - 1);
+    for _ in 0..64 {
+        edit.typed('f');
+    }
+    assert_eq!(edit.text.chars().count(), 32);
+    assert!(edit.refusal.is_some(), "the stroke past the cap says so");
+
+    // Why the commit compares before it writes: the field opens seeded with
+    // `viz_color_hex(now)`, and that hex reads back as a *different* pair for
+    // a good share of inks (the engine's round-trip canary counts 47 053 of
+    // 65 536 exact), so "write whatever the parse gave" would take an undo
+    // step for the colour the row was already showing. The fact is held here;
+    // the gate that reads it is pinned below.
+    let mut inexact = 0;
+    for hue in 0..=255u8 {
+        for sat in [0u8, 64, 160, 255] {
+            let seed = viz_color_hex(hue, sat);
+            match viz_color_from_text(&seed) {
+                // Exact: entering the seed is already a no-op for the write
+                // gate, whatever the gate says.
+                Some(pair) if pair == (hue, sat) => {}
+                // Inexact: this is the case the gate exists for -- without it
+                // every one of these takes a committing write on an untouched
+                // colour.
+                Some(_) => inexact += 1,
+                None => panic!("the row's own hex must be readable back: {seed}"),
+            }
+        }
+    }
+    assert!(
+        inexact > 0,
+        "no ink round-trips inexactly -- the commit's no-op gate would be dead weight"
+    );
+
+    // The gate itself, in the door that has it (`Player::commit_viz_hex`): the
+    // parse, then the comparison with the picked slot's own colour, and the
+    // write only past it.
+    let body = fn_body("commit_viz_hex");
+    let gate = body
+        .split_once("hue_sat(paint)")
+        .expect("the commit no longer compares with the colour on the slot")
+        .1;
+    assert!(
+        gate.contains("write_viz_hs("),
+        "the commit writes before it has compared, so the row's own seed is an edit"
+    );
+}
+
+/// The look family's writes arm autosave, and therefore the ledger's `unsaved`
+/// ghost and `Player::close_needs_answer`, which read the same flag: a colour
+/// picked in the Clip tab that armed nothing could be closed away with no
+/// prompt and no autosave.
+///
+/// A scan and not a drive: every one of these doors needs a `Player` and a
+/// gpui `Context`, and this crate has no window harness (`tests/view.rs`'s own
+/// note). What a scan can hold is the three doors themselves -- the two the
+/// whole paint family shares (`set_viz_paint_with` is where the wheel, the
+/// steppers and a typed colour all land) and the two writes that do not go
+/// through it (the style chips and the `Fast` chip, which write
+/// `clip.visualizer`). Pre-fix none of the three armed anything while every
+/// other engine-writing door did (`write_color`, `write_transform`,
+/// `set_eq`, the trim/place/fade doors).
+#[test]
+fn a_visualizer_look_write_arms_autosave() {
+    for name in ["set_viz_style", "toggle_viz_flag"] {
+        let body = fn_body(name);
+        assert!(
+            body.contains("session.set_visualizer"),
+            "{name} no longer writes the clip's look at all"
+        );
+        assert!(
+            body.contains("mark_dirty()"),
+            "{name} writes a look and arms nothing"
+        );
+    }
+    let body = fn_body("set_viz_paint_with");
+    // The arm rides the write that took, not the call: a no-op press (the
+    // colour under the hand already) is not an edit, and the ghost must stay
+    // off it.
+    let took = body
+        .split_once("if took {")
+        .expect("the paint door writes through a taken-write gate")
+        .1;
+    assert!(
+        took.contains("mark_dirty()"),
+        "the arm is outside the write gate, so a no-op press would dirty the project"
+    );
+    assert!(
+        took.contains("reset_after_reseek()"),
+        "the arm replaced the reseek bookkeeping instead of joining it"
+    );
+}
+
+/// The rest of the class the visualizer look family belonged to: every other
+/// door that writes the project from a *click* and so has no action behind it
+/// to arm autosave ([`Player::act`]'s list is the action doors only). Each arm
+/// rides its own "the write took" gate -- a pick that changed nothing must not
+/// dirty the project, or a window nobody has touched would ask to be saved.
+#[test]
+fn every_click_door_that_writes_the_project_arms_autosave() {
+    // The doors the engine answers with a bool *that means "the value
+    // moved"*: the arm goes inside it.
+    for name in ["apply_resolution", "apply_frame_rate", "apply_tone"] {
+        let body = fn_body(name);
+        assert!(
+            body.contains("mark_dirty()"),
+            "{name} writes the project and arms nothing"
+        );
+    }
+    // ...and the one whose bool does not mean that at all: `set_fit` says the
+    // index existed, and the picker keeps the row already in force clickable,
+    // so the arm rides the policy having moved -- on the engine's own bool it
+    // would light the `unsaved` ghost over a project nobody touched.
+    let body = fn_body("apply_fit");
+    assert!(
+        body.contains("fit_of(lane, idx) != fit"),
+        "apply_fit arms on the engine's own bool again, which a no-op pick also answers true"
+    );
+    assert!(body.contains("mark_dirty()"), "apply_fit arms nothing");
+    // The import path keeps no arm on purpose (the `autosave_armed` rule): its
+    // only caller is `install_media`, so an arm there could only ever fire for
+    // a project nobody has touched. The user's door is the two toggles.
+    let body = fn_body("apply_proxies");
+    assert!(
+        body.find("mark_dirty").is_none(),
+        "apply_proxies arms again -- its only caller is the import path"
+    );
+    // The doors whose setter takes no answer back, and the library row's
+    // removal: the arm rides a local `changed` (or the removal having landed),
+    // never the call.
+    for (name, gate) in [
+        ("apply_sample_rate", "if changed {"),
+        ("apply_encoder", "if changed {"),
+        ("toggle_proxies", "if changed {"),
+        ("toggle_auto_proxies", "if changed {"),
+        ("remove_source", "Some(Ok(idx))"),
+    ] {
+        let body = fn_body(name);
+        let after = body
+            .split_once(gate)
+            .unwrap_or_else(|| panic!("{name} lost the gate its arm rides"))
+            .1;
+        assert!(
+            after.contains("mark_dirty()"),
+            "{name} arms outside its gate, so a no-op pick would dirty the project"
+        );
+    }
+}
+
 /// [`crate::ui::dock_stance::transition_of`]: the dock's duration row
 /// appears only for an anchor that actually carries a dissolve or a
 /// crossfade, and the room it offers is capped at what the successor clip
