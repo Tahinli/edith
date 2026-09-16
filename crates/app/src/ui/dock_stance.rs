@@ -1197,7 +1197,10 @@ fn viz_style_verbs(player: &Player, cx: &mut Context<Player>) -> impl IntoElemen
         return div().id("dock-viz-styles");
     };
     let flags = clip.visualizer;
-    let paint = clip.viz_paint;
+    // The ink the wheel draws is the one a drag is holding, when one is: the
+    // clip still carries the sample before it until the worker lands the
+    // holding frame (`viz_held_paint`).
+    let paint = viz_held_paint(clip.viz_paint, player.pending_viz);
     let pick = |id: &'static str, label_text: &'static str, style: u8, on: bool| {
         let row = label(type_scale::LABEL_ROW_PX, FontWeight::MEDIUM);
         div()
@@ -1374,7 +1377,7 @@ fn viz_color_wheel(player: &Player, paint: u32, cx: &mut Context<Player>) -> imp
             MouseButton::Left,
             cx.listener(move |this, event: &MouseDownEvent, _, cx| {
                 this.viz_hs_dragging = true;
-                this.drag_viz_hs(event.position, cx);
+                this.drag_viz_hs(event.position, true, cx);
             }),
         )
 }

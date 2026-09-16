@@ -761,6 +761,13 @@ struct Player {
     viz_hs_dragging: bool,
     /// The wheel's box, recorded at prepaint for a drag's window position.
     viz_wheel: Rc<Cell<Bounds<Pixels>>>,
+    /// The ink the hand is on, held back because the worker still owes a frame
+    /// ([`Self::pending_color`]'s own reason, and a wheel sample is heavier
+    /// than a grade's: it is not a table entry but the painter's own input, so
+    /// the write is what rebuilds the picture). What the wheel draws while it
+    /// stands, and never lost -- the frame that lands writes it, and so does
+    /// the release.
+    pending_viz: Option<(u8, u8)>,
     /// Each slider's box, recorded at prepaint: a mouse listener is handed the
     /// window position only, so this is what a press and a drag are read against
     /// ([`frac_along`]). One per band, because the press picks the row it landed
@@ -1071,6 +1078,7 @@ fn main() {
                     color_dragging: false,
                     viz_hs_dragging: false,
                     viz_wheel: Rc::default(),
+                    pending_viz: None,
                     color_bars: std::array::from_fn(|_| Rc::default()),
                     pending_color: None,
                     transform_open: None,
