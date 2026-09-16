@@ -42,6 +42,112 @@ pub fn peaks(
     peaks_over(path.as_ref(), stream, buckets_per_sec, None)
 }
 
+/// How many buckets the process-wide envelope memo may hold before it gives
+/// them back. A bucket is a pair of `f32`s, so this is a ~64 MB ceiling over
+/// every *source* a session has asked for -- not over the asks themselves --
+/// and a single source larger than it is not held at all.
+const PEAKS_MEMO_BUCKETS: usize = 8 << 20;
+
+/// One file's envelope as the memo holds it: shared, so the second ask for the
+/// same source is a refcount rather than a decode of the whole file.
+pub(crate) type SharedPeaks = std::sync::Arc<Vec<(f32, f32)>>;
+
+/// The identity a memo entry is keyed by: what was asked for *and* the file it
+/// was answered from, so a source replaced on disk is read again rather than
+/// served the envelope of bytes that are gone.
+#[derive(PartialEq, Eq, Hash)]
+struct PeaksKey {
+    path: PathBuf,
+    stream: usize,
+    buckets_per_sec: u32,
+    bytes: u64,
+    mtime: Option<std::time::SystemTime>,
+}
+
+impl PeaksKey {
+    fn of(path: &Path, stream: usize, buckets_per_sec: u32) -> Self {
+        let stat = std::fs::metadata(path).ok();
+        Self {
+            path: path.to_path_buf(),
+            stream,
+            buckets_per_sec,
+            bytes: stat.as_ref().map_or(0, std::fs::Metadata::len),
+            mtime: stat.and_then(|m| m.modified().ok()),
+        }
+    }
+}
+
+/// The memo and how many buckets it is holding. One lock for both: a hit is a
+/// lookup and a refcount, which is the whole of what the caller saves.
+///
+/// `std::sync::Mutex`, not `parking_lot`'s: edith's workspace has no
+/// `parking_lot` of its own and this crate locks `std`'s everywhere (the audio
+/// device, the tap), so a new dependency is not what a memo is worth.
+fn peaks_memo() -> &'static std::sync::Mutex<(PeaksMemo, usize)> {
+    static MEMO: std::sync::LazyLock<std::sync::Mutex<(PeaksMemo, usize)>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new((PeaksMemo::new(), 0)));
+    &MEMO
+}
+
+/// Every envelope the process has been asked for, by identity.
+type PeaksMemo = std::collections::HashMap<PeaksKey, SharedPeaks>;
+
+/// [`peaks`] as a handle the caller can hold: the same envelope, shared rather
+/// than copied.
+///
+/// The visualizer seat asks this of every picture rebuild it makes
+/// ([`DecodeSession::open_visualizer`]): a rebuild happens once per look edit,
+/// and a look edit is what a drag across the colour wheel is -- so an envelope
+/// decoded per rebuild is a whole-file audio decode per pointer sample, for an
+/// answer that has not changed.
+///
+/// Keyed on the file's own stat ([`PeaksKey`]) and bounded by
+/// [`PEAKS_MEMO_BUCKETS`] *of what it holds*: past the ceiling the memo lets
+/// everything go rather than evicting one entry at a time, because the entries
+/// are large and a re-decode is the honest cost of asking for more than the
+/// ceiling. A single source whose own envelope is bigger than the ceiling is
+/// not memoized at all (see [`peaks_shared`]), so the ceiling is one -- an
+/// entry that no clear can bring the memo back under would be a memo that
+/// clears on every other ask.
+pub(crate) fn peaks_shared(
+    path: &Path,
+    stream: usize,
+    buckets_per_sec: u32,
+) -> crate::Result<Option<SharedPeaks>> {
+    let key = PeaksKey::of(path, stream, buckets_per_sec);
+    if let Some(hit) = peaks_memo().lock().unwrap().0.get(&key) {
+        return Ok(Some(SharedPeaks::clone(hit)));
+    }
+    let Some(peaks) = peaks_over(path, stream, buckets_per_sec, None)? else {
+        return Ok(None);
+    };
+    let shared = SharedPeaks::new(peaks);
+    let mut memo = peaks_memo().lock().unwrap();
+    // An entry bigger than the ceiling is never memoized at all: keeping it
+    // would put the count permanently over the ceiling, so the next ask of any
+    // *other* key would clear the map and drop it -- and this source would pay
+    // a whole-file decode per rebuild anyway, which is the stall the memo is
+    // here to remove. The caller gets its envelope either way.
+    if shared.len() <= PEAKS_MEMO_BUCKETS {
+        if memo.1 + shared.len() > PEAKS_MEMO_BUCKETS {
+            memo.0.clear();
+            memo.1 = 0;
+        }
+        // The map may already hold this very key: two workers that missed
+        // together both decode, and the slower one inserts after the faster
+        // one. The count follows what the map *holds*, so the replaced entry's
+        // buckets come off before the new one's go on -- otherwise every such
+        // race leaves the count high for good (only a clear resets it) and
+        // later asks clear the memo early, dropping entries that then pay a
+        // whole-file decode to be rebuilt.
+        if let Some(previous) = memo.0.insert(key, SharedPeaks::clone(&shared)) {
+            memo.1 -= previous.len();
+        }
+        memo.1 += shared.len();
+    }
+    Ok(Some(shared))
+}
+
 /// [`peaks`] with the split forced to `jobs` windows, which is how a test asks
 /// for the same envelope by both routes.
 fn peaks_over(
@@ -181,7 +287,7 @@ fn fold(
 mod tests {
     use std::path::PathBuf;
 
-    use super::{peaks, peaks_over};
+    use super::{peaks, peaks_over, peaks_shared};
 
     const BPS: u32 = 10;
 
@@ -349,5 +455,81 @@ mod tests {
         // any other stream rather than being refused.
         let two = peaks(&multi, 2, BPS).expect("AC-3 opens").expect("stream 2");
         assert!(!two.is_empty(), "the AC-3 stream drew nothing");
+    }
+
+    /// The memo is keyed on the *ask*, not on the file: a second visualizer
+    /// rebuild of one source reuses the envelope, and one of another stream is
+    /// decoded rather than handed the first one's -- the lie
+    /// [`each_stream_of_a_file_has_its_own_envelope`] refuses, one cache layer
+    /// down, where the visualizer seat reads it.
+    #[test]
+    fn the_shared_memo_answers_per_stream() {
+        let multi = asset("test_multiaudio.mp4");
+        let zero = peaks_shared(&multi, 0, BPS)
+            .expect("open")
+            .expect("stream 0");
+        let again = peaks_shared(&multi, 0, BPS)
+            .expect("open")
+            .expect("stream 0, second ask");
+        // Shared, not decoded again -- which is the whole of what the second
+        // visualizer rebuild saves.
+        assert!(
+            std::sync::Arc::ptr_eq(&zero, &again),
+            "the second ask decoded the file again"
+        );
+        // ...and the very envelope a plain ask draws, so nothing is served
+        // through the memo that the decoder would not have said.
+        let plain = peaks(&multi, 0, BPS).expect("open").expect("stream 0");
+        assert_eq!(*zero, plain);
+        let one = peaks_shared(&multi, 1, BPS)
+            .expect("open")
+            .expect("stream 1");
+        assert_ne!(*zero, *one, "a stream took another's memo entry");
+    }
+
+    /// A source replaced on disk is read again: the key carries the file's own
+    /// stat, so the memo cannot paint the old file's envelope for a clip that
+    /// no longer plays it. Asked of a *copy*, because the fixtures are
+    /// read-only for every other test in this binary.
+    #[test]
+    fn a_replaced_source_is_read_again() {
+        let path = std::env::temp_dir().join(format!("edith-peaks-memo-{}.mp4", std::process::id()));
+        let short = std::fs::read(asset("test_multiaudio.mp4")).expect("read the fixture");
+        let long = std::fs::read(asset("test_av.mp4")).expect("read the fixture");
+        // The two halves below are the length half and the clock half of the
+        // key, so their sizes have to differ for the first of them to be it.
+        assert_ne!(short.len(), long.len(), "fixtures must differ in length");
+
+        std::fs::write(&path, &short).expect("write the copy");
+        let first = peaks_shared(&path, 0, BPS).expect("open").expect("copy");
+        let again = peaks_shared(&path, 0, BPS).expect("open").expect("copy");
+        assert!(std::sync::Arc::ptr_eq(&first, &again), "the copy was not memoized");
+
+        // Other bytes behind the same path. A key without the file's length
+        // (or without any stat at all) serves `first` here -- the envelope of
+        // bytes that are gone.
+        std::fs::write(&path, &long).expect("rewrite the copy");
+        let replaced = peaks_shared(&path, 0, BPS).expect("open").expect("copy");
+        assert_ne!(*replaced, *first, "the memo served the replaced file's envelope");
+        assert_eq!(
+            *replaced,
+            peaks(&path, 0, BPS).expect("open").expect("copy"),
+            "the memo's answer is not what a plain ask draws"
+        );
+
+        // The *same* bytes written again: same length, a newer clock. Resolution
+        // is the filesystem's, so give it a moment to move.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&path, &long).expect("touch the copy");
+        let touched = peaks_shared(&path, 0, BPS).expect("open").expect("copy");
+        assert_eq!(*touched, *replaced);
+        // A key with length but no mtime hands the old handle back -- for a file
+        // that changed under it, which is the serve the mtime is in the key for.
+        assert!(
+            !std::sync::Arc::ptr_eq(&replaced, &touched),
+            "the mtime is not part of the key"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 }

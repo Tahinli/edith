@@ -660,7 +660,7 @@ impl DecodeSession {
                 // no track at all -- paints the flat line, which is what its
                 // silence looks like anyway: a visualizer frame always
                 // exists, and is never worth failing a span over.
-                let peaks = crate::waveform::peaks(&path, stream, VIZ_BUCKETS_PER_SEC)
+                let peaks = crate::waveform::peaks_shared(&path, stream, VIZ_BUCKETS_PER_SEC)
                     .ok()
                     .flatten()
                     .unwrap_or_default();
