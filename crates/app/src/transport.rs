@@ -204,6 +204,22 @@ pub(crate) fn stash_or_write<T: Copy>(
     }
 }
 
+/// What the wheel draws: the clip's own ink, or the sample a drag is holding
+/// while the worker is still behind ([`stash_or_write`]). The wheel is a
+/// picker with no table of its own, so a held sample would otherwise be
+/// invisible -- the clip carries the sample *before* it until the holding
+/// frame lands -- and the mark would sit still under a moving hand.
+/// [`Player::color_params`] holds exactly this rule for the card's sliders.
+pub(crate) fn viz_held_paint(paint: u32, held: Option<(u8, u8)>) -> u32 {
+    match held {
+        Some((hue, sat)) => engine::decode::with_viz_paint_sat(
+            engine::decode::with_viz_paint_hue(paint, hue),
+            sat,
+        ),
+        None => paint,
+    }
+}
+
 /// How long an open may stand before the window says so in words. Well past an
 /// ordinary seek (a warm reopen is under a tenth of this) and well under what a
 /// cold read of a big film takes, which is the only case worth a line.

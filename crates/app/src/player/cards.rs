@@ -673,6 +673,9 @@ impl Player {
         if let Some(speed) = self.pending_speed.take() {
             self.write_speed(speed, true, cx);
         }
+        if let Some((hue, sat)) = self.pending_viz.take() {
+            self.set_viz_hs(hue, sat, cx);
+        }
     }
 
     /// Opens the silence card on the clip to be scanned: the selected one, or

@@ -202,6 +202,38 @@ fn a_release_lands_the_value_the_hand_let_go_on() {
     assert_eq!(stash, None);
 }
 
+/// The wheel's own version of the same gesture, and the one thing a drag on it
+/// may not lose while the worker is behind: the mark follows the hand. A held
+/// sample is what the wheel draws -- the clip carries the ink from before it
+/// until the holding frame lands -- and the pen's own settings, which are not
+/// part of a hue/saturation sample, survive it untouched.
+#[test]
+fn the_wheel_draws_the_sample_a_drag_is_holding() {
+    // Nothing held: the clip's own ink, byte for byte -- the default 0
+    // included, which materializes to azure where it is read.
+    assert_eq!(viz_held_paint(0, None), 0);
+    assert_eq!(viz_held_paint(0x0208_d2fd, None), 0x0208_d2fd);
+    // Held: that hue and saturation over what the clip already carries.
+    let held = viz_held_paint(0, Some((253, 210)));
+    assert_eq!(engine::decode::viz_hue_ui(held), 253);
+    assert_eq!(engine::decode::viz_sat_ui(held), 210);
+    // ...in that order, never the other way round: a mark drawn at the wrong
+    // angle is the whole gesture showing the wrong colour.
+    let flipped = viz_held_paint(0, Some((210, 253)));
+    assert_ne!(held, flipped);
+    assert_eq!(engine::decode::viz_hue_ui(flipped), 210);
+    assert_eq!(engine::decode::viz_sat_ui(flipped), 253);
+    // Strands and glow are the clip's, not the sample's: the wheel carries no
+    // row for either, so a held hue may not move them.
+    assert_eq!(engine::decode::viz_strands_of(held), 8);
+    assert_eq!(engine::decode::viz_glow_of(held), 2);
+    let pen = engine::decode::with_viz_paint_glow(0x0208_d2fd, 9);
+    assert_eq!(
+        engine::decode::viz_glow_of(viz_held_paint(pen, Some((253, 210)))),
+        9
+    );
+}
+
 /// A seek says nothing until it has stood: an ordinary one is a flicker and
 /// a cold read of a big file is the case worth words.
 #[test]

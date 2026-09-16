@@ -237,12 +237,28 @@ impl Player {
     }
 
     pub(crate) fn set_viz_hs(&mut self, hue: u8, sat: u8, cx: &mut Context<Self>) {
+        // A write supersedes whatever a drag was holding
+        // ([`Player::write_color`]'s rule).
+        self.pending_viz = None;
         self.set_viz_paint_with(cx, |p| {
             engine::decode::with_viz_paint_sat(engine::decode::with_viz_paint_hue(p, hue), sat)
         });
     }
 
-    pub(crate) fn drag_viz_hs(&mut self, at: gpui::Point<Pixels>, cx: &mut Context<Self>) {
+    /// One pointer sample on the wheel, as the hue and saturation under it.
+    /// `first` is the press, which is never held: it is the pick the gesture
+    /// rolls back to, so it has to be taken against the ink the hand picked up.
+    /// Every sample after it goes through [`stash_or_write`] -- a wheel sample
+    /// is not a table entry but the painter's input, so the write is what
+    /// rebuilds the whole picture at the playhead, and a sweep that wrote each
+    /// one would queue a reopen per pixel, cancel all but one and freeze the
+    /// window for the sum.
+    pub(crate) fn drag_viz_hs(
+        &mut self,
+        at: gpui::Point<Pixels>,
+        first: bool,
+        cx: &mut Context<Self>,
+    ) {
         let b = self.viz_wheel.get();
         let w = f32::from(b.size.width).max(1.);
         let h = f32::from(b.size.height).max(1.);
@@ -254,7 +270,13 @@ impl Player {
         let ang = dx.atan2(dy).to_degrees();
         let hue_deg = (ang + 360.) % 360.;
         let hue = (hue_deg / 360. * 256.).round() as u16 as u8;
-        self.set_viz_hs(hue, sat, cx);
+        let busy = self.seek_since.is_some();
+        match stash_or_write(&mut self.pending_viz, (hue, sat), first, busy) {
+            Some((hue, sat)) => self.set_viz_hs(hue, sat, cx),
+            // The wheel draws off the held sample, so the mark goes on
+            // following the hand while the picture catches up.
+            None => cx.notify(),
+        }
     }
 
     pub(crate) fn set_viz_strands(&mut self, n: u8, cx: &mut Context<Self>) {
@@ -501,6 +523,7 @@ impl Player {
         self.color_dragging = false;
         self.viz_hs_dragging = false;
         self.pending_color = None;
+        self.pending_viz = None;
         self.transform_dragging = false;
         self.pending_transform = None;
         self.pending_speed = None;

@@ -31,7 +31,7 @@ use super::{
     row_enable, row_items, scrub_due, secs_label, should_resync, silence_rate, size_label,
     rate_label, snap_cue, snap_marks, snapped, source_tint, span_partner, speed_at, sub_pick_after_removal,
     subtitle_plan, timecode, timeline_fixed_h, tip_may_paint,
-    transport, typed, unseen_paths, unseen_sources, whole_take, window_title,
+    transport, typed, unseen_paths, unseen_sources, viz_held_paint, whole_take, window_title,
 };
 
 use super::{

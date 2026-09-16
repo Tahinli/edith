@@ -2103,11 +2103,18 @@ impl Player {
             }
             return;
         }
+        // The ink wheel, on the root for the same 4 px reason and gated on the
+        // worker like the bars above: one sample here is a whole picture
+        // rebuilt, so what is written is one ink per frame the worker delivers
+        // rather than one per pixel the pointer crossed.
         if self.viz_hs_dragging {
             if event.pressed_button == Some(MouseButton::Left) {
-                self.drag_viz_hs(event.position, cx);
+                self.drag_viz_hs(event.position, false, cx);
             } else {
+                // The release happened outside the window, so the sample the
+                // hand let go on is owed like any other ending.
                 self.viz_hs_dragging = false;
+                self.flush_drag(cx);
             }
             return;
         }
@@ -2228,7 +2235,11 @@ impl Player {
             return;
         }
         if std::mem::take(&mut self.viz_hs_dragging) {
-            self.drag_viz_hs(event.position, cx);
+            // The release lands exactly where the hand let go, and the flush
+            // is what makes that true while the worker is still busy: the
+            // sample above would only be held.
+            self.drag_viz_hs(event.position, false, cx);
+            self.flush_drag(cx);
             return;
         }
         if std::mem::take(&mut self.transform_dragging) {
