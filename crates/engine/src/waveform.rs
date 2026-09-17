@@ -89,8 +89,51 @@ fn peaks_memo() -> &'static std::sync::Mutex<(PeaksMemo, usize)> {
     &MEMO
 }
 
-/// Every envelope the process has been asked for, by identity.
-type PeaksMemo = std::collections::HashMap<PeaksKey, SharedPeaks>;
+/// Test-only: how many times an ask had to decode rather than answer from what
+/// the memo already held. A second ask for the same source -- trackless or not
+/// -- must not move it, which is what makes "the memo answered" observable.
+#[cfg(test)]
+static MEMO_DECODES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// [`MEMO_DECODES`], for a test that measures a delta across its own asks.
+#[cfg(test)]
+fn memo_decodes() -> usize {
+    MEMO_DECODES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// What the memo holds for one key: an envelope, or the stable answer that the
+/// source carries no audio track at all. The second is worth keeping too -- a
+/// trackless source re-opens its container on every ask otherwise, the same
+/// per-rebuild cost the envelope memo exists to remove -- and it holds no
+/// buckets, so the counter stays honest about what the map holds.
+enum MemoEntry {
+    /// A source with an audio track, shared so a second ask is a refcount.
+    Envelope(SharedPeaks),
+    /// A source with no audio track: a valid, empty answer ([`peaks`]'s
+    /// `Ok(None)`), kept rather than re-derived from the file each time.
+    NoTrack,
+}
+
+impl MemoEntry {
+    /// The answer this entry stands for, as [`peaks_shared`] returns it.
+    fn envelope(&self) -> Option<SharedPeaks> {
+        match self {
+            MemoEntry::Envelope(shared) => Some(SharedPeaks::clone(shared)),
+            MemoEntry::NoTrack => None,
+        }
+    }
+
+    /// How many buckets this entry adds to the counter.
+    fn buckets(&self) -> usize {
+        match self {
+            MemoEntry::Envelope(shared) => shared.len(),
+            MemoEntry::NoTrack => 0,
+        }
+    }
+}
+
+/// Every answer the process has been asked for, by identity.
+type PeaksMemo = std::collections::HashMap<PeaksKey, MemoEntry>;
 
 /// [`peaks`] as a handle the caller can hold: the same envelope, shared rather
 /// than copied.
@@ -109,43 +152,87 @@ type PeaksMemo = std::collections::HashMap<PeaksKey, SharedPeaks>;
 /// not memoized at all (see [`peaks_shared`]), so the ceiling is one -- an
 /// entry that no clear can bring the memo back under would be a memo that
 /// clears on every other ask.
+///
+/// A trackless source's `Ok(None)` is kept too: it is an answer the file will
+/// give again, and without it a visualizer clip on a silent source re-opens
+/// the container on every picture rebuild -- the whole cost the memo removes,
+/// paid once per look edit. It holds no buckets, so it never counts against
+/// the ceiling. A failed ask is *not* kept: a decode that failed once may fail
+/// for a reason that has gone away, and caching it would make that permanent.
 pub(crate) fn peaks_shared(
     path: &Path,
     stream: usize,
     buckets_per_sec: u32,
 ) -> crate::Result<Option<SharedPeaks>> {
+    peaks_shared_capped(path, stream, buckets_per_sec, PEAKS_MEMO_BUCKETS)
+}
+
+/// [`peaks_shared`] against a ceiling a test can drive down to a handful of
+/// buckets, so the over-the-ceiling path is walked without an eight-million-
+/// bucket fixture. `cap` is [`PEAKS_MEMO_BUCKETS`] everywhere but in a test.
+fn peaks_shared_capped(
+    path: &Path,
+    stream: usize,
+    buckets_per_sec: u32,
+    cap: usize,
+) -> crate::Result<Option<SharedPeaks>> {
     let key = PeaksKey::of(path, stream, buckets_per_sec);
     if let Some(hit) = peaks_memo().lock().unwrap().0.get(&key) {
-        return Ok(Some(SharedPeaks::clone(hit)));
+        return Ok(hit.envelope());
     }
-    let Some(peaks) = peaks_over(path, stream, buckets_per_sec, None)? else {
-        return Ok(None);
+    #[cfg(test)]
+    MEMO_DECODES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // A failure is *not* memoized: `?` leaves the map untouched, so a decode
+    // that failed once -- a file caught mid-write, a busy device -- is retried
+    // rather than frozen for the process's life. Only the two successful
+    // answers are kept: the envelope, and the trackless `None`.
+    let answer = peaks_over(path, stream, buckets_per_sec, None)?;
+    let entry = match answer {
+        None => MemoEntry::NoTrack,
+        Some(peaks) => MemoEntry::Envelope(SharedPeaks::new(peaks)),
     };
-    let shared = SharedPeaks::new(peaks);
-    let mut memo = peaks_memo().lock().unwrap();
-    // An entry bigger than the ceiling is never memoized at all: keeping it
-    // would put the count permanently over the ceiling, so the next ask of any
-    // *other* key would clear the map and drop it -- and this source would pay
-    // a whole-file decode per rebuild anyway, which is the stall the memo is
-    // here to remove. The caller gets its envelope either way.
-    if shared.len() <= PEAKS_MEMO_BUCKETS {
-        if memo.1 + shared.len() > PEAKS_MEMO_BUCKETS {
-            memo.0.clear();
-            memo.1 = 0;
-        }
-        // The map may already hold this very key: two workers that missed
-        // together both decode, and the slower one inserts after the faster
-        // one. The count follows what the map *holds*, so the replaced entry's
-        // buckets come off before the new one's go on -- otherwise every such
-        // race leaves the count high for good (only a clear resets it) and
-        // later asks clear the memo early, dropping entries that then pay a
-        // whole-file decode to be rebuilt.
-        if let Some(previous) = memo.0.insert(key, SharedPeaks::clone(&shared)) {
-            memo.1 -= previous.len();
-        }
-        memo.1 += shared.len();
+    // The handle the caller gets is the answer itself, whether or not the memo
+    // keeps a copy: an over-the-ceiling envelope is still returned below.
+    let handle = entry.envelope();
+    let mut guard = peaks_memo().lock().unwrap();
+    let (memo, count) = &mut *guard;
+    memoize(memo, count, cap, key, entry);
+    Ok(handle)
+}
+
+/// Record `entry` under `key` in `memo`, keeping `count` equal to the buckets
+/// the map holds. The arithmetic is what keeps the ceiling a ceiling:
+///
+/// - an entry bigger than `cap` is not held at all -- keeping it would put the
+///   count permanently over the ceiling, so the next ask of any *other* key
+///   would clear the map and drop it, and this source would pay a whole-file
+///   decode per rebuild anyway. The caller keeps the handle it was handed;
+/// - when the new entry would take the count past `cap`, the map is emptied
+///   rather than evicted one entry at a time (the entries are large);
+/// - an insert that replaces an entry the count already includes subtracts the
+///   replaced length first, so the racing-workers case -- two workers that
+///   missed one key each decode and insert it -- does not leave the count high
+///   for good: only a clear resets it, and a high count makes later asks clear
+///   early, dropping entries that then pay a whole-file decode to be rebuilt.
+fn memoize(
+    memo: &mut PeaksMemo,
+    count: &mut usize,
+    cap: usize,
+    key: PeaksKey,
+    entry: MemoEntry,
+) {
+    let len = entry.buckets();
+    if len > cap {
+        return;
     }
-    Ok(Some(shared))
+    if *count + len > cap {
+        memo.clear();
+        *count = 0;
+    }
+    if let Some(previous) = memo.insert(key, entry) {
+        *count -= previous.buckets();
+    }
+    *count += len;
 }
 
 /// [`peaks`] with the split forced to `jobs` windows, which is how a test asks
@@ -287,7 +374,10 @@ fn fold(
 mod tests {
     use std::path::PathBuf;
 
-    use super::{peaks, peaks_over, peaks_shared};
+    use super::{
+        memo_decodes, memoize, peaks, peaks_over, peaks_shared, peaks_shared_capped, MemoEntry,
+        PeaksKey, PeaksMemo, SharedPeaks,
+    };
 
     const BPS: u32 = 10;
 
@@ -295,6 +385,16 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../assets")
             .join(name)
+    }
+
+    /// A private copy of a fixture, so the memo key a test drives is not one
+    /// another test in this binary may already hold.
+    fn copy_of(name: &str, tag: &str) -> PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("edith-peaks-{tag}-{}.mp4", std::process::id()));
+        std::fs::write(&path, std::fs::read(asset(name)).expect("read the fixture"))
+            .expect("write the copy");
+        path
     }
 
     #[test]
@@ -531,5 +631,120 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A trackless source is an answer too, and the memo keeps it: without that
+    /// a visualizer clip on a silent source re-opens the container on every
+    /// picture rebuild -- the whole cost the memo exists to remove, paid once
+    /// per look edit. Proved by counting decodes: the second ask must not take
+    /// one. A copy is used so the key is this test's alone.
+    #[test]
+    fn a_trackless_source_is_memoized_too() {
+        let path = copy_of("test_baseline.mp4", "none");
+
+        let before = memo_decodes();
+        let first = peaks_shared(&path, 0, BPS).expect("open");
+        assert!(first.is_none(), "test_baseline.mp4 has no audio track");
+        let after_first = memo_decodes();
+        assert_eq!(after_first - before, 1, "the first ask did not decode");
+
+        let second = peaks_shared(&path, 0, BPS).expect("open");
+        assert!(second.is_none());
+        assert_eq!(
+            memo_decodes(),
+            after_first,
+            "the second ask re-opened a trackless source"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A trackless answer holds no buckets, so the ceiling counts only
+    /// envelopes -- and a source that gains an audio track (a re-encode) swaps
+    /// the `NoTrack` entry for an envelope without stranding the old count.
+    #[test]
+    fn a_trackless_answer_holds_no_buckets() {
+        let mut memo = PeaksMemo::new();
+        let mut count = 0;
+        let key = || PeaksKey::of(std::path::Path::new("edith-peaks-none-key"), 0, BPS);
+
+        memoize(&mut memo, &mut count, 100, key(), MemoEntry::NoTrack);
+        assert_eq!(count, 0, "a trackless answer counted buckets");
+        assert!(memo.contains_key(&key()));
+
+        memoize(
+            &mut memo,
+            &mut count,
+            100,
+            key(),
+            MemoEntry::Envelope(SharedPeaks::new(vec![(0.0, 0.0); 4])),
+        );
+        assert_eq!(count, 4, "the envelope did not replace the trackless count");
+    }
+
+    /// An envelope larger than the ceiling is handed to the caller but never
+    /// held, so a clear can always bring the memo back under the ceiling. The
+    /// real ceiling is 8M buckets (~35 min at 10/s), unreachable from a
+    /// fixture, so this drives the same code through a ceiling of ten buckets
+    /// against a five-second source (about fifty buckets). Covers: the
+    /// over-the-ceiling *decision* and the caller-still-gets-its-handle half.
+    /// Does not cover: an end-to-end decode past eight million buckets.
+    #[test]
+    fn an_envelope_over_the_ceiling_is_not_held() {
+        let file = copy_of("test_av.mp4", "over");
+        let before = memo_decodes();
+        let first = peaks_shared_capped(&file, 0, BPS, 10)
+            .expect("open")
+            .expect("test_av.mp4 has an audio track");
+        assert!(first.len() > 10, "the fixture must exceed the test ceiling");
+        let mid = memo_decodes();
+        assert_eq!(mid - before, 1, "the first ask did not decode");
+
+        let second = peaks_shared_capped(&file, 0, BPS, 10)
+            .expect("open")
+            .expect("test_av.mp4 has an audio track");
+        assert_eq!(*first, *second, "the caller did not get its envelope");
+        assert_eq!(
+            memo_decodes() - mid,
+            1,
+            "an envelope over the ceiling was held"
+        );
+
+        let _ = std::fs::remove_file(&file);
+    }
+
+    /// An insert that replaces an entry the counter already includes subtracts
+    /// the replaced length: the racing-workers case, where two workers that
+    /// missed one key each decode and insert it. The count follows what the map
+    /// *holds*, so a missing subtraction leaves it high for good -- only a
+    /// clear resets it, and later asks then clear early, dropping entries that
+    /// pay a whole-file decode to be rebuilt. Driven through the same [`memoize`]
+    /// the ask path uses (a second *ask* on one key hits the memo, so it cannot
+    /// reach the insert): without the subtraction the second insert would read
+    /// 3 + 5 = 8.
+    #[test]
+    fn replacing_an_entry_subtracts_the_old_buckets() {
+        let mut memo = PeaksMemo::new();
+        let mut count = 0;
+        let key = || PeaksKey::of(std::path::Path::new("edith-peaks-replace-key"), 0, BPS);
+
+        memoize(
+            &mut memo,
+            &mut count,
+            100,
+            key(),
+            MemoEntry::Envelope(SharedPeaks::new(vec![(0.0, 0.0); 3])),
+        );
+        assert_eq!(count, 3, "the first insert was not counted");
+
+        memoize(
+            &mut memo,
+            &mut count,
+            100,
+            key(),
+            MemoEntry::Envelope(SharedPeaks::new(vec![(0.0, 0.0); 5])),
+        );
+        assert_eq!(count, 5, "the replaced entry's buckets were not subtracted");
+        assert_eq!(memo.len(), 1, "the replace added a second entry");
     }
 }
