@@ -4427,6 +4427,9 @@ enum ClipDecoder {
         next: u32,
         flags: u8,
         paint: u64,
+        /// This seat's own painting scratch, kept for the whole export: the
+        /// same reuse the playback worker's thread does.
+        scratch: crate::decode::VizScratch,
         y: Vec<u8>,
         u: Vec<u8>,
         v: Vec<u8>,
@@ -4555,6 +4558,7 @@ impl ClipDecoder {
             next: start_frame,
             flags,
             paint,
+            scratch: crate::decode::VizScratch::default(),
             y: Vec::new(),
             u: Vec::new(),
             v: Vec::new(),
@@ -4577,12 +4581,20 @@ impl ClipDecoder {
                 next,
                 flags,
                 paint,
+                scratch,
                 y,
                 u,
                 v,
             } => {
-                let (yy, uu, vv) =
-                    crate::decode::visualizer_i420(peaks, f64::from(*next) / *fps, *width, *height, *flags, *paint);
+                let (yy, uu, vv) = crate::decode::visualizer_i420(
+                    scratch,
+                    peaks,
+                    f64::from(*next) / *fps,
+                    *width,
+                    *height,
+                    *flags,
+                    *paint,
+                );
                 *y = yy;
                 *u = uu;
                 *v = vv;

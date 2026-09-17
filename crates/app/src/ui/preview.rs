@@ -123,42 +123,132 @@ impl Player {
         )
     }
 
-    /// The frame on screen right now, written to a PNG: `image` and its
-    /// `as_bytes` are gpui's own cached copy of what was last handed to the
-    /// atlas ([`Player::pump`]), so this reads no decoder and races nothing --
-    /// works during preview or on the timeline, whichever is showing.
+    /// The frame on screen right now, written to a PNG -- at the size the
+    /// **project** is, not at the size the preview shows it.
+    ///
+    /// The picture area asks the session for frames the size of its own box
+    /// ([`PlaybackSession::set_view_size`]), so the atlas holds a preview-sized
+    /// picture: saving that would cost the user the resolution they asked for
+    /// (a still of a 1080p project, an 11th of it). So the seat is asked for
+    /// one picture at the project's own size and the file is written when it
+    /// lands ([`Player::flush_shot`], off `pump`'s frame-owed signal). Every
+    /// other part of the gesture is what it always was: the same directory,
+    /// the same name, the same notice.
+    ///
+    /// A library preview is the same rule about *its* file: the seat paints at
+    /// the file's own resolution for it, which is the full size a still of that
+    /// file wants.
     pub(crate) fn take_screenshot(&mut self, cx: &mut Context<Self>) {
-        let no_frame = || "NO FRAME TO SAVE — nothing is showing yet".to_string();
-        let Some(image) = self.image.clone() else {
-            self.notify_user(no_frame().into());
+        if self.shot_pending.is_some() {
+            return; // one at a time: the picture is on its way
+        }
+        let Some(session) = self.active_session() else {
+            self.notify_user("NO FRAME TO SAVE — nothing is showing yet".into());
             cx.notify();
             return;
         };
-        let Some(bytes) = image.as_bytes(0) else {
-            self.notify_user(no_frame().into());
-            cx.notify();
-            return;
-        };
-        let size = image.size(0);
-        let stem = self
-            .active_session()
-            .and_then(|s| s.sources().first())
+        let full = (session.meta().width, session.meta().height);
+        let stem = session
+            .sources()
+            .first()
             .map_or_else(|| self.name.to_string(), |s| file_name(&s.path));
         let stem = std::path::Path::new(&stem)
             .file_stem()
             .map_or(stem.clone(), |s| s.to_string_lossy().into_owned());
-        let tc = timecode(
-            self.active_session().map_or(0., PlaybackSession::now),
-            self.active_fps(),
-        )
-        .replace(':', "-");
+        let tc = timecode(session.now(), self.active_fps()).replace(':', "-");
+        // The *exact* setter, not the deadbanded push: a view within 8 px of
+        // the project is a still of the wrong size. `false` says the view is
+        // already at it -- and then the frame in hand *is* the project's frame,
+        // so waiting for a picture that would never come (nothing moved, so
+        // nothing reseeks) is exactly the trap this avoids.
+        let moved = self
+            .active_session_mut()
+            .is_some_and(|s| s.set_view_size_exact(full.0, full.1));
+        if moved {
+            // One frame at the project's own size, which is a reseek like any
+            // other edit: the frame it owes is what the flush waits on.
+            if let Some(session) = self.active_session_mut() {
+                session.resync_picture();
+            }
+            self.shot_pending = Some((self.session_gen, stem, tc));
+            self.reset_after_reseek();
+        } else if !self.write_shot(&stem, &tc) {
+            self.notify_user("NO FRAME TO SAVE — nothing is showing yet".into());
+        }
+        cx.notify();
+    }
+
+    /// Writes the picture the atlas is holding, at the size it holds it, and
+    /// says whether there was one. The tail [`Player::take_screenshot`] and
+    /// [`Player::flush_shot`] share, so the two doors cannot write differently.
+    fn write_shot(&mut self, stem: &str, tc: &str) -> bool {
+        let Some(image) = self.image.clone() else {
+            return false;
+        };
+        let Some(bytes) = image.as_bytes(0) else {
+            return false;
+        };
+        let size = image.size(0);
         let text =
-            match save_screenshot(bytes, size.width.0 as u32, size.height.0 as u32, &stem, &tc) {
+            match save_screenshot(bytes, size.width.0 as u32, size.height.0 as u32, stem, tc) {
                 Ok(path) => format!("SAVED {}", path.display()),
                 Err(e) => format!("SCREENSHOT FAILED: {e}"),
             };
         self.notify_user(text.into());
+        true
+    }
+
+    /// The screenshot a preview-sized picture had to wait for: written once the
+    /// seat's project-sized frame has landed, then the preview takes its own
+    /// size back ([`Player::push_view_size`] pushes it on the next repaint).
+    ///
+    /// A picture that never lands -- the timeline emptied, a source that died
+    /// -- gives up rather than leaving the preview stuck at the project's size:
+    /// the wait is bounded, and the notice names what happened.
+    pub(crate) fn flush_shot(&mut self, cx: &mut Context<Self>) {
+        let Some((asked, stem, tc)) = self.shot_pending.clone() else {
+            return;
+        };
+        if asked != self.session_gen {
+            // The session that asked is gone (a preview opened, another file
+            // opened, a session closed): its picture is not coming, and the new
+            // session's frame must not be written under its name.
+            self.shot_pending = None;
+            self.notify_user("NO FRAME TO SAVE — the session changed meanwhile".into());
+            cx.notify();
+            return;
+        }
+        if self
+            .seek_since
+            .is_some_and(|since| since.elapsed() < std::time::Duration::from_secs(2))
+        {
+            return; // the frame is still being painted
+        }
+        self.shot_pending = None;
+        // The seat's own clamp is the truth about the size it can paint, which
+        // is what the ask settled on ([`PlaybackSession::set_view_size_exact`]),
+        // and with the push held while the shot is in flight
+        // ([`Player::push_view_size`]) it is still holding it here.
+        let want = self.active_session().map(PlaybackSession::view_size);
+        let landed = self
+            .image
+            .as_ref()
+            .map(|i| (i.size(0).width.0 as u32, i.size(0).height.0 as u32))
+            == want;
+        if !landed || !self.write_shot(&stem, &tc) {
+            self.notify_user("NO FRAME TO SAVE — the picture could not be redrawn".into());
+        }
         cx.notify();
+    }
+
+    /// The active session has been swapped (`session` or `preview_session`):
+    /// what anything keyed to a session has to hear. A screenshot in flight is
+    /// the one such thing ([`Player::shot_pending`]), and it is *keyed* rather
+    /// than cleared here because a door that forgot to call this would still be
+    /// caught by the key -- the picture it is holding came from a session that
+    /// is no longer the one on screen.
+    pub(crate) fn session_swapped(&mut self) {
+        self.session_gen += 1;
     }
 
     /// The cues the *subtitle lanes* put on screen at `at`, over the picture and

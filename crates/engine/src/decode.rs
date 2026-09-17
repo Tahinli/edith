@@ -668,6 +668,9 @@ impl DecodeSession {
                     return;
                 }
                 let fps = if fps.is_finite() && fps > 0.0 { fps } else { 30.0 };
+                // One frame's painting no longer allocates per strand per
+                // frame: this thread lives for the span.
+                let mut scratch = VizScratch::default();
                 let mut render = Render::new(
                     color,
                     transform,
@@ -681,7 +684,8 @@ impl DecodeSession {
                         return;
                     }
                     let t = f64::from(start_frame + index) / fps;
-                    let (y, u, v) = visualizer_i420(&peaks, t, width, height, flags, paint);
+                    let (y, u, v) =
+                        visualizer_i420(&mut scratch, &peaks, t, width, height, flags, paint);
                     let frame = render.frame(start_frame + index, &y, &u, &v, width, height);
                     if tx.send(frame).is_err() {
                         return; // caller moved on
@@ -1735,6 +1739,26 @@ fn viz_span(
     }
 }
 
+/// What one frame's painting borrows instead of allocating, owned by whoever
+/// paints a *stream* of frames -- the visualizer worker's own thread, an
+/// export seat, a test -- and reused for every strand of every frame. Eight
+/// `Vec`s, against the twenty-seven a fresh set per strand cost a ring at
+/// eight strands.
+#[derive(Default)]
+pub(crate) struct VizScratch {
+    /// The frame's own columns, kept across frames to the widest picture yet.
+    lo: Vec<f32>,
+    hi: Vec<f32>,
+    sig: Vec<f32>,
+    /// One strand's sampled positions, the cells its Bresenham runs cover,
+    /// the chain's rows, the row band's candidates and their lower hull.
+    pts: Vec<(i32, i32)>,
+    chain: Vec<(i32, i32)>,
+    rows: Vec<(i32, usize, usize)>,
+    cand: Vec<(i32, i32)>,
+    hull: Vec<usize>,
+}
+
 /// One segment's glow as its own disc, stamped at every Bresenham cell: what
 /// a chain was painted by before [`viz_chain`], and still the cheaper of the
 /// two when the chain is long ([`viz_discs_are_cheaper`]).
@@ -1807,6 +1831,18 @@ fn viz_discs_are_cheaper(samples: usize, cells: usize, glow: u8) -> bool {
     (samples as u64) * (2 * u64::from(glow) + 1) < cells as u64
 }
 
+/// How many cells [`viz_walk`] would push for these samples, without walking
+/// them: one per iteration of that loop, and it iterates `max(dx, dy) + 1`
+/// times a segment.
+fn chain_cells(pts: &[(i32, i32)]) -> usize {
+    pts.windows(2)
+        .map(|w| {
+            let (dx, dy) = ((w[1].0 - w[0].0).abs(), (w[1].1 - w[0].1).abs());
+            dx.max(dy) as usize + 1
+        })
+        .sum()
+}
+
 /// The Bresenham cells of one segment, collected rather than stamped: the same
 /// walk [`viz_line`] used to rasterise, kept for [`viz_chain`] to paint the
 /// whole chain from.
@@ -1855,13 +1891,18 @@ fn viz_chain(
     h: usize,
     cw: usize,
     ch: usize,
-    chain: &mut Vec<(i32, i32)>,
+    scratch: &mut VizScratch,
     bg_y: u8,
     ink_y: u8,
     ink_u: u8,
     ink_v: u8,
     glow: u8,
 ) {
+    let VizScratch { pts, chain, rows, cand, hull, .. } = scratch;
+    chain.clear();
+    for pair in pts.windows(2) {
+        viz_walk(pair[0].0, pair[0].1, pair[1].0, pair[1].1, chain);
+    }
     if chain.is_empty() {
         return;
     }
@@ -1880,7 +1921,7 @@ fn viz_chain(
     // a pixel) and a repeat is the same candidate.
     chain.sort_unstable_by_key(|&(x, row)| (row, x));
     chain.dedup();
-    let mut rows: Vec<(i32, usize, usize)> = Vec::new();
+    rows.clear();
     let mut i = 0;
     while i < chain.len() {
         let row = chain[i].1;
@@ -1895,10 +1936,8 @@ fn viz_chain(
     let mut band = 0usize;
     // `(x, dy^2)` -- a candidate's horizontal offset is left to the cell that
     // asks, its vertical one is its own.
-    let mut cand: Vec<(i32, i32)> = Vec::new();
-    // The candidates a run's cells are decided by, once the ones that can never
-    // be nearest are off ([`viz_chain`]'s own note).
-    let mut hull: Vec<usize> = Vec::new();
+    // ...and the candidates a run's cells are decided by, once the ones that
+    // can never be nearest are off ([`viz_chain`]'s own note).
     for row in first..=last {
         while band < rows.len() && rows[band].0 < row - g {
             band += 1;
@@ -1981,25 +2020,25 @@ fn viz_chain(
                 }
                 hull.push(c);
             }
+            // Only the hull's last two entries can change places as x moves
+            // forward, so this is a walk and not a search -- and `value` is
+            // asked of those two alone.
             let mut hp = 0usize;
             for x in x_lo..=x_hi {
-                while hp + 1 < hull.len()
-                    && value(hull[hp + 1], x) <= value(hull[hp], x)
-                {
+                while hp + 1 < hull.len() && value(hull[hp + 1], x) <= value(hull[hp], x) {
                     hp += 1;
                 }
                 let (cx, dy2) = cand[hull[hp]];
                 let d = x - cx;
                 let d2 = d * d + dy2;
-                if d2 > g * g {
-                    continue;
+                if d2 <= g * g {
+                    let fall = if d2 == 0 {
+                        1.0
+                    } else {
+                        (-0.45 * d2 as f32 / (g * g).max(1) as f32).exp()
+                    };
+                    viz_stamp(y, u, v, w, h, cw, ch, x, row, fall, bg_y, ink_y, ink_u, ink_v);
                 }
-                let fall = if d2 == 0 {
-                    1.0
-                } else {
-                    (-0.45 * d2 as f32 / (g * g).max(1) as f32).exp()
-                };
-                viz_stamp(y, u, v, w, h, cw, ch, x, row, fall, bg_y, ink_y, ink_u, ink_v);
             }
         }
     }
@@ -2010,6 +2049,7 @@ fn viz_chain(
 /// envelope at pixel resolution, or a multi-strand ribbon. Ink is
 /// [`viz_ink_from_paint`]. A frame always exists; silence is the zero line.
 pub(crate) fn visualizer_i420(
+    scratch: &mut VizScratch,
     peaks: &[(f32, f32)],
     t_secs: f64,
     width: u32,
@@ -2036,9 +2076,12 @@ pub(crate) fn visualizer_i420(
         y[z * w + col] = y[z * w + col].max(bg_y.saturating_add(18));
     }
 
-    let mut lo = vec![0.0f32; w];
-    let mut hi = vec![0.0f32; w];
-    let mut sig = vec![0.0f32; w];
+    scratch.lo.clear();
+    scratch.lo.resize(w, 0.0);
+    scratch.hi.clear();
+    scratch.hi.resize(w, 0.0);
+    scratch.sig.clear();
+    scratch.sig.resize(w, 0.0);
     if !peaks.is_empty() {
         let duration = peaks.len() as f64 / f64::from(VIZ_BUCKETS_PER_SEC);
         let per_sec = f64::from(VIZ_BUCKETS_PER_SEC);
@@ -2081,9 +2124,9 @@ pub(crate) fn visualizer_i420(
                 mn = mn.min(l);
                 mx = mx.max(h);
             }
-            lo[col] = mn;
-            hi[col] = mx;
-            sig[col] = signed_at(origin + (col as f64 + 0.5) / w as f64 * window);
+            scratch.lo[col] = mn;
+            scratch.hi[col] = mx;
+            scratch.sig[col] = signed_at(origin + (col as f64 + 0.5) / w as f64 * window);
         }
         // Whole-file peak, not the window's: a 2s window that gains or loses
         // a loud hit used to rescale every column, so the same bump changed
@@ -2094,9 +2137,9 @@ pub(crate) fn visualizer_i420(
             .fold(0.0f32, f32::max);
         if peak > 1e-4 {
             for i in 0..w {
-                lo[i] /= peak;
-                hi[i] /= peak;
-                sig[i] /= peak;
+                scratch.lo[i] /= peak;
+                scratch.hi[i] /= peak;
+                scratch.sig[i] /= peak;
             }
         }
     }
@@ -2106,7 +2149,7 @@ pub(crate) fn visualizer_i420(
             let tau = std::f64::consts::TAU;
             let travel = t_secs * 1.35;
             for col in 0..w {
-                let env = lo[col].abs().max(hi[col]).max(0.06);
+                let env = scratch.lo[col].abs().max(scratch.hi[col]).max(0.06);
                 let x_phase = (col as f64 / w.max(1) as f64) * 2.15 * tau;
                 for s in 0..u32::from(viz_strands_of(paint)).max(1) {
                     let frac = s as f32 / (viz_strands_of(paint).max(2) as f32 - 1.0);
@@ -2141,8 +2184,6 @@ pub(crate) fn visualizer_i420(
             let steps = w.max(h) * 4;
             let strands = viz_strands_of(paint);
             let glow = viz_glow_of(paint);
-            let mut chain: Vec<(i32, i32)> = Vec::new();
-            let mut pts: Vec<(i32, i32)> = Vec::new();
             for strand in 0..strands {
                 let dual = strands >= 2 && strand >= strands / 2;
                 // The dual half takes the clip's own strand colour when it
@@ -2164,24 +2205,20 @@ pub(crate) fn visualizer_i420(
                 let (iy, iu, iv) = rgb_yuv(ir as i32, ig as i32, ib as i32);
                 let scale = 0.65 + 0.35 * f32::from(strand % 4) / 3.0;
                 let phase = f32::from(strand) * 0.35;
-                pts.clear();
+                scratch.pts.clear();
                 for i in 0..=steps {
                     let t = i as f32 / steps as f32;
                     let theta = t * tau + t_secs as f32 * 1.1 + phase;
                     let col = ((t * w as f32) as usize).min(w.saturating_sub(1));
-                    let env = lo[col].abs().max(hi[col]);
+                    let env = scratch.lo[col].abs().max(scratch.hi[col]);
                     let wobble = (theta * 3.0 + phase).sin() * 0.12 * env;
                     let r = r0 + amp * env * scale + amp * wobble;
                     let x = (cx + r * theta.cos()).round() as i32;
                     let row = (cy + r * theta.sin()).round() as i32;
-                    pts.push((x, row));
+                    scratch.pts.push((x, row));
                 }
-                chain.clear();
-                for pair in pts.windows(2) {
-                    viz_walk(pair[0].0, pair[0].1, pair[1].0, pair[1].1, &mut chain);
-                }
-                if viz_discs_are_cheaper(pts.len(), chain.len(), glow) {
-                    for pair in pts.windows(2) {
+                if viz_discs_are_cheaper(scratch.pts.len(), chain_cells(&scratch.pts), glow) {
+                    for pair in scratch.pts.windows(2) {
                         viz_line(
                             &mut y, &mut u, &mut v, w, h, cw, ch, pair[0].0, pair[0].1, pair[1].0,
                             pair[1].1, bg_y, iy, iu, iv, glow,
@@ -2189,23 +2226,21 @@ pub(crate) fn visualizer_i420(
                     }
                 } else {
                     viz_chain(
-                        &mut y, &mut u, &mut v, w, h, cw, ch, &mut chain, bg_y, iy, iu, iv, glow,
+                        &mut y, &mut u, &mut v, w, h, cw, ch, scratch, bg_y, iy, iu, iv, glow,
                     );
                 }
             }
         }
         VIZ_STYLE_WAVE => {
-            let mut chain: Vec<(i32, i32)> = Vec::new();
-            let mut pts: Vec<(i32, i32)> = Vec::new();
+            scratch.pts.clear();
             for col in 0..w {
-                pts.push((col as i32, (center - sig[col] * half).round() as i32));
-            }
-            for pair in pts.windows(2) {
-                viz_walk(pair[0].0, pair[0].1, pair[1].0, pair[1].1, &mut chain);
+                scratch
+                    .pts
+                    .push((col as i32, (center - scratch.sig[col] * half).round() as i32));
             }
             let glow = viz_glow_of(paint);
-            if viz_discs_are_cheaper(pts.len(), chain.len(), glow) {
-                for pair in pts.windows(2) {
+            if viz_discs_are_cheaper(scratch.pts.len(), chain_cells(&scratch.pts), glow) {
+                for pair in scratch.pts.windows(2) {
                     viz_line(
                         &mut y, &mut u, &mut v, w, h, cw, ch, pair[0].0, pair[0].1, pair[1].0,
                         pair[1].1, bg_y, ink_y, ink_u, ink_v, glow,
@@ -2213,7 +2248,7 @@ pub(crate) fn visualizer_i420(
                 }
             } else {
                 viz_chain(
-                    &mut y, &mut u, &mut v, w, h, cw, ch, &mut chain, bg_y, ink_y, ink_u, ink_v,
+                    &mut y, &mut u, &mut v, w, h, cw, ch, scratch, bg_y, ink_y, ink_u, ink_v,
                     glow,
                 );
             }
@@ -2223,8 +2258,8 @@ pub(crate) fn visualizer_i420(
             // the fold+smooth above. Default look.
             let glow = i32::from(viz_glow_of(paint));
             for col in 0..w {
-                let top = (center - hi[col] * half).round() as i32;
-                let bot = (center - lo[col] * half).round() as i32;
+                let top = (center - scratch.hi[col] * half).round() as i32;
+                let bot = (center - scratch.lo[col] * half).round() as i32;
                 viz_span(
                     &mut y, &mut u, &mut v, w, h, cw, ch, col as i32, top, bot, bg_y, ink_y, ink_u,
                     ink_v,
@@ -2570,7 +2605,7 @@ mod tests {
             *p = (-a.abs(), a.abs());
         }
         let flags = 1u8;
-        let (y, u, v) = visualizer_i420(&peaks, 1.0, 320, 180, flags, 0);
+        let (y, u, v) = visualizer_i420(&mut VizScratch::default(), &peaks, 1.0, 320, 180, flags, 0);
         let ink = y.iter().filter(|&&p| p > 40).count();
         assert!(ink > 200, "envelope missing: {ink}");
         assert!(ink < y.len() * 9 / 10, "solid frame, not an envelope: {ink}");
@@ -2583,13 +2618,13 @@ mod tests {
         assert!(blue > 10, "default ink was not timeline blue: {blue}");
 
         let ring = with_viz_style(flags, VIZ_STYLE_RING);
-        let (yr, _, _) = visualizer_i420(&peaks, 1.0, 320, 180, ring, 0);
+        let (yr, _, _) = visualizer_i420(&mut VizScratch::default(), &peaks, 1.0, 320, 180, ring, 0);
         let ring_ink = yr.iter().filter(|&&p| p > 40).count();
         assert!(ring_ink > 80, "ring missing: {ring_ink}");
         assert!(ring_ink < ink, "ring should be a stroke, not a fill");
 
         let hue_paint = with_viz_paint_hue(0, 40);
-        let (_, u2, v2) = visualizer_i420(&peaks, 1.0, 64, 32, flags, hue_paint);
+        let (_, u2, v2) = visualizer_i420(&mut VizScratch::default(), &peaks, 1.0, 64, 32, flags, hue_paint);
         let mut shifted = 0usize;
         for i in 0..u2.len() {
             if u2[i] < 120 && v2[i] > 130 {
@@ -2686,7 +2721,7 @@ mod tests {
         }
         let ring = with_viz_style(1, VIZ_STYLE_RING);
         let auto = VIZ_PAINT_AZURE;
-        let (y0, u0, v0) = visualizer_i420(&peaks, 1.0, 320, 180, ring, auto);
+        let (y0, u0, v0) = visualizer_i420(&mut VizScratch::default(), &peaks, 1.0, 320, 180, ring, auto);
 
         // The automatic dual is half a wheel from the clip's hue at the
         // clip's own saturation; choosing exactly that colour changes
@@ -2696,14 +2731,14 @@ mod tests {
             viz_sat_ui(auto),
         );
         assert!(viz_strand_set(same));
-        let (ys, us, vs) = visualizer_i420(&peaks, 1.0, 320, 180, ring, same);
+        let (ys, us, vs) = visualizer_i420(&mut VizScratch::default(), &peaks, 1.0, 320, 180, ring, same);
         assert_eq!(ys, y0, "the automatic complement, spelled out, is the same frame");
         assert_eq!(us, u0);
         assert_eq!(vs, v0);
 
         // A colour of its own repaints the dual strands in it.
         let red = with_viz_paint_strand_sat(with_viz_paint_strand_hue(auto, 0), 255);
-        let (_, u1, v1) = visualizer_i420(&peaks, 1.0, 320, 180, ring, red);
+        let (_, u1, v1) = visualizer_i420(&mut VizScratch::default(), &peaks, 1.0, 320, 180, ring, red);
         let red_px = (0..u1.len()).filter(|&i| u1[i] < 110 && v1[i] > 200).count();
         let auto_px = (0..u0.len()).filter(|&i| u0[i] < 110 && v0[i] > 200).count();
         assert!(red_px > 20, "the chosen colour did not reach the frame: {red_px}");
@@ -2713,7 +2748,7 @@ mod tests {
         // the unset picture, byte for byte.
         let stale = auto | (77u64 << 32) | (9u64 << 40);
         assert!(!viz_strand_set(stale));
-        let (yt, ut, vt) = visualizer_i420(&peaks, 1.0, 320, 180, ring, stale);
+        let (yt, ut, vt) = visualizer_i420(&mut VizScratch::default(), &peaks, 1.0, 320, 180, ring, stale);
         assert_eq!(yt, y0, "an unset strand colour is the frame it always was");
         assert_eq!(ut, u0);
         assert_eq!(vt, v0);
@@ -2761,7 +2796,7 @@ mod tests {
             };
             let flags = with_viz_style(1, style);
             let paint = with_viz_paint_glow(VIZ_PAINT_AZURE, glow);
-            let (y, u, v) = visualizer_i420(&peaks, 37.5, 1920, 1080, flags, paint);
+            let (y, u, v) = visualizer_i420(&mut VizScratch::default(), &peaks, 37.5, 1920, 1080, flags, paint);
             let mut hash = 0xcbf2_9ce4_8422_2325u64;
             for buf in [&y, &u, &v] {
                 for &b in buf.iter() {

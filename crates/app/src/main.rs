@@ -761,6 +761,23 @@ struct Player {
     viz_hs_dragging: bool,
     /// The wheel's box, recorded at prepaint for a drag's window position.
     viz_wheel: Rc<Cell<Bounds<Pixels>>>,
+    /// Where the picture actually lands on screen, probed by the picture area
+    /// (`render.rs`): what tells the session to paint at the size the preview
+    /// is *watched* at rather than at the project's own
+    /// ([`engine::PlaybackSession::set_view_size`]).
+    picture_box: Rc<Cell<Bounds<Pixels>>>,
+    /// A screenshot asked for while the picture was painted at the preview's
+    /// own size: `(session, stem, timecode)`, written by [`Player::flush_shot`]
+    /// once the seat has painted one frame at the project's size. Taken at the
+    /// ask so a shot mid-playback is named for the frame it was asked at, not
+    /// for the one it landed on -- and *keyed to the session that asked*, so a
+    /// swap mid-flight (a preview opened, another file opened, a session
+    /// closed) cannot have the new session's frame written under the old name
+    /// ([`Player::session_swapped`]).
+    shot_pending: Option<(u64, String, String)>,
+    /// The active session's identity, for the above: bumped by every door that
+    /// swaps `session` or `preview_session`.
+    session_gen: u64,
     /// Which of the clip's two inks the look section's wheel and colour field
     /// act on ([`VizSlot`]): the clip's own colour, or the ring's dual half.
     /// The pick stays picked across clips, the way the dock tab's does.
@@ -1086,6 +1103,9 @@ fn main() {
                     color_dragging: false,
                     viz_hs_dragging: false,
                     viz_wheel: Rc::default(),
+                    picture_box: Rc::default(),
+                    shot_pending: None,
+                    session_gen: 0,
                     viz_slot: VizSlot::Main,
                     viz_hex_edit: None,
                     pending_viz: None,
