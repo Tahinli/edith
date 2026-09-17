@@ -431,6 +431,11 @@ pub struct PlaybackSession {
     /// span most of the time.
     dissolve: Option<Dissolve>,
     /// The last clip has been played out; see [`PlaybackSession::is_eos`].
+    /// The size a front-end showing this session *on screen* wants its
+    /// pictures at, in device pixels ([`Self::set_view_size`]). `None` is the
+    /// project's own -- every file-level caller, every test, and an export,
+    /// which has a seat of its own ([`crate::export`]) and never comes here.
+    view: Option<(u32, u32)>,
     eos: bool,
     /// The mix the running mixer is reading, when there is one: what lets a
     /// fader and the master ceiling move without rebuilding the audio pipeline
@@ -632,6 +637,7 @@ impl PlaybackSession {
             span,
             span_priming: true,
             dissolve: None,
+            view: None,
             eos: false,
             mix: None,
             priming: false,
@@ -761,6 +767,7 @@ impl PlaybackSession {
             span,
             span_priming: true,
             dissolve: None,
+            view: None,
             eos: false,
             mix: None,
             priming: false,
@@ -854,6 +861,7 @@ impl PlaybackSession {
             span,
             span_priming: true,
             dissolve: None,
+            view: None,
             eos: false,
             mix: None,
             priming: false,
@@ -1207,6 +1215,7 @@ impl PlaybackSession {
             span,
             span_priming: true,
             dissolve: None,
+            view: None,
             eos: false,
             mix: None,
             priming: false,
@@ -1749,6 +1758,10 @@ impl PlaybackSession {
     /// video that is now the worker's own doing -- it opens the file, so it is
     /// the one that finds out -- and nothing on this thread waits to hear it.
     fn start_span(&mut self, span: Option<Span>) {
+        // The viewer's own size, once one has said it ([`Self::set_view_size`]):
+        // every picture below is painted at *this*, and the project's
+        // resolution otherwise.
+        let (canvas_w, canvas_h) = self.view_size();
         // The outgoing span's own dissolve, if it ever opened B's decoder:
         // that decoder's pictures were for a window this span is leaving
         // (played through, paused before, or seeked away from), and never
@@ -1828,8 +1841,8 @@ impl PlaybackSession {
                         .copied()
                         .unwrap_or_default(),
                     Composer::new(
-                        self.meta.width,
-                        self.meta.height,
+                        canvas_w,
+                        canvas_h,
                         self.project.composite_fit_at(start),
                     ),
                 )
@@ -1861,8 +1874,8 @@ impl PlaybackSession {
                         .copied()
                         .unwrap_or_default(),
                     Composer::new(
-                        self.meta.width,
-                        self.meta.height,
+                        canvas_w,
+                        canvas_h,
                         self.project.composite_fit_at(start),
                     ),
                     self.project.composite_visualizer_at(start),
@@ -1918,7 +1931,7 @@ impl PlaybackSession {
                 // than kept in a local, because a `Composer` owns the scratch
                 // buffers it places through -- the value is not copied about.
                 let fit = self.project.composite_fit_at(start);
-                let canvas = || Composer::new(self.meta.width, self.meta.height, fit);
+                let canvas = || Composer::new(canvas_w, canvas_h, fit);
                 // ...and the rendition an HDR source among them is mapped to,
                 // the project's own and constant across the span for that
                 // reason too.
@@ -1975,8 +1988,8 @@ impl PlaybackSession {
             // span at all and gets one frame of it -- enough to put black on
             // screen, and it ends where the timeline does, at once.
             gap => Ok(DecodeSession::open_black(
-                self.meta.width,
-                self.meta.height,
+                canvas_w,
+                canvas_h,
                 gap.map_or(1, |s| s.len),
             )),
         };
@@ -2018,6 +2031,7 @@ impl PlaybackSession {
     /// (still inside A's span) -- the same asymmetry
     /// [`crate::export`]'s own `Dissolve` is built with.
     fn open_dissolve_b(&mut self) {
+        let (canvas_w, canvas_h) = self.view_size();
         let Some(d) = &self.dissolve else { return };
         if d.b.is_some() {
             return;
@@ -2038,8 +2052,8 @@ impl PlaybackSession {
             .copied()
             .unwrap_or_default();
         let canvas = Composer::new(
-            self.meta.width,
-            self.meta.height,
+            canvas_w,
+            canvas_h,
             self.project.composite_fit_at(b_start),
         );
         let tone = self.project.tone();
@@ -3567,6 +3581,55 @@ impl PlaybackSession {
         }
     }
 
+    /// Says how big the picture is on screen, in device pixels -- what a
+    /// front-end showing this session pushes once it knows where the picture
+    /// actually lands. Rendering a 1080p project's visualizer for a 600 px
+    /// preview costs nine times the pixels for nothing the eye can see; a
+    /// window that is fullscreen gets the project's own size back by pushing
+    /// it. `true` when the size moved enough to be worth a new picture: under
+    /// 8 px on both axes is a resize nobody can see, and a window being
+    /// dragged would otherwise restart the picture every tick.
+    pub fn set_view_size(&mut self, width: u32, height: u32) -> bool {
+        let want = self.view_want(width, height);
+        match self.view {
+            Some(now) if now.0.abs_diff(want.0) < 8 && now.1.abs_diff(want.1) < 8 => false,
+            _ => {
+                self.view = Some(want);
+                true
+            }
+        }
+    }
+
+    /// [`Self::set_view_size`] with no deadband: what asks for the *exact*
+    /// size rather than one within 8 px of it. A still saved at the project's
+    /// own pixels is a file whose dimensions are read back, so "close enough
+    /// to be invisible" is not close enough to be right. `true` when the view
+    /// moved, `false` when it was already there -- which is also the answer
+    /// that lets a caller skip waiting for a frame it already has.
+    pub fn set_view_size_exact(&mut self, width: u32, height: u32) -> bool {
+        let want = self.view_want(width, height);
+        match self.view {
+            Some(now) if now == want => false,
+            _ => {
+                self.view = Some(want);
+                true
+            }
+        }
+    }
+
+    /// The size a push of `(width, height)` settles on: even on both axes
+    /// (YUV 4:2:0 has no odd chroma) and never past the project's own.
+    fn view_want(&self, width: u32, height: u32) -> (u32, u32) {
+        let fit = |n: u32, cap: u32| (n & !1).clamp(2, cap.max(2));
+        (fit(width, self.meta.width), fit(height, self.meta.height))
+    }
+
+    /// The canvas a span's pictures are painted at: [`Self::set_view_size`]'s
+    /// size once one has been pushed, the project's own otherwise.
+    pub fn view_size(&self) -> (u32, u32) {
+        self.view.unwrap_or((self.meta.width, self.meta.height))
+    }
+
     /// Current timeline position in seconds.
     pub fn now(&self) -> f64 {
         self.clock.now()
@@ -4451,6 +4514,41 @@ mod tests {
         assert_eq!(blend_bgra(&a, &b, 0.0), a);
         assert_eq!(blend_bgra(&a, &b, 1.0), b);
         assert_eq!(blend_bgra(&a, &b, 0.5), [60, 70, 80, 255]);
+    }
+
+    /// A still wants the project's own pixels, not a view near them.
+    /// [`PlaybackSession::set_view_size`] calls under 8 px no change at all (a
+    /// window being dragged must not restart the picture every tick), so a
+    /// caller that means "paint at the project's size" has to say it through
+    /// [`PlaybackSession::set_view_size_exact`] -- and read its `false` as "the
+    /// view is already there, the frame in hand is the one wanted", which is
+    /// what stops it waiting for a picture nothing will reseek into existence.
+    #[test]
+    fn a_still_gets_the_exact_view_size_where_a_push_settles_for_near() {
+        let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+        assert!(session.set_resolution(1920, 1080));
+        let (w, h) = session.resolution();
+        assert_eq!((w, h), (1920, 1080));
+        // A preview-sized push, then the ask a still makes: two pixels short on
+        // each axis, which the deadbanded push calls no change at all.
+        assert!(session.set_view_size(1918, 1078));
+        assert!(
+            std::ops::Not::not(session.set_view_size(w, h)),
+            "the push's deadband is exactly what a still cannot use"
+        );
+        assert_eq!(
+            session.view_size(),
+            (1918, 1078),
+            "the push left the view near, not at, full -- so a still written now would be short"
+        );
+        assert!(
+            session.set_view_size_exact(w, h),
+            "the exact setter must move a view the push called close enough"
+        );
+        assert_eq!(session.view_size(), (w, h));
+        // ...and at the size already it says so rather than repainting: that
+        // `false` is the caller's "write the frame you have".
+        assert!(std::ops::Not::not(session.set_view_size_exact(w, h)));
     }
 
     /// The dissolve window's own edges, in the units [`PlaybackSession::start_span`]

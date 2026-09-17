@@ -76,6 +76,9 @@ impl Player {
             // bottom of the picture region, which is the one box that is the
             // picture and nothing else.
             .relative()
+            // ...and the box the frame is *watched* in, which is what the
+            // session paints at ([`Player::push_view_size`]).
+            .child(bounds_probe(self.picture_box.clone()))
             .flex()
             .justify_center()
             .items_center()
@@ -125,6 +128,51 @@ impl Player {
     }
 }
 
+impl Player {
+    /// Tells the active session where the picture actually lands, in device
+    /// pixels, so its seats can paint at that size instead of the project's
+    /// ([`engine::PlaybackSession::set_view_size`]). Read off the picture
+    /// area's own bounds -- the box `letterboxed_image` fits the frame into --
+    /// and the project's aspect, which is the aspect of every frame it hands
+    /// over.
+    ///
+    /// A size that moved enough for the eye to see gets a fresh picture: the
+    /// canvas a span paints at is decided when it opens, so a resized window
+    /// would otherwise sharpen on its next seek and not before.
+    fn push_view_size(&mut self, window: &mut Window) {
+        if self.shot_pending.is_some() {
+            // A screenshot in flight asked for the project's own size and is
+            // waiting on that frame: pushing the preview's size back now would
+            // cancel the very picture it is waiting for.
+            return;
+        }
+        let region = self.picture_box.get();
+        if region.size.width <= px(1.) || region.size.height <= px(1.) {
+            // Before the first paint there is no box to read, and a floor is
+            // not a measurement.
+            return;
+        }
+        let scale = window.scale_factor();
+        let Some(session) = self.active_session_mut() else {
+            return;
+        };
+        // Device pixels, the unit `Contain` measures its fitting size in.
+        let meta = session.meta();
+        let fitted = gpui::ObjectFit::Contain.get_bounds(
+            region,
+            size(
+                gpui::DevicePixels(meta.width as i32),
+                gpui::DevicePixels(meta.height as i32),
+            ),
+        );
+        let w = (f32::from(fitted.size.width) * scale).round() as u32;
+        let h = (f32::from(fitted.size.height) * scale).round() as u32;
+        if session.set_view_size(w, h) {
+            session.resync_picture();
+        }
+    }
+}
+
 impl Render for Player {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // A file that has just been opened sits on its first frame with the
@@ -134,6 +182,15 @@ impl Render for Player {
             session.tick();
         }
         self.pump(window);
+        // A screenshot waiting for its project-sized frame is written on the
+        // repaint that lands it -- and before the size push below, which is
+        // what gives the preview its own size back.
+        self.flush_shot(cx);
+        // ...at the size it is watched at, not the project's: a visualizer
+        // seat redrawing 1920x1080 for a 600 px preview is nine times the
+        // pixels for nothing the eye can see. An export has a seat of its own
+        // and never comes through here.
+        self.push_view_size(window);
         // What every hover label asks before it paints: a card or a menu is
         // drawn over whatever the pointer is resting on.
         OVERLAID.store(self.overlaid(), Ordering::Relaxed);

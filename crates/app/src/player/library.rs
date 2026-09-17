@@ -569,6 +569,7 @@ impl Player {
     /// again.
     pub(crate) fn close_session(&mut self) {
         self.session = None;
+        self.session_swapped();
         // The picture goes with it, or the empty window would keep showing the
         // last frame of a timeline that no longer exists.
         //
@@ -677,6 +678,7 @@ impl Player {
                 // reads as a frozen picture, not as a player awaiting a click.
                 session.play();
                 self.preview_session = Some(session);
+                self.session_swapped();
                 self.notify_user(
                     format!(
                         "PREVIEWING {} — not on the timeline; esc stops it",
@@ -1477,6 +1479,7 @@ impl Player {
                 // is not track 3 of this.
                 self.sub_track = 0;
                 self.session = Some(session);
+                self.session_swapped();
                 // A fresh session comes up at full volume; the player's own
                 // setting outlives the file, so it is pushed at every new one.
                 self.apply_volume();
@@ -1790,6 +1793,7 @@ impl Player {
                 // media: that is the only place an export has ever landed.
                 self.export_path = retarget(&export_path(&session.sources()[0].path), self.format);
                 self.session = Some(session);
+                self.session_swapped();
                 self.apply_volume();
                 // The other way round from every other door: a project carries
                 // its own two switches ([`engine::edith`]) and they are what it
