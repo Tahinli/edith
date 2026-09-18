@@ -18,7 +18,7 @@ use ec_h264::H264Decoder;
 use crate::color::ColorParams;
 use crate::colorspace::{ColorDescription, Matrix, Transfer};
 use crate::convert::{i420_to_bgra, i420_to_bgra_with};
-use crate::demux::{Codec, Demuxer, VideoMeta};
+use crate::demux::{Codec, Demuxer, Rotation, VideoMeta};
 use crate::hw::HwSession;
 use crate::project::Speed;
 use crate::scale::Composer;
@@ -561,6 +561,8 @@ impl DecodeSession {
         let first = Render::new(
             color,
             transform,
+            // A still has no display matrix: what the file holds is what it is.
+            Rotation::None,
             ColorDescription::default(),
             canvas,
             tonemap::Preset::default(),
@@ -674,6 +676,8 @@ impl DecodeSession {
                 let mut render = Render::new(
                     color,
                     transform,
+                    // Painted here, at the canvas's own size: nothing turned it.
+                    Rotation::None,
                     ColorDescription::default(),
                     canvas,
                     tonemap::Preset::default(),
@@ -1081,7 +1085,15 @@ fn run_span(
     // The stream's own colour and peak brightness: properties of the stream, so
     // neither can change while one range decodes -- but the grade, the canvas
     // and the rendition are the *span's*, so this is built per span.
-    let mut render = Render::new(color, transform, opened.meta.color, canvas, tone, opened.peak);
+    let mut render = Render::new(
+        color,
+        transform,
+        opened.meta.rotation,
+        opened.meta.color,
+        canvas,
+        tone,
+        opened.peak,
+    );
     if let Some(reused) = opened.position_hw(path, start) {
         // Cancelled during the init (or the seek): leave without decoding.
         if abort.hit() {
@@ -1152,6 +1164,13 @@ struct Render {
     /// This clip's placement, on top of whatever the canvas's own fit policy
     /// already does ([`crate::scale::Composer::place_transformed`]).
     transform: TransformParams,
+    /// How far the *file* asks its picture to be turned before anything else
+    /// happens to it ([`crate::demux::Rotation`]): the phone-portrait turn,
+    /// made here so the grade, the canvas and the preview's own renderer all
+    /// see the picture the way it is meant to be seen. [`Rotation::None`] for
+    /// every file that states no turn, which is the whole of an ordinary
+    /// library.
+    rotation: Rotation,
     /// What the source's samples mean -- the stream's own matrix and range,
     /// which is what the conversion below is done in rather than the BT.601 it
     /// used to assume of every file.
@@ -1166,6 +1185,10 @@ struct Render {
     /// across the worker's whole range. Empty unless the clip needs one: it is
     /// tone-mapped in place, graded in place, or both.
     graded: (Vec<u8>, Vec<u8>, Vec<u8>),
+    /// The same, for the display-matrix turn above: empty for every file that
+    /// asks for none, and resized once for one that does -- a steady-state
+    /// buffer rather than three plane allocations per decoded frame.
+    turned: (Vec<u8>, Vec<u8>, Vec<u8>),
     /// Where [`Composer::place_transformed`]'s owned picture lands, so a
     /// transformed frame's planes live as long as `self` -- matching what
     /// [`Composer::place`] already hands back by borrowing `self.canvas`.
@@ -1188,6 +1211,7 @@ impl Render {
     fn new(
         color: ColorParams,
         transform: TransformParams,
+        rotation: Rotation,
         desc: ColorDescription,
         canvas: Composer,
         preset: tonemap::Preset,
@@ -1196,6 +1220,7 @@ impl Render {
         Self {
             color,
             transform,
+            rotation,
             desc,
             canvas,
             // corner-cut: the ceiling is that the map reads limited-range codes
@@ -1209,6 +1234,7 @@ impl Render {
                 Transfer::Hlg => Some(ToneMapper::new(tonemap::Transfer::Hlg, preset, peak)),
             },
             graded: (Vec::new(), Vec::new(), Vec::new()),
+            turned: (Vec::new(), Vec::new(), Vec::new()),
             placed: (Vec::new(), Vec::new(), Vec::new()),
         }
     }
@@ -1222,6 +1248,34 @@ impl Render {
         width: u32,
         height: u32,
     ) -> Frame {
+        // The file's own turn, before anything else: a phone's portrait video
+        // arrives as landscape planes, and the grade, the canvas and the
+        // conversion below all have to see the picture the way it is meant to
+        // be seen. Nothing here at all for the ordinary file that states no
+        // turn -- `Rotation::None` takes the planes by reference and not one
+        // byte is copied.
+        let (y, u, v, width, height) = match self.rotation.is_none() {
+            true => (y, u, v, width, height),
+            false => {
+                let steps = self.rotation.steps();
+                let (rw, rh) = crate::scale::rotate_i420_90s_into(
+                    y,
+                    u,
+                    v,
+                    width,
+                    height,
+                    steps,
+                    &mut self.turned,
+                );
+                (
+                    &self.turned.0[..],
+                    &self.turned.1[..],
+                    &self.turned.2[..],
+                    rw,
+                    rh,
+                )
+            }
+        };
         let passthrough = self.canvas.is_passthrough(width, height);
         // A transform still has a picture to place even where the canvas
         // itself would hand this size back untouched -- moving, scaling,

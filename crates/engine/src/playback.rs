@@ -24,7 +24,7 @@ use crate::clock::{ClockSource, PlaybackClock};
 use crate::color::ColorParams;
 use crate::colorspace::{ColorDescription, ContentLight};
 use crate::decode::{Backend, BackendCell, DecodeSession, Frame, Worker};
-use crate::demux::{Codec, Demuxer, NoVideoTrack, VideoMeta};
+use crate::demux::{Codec, Demuxer, NoVideoTrack, Rotation, VideoMeta};
 use crate::eq::EqParams;
 use crate::project::{
     Clip, Edge, GapSweep, Lane, LaneKind, Project, Rate, Source, Span, Speed, SubClip,
@@ -704,6 +704,7 @@ impl PlaybackSession {
             // A canvas this engine drew itself, not a stream that was read:
             // the default description is what it is drawn in.
             color: ColorDescription::default(),
+            rotation: Rotation::None,
         };
         let (audio, audio_disabled) = open_audio(path, stream);
         // Through `from_parts` rather than `Project::single`, which is the
@@ -801,6 +802,7 @@ impl PlaybackSession {
             frame_count: image_frames(IMAGE_ONLY_RATE),
             codec: Codec::H264,
             color: ColorDescription::default(),
+            rotation: Rotation::None,
         };
         let clip = Clip {
             fade_in: 0,
@@ -964,6 +966,7 @@ impl PlaybackSession {
                         .map_err(|e| format!("source {}: {e}", first.path.display()))?,
                     codec: Codec::H264,
                     color: ColorDescription::default(),
+                    rotation: Rotation::None,
                 };
                 (meta, DecodeSession::open_black(width, height, 1))
             }
@@ -981,6 +984,7 @@ impl PlaybackSession {
                     frame_count: image_frames(frame_rate),
                     codec: Codec::H264,
                     color: ColorDescription::default(),
+                    rotation: Rotation::None,
                 };
                 let stream = DecodeSession::open_still(
                     &first.path,
@@ -1022,6 +1026,7 @@ impl PlaybackSession {
                             .map_err(|e| format!("source {}: {e}", first.path.display()))?,
                         codec: Codec::H264,
                         color: ColorDescription::default(),
+                        rotation: Rotation::None,
                     };
                     (meta, DecodeSession::open_black(width, height, 1))
                 }
@@ -2646,6 +2651,43 @@ impl PlaybackSession {
         }
         debug_assert_eq!(self.counts.len(), self.project.sources().len());
         debug_assert_eq!(self.rates.len(), self.counts.len());
+        // A source just joined, which is the one moment the session's audio
+        // device may need arming ([`Self::arm_audio`]).
+        self.arm_audio();
+    }
+
+    /// Opens the audio device for the first source in the library that has a
+    /// track, when this session has none.
+    ///
+    /// A session opened silent -- its first file carried no sound, so
+    /// [`Self::open_library`]/[`Self::open`] had no track to open a device on
+    /// -- must not stay silent once a source *with* sound joins it: every later
+    /// clip's audio would go unheard for the rest of the session. That is
+    /// exactly what the walk [`Self::open_project`] makes at open prevents for
+    /// a loaded project (c581d41); this is the same walk at the add door, and
+    /// [`Self::note_frames`] is the one place a source joins.
+    ///
+    /// A no-op once a device is open, so it costs a scan of `is_some` on every
+    /// later import. The clock stays on wall time until the next seek
+    /// ([`Self::seek`]'s own `switch_to_audio`), which is the seek a front-end
+    /// makes as it places the file it just imported.
+    fn arm_audio(&mut self) {
+        if self.audio.is_some() {
+            return;
+        }
+        for source in self
+            .project
+            .sources()
+            .iter()
+            .filter(|s| !crate::is_image(&s.path))
+        {
+            let (audio, disabled) = open_audio(&source.path, source.audio_stream);
+            if audio.is_some() {
+                self.audio = audio;
+                self.audio_disabled = disabled;
+                return;
+            }
+        }
     }
 
     /// The rate noted for whichever source plays `path`, by
@@ -3511,10 +3553,10 @@ impl PlaybackSession {
     /// picture, so the length noted for it is its playing time rounded up to
     /// whole frames, which is the only frame count such a source has.
     ///
-    /// Refused in the same words as any other import when its rate or layout
-    /// disagrees with the timeline's -- one output device, one set of
-    /// parameters -- and refused outright on a silent timeline, which has no
-    /// device open at all. Nothing is changed by a refusal.
+    /// Refused in the same words as any other import when its layout disagrees
+    /// with the timeline's track -- one output device, one layout. A silent
+    /// timeline has no track to disagree with, so a song joins it and *is* its
+    /// sound ([`Self::arm_audio`]). Nothing is changed by a refusal.
     fn import_audio(&mut self, path: &Path) -> crate::Result<usize> {
         let first = self.first_audio()?;
         // Stream 0, and there is no other: a standalone audio file carries one
@@ -4199,21 +4241,30 @@ fn matches_timeline(
 /// cannot do is be copied into an export, which is a refusal of its own, at
 /// export time (`AudioSession::copy_multi_streams`).
 /// What a timeline's audio is held to: the probe of the first source that could
-/// have any. A still image is never it -- a picture defines no rate and no
-/// layout, so a PNG at index 0 would otherwise be *probed* as a broken mp4 and
-/// fail the open outright.
+/// have any track.
 ///
-/// `Ok(None)` for a timeline whose first such source is silent, and for one of
-/// nothing but stills. That is a silent timeline, and a file with sound is
-/// still refused by [`audio_matches`] in the words it always used ("the file
-/// has audio, the timeline is silent") -- the device was opened on source 0's
-/// track and there is none to open. This function widens which source is asked,
-/// not what the answer means.
+/// The probe of the first source that really **has a track**, walking forward
+/// past a still (no track by definition) and past a source whose file carries
+/// none (a screen recording with no sound). A silent leading source must not
+/// pin the timeline's layout: pinned to it, a later file with sound could never
+/// be admitted, and the layout a *following* file is held to would be the
+/// silent source's `None`. This is the same walk
+/// [`PlaybackSession::open_project`] makes when it opens the device -- the two
+/// have to agree, so probing and opening can never name different sources.
+///
+/// `Ok(None)` for a timeline with no track anywhere: nothing but stills, with
+/// no file at all, or every non-still source silent. That is a silent timeline,
+/// and a file with sound is admitted onto it -- it *becomes* the timeline's
+/// sound ([`PlaybackSession::arm_audio`] opens the device for it), exactly the
+/// c581d41 rule ("a later source with real audio must be heard") at the add
+/// door.
 fn first_audio_of(sources: &[Source]) -> crate::Result<Option<crate::AudioProbe>> {
-    match audio_source_of(sources) {
-        Some(first) => AudioSession::probe(&first.path, first.audio_stream),
-        None => Ok(None),
+    for source in sources.iter().filter(|s| !crate::is_image(&s.path)) {
+        if let Some(probe) = AudioSession::probe(&source.path, source.audio_stream)? {
+            return Ok(Some(probe));
+        }
     }
+    Ok(None)
 }
 
 /// *Which* source that is: the first one that is not a still. The single answer
@@ -4268,13 +4319,21 @@ fn audio_matches_probed(
     let Some(probe) = probe else {
         return Ok(());
     };
-    Err(match first {
-        None => "the file has audio, the timeline is silent".to_string(),
-        Some(b) => format!(
-            "audio {} ch does not match the timeline's {} ch",
-            probe.channels, b.channels
-        ),
-    }
+    // The timeline has no track anywhere (nothing but stills, or every
+    // non-image source silent): there is no layout to disagree with, and the
+    // arriving file with sound *becomes* the timeline's sound --
+    // [`PlaybackSession::arm_audio`] opens the device for it, exactly the walk
+    // [`PlaybackSession::open_project`] makes. Refusing here ("the file has
+    // audio, the timeline is silent") pinned the timeline to its silent first
+    // source for good: remove that file and add another, and the second file's
+    // sound could never be heard.
+    let Some(b) = first else {
+        return Ok(());
+    };
+    Err(format!(
+        "audio {} ch does not match the timeline's {} ch",
+        probe.channels, b.channels
+    )
     .into())
 }
 

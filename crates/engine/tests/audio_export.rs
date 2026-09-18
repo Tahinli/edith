@@ -22,7 +22,7 @@ use engine::export::{ExportSettings, Format};
 use engine::project::{Lane, LaneKind, Source, Speed};
 use engine::scale::FitPolicy;
 use engine::scratch::Scratch;
-use engine::{AudioSession, Clip, ExportHandle, Project};
+use engine::{AudioSession, Clip, ExportHandle, Project, Rotation};
 
 const RATE: u32 = 44_100;
 
@@ -378,6 +378,7 @@ fn a_still_and_a_song_export_as_an_mp4_with_sound() {
         frame_count: 60,
         codec: engine::Codec::H264,
         color: Default::default(),
+        rotation: Rotation::None,
     };
     let out = out_path("still_song", "mp4");
     let handle = engine::export::start(project, meta, &out, &ExportSettings::default(), None);
@@ -704,6 +705,7 @@ fn the_sound_is_written_at_the_rate_that_was_asked_for() {
         frame_count: 60,
         codec: engine::Codec::H264,
         color: Default::default(),
+        rotation: Rotation::None,
     };
     for want in [128u32, 320] {
         let out = out_path(&format!("mp4_aac_{want}"), "mp4");
@@ -1001,6 +1003,7 @@ fn a_fade_in_reaches_the_exported_audio() {
         frame_count: 90,
         codec: engine::Codec::H264,
         color: Default::default(),
+        rotation: Rotation::None,
     };
     let out = out_path("fadein", "wav");
     let handle = engine::export::start(
@@ -1097,6 +1100,7 @@ fn a_split_and_crossfaded_clip_has_no_muted_interior() {
         frame_count: 90,
         codec: engine::Codec::H264,
         color: Default::default(),
+        rotation: Rotation::None,
     };
     let out = out_path("crossfade", "wav");
     let handle = engine::export::start(

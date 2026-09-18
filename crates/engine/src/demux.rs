@@ -267,9 +267,102 @@ impl NoVideoTrack {
     }
 }
 
+/// How far a container's display matrix says the picture must be turned to be
+/// seen the way it was shot: quarter turns **clockwise**, the direction
+/// [`crate::scale::rotate_i420_90s`] takes and the one a clip's own
+/// [`TransformParams`](crate::transform::TransformParams) rotate is measured
+/// in.
+///
+/// This is metadata about the *pixels*, not a user's edit: an mp4's `tkhd`
+/// matrix, a phone's 90-degree turn, and every consumer of this engine's
+/// pictures -- the preview and the encoder alike -- has to make it, or the film
+/// plays and exports sideways. [`VideoMeta::width`] and
+/// [`VideoMeta::height`] are therefore the *displayed* size: the coded picture
+/// is the swapped one, and every picture this engine hands out is turned to
+/// match. A container asking for anything that is not a right angle is refused
+/// at the door ([`UnsupportedRotation`]) rather than shown wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Rotation {
+    #[default]
+    None,
+    Cw90,
+    Cw180,
+    Cw270,
+}
+
+impl Rotation {
+    /// Quarter turns clockwise, the count
+    /// [`crate::scale::rotate_i420_90s`] applies.
+    pub fn steps(self) -> u8 {
+        match self {
+            Rotation::None => 0,
+            Rotation::Cw90 => 1,
+            Rotation::Cw180 => 2,
+            Rotation::Cw270 => 3,
+        }
+    }
+
+    /// Whether the turned picture's width and height are the coded ones
+    /// swapped.
+    pub fn swaps_axes(self) -> bool {
+        matches!(self, Rotation::Cw90 | Rotation::Cw270)
+    }
+
+    /// Whether there is anything to do at all, asked exactly as
+    /// [`TransformParams::is_identity`](crate::transform::TransformParams::is_identity)
+    /// is: the common case of a file that was shot the way it is stored.
+    pub fn is_none(self) -> bool {
+        matches!(self, Rotation::None)
+    }
+}
+
+/// A container that asks for a turn this engine cannot make: a display matrix
+/// that is not a pure right-angle rotation -- a mirror, a shear, or an angle
+/// that is not a multiple of 90 degrees.
+///
+/// Named and refused rather than ignored, for [`NoVideoTrack`]'s reason prose
+/// might have to be reworded: a file whose picture is 45 degrees off has no
+/// correct rendition here, and showing it sideways is a wrong picture rather
+/// than a missing feature. The `Display` is what a user is refused by.
+#[derive(Debug)]
+pub struct UnsupportedRotation {
+    /// The angle the matrix states, where it states one at all -- `None` for a
+    /// mirror or a shear, which is not one -- for the sentence only.
+    pub degrees: Option<f64>,
+}
+
+impl std::fmt::Display for UnsupportedRotation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.degrees {
+            Some(degrees) => write!(
+                f,
+                "this file carries a display matrix of {degrees:.1}°, which is not a quarter \
+                 turn; only 0°, 90°, 180° and 270° can be straightened here"
+            ),
+            None => f.write_str(
+                "this file's display matrix is not a rotation at all (a mirror or a shear); only \
+                 0°, 90°, 180° and 270° can be straightened here",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for UnsupportedRotation {}
+
+impl UnsupportedRotation {
+    /// Whether `error` is one of these, however deep in a `Box` it is --
+    /// [`NoVideoTrack::is_it`]'s twin.
+    pub fn is_it(error: &crate::Error) -> bool {
+        error.downcast_ref::<Self>().is_some()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct VideoMeta {
+    /// The displayed width: the coded one, swapped where the file's display
+    /// matrix is a 90- or 270-degree turn (see [`Rotation`]).
     pub width: u32,
+    /// The displayed height; see [`VideoMeta::width`].
     pub height: u32,
     pub frame_rate: f64,
     pub frame_count: u32,
@@ -278,6 +371,14 @@ pub struct VideoMeta {
     /// which range -- resolved off the container's tags, the bitstream's, and
     /// the resolution, in that order. See [`crate::colorspace`].
     pub color: ColorDescription,
+    /// How far the picture must be turned to be seen right, off the
+    /// container's display matrix. [`Rotation::None`] for everything whose
+    /// container states no turn, and for a Matroska file: only the mp4 half is
+    /// read today, because Matroska's own spelling (a `ProjectionPoseYaw`
+    /// element) is written by nobody in practice while the `tkhd` matrix is how
+    /// every phone records it. That is a known gap and not a silent one:
+    /// [`MkvDemuxer::open`] says where a reader for it would go.
+    pub rotation: Rotation,
 }
 
 /// What a file spends its bytes at, in bits per second -- the whole file, and
@@ -730,15 +831,41 @@ impl Mp4Demuxer {
             .ok_or_else(|| mp4_no_video(path, &reader))?;
 
         let track_id = track.track_id();
+        // The turn the file was shot at, off its `tkhd` display matrix -- how
+        // every phone records "this is portrait". `track.width()`/`height()` are
+        // the *coded* ones for an H.264 track (the `avc1` sample entry), so a
+        // quarter turn is what makes this file's displayed size the swapped one,
+        // and the whole engine reads these two as the picture's size.
+        let rotation = match reader
+            .moov
+            .traks
+            .iter()
+            .find(|trak| trak.tkhd.track_id == track_id)
+        {
+            // The values, not the type: `mp4`'s `tkhd` module is `pub(crate)`,
+            // so its `Matrix` cannot be named here -- but its fields are public
+            // and the four linear ones are all this needs.
+            Some(trak) => {
+                let m = &trak.tkhd.matrix;
+                rotation_of_matrix(m.a, m.b, m.c, m.d)?
+            }
+            None => Rotation::None,
+        };
+        let (coded_w, coded_h) = (u32::from(track.width()), u32::from(track.height()));
+        let (width, height) = match rotation.swaps_axes() {
+            true => (coded_h, coded_w),
+            false => (coded_w, coded_h),
+        };
         let meta = VideoMeta {
-            width: track.width() as u32,
-            height: track.height() as u32,
+            width,
+            height,
             frame_rate: frame_rate(track),
             frame_count: 0,
             codec,
             // Filled below, once the parameter sets the bitstream tier reads are
             // in hand.
             color: ColorDescription::default(),
+            rotation,
         };
         let first_sample = first_frame_sample(stts_pairs(track), trim_ticks(track));
         let mut parameter_sets = Vec::new();
@@ -1196,6 +1323,11 @@ impl MkvDemuxer {
                 bitstream_tags(video.codec, &mkv.config),
                 video.height,
             ),
+            // FLAG: Matroska's turn is not read yet -- see [`VideoMeta::rotation`].
+            // Nothing in this tree writes a `ProjectionPoseYaw`, and the mkv
+            // tracks a phone or a camera app produces are mp4s; a `.mkv` that
+            // does carry one would play sideways until this is written.
+            rotation: Rotation::None,
         };
         Ok((meta, mkv))
     }
@@ -2495,6 +2627,61 @@ fn parse_av1c(rec: &[u8]) -> crate::Result<(Vec<u8>, u8)> {
         _ => 8,
     };
     Ok((rec.get(4..).unwrap_or_default().to_vec(), bit_depth))
+}
+
+/// The quarter turns an mp4 `tkhd` display matrix asks for, or an
+/// [`UnsupportedRotation`] where it asks for something else.
+///
+/// The matrix is the ISO 14496-12 §8.3.2 3x3 affine, stored as nine 16.16
+/// fixed-point values in the order `a b u c d v x y w`; only the four linear
+/// ones matter here, and only as a rotation: the values are normalised by the
+/// matrix's own scale so a differently-scaled copy of a quarter turn still
+/// reads as one, and anything that is not a pure right-angle turn -- a mirror
+/// (a negative determinant), a shear, a 45-degree phone quirk -- is refused by
+/// name rather than shown sideways.
+///
+/// The direction is this engine's: the linear part is `[[a, c], [b, d]]` (a
+/// point maps to `(a*x + c*y, b*x + d*y)`), so `atan2(b, a)` is the clockwise
+/// angle when `(a, b)` is the turned x-axis, and the quarter count it falls on
+/// is exactly what [`crate::scale::rotate_i420_90s`] applies. Measured against
+/// ffmpeg's own autorotate on the `test_rotation*.mp4` fixtures
+/// (`scripts/gen_fixtures.sh`): a `tkhd` matrix of `a=0, b=-65536, c=65536,
+/// d=0` -- what `-display_rotation 90` writes, and what a phone's portrait
+/// video carries -- is [`Rotation::Cw270`] here, the quarter turn that puts the
+/// coded left edge at the top.
+fn rotation_of_matrix(a: i32, b: i32, c: i32, d: i32) -> crate::Result<Rotation> {
+    let fixed = |raw: i32| f64::from(raw) / 65536.0;
+    let (a, b, c, d) = (fixed(a), fixed(b), fixed(c), fixed(d));
+    let scale = a.hypot(b);
+    let unsupported = || -> crate::Error {
+        crate::Error::from(UnsupportedRotation {
+            // The honest number where the matrix states one at all; a mirror or
+            // a shear has no angle, and 0.0 would be a claim rather than a
+            // reading.
+            degrees: (scale > 0.0).then(|| b.atan2(a).to_degrees()),
+        })
+    };
+    // Pure and isotropic: both columns the same length, and one the other's
+    // quarter turn (`d == a`, `-c == b` after normalising) -- no shear, no
+    // anisotropic scale.
+    if scale == 0.0
+        || (scale - c.hypot(d)).abs() > 1e-3
+        || ((a - d) / scale).abs() > 1e-3
+        || ((b + c) / scale).abs() > 1e-3
+    {
+        return Err(unsupported());
+    }
+    let degrees = b.atan2(a).to_degrees();
+    let steps = (degrees / 90.0).round();
+    if (degrees - steps * 90.0).abs() > 0.5 {
+        return Err(unsupported());
+    }
+    Ok(match steps.rem_euclid(4.0) as u8 {
+        0 => Rotation::None,
+        1 => Rotation::Cw90,
+        2 => Rotation::Cw180,
+        _ => Rotation::Cw270,
+    })
 }
 
 /// Why an mp4 came back with no picture, by the fourcc of the video track it

@@ -162,6 +162,15 @@ const DMA_HOLD: usize = 6;
 /// real seek wins.
 const FORWARD_SECS: f64 = 0.5;
 
+/// Whether `data` still holds a NAL unit: the same `00 00 01` scan
+/// cros-codecs' `Nalu::next`/`find_start_code` uses to frame Annex B. `false`
+/// for the `trailing_zero_8bits` / `cabac_zero_word` that may trail the last
+/// NAL of an access unit -- bytes that are part of the stream but not a unit
+/// any decoder will parse.
+fn has_start_code(data: &[u8]) -> bool {
+    data.windows(3).any(|w| w == [0x00, 0x00, 0x01])
+}
+
 /// The forward reach in frames: [`FORWARD_SECS`] at the stream's own rate.
 /// `0` for a rate the stream does not really state, which is "never forward"
 /// -- exactly the flush every reposition did before this distinction existed.
@@ -559,6 +568,18 @@ impl Session {
                 Ok(0) => return Err("decoder consumed no input".into()),
                 Ok(n) => {
                     pending.drain(..n.min(pending.len()));
+                    // cros-codecs reports the bytes of the NAL it consumed, and
+                    // that length excludes the `trailing_zero_8bits` /
+                    // `cabac_zero_word` an encoder may append after the *last*
+                    // NAL of an access unit (H.264 7.4.1.2.3). Those leftovers
+                    // are not a NAL: feeding them back makes `Nalu::next` fail
+                    // with "No NAL found", which is a hard session failure for
+                    // an otherwise decodable file -- measured on a phone-camera
+                    // mp4 whose every sample ends in zero words. The access unit
+                    // is consumed when no start code is left in it.
+                    if !has_start_code(pending) {
+                        pending.clear();
+                    }
                     if pending.is_empty() {
                         *timestamp += 1;
                     }

@@ -37,7 +37,7 @@ pub use audio::{
 };
 pub use clock::PlaybackClock;
 pub use decode::{DecodeSession, Frame, image_size};
-pub use demux::{Codec, MediaBitrate, VideoMeta, probe_bitrate};
+pub use demux::{Codec, MediaBitrate, Rotation, UnsupportedRotation, VideoMeta, probe_bitrate};
 pub use export::ExportHandle;
 pub use mux::{AudioParams, Mp4Muxer, VideoParams};
 pub use playback::{ImportGate, ImportProbe, PlaybackSession};
@@ -55,11 +55,24 @@ pub use project::{Clip, Project, Rate, Speed};
 /// has. A `.dts` or a bare `.ac3` is refused by the same door that refuses a
 /// `.txt` -- there is no reader here that opens an elementary stream -- which is
 /// the honest answer.
+///
+/// The `.mpeg` and `.mpg` spellings are on the list because an MPEG audio
+/// stream has no container to name it and the file is whatever a recorder
+/// called it: those two are the *standard's* name -- what a voice note or a
+/// tagged download off the web wears -- where `.mp3` is the codec's. Symphonia's
+/// `mp3` reader is what reads them, the same reader an `.mp3` goes through, and
+/// it skips the ID3v2 tag and any cover picture muxed into one. A `.mpeg` that
+/// is really an MPEG *program stream* with a picture in it is still no picture
+/// here -- nothing demuxes one, and it is symphonia's refusal that says so
+/// rather than the mp4 crate's. (MPEG's other two layers, `.mp1`/`.mp2`, are
+/// deliberately absent: this build compiles the mp3 bundle without its `mp1`/
+/// `mp2` features, so a layer II stream is a codec nothing here decodes, and
+/// admitting the spelling would be a promise the reader cannot keep.)
 pub fn is_audio(path: &std::path::Path) -> bool {
     path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
         matches!(
             e.to_ascii_lowercase().as_str(),
-            "mp3" | "wav" | "flac" | "ogg" | "oga" | "opus" | "mka" | "m4a" | "aac"
+            "mp3" | "mpeg" | "mpg" | "wav" | "flac" | "ogg" | "oga" | "opus" | "mka" | "m4a" | "aac"
         )
     })
 }
@@ -117,6 +130,8 @@ mod tests {
             "g.opus",
             "h.OPUS",
             "i.mka",
+            "j.MPEG",
+            "k.mpg",
         ] {
             assert!(super::is_audio(Path::new(name)), "{name}");
         }

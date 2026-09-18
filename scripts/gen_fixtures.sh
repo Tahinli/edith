@@ -572,6 +572,26 @@ for fmt in mp3 wav flac ogg m4a aac; do
         -filter_complex "$tone" -map "[a]" -ar 44100 "${codec[@]}" \
         "assets/test_tone.$fmt"
 done
+# ...and the same tone in the MPEG audio spellings an encoder names after the
+# standard rather than the codec (`.mpeg`/`.mpg`), carrying a JPEG cover in its
+# ID3v2 tag -- the shape a voice note or a tagged download has. `-f mp3` is what
+# makes it an MPEG *audio* stream: left to the extension, ffmpeg would write an
+# MPEG program stream instead, which is a different file that this engine has no
+# demuxer for. `test_tone_cover.jpg` is the cover it muxes in; a reader that
+# walked the file as an mp4 saw only `InvalidData("file contains a box with a
+# larger size than it")` before `is_audio` admitted the spelling.
+ffmpeg -y -f lavfi -i "color=c=blue:s=64x64:d=1" -frames:v 1 \
+    "assets/test_tone_cover.jpg"
+ffmpeg -y -f lavfi -i "sine=frequency=440:duration=3" \
+    -f lavfi -i "sine=frequency=880:duration=3" \
+    -i "assets/test_tone_cover.jpg" \
+    -filter_complex "$tone" -map "[a]" -map 2:v -ar 44100 \
+    -c:a libmp3lame -b:a 128k -c:v mjpeg -disposition:v attached_pic \
+    -id3v2_version 3 -f mp3 "assets/test_tone_cover.mpeg"
+ffmpeg -y -f lavfi -i "sine=frequency=440:duration=3" \
+    -f lavfi -i "sine=frequency=880:duration=3" \
+    -filter_complex "$tone" -map "[a]" -ar 44100 \
+    -c:a libmp3lame -b:a 128k -id3v2_version 3 -f mp3 "assets/test_tone.mpg"
 # The two Opus fixtures, which cannot join the loop above: Opus decodes at 48 kHz
 # and nothing else, so these are the 48k twins of the tone rather than 44.1k ones.
 # First the standalone `.opus`, an Ogg file `crate::is_audio` now admits.
@@ -671,5 +691,45 @@ ffmpeg -y -f lavfi -i testsrc2=size=320x240:rate=24:duration=2 \
     -filter_complex "[1:a][2:a]join=inputs=2:channel_layout=stereo[a]" \
     -map 0:v -map "[a]" -c:v libx264 -profile:v baseline -pix_fmt yuv420p \
     -c:a aac -b:a 96k -f mov assets/test_qt.mov
+
+# The display matrix: `test_rotation*.mp4` are one 320x180 source -- four
+# coloured quadrants, so a quarter turn is readable from a single sampled pixel
+# per corner and a wrong direction cannot pass -- written back out with a
+# rotation asked for. This is how a phone records a portrait video: the pixels
+# stay landscape and the container says which way to turn them.
+#
+# The trap this recipe exists to avoid: `-metadata:s:v rotate=90`, the form
+# every search result gives, writes **no display matrix at all** with this
+# machine's ffmpeg (`ffprobe -show_streams` comes back with an empty side-data
+# block, so a "rotated" fixture is really an unrotated one and the test passes
+# against nothing). `-display_rotation` is a *muxer* option here and, being an
+# input option, goes **before** the `-i` it applies to.
+#
+# The four quadrants are red, green, blue and yellow:
+#
+#   coded            -display_rotation 90      -display_rotation 180
+#   red  green       green yellow              yellow blue
+#   blue yellow      red   blue                green  red
+#
+# which is exactly ffmpeg's own autorotation of each file -- measured
+# (`ffmpeg -i f.mp4 -f rawvideo -pix_fmt rgb24 -`) rather than derived, because
+# which way a display matrix turns a picture is the one thing a reader has to be
+# told rather than guess. `tests/rotation.rs` asserts those layouts.
+#
+# `-display_rotation 45` is the other half: a matrix that is a rotation and not
+# a *quarter* turn, which this engine refuses by name (`demux::UnsupportedRotation`)
+# instead of showing it sideways.
+ffmpeg -y -f lavfi -i "color=c=red:s=160x90:d=1:r=30,format=yuv420p" \
+    -f lavfi -i "color=c=green:s=160x90:d=1:r=30,format=yuv420p" \
+    -f lavfi -i "color=c=blue:s=160x90:d=1:r=30,format=yuv420p" \
+    -f lavfi -i "color=c=yellow:s=160x90:d=1:r=30,format=yuv420p" \
+    -filter_complex "[0:v][1:v]hstack[top];[2:v][3:v]hstack[bot];[top][bot]vstack[v]" \
+    -map "[v]" -frames:v 30 -c:v libx264 -profile:v baseline -pix_fmt yuv420p \
+    assets/.rotation_src.mp4
+for deg in 90 180 270 45; do
+    ffmpeg -y -display_rotation "$deg" -i assets/.rotation_src.mp4 \
+        -c copy "assets/test_rotation$deg.mp4"
+done
+rm -f assets/.rotation_src.mp4
 
 echo "fixtures written to assets/"

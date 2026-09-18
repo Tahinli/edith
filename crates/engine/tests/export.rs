@@ -35,7 +35,7 @@ use engine::mux::{AudioParams, Mp4Muxer, VideoParams, parameter_sets};
 use engine::project::{Lane, Source, Speed};
 use engine::scale::FitPolicy;
 use engine::scratch::Scratch;
-use engine::{DecodeSession, ExportHandle, PlaybackSession, Project};
+use engine::{DecodeSession, ExportHandle, PlaybackSession, Project, Rotation};
 use ec_core::registry::{CodecId, CodecParameters, Decoder as _};
 use ec_core::{Packet, TimeBase};
 use ec_h264::H264Decoder;
@@ -277,6 +277,7 @@ fn exports_at_the_project_resolution_with_the_watched_geometry() {
         frame_count: 20,
         codec: engine::Codec::H264,
         color: Default::default(),
+        rotation: Rotation::None,
     };
     let out = out_path("mixed");
     let handle = engine::export::start(project, meta, &out, &ExportSettings::default(), None);

@@ -615,6 +615,7 @@ fn started(
 mod tests {
     use super::*;
     use crate::colorspace::ColorDescription;
+    use crate::demux::Rotation;
 
     /// A cancel flag no test in this file is exercising, for the calls that
     /// have nothing to cancel.
@@ -630,6 +631,7 @@ mod tests {
             frame_count: 240,
             codec,
             color: ColorDescription::default(),
+            rotation: Rotation::None,
         }
     }
 
