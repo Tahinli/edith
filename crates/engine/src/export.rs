@@ -80,7 +80,7 @@ use oxideav_core::Muxer as _;
 
 use crate::audio::{AudioMeta, AudioSession};
 use crate::colorspace::{ColorDescription, Matrix, Transfer};
-use crate::demux::{Codec, Demuxer, MkvDemuxer, VideoMeta};
+use crate::demux::{Codec, Demuxer, MkvDemuxer, Rotation, VideoMeta};
 use crate::hw::{DmaFrame, DmaWant, HwEncoder, HwPicture, HwSession};
 use crate::mux::{
     AudioParams, Av1Params, CopyParams, HevcParams, MkvMuxer, Mp4Muxer, SubParams, VideoParams,
@@ -1174,7 +1174,13 @@ struct Dissolve<'a> {
     remap: Option<(Matrix, Matrix)>,
     grade: Option<crate::color::ColorParams>,
     transform: TransformParams,
+    /// B's own file's display-matrix turn, [`place_picture`]'s first stage;
+    /// B is a different file and may be turned differently from A.
+    rotation: Rotation,
     canvas: Composer,
+    /// The turn's, the grade's and the transform's scratch, exactly as A's
+    /// span keeps them: refilled per picture, allocated once.
+    rotated: (Vec<u8>, Vec<u8>, Vec<u8>),
     graded: (Vec<u8>, Vec<u8>, Vec<u8>),
     transformed: (Vec<u8>, Vec<u8>, Vec<u8>),
 }
@@ -1801,7 +1807,14 @@ impl CopyPlan {
                 // The stream this file would carry, at the size and the rate the
                 // timeline is in: anything else is a picture that has to be
                 // coded again to become this file's.
-                if source_meta.codec != codec
+                //
+                // A source whose display matrix asks for a turn is one of
+                // those: a copied packet is the source's own coded picture, and
+                // this export bakes the turn into the pixels -- so a copy would
+                // ship the file sideways. Re-encoding is the only honest
+                // answer here.
+                if !source_meta.rotation.is_none()
+                    || source_meta.codec != codec
                     || source_meta.width != meta.width
                     || source_meta.height != meta.height
                     || Rate::from_fps(source_meta.frame_rate, meta.frame_rate).ok()?
@@ -2652,7 +2665,7 @@ fn run(
     // samples *mean* ([`ColorDescription`]), which is what decides whether they
     // are remapped on the way in. Real time for a still, a song and a
     // single-rate project, where every conversion below is the identity.
-    let rates: Vec<(Rate, ColorDescription, Option<f32>)> = sources
+    let rates: Vec<(Rate, ColorDescription, Option<f32>, Rotation)> = sources
         .iter()
         .map(|source| source_rate(&source.path, meta.frame_rate))
         .collect();
@@ -2671,7 +2684,7 @@ fn run(
     let preset = project.tone();
     let tone: Vec<Option<ToneMapper>> = rates
         .iter()
-        .map(|(_, color, peak)| match color.transfer {
+        .map(|(_, color, peak, _)| match color.transfer {
             // A preview file keeps the film's own curve and is tone-mapped when
             // it is *shown* ([`ExportSettings::keep_source_colour`]), which is
             // both cheaper and the only way the preset can still be changed
@@ -2734,12 +2747,12 @@ fn run(
         // A's pixels on the CPU, so a dissolving span never asks for a GPU
         // buffer, not even outside its own window.
         let dissolve = dissolve_window(project, &span);
-        let (mut pictures, rate, in_frame, color, mapper) = match span.from {
+        let (mut pictures, rate, in_frame, color, mapper, rotation) = match span.from {
             Some((source, in_frame)) => {
                 let entry = sources
                     .get(source)
                     .ok_or_else(|| format!("clip names source {source} of {}", sources.len()))?;
-                let (rate, color, _peak) = rates[source];
+                let (rate, color, _peak, rotation) = rates[source];
                 let mapper = tone[source].as_ref();
                 // Nothing on the way from this span's decoder to the encoder
                 // touches a sample: no tone map, no matrix remap, no grade --
@@ -2756,6 +2769,11 @@ fn run(
                     && project
                         .composite_transform_at(span.start)
                         .is_none_or(|params| params.is_identity())
+                    // A file whose display matrix asks for a turn is *not*
+                    // untouched, whatever else the timeline says: its pictures
+                    // have to be turned, which is a read-back no GPU buffer
+                    // survives.
+                    && rotation.is_none()
                     && dissolve.is_none();
                 let want = untouched.then(|| encoder.dma_want(meta)).flatten();
                 // Opened at the file's own frame, which is the only place the
@@ -2775,12 +2793,13 @@ fn run(
                 } else {
                     ClipDecoder::open(&entry.path, rate.source_at(in_frame), want)?
                 };
-                (Some(pictures), rate, in_frame, Some(color), mapper)
+                (Some(pictures), rate, in_frame, Some(color), mapper, rotation)
             }
             // A gap's black is 16/128/128, which is black in every matrix here
             // and on every curve: nothing to remap and nothing to tone-map,
-            // which is what `None` says.
-            None => (None, Rate::REAL_TIME, 0, None, None),
+            // which is what `None` says. A gap is no file either, so nothing
+            // turns it.
+            None => (None, Rate::REAL_TIME, 0, None, None, Rotation::None),
         };
         // Mixed spaces on one timeline: a clip coded against another matrix than
         // the one this file declares is rewritten into it, *after* the grade --
@@ -2805,6 +2824,10 @@ fn run(
             .unwrap_or_default();
         let mut graded = (Vec::new(), Vec::new(), Vec::new());
         let mut transformed = (Vec::new(), Vec::new(), Vec::new());
+        // ...and one more for the file's own display-matrix turn, which happens
+        // before all of those (see [`place_picture`]): empty for every source
+        // that states no turn.
+        let mut rotated = (Vec::new(), Vec::new(), Vec::new());
         // ...and the canvas it is placed on, which is where a source of another
         // resolution becomes a picture at the project's. The same `Composer`
         // playback composes with, given the same policy, so an export is what
@@ -2823,7 +2846,7 @@ fn run(
                 let entry = sources.get(b_source).ok_or_else(|| {
                     format!("clip names source {b_source} of {}", sources.len())
                 })?;
-                let (b_rate, b_color, _peak) = rates[b_source];
+                let (b_rate, b_color, _peak, b_rotation) = rates[b_source];
                 let b_mapper = tone[b_source].as_ref();
                 let b_remap = remap_into(Some(b_color), b_mapper.is_some(), out_color.matrix);
                 Ok(Dissolve {
@@ -2852,11 +2875,13 @@ fn run(
                         .composite_transform_at(b_start)
                         .copied()
                         .unwrap_or_default(),
+                    rotation: b_rotation,
                     canvas: Composer::new(
                         meta.width,
                         meta.height,
                         project.composite_fit_at(b_start),
                     ),
+                    rotated: (Vec::new(), Vec::new(), Vec::new()),
                     graded: (Vec::new(), Vec::new(), Vec::new()),
                     transformed: (Vec::new(), Vec::new(), Vec::new()),
                 })
@@ -2946,10 +2971,12 @@ fn run(
                     v,
                     width,
                     height,
+                    rotation,
                     grade,
                     transform,
                     remap,
                     mapper,
+                    &mut rotated,
                     &mut graded,
                     &mut transformed,
                     &mut canvas,
@@ -2979,9 +3006,9 @@ fn run(
                             }
                             Some(Frame::Pixels(by, bu, bv, bw, bh)) => {
                                 let (by, bu, bv, _, _) = place_picture(
-                                    by, bu, bv, bw, bh, d.grade, d.transform, d.remap,
-                                    d.mapper, &mut d.graded, &mut d.transformed,
-                                    &mut d.canvas,
+                                    by, bu, bv, bw, bh, d.rotation, d.grade, d.transform,
+                                    d.remap, d.mapper, &mut d.rotated, &mut d.graded,
+                                    &mut d.transformed, &mut d.canvas,
                                 );
                                 let idx_in_window = done_here + r - d.tail_start;
                                 let t = dissolve_weight(idx_in_window, d.window);
@@ -3111,12 +3138,16 @@ fn run(
     Ok(())
 }
 
-/// One decoded picture graded, tone-mapped, remapped and placed on the canvas
-/// -- everything between a source's own samples and the ones an encoder is fed,
-/// which is exactly the work a zero-copy span has none of.
+/// One decoded picture turned, graded, tone-mapped, remapped and placed on the
+/// canvas -- everything between a source's own samples and the ones an encoder
+/// is fed, which is exactly the work a zero-copy span has none of.
 ///
-/// `graded` and `canvas` are the span's scratch: the planes come back borrowed
-/// from one of them, or from the picture itself where not a byte was touched.
+/// `rotation` first, before the grade: it is the file's own display matrix, the
+/// turn a player would make before showing the picture at all, and everything
+/// after this -- the grade, the letterbox, the encoder -- is about the picture
+/// as it is *meant* to be seen. `turned`, `graded` and `canvas` are the span's
+/// scratch: the planes come back borrowed from one of them, or from the picture
+/// itself where not a byte was touched.
 #[expect(clippy::too_many_arguments, reason = "one span's whole picture path")]
 fn place_picture<'a>(
     y: &'a [u8],
@@ -3124,14 +3155,35 @@ fn place_picture<'a>(
     v: &'a [u8],
     width: u32,
     height: u32,
+    rotation: Rotation,
     grade: Option<crate::color::ColorParams>,
     transform: TransformParams,
     remap: Option<(Matrix, Matrix)>,
     mapper: Option<&ToneMapper>,
+    turned: &'a mut (Vec<u8>, Vec<u8>, Vec<u8>),
     graded: &'a mut (Vec<u8>, Vec<u8>, Vec<u8>),
     transformed: &'a mut (Vec<u8>, Vec<u8>, Vec<u8>),
     canvas: &'a mut Composer,
 ) -> (&'a [u8], &'a [u8], &'a [u8], u32, u32) {
+    // The file's own turn, taken exactly as playback's decode funnel takes it
+    // ([`crate::decode`]): a phone's portrait video is landscape in the file,
+    // and the encoder must be fed what the preview showed. A file that states
+    // no turn skips this entirely -- the planes go on borrowed.
+    let (y, u, v, width, height) = match rotation.is_none() {
+        true => (y, u, v, width, height),
+        false => {
+            let (w, h) = crate::scale::rotate_i420_90s_into(
+                y,
+                u,
+                v,
+                width,
+                height,
+                rotation.steps(),
+                turned,
+            );
+            (&turned.0[..], &turned.1[..], &turned.2[..], w, h)
+        }
+    };
     // The planes are borrowed from the decoder (and `Black::picture` hands the
     // same slice as both u and v), so a grade cannot be applied in place: it
     // goes onto a copy, which the encoder then reads instead.
@@ -3199,12 +3251,16 @@ fn remap_into(
 /// -- a still, a song -- and for one that will not open here: the decoder is
 /// opened a few lines later and fails the export by name, which is a better
 /// error than this one could raise.
-fn source_rate(path: &Path, timeline_fps: f64) -> (Rate, ColorDescription, Option<f32>) {
+fn source_rate(
+    path: &Path,
+    timeline_fps: f64,
+) -> (Rate, ColorDescription, Option<f32>, Rotation) {
     if crate::is_image(path) || crate::is_audio(path) {
         // A still is BT.601 by construction whatever it was authored as:
         // `decode::rgb_to_i420` is the one matrix that turns its pixels into
-        // planes. A song has no picture and the answer is never read.
-        return (Rate::REAL_TIME, ColorDescription::default(), None);
+        // planes. A song has no picture and the answer is never read. Neither
+        // has a display matrix to be turned by.
+        return (Rate::REAL_TIME, ColorDescription::default(), None, Rotation::None);
     }
     match Demuxer::open(path) {
         // ...and one whose rate cannot be named against the timeline's, which
@@ -3218,10 +3274,13 @@ fn source_rate(path: &Path, timeline_fps: f64) -> (Rate, ColorDescription, Optio
             Rate::from_fps(meta.frame_rate, timeline_fps).unwrap_or(Rate::REAL_TIME),
             meta.color,
             demuxer.light().peak(),
+            // The file's own turn, so the encoder is fed the picture the
+            // preview shows: the same header read, one more answer.
+            meta.rotation,
         ),
         // Unreadable here means unreadable below too, where the span dies with a
         // real message; the file's own space is the least of that.
-        Err(_) => (Rate::REAL_TIME, ColorDescription::default(), None),
+        Err(_) => (Rate::REAL_TIME, ColorDescription::default(), None, Rotation::None),
     }
 }
 
@@ -4397,9 +4456,11 @@ fn pop_av1<'a>(
 /// which would cost two conversions and a generation of colour precision.
 ///
 /// This mirrors `decode`'s two worker loops rather than reusing `DecodeSession`,
-/// which only speaks BGRA. Unlike playback there is no mid-clip fallback to
-/// software: a hardware decode that fails after the first picture fails the
-/// export, which then deletes the half-written file.
+/// which only speaks BGRA. A hardware decode that fails *before* the first
+/// picture falls back to software, exactly as playback's does -- nothing has
+/// been encoded yet, so the span can be taken over cleanly. One that fails
+/// after the first picture fails the export, which then deletes the
+/// half-written file: a restart there would re-encode what the muxer holds.
 enum ClipDecoder {
     /// A stream, decoded on a thread of its own: the encode of picture *n* and
     /// the decode of picture *n + 1* are the two halves an export used to do in
@@ -4628,9 +4689,9 @@ impl ClipDecoder {
 /// will have it, software otherwise) and send every picture until the encoder
 /// stops taking them.
 ///
-/// Unlike playback there is no mid-clip fallback to software: a hardware decode
-/// that fails after the first picture fails the export, which then deletes the
-/// half-written file.
+/// Hardware that fails before the first picture falls back to the software seat
+/// (see the loop's `decoded == 0` arm); one that fails after it fails the
+/// export, which then deletes the half-written file.
 ///
 /// Every way this returns says which way it was, down the channel: a picture, an
 /// error, or the `Ok(None)` that *is* end of stream. Closing the channel is not
@@ -4656,6 +4717,12 @@ fn decode_stream(
             }
         },
     };
+    // Pictures handed down the channel. Hardware that dies *before* the first
+    // one is the fallback playback already makes, and here nothing has been
+    // encoded yet, so the software seat can take the whole span with no frame
+    // repeated. Past one picture a restart would re-encode what the muxer
+    // already holds, which is why the export still fails there.
+    let mut decoded = 0u32;
     loop {
         let frame = match decoder.next(want) {
             Ok(Some(frame)) => frame,
@@ -4664,6 +4731,21 @@ fn decode_stream(
                 return;
             }
             Err(e) => {
+                if decoded == 0 && matches!(decoder, Pictures::Hw(_)) {
+                    eprintln!(
+                        "export decode: hardware failed before any frame ({e}); falling back to software"
+                    );
+                    match SwDecoder::open(path, start_frame) {
+                        Ok(sw) => {
+                            decoder = Pictures::Sw(sw);
+                            continue;
+                        }
+                        Err(sw_refusal) => {
+                            let _ = tx.send(Err(sw_refusal));
+                            return;
+                        }
+                    }
+                }
                 let _ = tx.send(Err(e));
                 return;
             }
@@ -4673,6 +4755,7 @@ fn decode_stream(
         if tx.send(Ok(Some(frame))).is_err() {
             return;
         }
+        decoded += 1;
     }
 }
 
@@ -5283,6 +5366,7 @@ mod tests {
             frame_count: 1,
             codec: crate::demux::Codec::H264,
             color: Default::default(),
+            rotation: Rotation::None,
         };
         // 1280 * 720 * 30 * 0.1
         assert_eq!(bitrate_for(&meta(1280, 720, 30.0)), 2_764_800);
@@ -5332,6 +5416,7 @@ mod tests {
             frame_count: 1,
             codec: crate::demux::Codec::H264,
             color: Default::default(),
+            rotation: Rotation::None,
         }
     }
 

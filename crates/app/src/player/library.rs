@@ -1407,6 +1407,12 @@ impl Player {
                     .as_mut()
                     .and_then(|session| subtitle_tail(session, subs))
                     .unwrap_or_default();
+                // A file with sound joining a session that opened silent is the
+                // one import that *arms* the audio device
+                // ([`engine::PlaybackSession::arm_audio`]); it comes up at full
+                // volume, so the player's own level and mute are pushed at it
+                // again here or a muted window would play.
+                self.apply_volume();
                 format!(
                     "IMPORTED {} to the library{tail}{}",
                     file_name(path),

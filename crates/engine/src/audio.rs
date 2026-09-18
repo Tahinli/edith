@@ -413,20 +413,41 @@ impl AudioSession {
         fps: f64,
         sample_rate: Option<u32>,
     ) -> crate::Result<Option<(AudioMeta, Receiver<AudioChunk>)>> {
-        // The first source that could have a track, which is not always index 0:
-        // a still image has none, and one at the front of the list (a save
-        // renumbers, a library removal moves indexes) would be opened as a
-        // broken audio file and take the whole timeline's sound down with it.
-        // The same rule `PlaybackSession` probes by (`audio_source_of`).
-        let Some((at, (path, stream))) = sources
-            .iter()
-            .enumerate()
-            .find(|(_, (path, _))| !crate::is_image(path))
-        else {
-            return Ok(None);
-        };
-        let Some(first) = Track::open(path, *stream)? else {
-            return Ok(None);
+        // The first source that really *opens* a track, which is not always
+        // index 0 and not always the first non-image one: a still image has no
+        // track by definition, and a video whose file carries none (a screen
+        // recording with no sound) has `Track::open` answer `None`. Pinning to
+        // the first non-image source regardless would return `Ok(None)` for a
+        // whole timeline whenever that one source happened to be silent,
+        // silencing every later clip that does have sound -- the very failure
+        // `PlaybackSession::open_project`'s device walk exists to prevent, and
+        // it has to hold here too or the walk is defeated at playback.
+        //
+        // A source that cannot be opened at all is skipped like a silent one,
+        // so a broken file at the head of the list cannot take a later clip's
+        // sound down with it; the last error is kept and returned only when
+        // *nothing* opens, which is today's answer for a timeline of one broken
+        // source.
+        let mut first: Option<(usize, Track)> = None;
+        let mut refused: Option<crate::Error> = None;
+        for (at, (path, stream)) in sources.iter().enumerate() {
+            if crate::is_image(path) {
+                continue;
+            }
+            match Track::open(path, *stream) {
+                Ok(Some(track)) => {
+                    first = Some((at, track));
+                    break;
+                }
+                Ok(None) => {}
+                Err(e) => refused = Some(e),
+            }
+        }
+        let Some((at, first)) = first else {
+            return match refused {
+                Some(e) => Err(e),
+                None => Ok(None),
+            };
         };
         // The timeline's meta is that source's: policy makes every other source
         // match it, and the checks below hold them to that.

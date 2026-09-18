@@ -459,48 +459,74 @@ pub fn rotate_i420_90s(
     h: u32,
     steps: u8,
 ) -> (Vec<u8>, Vec<u8>, Vec<u8>, u32, u32) {
-    let steps = steps % 4;
-    if steps == 0 || w == 0 || h == 0 {
-        return (y.to_vec(), u.to_vec(), v.to_vec(), w, h);
-    }
-    let (cw, ch) = chroma_dims(w as usize, h as usize);
-    let (ry, rw, rh) = rotate_plane(y, w as usize, h as usize, steps);
-    let (ru, ..) = rotate_plane(u, cw, ch, steps);
-    let (rv, ..) = rotate_plane(v, cw, ch, steps);
-    (ry, ru, rv, rw as u32, rh as u32)
+    let mut out = (Vec::new(), Vec::new(), Vec::new());
+    let (rw, rh) = rotate_i420_90s_into(y, u, v, w, h, steps, &mut out);
+    (out.0, out.1, out.2, rw, rh)
 }
 
-/// One tightly packed plane, rotated `steps` (1..=3) quarter turns clockwise.
-fn rotate_plane(src: &[u8], w: usize, h: usize, steps: u8) -> (Vec<u8>, usize, usize) {
+/// [`rotate_i420_90s`] into a caller's own buffers: the top-left of a phone
+/// file's display matrix has to be made on **every decoded frame**, so the
+/// three plane allocations are a steady-state cost to pay once rather than a
+/// per-frame one. The output is exactly what the allocating form returns; the
+/// scratch tuple is resized and refilled, never appended to.
+pub fn rotate_i420_90s_into(
+    y: &[u8],
+    u: &[u8],
+    v: &[u8],
+    w: u32,
+    h: u32,
+    steps: u8,
+    out: &mut (Vec<u8>, Vec<u8>, Vec<u8>),
+) -> (u32, u32) {
+    let steps = steps % 4;
+    if steps == 0 || w == 0 || h == 0 {
+        out.0.clear();
+        out.0.extend_from_slice(y);
+        out.1.clear();
+        out.1.extend_from_slice(u);
+        out.2.clear();
+        out.2.extend_from_slice(v);
+        return (w, h);
+    }
+    let (cw, ch) = chroma_dims(w as usize, h as usize);
+    rotate_plane_into(y, w as usize, h as usize, steps, &mut out.0);
+    rotate_plane_into(u, cw, ch, steps, &mut out.1);
+    rotate_plane_into(v, cw, ch, steps, &mut out.2);
+    if steps == 2 {
+        (w, h)
+    } else {
+        (h, w)
+    }
+}
+
+/// One tightly packed plane, rotated `steps` (1..=3) quarter turns clockwise,
+/// written into `out` -- resized to the turned size, which is the source's
+/// swapped at 90 and 270 and its own at 180.
+fn rotate_plane_into(src: &[u8], w: usize, h: usize, steps: u8, out: &mut Vec<u8>) {
     match steps {
         1 => {
-            let (nw, nh) = (h, w);
-            let mut out = vec![0u8; nw * nh];
-            for yp in 0..nh {
-                for xp in 0..nw {
-                    out[yp * nw + xp] = src[(h - 1 - xp) * w + yp];
+            out.resize(h * w, 0);
+            for yp in 0..w {
+                for xp in 0..h {
+                    out[yp * h + xp] = src[(h - 1 - xp) * w + yp];
                 }
             }
-            (out, nw, nh)
         }
         2 => {
-            let mut out = vec![0u8; w * h];
+            out.resize(w * h, 0);
             for yp in 0..h {
                 for xp in 0..w {
                     out[yp * w + xp] = src[(h - 1 - yp) * w + (w - 1 - xp)];
                 }
             }
-            (out, w, h)
         }
         3 => {
-            let (nw, nh) = (h, w);
-            let mut out = vec![0u8; nw * nh];
-            for yp in 0..nh {
-                for xp in 0..nw {
-                    out[yp * nw + xp] = src[xp * w + (w - 1 - yp)];
+            out.resize(h * w, 0);
+            for yp in 0..w {
+                for xp in 0..h {
+                    out[yp * h + xp] = src[xp * w + (w - 1 - yp)];
                 }
             }
-            (out, nw, nh)
         }
         _ => unreachable!("steps % 4 is 1, 2 or 3 here"),
     }

@@ -19,6 +19,7 @@ use engine::DecodeSession;
 use engine::colorspace::{ColorDescription, Matrix};
 use engine::convert::i420_to_bgra;
 use engine::demux::{Codec, Demuxer};
+use engine::mux::{self, Mp4Muxer, VideoParams};
 use engine::scratch::Scratch;
 use engine::hw::HwSession;
 use engine::tonemap::{ToneMapper, Transfer};
@@ -476,4 +477,112 @@ fn av1_ten_bit_hardware_matches_software_on_every_frame() {
     let diff = hw_frame_30.iter().zip(&sw_frame_30).filter(|(a, b)| a != b).count();
     eprintln!("frame 30 differing bytes: {diff} / {}", sw_frame_30.len());
     assert_eq!(diff, 0, "hardware and software 10-bit AV1 decode disagree");
+}
+
+/// Annex-B NAL payloads (start codes stripped, trailing zeros trimmed).
+fn nals(annex_b: &[u8]) -> Vec<&[u8]> {
+    let mut out = Vec::new();
+    let mut start = None;
+    let mut i = 0;
+    while i + 2 < annex_b.len() {
+        if annex_b[i] == 0 && annex_b[i + 1] == 0 && annex_b[i + 2] == 1 {
+            if let Some(s) = start {
+                out.push(&annex_b[s..i]);
+            }
+            i += 3;
+            start = Some(i);
+        } else {
+            i += 1;
+        }
+    }
+    if let Some(s) = start {
+        out.push(&annex_b[s..]);
+    }
+    out
+}
+
+/// One access unit as a length-prefixed AVCC sample with `cabac_zero_word` --
+/// `zeros` zero bytes -- inside the *last* coded NAL's declared length. That is
+/// byte-for-byte what a phone-camera encoder writes, and what a decoder that
+/// stops consuming at the last NAL leaves behind as "not a NAL".
+fn sample_with_trailing_zeros(annex_b: &[u8], zeros: usize) -> (Vec<u8>, bool) {
+    let mut coded: Vec<&[u8]> = Vec::new();
+    let mut key = false;
+    for nal in nals(annex_b) {
+        let end = nal.iter().rposition(|&b| b != 0).map_or(0, |p| p + 1);
+        let nal = &nal[..end];
+        if nal.is_empty() {
+            continue;
+        }
+        match nal[0] & 0x1f {
+            7 | 8 | 6 | 9 => continue, // parameter sets/SEI live in avcC or are dropped
+            5 => key = true,
+            _ => {}
+        }
+        coded.push(nal);
+    }
+    let mut sample = Vec::new();
+    let last = coded.len().saturating_sub(1);
+    for (i, nal) in coded.iter().enumerate() {
+        let len = nal.len() + if i == last { zeros } else { 0 };
+        sample.extend_from_slice(&(len as u32).to_be_bytes());
+        sample.extend_from_slice(nal);
+        if i == last {
+            sample.extend(std::iter::repeat_n(0u8, zeros));
+        }
+    }
+    (sample, key)
+}
+
+/// An mp4 cut from `test_baseline.mp4` whose every H.264 sample ends in four
+/// zero bytes.
+fn write_trailing_zero_fixture(src: &Path, out: &Path, frames: usize) {
+    let (meta, mut demuxer) = Demuxer::open(src).expect("open fixture source");
+    let first = demuxer.next_access_unit().expect("read").expect("au");
+    let (sps, pps) = mux::parameter_sets(&first).expect("parameter sets in the first au");
+    let mut muxer = Mp4Muxer::create(
+        out,
+        &VideoParams {
+            width: meta.width,
+            height: meta.height,
+            frame_rate: meta.frame_rate,
+            sps,
+            pps,
+        },
+        None,
+    )
+    .expect("create fixture");
+    let (sample, key) = sample_with_trailing_zeros(&first, 4);
+    muxer.write_coded_sample(&sample, key).expect("first sample");
+    for _ in 1..frames {
+        let Some(au) = demuxer.next_access_unit().expect("read") else {
+            break;
+        };
+        let (sample, key) = sample_with_trailing_zeros(&au, 4);
+        muxer.write_coded_sample(&sample, key).expect("sample");
+    }
+    muxer.finish().expect("finish fixture");
+}
+
+/// A phone-camera mp4 ends its every coded sample in `cabac_zero_word`. The
+/// plugin consumed each access unit only up to the last NAL cros-codecs
+/// reported and fed the leftover zero bytes back as if they were the next unit;
+/// `Nalu::next` refuses a buffer with no start code ("No NAL found"), so the
+/// whole session failed with code -2 before the first picture -- the export's
+/// `hardware decode failed (code -2)` on a file VA-API otherwise decodes.
+#[test]
+#[ignore = "needs libengine_hw.so and a VA-API driver"]
+fn hardware_decodes_samples_with_trailing_zero_words() {
+    let out = Scratch::file("ve_hw_trailing_zeros", "mp4");
+    write_trailing_zero_fixture(&asset("test_baseline.mp4"), &out, 30);
+    let mut hw = open_hw(&out);
+    let mut count = 0usize;
+    while let Some((_, _, _, w, h)) = hw
+        .next_frame()
+        .expect("hardware decode of trailing-zero samples")
+    {
+        assert_eq!((w, h), (1280, 720), "frame {count} dims");
+        count += 1;
+    }
+    assert_eq!(count, 30, "every picture decoded");
 }

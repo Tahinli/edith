@@ -18,8 +18,11 @@ use engine::{AudioSession, Clip, PlaybackSession, Project};
 /// The fixtures `scripts/gen_fixtures.sh` writes: 3 s of 440 Hz left / 880 Hz
 /// right at 44.1k stereo, under a 1 Hz volume pulse -- the same tone
 /// `test_av.mp4` carries, so a song and a video clip share one timeline.
-const CONTAINERS: [&str; 6] = [
+/// `test_tone.mpg` is the same MPEG audio stream under the standard's spelling
+/// rather than the codec's; the cover-carrying `.mpeg` has its own test below.
+const CONTAINERS: [&str; 7] = [
     "test_tone.mp3",
+    "test_tone.mpg",
     "test_tone.wav",
     "test_tone.flac",
     "test_tone.ogg",
@@ -789,6 +792,47 @@ fn an_audio_only_file_wearing_an_mp4_extension_still_opens() {
     );
     assert_eq!(session.lane_clips(Lane::A1).len(), 1);
     assert!((session.timeline_duration() - 3.0).abs() < 0.1);
+}
+
+/// An MPEG audio stream wearing the *standard's* spelling -- `.mpeg`, what a
+/// voice note or a tagged download off the web is called -- with a JPEG cover
+/// muxed into its ID3v2 tag beside the sound. Two claims, and the first is the
+/// bug: the spelling has to reach the audio door at all (`is_audio`, and with
+/// it every lane decision and the import itself). While the extension list did
+/// not admit it the file fell through to the mp4 demuxer and the library door
+/// answered `IMPORT FAILED: <name> — file contains a box with a larger size
+/// than it`, this test's `import`/`open` failing in exactly those words. The
+/// second is that the cover is not mistaken for a picture: symphonia skips the
+/// ID3v2 tag, the file opens audio-only, and the tone decodes non-silent.
+#[test]
+fn an_mpeg_audio_file_with_a_cover_stream_opens_and_imports() {
+    let name = "test_tone_cover.mpeg";
+    let path = asset(name);
+    assert!(engine::is_audio(&path), "{name} is sound");
+
+    // The open door: a song *is* a timeline, and no cover stream puts a clip on
+    // the video lane.
+    let session = open(&path);
+    assert!(
+        session.lane_clips(Lane::V1).is_empty(),
+        "{name}: the cover is not a picture source"
+    );
+    assert_eq!(session.lane_clips(Lane::A1).len(), 1);
+    assert!((session.timeline_duration() - 3.0).abs() < 0.1, "{name}");
+    drop(session);
+
+    // The library door the message came from: an import into a session that
+    // already has a timeline.
+    let mut session = open(asset("test_tone.mp3"));
+    import_and_place(&mut session, &path);
+    drop(session);
+
+    let (rate, channels, samples) = decode(&path);
+    assert_eq!((rate, channels), (44100, 2), "{name}");
+    let secs = samples.len() as f64 / f64::from(rate) / f64::from(channels);
+    assert!((secs - 3.0).abs() < 0.1, "{name}: {secs:.3} s of audio");
+    let peak = samples.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+    assert!(peak > 0.05, "{name}: decoded everything silent (peak {peak})");
 }
 
 /// The same fallback in [`PlaybackSession::open_project`]'s scaffold branch: a
