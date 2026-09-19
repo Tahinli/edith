@@ -78,8 +78,11 @@ Two faces, fixed roles (bundled, no runtime deps):
 
 Scale: 18px hero timecode (700, colons in `ink3`) · 15px labels/rows (500) · 13–14px chords
 and metadata (500) · 12px section heads (Archivo 700, uppercase, +0.14em letter-spacing, `ink3`).
-Room/column heads (Settings) are 15px Archivo 700 `ink1`; in-list section heads stay 12px `ink3`
+Room/column heads are 15px Archivo 700 `ink1`; in-list section heads stay 12px `ink3`
 (2026-09-10 -- the settings columns read as body text and a person could not find them).
+Settings itself is a tab strip since 2026-09-19 (one section shows at a time), so its heads are
+gone: the tabs wear the dock's tab look instead -- 15px Archivo 500, the showing tab marked by a
+1px `ink1` top rule and `ink1` text, the resting one `ink3`.
 Nothing below 10px. Every size is a whole pixel (no half-pixel sizes -- they put glyph baselines
 off the pixel grid and blurred cosmic-text's AA). No italics. Tabular figures wherever digits
 align.

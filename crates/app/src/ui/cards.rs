@@ -934,19 +934,6 @@ impl Player {
                         .child(note(
                             format!("{source} → {}", file_name(&self.export_path)).into(),
                         ))
-                        .child(note(
-                            match armed {
-                                true => {
-                                    "cancelling deletes what has been written so far".to_string()
-                                }
-                                false => format!(
-                                    "{} cancels · esc alone does nothing while this runs · the \
-                                     timeline is read-only until it finishes",
-                                    self.keymap.display(ActionId::CancelExport)
-                                ),
-                            }
-                            .into(),
-                        ))
                         // One button, or the pair that answers it: never a
                         // control that cycles -- both choices are on screen at
                         // once, each saying which one it is.
