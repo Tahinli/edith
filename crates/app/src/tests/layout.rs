@@ -4093,6 +4093,63 @@ fn the_settings_sections_are_tabs_that_carry_their_own_explanation() {
     }
 }
 
+/// The page's own geometry, after the user retired the below-picture sheet
+/// (2026-09-19: "this settings section should be a modal instead of covering
+/// the timeline"). The page is a centred modal now -- a centred scrim and a
+/// plate of one tabbed column's own measure, never `w_full()`, which put a
+/// `justify_between` row's value a window away from its label, and never the
+/// [`crate::ui::stance::below_picture_floor`] anchor that laid the sheet over
+/// the bench at the window's full width. The height is a viewport cap with
+/// headroom, the rows scroll under the strip when a short window cannot hold
+/// them, and the modal keeps the two things its callers read: the
+/// `settings-card` id and the press-away exit (`this.close_card()`, the same
+/// one every other card's scrim leads with). A source scan, like every other
+/// guard on this page -- this binary renders no window of its own.
+#[test]
+fn the_settings_page_is_a_centred_modal_with_one_column_of_measure() {
+    let source = src_text("ui/settings_stance.rs");
+    let start = source
+        .find("pub(crate) fn render(")
+        .expect("the page's render fn");
+    let body = &source[start..];
+    let end = body.find("\n}\n").map_or(body.len(), |at| at + 2);
+    let body = &body[..end];
+
+    // Centred on both axes, and the below-picture sheet gone with the rest
+    // of it: no floor arithmetic, no bottom-edge alignment, no full-width
+    // plate.
+    for needle in [".justify_center()", ".items_center()"] {
+        assert!(body.contains(needle), "the settings modal lost {needle}");
+    }
+    for gone in ["below_picture_floor", "items_end()", "w_full()"] {
+        assert!(
+            !body.contains(gone),
+            "the settings page drew {gone} again -- that is the below-picture sheet, \
+             not the centred modal the user asked for"
+        );
+    }
+    // The plate: one column's own measure with its yield for a narrow centre
+    // column, a capped height, and the rows scrolled inside the cap.
+    for needle in [
+        ".id(\"settings-card\")",
+        ".w(px(SETTINGS_W))",
+        ".max_w(relative(1.))",
+        ".max_h(px(max_h))",
+        "\"settings-rows\"",
+        "overflow_y_scroll()",
+    ] {
+        assert!(
+            body.contains(needle),
+            "the settings modal lost {needle} -- the plate is no longer one capped \
+             column with its rows scrolling"
+        );
+    }
+    assert!(
+        body.contains("this.close_card()"),
+        "the settings scrim swallows the press without closing the modal"
+    );
+}
+
 /// The Picture row said every refused format's reason after its value
 /// (`H.264 no picture -- an mp4 would \u{b7} AV1 no picture -- ...`; the user
 /// called it "funny"). A row says its own pick: one value, and a refusal only

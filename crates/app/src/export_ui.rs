@@ -686,13 +686,15 @@ pub(crate) fn probe_settings(format: Format, audio_kbps: u32, seat: EncoderSeat)
 
 /// The budget's bounds, the engine's own (`engine::export`'s `MIN_BITRATE`
 /// and `MAX_EXPLICIT_BITRATE`): a number outside them would be written as a
-/// different one, so the lever and the field clamp to exactly these.
-pub(crate) const BPS_MIN: u64 = 1_000_000;
+/// different one, so the lever and the field clamp to exactly these. The floor
+/// is 100 kbps, not a megabit: a sub-Mbps delivery is an export too, and at a
+/// megabit this row could not say `0.6` at all.
+pub(crate) const BPS_MIN: u64 = 100_000;
 pub(crate) const BPS_MAX: u64 = 50_000_000;
 
-/// A wheel notch, and a notch with shift held: 0.1 and 1 Mbps. Fifty presses
-/// is not a way across this range, and a tenth is the smallest step the row's
-/// own readout can show.
+/// A wheel notch, and a notch with shift held: 0.1 and 1 Mbps. Five hundred
+/// tenths is not a way across this range, and a tenth is the smallest step
+/// the row's own readout can show.
 pub(crate) const BPS_FINE: u64 = 100_000;
 pub(crate) const BPS_COARSE: u64 = 1_000_000;
 

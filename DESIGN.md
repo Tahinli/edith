@@ -340,7 +340,10 @@ Before any new surface merges, it answers:
 4. **Scale:** define its degradation ladder step-by-width before merge.
 5. **Achromatic check:** zero new hues in chrome; film inks only for identity; white only if it
    is literally the lamp.
-6. **Occlusion check:** the picture stays visible; nothing floats over the screen.
+6. **Occlusion check:** the picture stays visible; nothing floats over the screen. Accepted
+   exceptions are named where they live: the held-`?` cheat-sheet (amendment above), and the
+   settings page, a centred modal since 2026-09-19 (user: the below-picture sheet covered the
+   timeline) — it floats over the screen while open, and closes on a click away or `esc`.
 7. **States:** empty (safelight-composed, never bare), refusing (reason named), failing
    (notice plate with remedy).
 8. **Feel:** one ≤150ms motion spec from §10's vocabulary, or a stated reason for none.

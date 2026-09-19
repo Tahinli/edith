@@ -777,38 +777,51 @@ fn export_section(player: &Player, cx: &mut Context<Player>) -> impl IntoElement
         ))
 }
 
-/// The page itself: a plate in the room's own below-picture footprint,
-/// closed by a click away or `esc` through [`Player::close_card`] like every
-/// other card here.
+/// The centred modal's plate width: one tabbed column's own measure, wide
+/// enough for the longest row a section carries (the EXPORT range's marks
+/// line, its chords and all) beside its label -- and no wider. The sheet this
+/// replaces was `w_full()`, which read every row as a line stretched across
+/// the room with its value a window away from the label it belongs to.
+/// [`KEYS_W`]'s class, and a step past its number: these rows carry the same
+/// label-left/stroke-right anatomy with a value where that card has none.
+const SETTINGS_W: f32 = 480.;
+
+/// The breathing room the modal keeps against the window edge, and the
+/// margin the plate's height cap is measured less -- headroom that keeps a
+/// short window's plate off both edges rather than clipped against them.
+const SETTINGS_EDGE: f32 = 24.;
+
+/// The floor under that cap, so a very short window's plate still shows the
+/// strip and a row under it -- the rows scroll from there.
+const SETTINGS_MIN_H: f32 = 160.;
+
+/// The page itself: a centred modal card, closed by a click away or `esc`
+/// through [`Player::close_card`] like every other card here.
 ///
-/// It used to be a centred modal over a dimming scrim, which put the whole
-/// settings sheet -- and every picker opened off one of its rows -- straight
-/// over the picture: DESIGN §11 check 6's one hard occlusion rule, and half
-/// of the user's 2026-08-21 report about menus "not aligning with our
-/// design". Anchored to [`crate::ui::stance::below_picture_floor`] it sits
-/// over the bench and ledger exactly as the export plate and the menus
-/// already do, and the catcher behind it paints nothing rather than tinting
-/// the frame.
+/// It held to [`crate::ui::stance::below_picture_floor`] from 2026-08-21
+/// until 2026-09-19: a centred sheet then drew the whole page -- and every
+/// picker opened off one of its rows -- over the picture (DESIGN §11 check
+/// 6's occlusion rule, half of the user's own report about menus "not
+/// aligning with our design"), so the page was anchored over the bench and
+/// ledger at the window's full width. The user 2026-09-19 retired that read
+/// -- "this settings section should be a modal instead of covering the
+/// timeline" -- so the plate is centred again, at one tabbed column's own
+/// measure: it floats over the room's middle, the timeline beneath is not
+/// laid under a full-width sheet, and a short window scrolls the rows under
+/// the strip rather than clipping them. The catcher still paints nothing
+/// rather than tinting the frame, the same rule the menus it opens follow.
 pub(crate) fn render(
     player: &Player,
     window_size: Size<Pixels>,
     cx: &mut Context<Player>,
 ) -> impl IntoElement {
-    let floor = crate::ui::stance::below_picture_floor(
-        f32::from(window_size.height),
-        player.split_px(Split::Bench, window_size),
-    );
-    // Below the time band, not merely below the picture: the transport and
-    // the Export chip live on that band and a sheet over them hides controls
-    // the editor is still using. Bench + ledger is this page's footprint.
-    let top = floor + crate::ui::stance::TIME_BAND_H;
-    let room = f32::from(window_size.height) - top;
+    // The plate's own cap, a [`SETTINGS_EDGE`] off each edge.
+    let max_h = (f32::from(window_size.height) - 2. * SETTINGS_EDGE).max(SETTINGS_MIN_H);
     drag_scrim(cx)
         .flex()
         .justify_center()
-        .items_end()
-        .pt(px(top + 6.))
-        .pb(px(6.))
+        .items_center()
+        .p(px(SETTINGS_EDGE))
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(|this, _: &MouseDownEvent, _, cx| {
@@ -820,14 +833,15 @@ pub(crate) fn render(
         .child(
             div()
                 .id("settings-card")
-                // The whole footprint's width: at 720p a 420px single column
-                // put Mix, the palette and the subtitle font below a fold with
-                // no visible scrollbar -- settings an editor cannot see are
-                // settings only a chord reaches, which is the defect class
-                // this page exists to close. The strip spends the width on
-                // tabs, and one section shows flat beneath it.
-                .w_full()
-                .max_h(px((room - 12.).max(120.)))
+                // One tabbed column's own measure, never the window's: the
+                // sheet this replaces spent the full width on one section --
+                // a folded list is now answered by the height cap and
+                // `settings-rows`' own scroll, not by the plate reaching for
+                // the window's edges. `max_w` yields to a centre column
+                // narrower than the measure (the 640px floor's own case).
+                .w(px(SETTINGS_W))
+                .max_w(relative(1.))
+                .max_h(px(max_h))
                 .on_mouse_down(MouseButton::Left, swallow)
                 .flex()
                 .flex_col()

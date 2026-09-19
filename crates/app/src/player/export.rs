@@ -536,7 +536,7 @@ impl Player {
         if self.custom_bps > 0 {
             return self.custom_bps;
         }
-        self.session.as_ref().map_or(BPS_MIN * 6, |s| {
+        self.session.as_ref().map_or(6_000_000, |s| {
             let (w, h) = s.resolution();
             auto_bps(w, h, s.meta().frame_rate)
         })
