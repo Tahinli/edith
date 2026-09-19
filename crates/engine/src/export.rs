@@ -112,7 +112,12 @@ fn picture_progress(done: u32, total: u32) -> u32 {
 /// D2 rate control: bits per pixel per second, then a sane range. 720p30 lands
 /// at 2.76 Mbps, which S1 measured the software encoder hitting within 1%.
 const BITS_PER_PIXEL: f64 = 0.1;
-const MIN_BITRATE: u64 = 1_000_000;
+/// The floor under a rate somebody *asked* for, and under the derived one: 100
+/// kbps, so a sub-Mbps budget -- a lo-fi delivery, a tiny picture, a
+/// phone-rate master -- is a rate this export is written at. A megabit was the
+/// old floor, and it silently rewrote every such ask. Nothing below this is
+/// worth a container: the sound's own row starts at 128 kbps.
+const MIN_BITRATE: u64 = 100_000;
 const MAX_BITRATE: u64 = 20_000_000;
 
 /// The ceiling on a bitrate somebody *asked* for, which is a different question
@@ -679,8 +684,9 @@ fn faded(project: &Project) -> bool {
 }
 
 /// The bitrate an export codes at: the caller's number clamped into what an
-/// asked-for rate may be ([`MAX_EXPLICIT_BITRATE`]), the derived one where there
-/// was none. Clamped rather than refused, for the reason [`Enc::open`] states.
+/// asked-for rate may be ([`MIN_BITRATE`]..[`MAX_EXPLICIT_BITRATE`]), the
+/// derived one where there was none. Clamped rather than refused, for the
+/// reason [`Enc::open`] states.
 fn bitrate_of(meta: &VideoMeta, settings: &ExportSettings) -> u64 {
     settings.bitrate.map_or_else(
         || bitrate_for(meta),
@@ -5370,7 +5376,8 @@ mod tests {
         };
         // 1280 * 720 * 30 * 0.1
         assert_eq!(bitrate_for(&meta(1280, 720, 30.0)), 2_764_800);
-        assert_eq!(bitrate_for(&meta(320, 240, 30.0)), MIN_BITRATE, "tiny");
+        assert_eq!(bitrate_for(&meta(320, 240, 30.0)), 230_400, "tiny");
+        assert_eq!(bitrate_for(&meta(160, 120, 15.0)), MIN_BITRATE, "tinier floors");
         assert_eq!(bitrate_for(&meta(3840, 2160, 60.0)), MAX_BITRATE, "huge");
         // A rate somebody typed goes through untouched to its own ceiling, which
         // is above where the derived one stops: the card offers 50 Mbps, and a
@@ -5386,6 +5393,7 @@ mod tests {
         };
         assert_eq!(asked(50_000_000), 50_000_000, "the card's ceiling travels");
         assert_eq!(asked(21_000_000), 21_000_000, "past the derived range");
+        assert_eq!(asked(600_000), 600_000, "a sub-Mbps ask travels");
         assert_eq!(asked(999_000_000), MAX_EXPLICIT_BITRATE, "still bounded");
         assert_eq!(asked(1), MIN_BITRATE, "and floored");
     }

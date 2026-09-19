@@ -907,13 +907,13 @@ fn the_budget_is_the_one_number_the_engine_gets() {
     }
     // The lever's bounds are the engine's own (`MIN_BITRATE`,
     // `MAX_EXPLICIT_BITRATE`), so no reachable number is silently rewritten.
-    assert_eq!(BPS_MIN, 1_000_000);
+    assert_eq!(BPS_MIN, 100_000);
     assert_eq!(BPS_MAX, 50_000_000);
     // The default the lever opens on is the engine's automatic figure for
     // the picture that is open -- never the 0 Mbps the old `custom_mbps: 0`
     // put on screen.
     assert_eq!(auto_bps(1920, 1080, 30.), 6_220_800);
-    assert!(auto_bps(320, 240, 30.) >= BPS_MIN, "a tiny picture floors");
+    assert_eq!(auto_bps(160, 120, 15.), BPS_MIN, "a tiny picture floors");
     assert!(auto_bps(7680, 4320, 60.) <= 20_000_000, "and a huge one caps");
     for bps in [auto_bps(1920, 1080, 30.), auto_bps(320, 240, 24.)] {
         assert!((BPS_MIN..=BPS_MAX).contains(&bps));
@@ -930,9 +930,11 @@ fn a_budget_is_said_four_ways_and_lands_inside_the_engines_range() {
     assert_eq!(parse_budget("6.5", seconds, audio), Some(6_500_000));
     assert_eq!(parse_budget("6.5 mbps", seconds, audio), Some(6_500_000));
     assert_eq!(parse_budget("12M", seconds, audio), Some(12_000_000));
-    // 850 kbps is under the engine's floor, so it lands *on* the floor --
-    // clamped, and shown clamped in the same keystroke.
-    assert_eq!(parse_budget("850k", seconds, audio), Some(BPS_MIN));
+    // A sub-Mbps ask is a rate this row can say: 850 kbps travels as itself.
+    assert_eq!(parse_budget("850k", seconds, audio), Some(850_000));
+    // Under the engine's floor it lands *on* the floor -- clamped, and shown
+    // clamped in the same keystroke.
+    assert_eq!(parse_budget("50k", seconds, audio), Some(BPS_MIN));
     assert_eq!(parse_budget("2500k", seconds, audio), Some(2_500_000));
     // `G` is a target file size: 1.2 GB over a minute is 160 Mbit/s of file,
     // less the sound -- past the ceiling, so the ceiling is what is written.
@@ -964,8 +966,9 @@ fn the_budget_lever_steps_by_a_tenth_and_a_whole_megabit() {
     assert_eq!(BPS_COARSE, 1_000_000);
     assert_eq!(rate_label(6_000_000 + BPS_FINE), "6.1");
     assert_eq!(rate_label(6_000_000 + BPS_COARSE), "7.0");
-    // Fifty notches of the coarse step crosses the whole range, which is
-    // what a wheel is for; the fine one would take five hundred.
+    // Forty-nine coarse notches carry the range with change left in the
+    // fiftieth, which is what a wheel is for; the fine step would take five
+    // hundred.
     assert_eq!((BPS_MAX - BPS_MIN) / BPS_COARSE, 49);
     // The step arithmetic itself, as `Player::nudge_budget` does it: a
     // saturating walk that stops at both ends rather than wrapping.

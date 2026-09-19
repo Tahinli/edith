@@ -796,10 +796,12 @@ fn the_budget_row_states_the_size_before_it_is_written() {
     assert_eq!(size_label(999_999_999), "1000 MB");
     assert_eq!(size_label(1_000_000_000), "1.00 GB");
     assert_eq!(size_label(1_240_000_000), "1.24 GB");
-    // The lever's own readout, one decimal, in the unit it is moved in.
+    // The lever's own readout, one decimal, in the unit it is moved in --
+    // including below a megabit, which is where the floor lives now.
     assert_eq!(rate_label(6_000_000), "6.0");
     assert_eq!(rate_label(6_500_000), "6.5");
-    assert_eq!(rate_label(BPS_MIN), "1.0");
+    assert_eq!(rate_label(600_000), "0.6");
+    assert_eq!(rate_label(BPS_MIN), "0.1");
     // Row 3's range readout: the marked span where there is one, and a
     // sound-only file names no film to take a range from.
     assert_eq!(range_word(None, true), "whole film");
