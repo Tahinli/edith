@@ -2,6 +2,7 @@
 //! silence, the mixer and the equalizer.
 
 use crate::*;
+use crate::ui::settings_stance::SettingsTab;
 
 impl Player {
     /// Cycles the *project's* resolution through [`RESOLUTIONS`], starting from
@@ -927,12 +928,12 @@ impl Player {
         self.apply_encoder(EncoderSeat::ALL[(at + 1) % EncoderSeat::ALL.len()], cx);
     }
 
-    /// Opens the settings page (PROJECT rows beside EDITOR rows,
-    /// `ui::settings_stance`): the one door for "edit project and editor
-    /// settings" -- refused while an export is running, same as every other
-    /// card here, since the exporting card owns this same modal slot
-    /// (`oracle.rs` agrees: `ActionId::Settings` is `No` there too, for the
-    /// same reason).
+    /// Opens the settings page (three tabs -- PROJECT/EDITOR/EXPORT -- over
+    /// whichever section is showing, `ui::settings_stance`): the one door for
+    /// "edit project and editor settings" -- refused while an export is
+    /// running, same as every other card here, since the exporting card owns
+    /// this same modal slot (`oracle.rs` agrees: `ActionId::Settings` is `No`
+    /// there too, for the same reason).
     pub(crate) fn open_settings(&mut self, cx: &mut Context<Self>) {
         if self.exporting().is_some() {
             return;
@@ -941,6 +942,19 @@ impl Player {
         self.close_card();
         self.settings_open = true;
         self.context_menu = None;
+        cx.notify();
+    }
+
+    /// Which of the settings page's three tabs is showing -- the strip's one
+    /// door, and the page's only piece of state that [`Self::close_card`]
+    /// leaves alone, so a close and a reopen come back to the section a hand
+    /// left rather than snapping back to PROJECT. Display state and nothing
+    /// else: no row reads it, it writes no project value, and it therefore
+    /// never lights the ledger or arms autosave -- picking a tab is not an
+    /// edit, which is why this is a setter with no [`Self::mark_dirty`] in
+    /// it, unlike every row the page carries that writes a value.
+    pub(crate) fn set_settings_tab(&mut self, tab: SettingsTab, cx: &mut Context<Self>) {
+        self.settings_tab = tab;
         cx.notify();
     }
 

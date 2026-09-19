@@ -1257,6 +1257,13 @@ fn viz_style_verbs(player: &Player, cx: &mut Context<Player>) -> impl IntoElemen
         .flex()
         .flex_col()
         .gap(px(2.))
+        .child(
+            div()
+                .flex_none()
+                .pt(px(4.))
+                .px(px(8.))
+                .child(section_head("VISUALIZER")),
+        )
         .child(pick(
             "dock-viz-fill",
             "Fill",

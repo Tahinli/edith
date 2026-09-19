@@ -567,6 +567,15 @@ struct Player {
     /// list). Cleared by [`Player::close_card`], the one reset list every
     /// opener routes through.
     settings_open: bool,
+    /// Which of the settings page's three tabs is showing
+    /// ([`ui::settings_stance::render`]'s strip). A field rather than state
+    /// inside the page so a close and a reopen return to the section a hand
+    /// left; it is deliberately *not* in [`Player::close_card`]'s reset list,
+    /// the same way the dock's tab pick outlives its panel
+    /// ([`Player::dock_src_active`]). Nothing but the strip reads it, and
+    /// picking a tab writes no project value, so the pick never arms
+    /// autosave.
+    settings_tab: ui::settings_stance::SettingsTab,
     /// Where the actions list is scrolled to. Held here rather than left to
     /// the wheel alone: forty actions are four times what a 360 px window
     /// shows, and the rows past the fold have to be reachable from the
@@ -1057,6 +1066,7 @@ fn main() {
                     keymap: keymap.clone(),
                     keys_open: false,
                     settings_open: false,
+                    settings_tab: ui::settings_stance::SettingsTab::Project,
                     keys_scroll: ScrollHandle::new(),
                     lanes_scroll: ScrollHandle::new(),
                     eq_scroll: ScrollHandle::new(),

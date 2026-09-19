@@ -2338,9 +2338,10 @@ fn every_darkroom_menu_sizes_its_list_against_the_floor_room_not_the_raw_viewpor
 /// (`ui::dock_stance::config_path`/`ui::theme::config_path`/
 /// `keymap::Keymap::config_path`) directly, which every editor-side row
 /// already routes around through its own opener. A row wired to the wrong
-/// section's opener is exactly the regression a page organised around two
-/// headings invites; this pins each half to its own doors so the two lists
-/// cannot cross.
+/// section's opener is exactly the regression a page organised around named
+/// sections invites -- and the tab strip did not loosen it: a tab decides
+/// which section is *shown*, never which door a row opens. This pins each
+/// half to its own doors so the two lists cannot cross.
 #[test]
 fn settings_project_and_editor_sections_open_disjoint_doors() {
     let source = src_text("ui/settings_stance.rs");
@@ -4019,35 +4020,75 @@ fn no_region_root_wears_a_focus_ring() {
 
 /// The user could not find the three columns (2026-09-10: "I couldn't realize
 /// them when I look at"), because their heads were 12px `ink3` -- the room's
-/// quietest type -- with a prose tail running on after each one. DESIGN §3's
-/// new line: a room/column head is 15px Archivo 700 `ink1`, and the prose is a
-/// hover plate (DESIGN §8), never ambient text on the head itself.
+/// quietest type -- with a prose tail running on after each one. The page's
+/// answer has since become a tab strip (user 2026-09-19): three columns at
+/// once asked the eye to find three anchors in one glance and then to read a
+/// column that began mid-screen. The pin moved with the page: the sections are
+/// tabs now, each tab wears the dock's own tab look -- [`crate::ui::dock_stance`]'s
+/// `dock_tab`, reproduced here because that fn is private to its module -- and
+/// each section's one-line explanation rides the tab's hover plate
+/// (DESIGN §8), never running on after a head as ambient text.
 #[test]
-fn the_settings_columns_wear_room_heads_not_section_heads() {
+fn the_settings_sections_are_tabs_that_carry_their_own_explanation() {
     let source = src_text("ui/settings_stance.rs");
-    let start = source.find("fn room_head(").expect("the room head");
+    let start = source.find("fn settings_tab(").expect("the tab builder");
     let body = &source[start..source[start..].find("\n}\n").unwrap() + start];
+    // The dock's own tab look: no pill, no fill; a 1px `ink1` top rule and
+    // `ink1` text mark the showing tab, the resting one is `ink3`. Every tab
+    // is a `hitmap::control` wearing a plate of its own (the hover-line gate
+    // below counts the plates one to one).
     for needle in [
         "type_scale::LABEL_ROW_PX",
-        "FontWeight::BOLD",
+        "gpui::FontWeight::MEDIUM",
+        "border_t_1()",
         "rgb(INK1())",
+        "INK3()",
+        ".cursor_pointer()",
         ".tooltip(",
-        ".pb(px(12.))",
+        "hitmap::control(",
     ] {
-        assert!(body.contains(needle), "a room head lost {needle}");
+        assert!(body.contains(needle), "a settings tab lost {needle}");
     }
     assert!(
-        !body.contains("INK3()") && !body.contains("type_scale::head()"),
-        "the room heads fell back to the 12px in-list section head"
+        !body.contains("type_scale::head()"),
+        "the settings tabs fell back to the 12px in-list section head"
     );
-    // Each column head is one word, and its prose lives on the plate.
-    for head in ["\"PROJECT\"", "\"EDITOR\"", "\"EXPORT\""] {
-        assert!(source.contains(head), "the settings room lost its {head} head");
+    // Three tabs, one per section, named the way the room names the section.
+    for tab in ["project", "editor", "export"] {
+        assert!(
+            source.contains(&format!("\"settings-tab-{tab}\"")),
+            "the settings strip has no {tab} tab"
+        );
     }
+    // Each section's one-line explanation is the tab's plate now.
+    for explanation in [
+        "stored in the .edith file",
+        "this machine, this window",
+        "what a delivery is written as",
+    ] {
+        assert!(
+            source.contains(explanation),
+            "a settings tab lost its explanation: {explanation}"
+        );
+    }
+    // ...and none of them runs on after a head as ambient text.
     for run_on in ["PROJECT \u{b7}", "EDITOR \u{b7}", "EXPORT \u{b7}"] {
         assert!(
             !source.contains(run_on),
             "a settings head grew its prose tail back: {run_on}"
+        );
+    }
+    // One section shows at a time: the plate mounts the showing tab's own
+    // section and nothing else -- a page that drew all three under the strip
+    // would be the three columns back with the strip doing nothing.
+    for (tab, section) in [
+        ("SettingsTab::Project", "project_section(player, cx)"),
+        ("SettingsTab::Editor", "editor_section(player, cx)"),
+        ("SettingsTab::Export", "export_section(player, cx)"),
+    ] {
+        assert!(
+            source.contains(&format!("{tab} => {section}")),
+            "the {tab} tab no longer shows {section}"
         );
     }
 }

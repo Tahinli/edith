@@ -1,6 +1,12 @@
 //! The settings page (user complaint: "we should have a settings page that
-//! we can edit project and editor settings"). Two clearly-headed sections,
-//! per the split rule a rubric pass settled:
+//! we can edit project and editor settings"). Three sections, per the split
+//! rule a rubric pass settled -- but never three columns at once: they are
+//! tabs of one strip since 2026-09-19 (user: the three-column row asked the
+//! eye to find three anchors in one glance and then to read a column that
+//! began mid-screen). One section shows under the strip; the strip wears the
+//! dock's own tab look ([`crate::ui::dock_stance`]'s `dock_tab`, reproduced
+//! here because that fn is private to its module) and each tab's hover plate
+//! carries the one-line explanation the column head used to trail:
 //!
 //! - PROJECT: anything that changes the rendered output or is stored in the
 //!   `.edith` file -- resolution, fps, sample-rate, the HDR tonemap, the mix.
@@ -37,27 +43,61 @@ use crate::ui::type_scale;
 use crate::*;
 use engine::colorspace::ContentLight;
 
-/// The room's three anchors (user 2026-09-10: "I couldn't realize them when I
-/// look at"): 15px Archivo 700 `ink1`, uppercase, with a row's own height of
-/// air below (+12px past a row's gap) so a head reads as the start of a
-/// column and not as one more line in it. The prose that used to trail each
-/// head (`· stored in the .edith file`) is a hover plate on the head now,
-/// ≤6 words -- DESIGN §8: a distinction that matters is a plate, not ambient
-/// text. In-list section heads (the dock's own KEYS head) stay 12px
-/// `ink3`.
-fn room_head(id: &'static str, text: &'static str, tail: &'static str) -> impl IntoElement {
-    let style = type_scale::label(type_scale::LABEL_ROW_PX, gpui::FontWeight::BOLD);
-    let tail: SharedString = tail.into();
+/// Which of the page's three sections is showing. Kept on [`Player`] beside
+/// [`Player::settings_open`] rather than in the leaf, so a close and a reopen
+/// return to the section a hand left instead of snapping back to the first --
+/// the dock keeps its own tab pick the same way ([`Player::dock_src_active`]).
+/// Display state and nothing else: no row reads it, and picking a tab writes
+/// no project value, so the pick never lights the ledger.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SettingsTab {
+    Project,
+    Editor,
+    Export,
+}
+
+/// One tab of the page's strip (PROJECT/EDITOR/EXPORT), wearing the dock's
+/// own tab look -- [`crate::ui::dock_stance`]'s `dock_tab` verbatim: no pill,
+/// no fill, no rounded button, a 1px `ink1` top rule and `ink1` text mark the
+/// showing tab, the resting one is `ink3`, and the whole row is a
+/// [`hitmap::control`] so the harness can press it. The section's one-line
+/// explanation -- what used to run on after a column head as ambient prose --
+/// is the tab's hover plate (DESIGN §8: a distinction that matters is a plate,
+/// not ambient text).
+fn settings_tab(
+    id: &'static str,
+    label_text: &'static str,
+    explanation: &'static str,
+    tab: SettingsTab,
+    active: bool,
+    cx: &mut Context<Player>,
+) -> impl IntoElement {
+    let style = type_scale::label(type_scale::LABEL_ROW_PX, gpui::FontWeight::MEDIUM);
     div()
         .id(id)
-        .flex_none()
-        .pt(px(4.))
-        .pb(px(12.))
-        .font(style.font)
-        .text_size(style.size)
-        .text_color(rgb(INK1()))
-        .tooltip(move |_, cx| cx.new(|_| Tip(tail.clone())).into())
-        .child(text)
+        .flex_1()
+        .flex()
+        .items_center()
+        .justify_center()
+        .gap(px(4.))
+        .pt(px(6.))
+        .pb(px(6.))
+        .when(active, |d| d.border_t_1().border_color(rgb(INK1())))
+        .cursor_pointer()
+        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.set_settings_tab(tab, cx)))
+        .tooltip(crate::ui::widgets::tip_hover(
+            &format!("Show {}", label_text.to_lowercase()),
+            explanation,
+            None,
+        ))
+        .children(hitmap::control(id, label_text, true))
+        .child(
+            div()
+                .font(style.font.clone())
+                .text_size(style.size)
+                .text_color(rgb(if active { INK1() } else { INK3() }))
+                .child(label_text),
+        )
 }
 
 /// One row: a ≤16-char label, its current value in mono (units carried,
@@ -327,11 +367,6 @@ fn project_section(player: &Player, cx: &mut Context<Player>) -> impl IntoElemen
         .flex()
         .flex_col()
         .gap(px(2.))
-        .child(room_head(
-            "settings-head-project",
-            "PROJECT",
-            "stored in the .edith file",
-        ))
         .child(row_ink(
             "settings-resolution",
             "Resolution",
@@ -418,11 +453,6 @@ fn editor_section(player: &Player, cx: &mut Context<Player>) -> impl IntoElement
         .flex()
         .flex_col()
         .gap(px(2.))
-        .child(room_head(
-            "settings-head-editor",
-            "EDITOR",
-            "this machine, this window",
-        ))
         // The monitoring level, which lost its slider when the time band was
         // cleansed (DESIGN §5 -- "the level lives in Settings"). A readout and
         // not a widget: the number is spent rarely, so the wheel over the row
@@ -671,11 +701,6 @@ fn export_section(player: &Player, cx: &mut Context<Player>) -> impl IntoElement
         .flex()
         .flex_col()
         .gap(px(2.))
-        .child(room_head(
-            "settings-head-export",
-            "EXPORT",
-            "what a delivery is written as",
-        ))
         .child(row_full(
             "settings-export-picture",
             "Picture",
@@ -795,11 +820,12 @@ pub(crate) fn render(
         .child(
             div()
                 .id("settings-card")
-                // The whole footprint's width, two columns inside: at 720p a
-                // 420px single column put Mix, the palette and the subtitle
-                // font below a fold with no visible scrollbar -- settings an
-                // editor cannot see are settings only a chord reaches, which
-                // is the defect class this page exists to close.
+                // The whole footprint's width: at 720p a 420px single column
+                // put Mix, the palette and the subtitle font below a fold with
+                // no visible scrollbar -- settings an editor cannot see are
+                // settings only a chord reaches, which is the defect class
+                // this page exists to close. The strip spends the width on
+                // tabs, and one section shows flat beneath it.
                 .w_full()
                 .max_h(px((room - 12.).max(120.)))
                 .on_mouse_down(MouseButton::Left, swallow)
@@ -838,40 +864,52 @@ pub(crate) fn render(
                 })
                 .child(
                     div()
+                        .id("settings-tabs")
+                        .flex_none()
+                        .flex()
+                        .child(settings_tab(
+                            "settings-tab-project",
+                            "PROJECT",
+                            "stored in the .edith file",
+                            SettingsTab::Project,
+                            player.settings_tab == SettingsTab::Project,
+                            cx,
+                        ))
+                        .child(settings_tab(
+                            "settings-tab-editor",
+                            "EDITOR",
+                            "this machine, this window",
+                            SettingsTab::Editor,
+                            player.settings_tab == SettingsTab::Editor,
+                            cx,
+                        ))
+                        .child(settings_tab(
+                            "settings-tab-export",
+                            "EXPORT",
+                            "what a delivery is written as",
+                            SettingsTab::Export,
+                            player.settings_tab == SettingsTab::Export,
+                            cx,
+                        )),
+                )
+                // The showing section alone, on the plate's whole width: the
+                // three columns this row used to hold side by side -- each
+                // with its own head and a hairline down its left edge -- asked
+                // the eye to find three anchors at once and then to read a
+                // column that began mid-screen. The strip above is the way
+                // between them; there is one section in the tree at a time, so
+                // a row that is not showing cannot be reached by a tab stroke
+                // or by the pointer either.
+                .child(
+                    div()
                         .id("settings-rows")
                         .min_h(px(0.))
                         .overflow_y_scroll()
-                        .flex()
-                        .gap(px(16.))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w(px(0.))
-                                .child(project_section(player, cx)),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w(px(0.))
-                                .border_l_1()
-                                .border_color(rgb(DARK_HAIRLINE()))
-                                .pl(px(12.))
-                                .child(editor_section(player, cx)),
-                        )
-                        // The third column: what a delivery is written as, the
-                        // rows the export card used to hold (user: it was "too
-                        // complicated"). Beside the other two rather than under
-                        // them -- a fold with no scrollbar is the defect this
-                        // page's own two columns exist to avoid.
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w(px(0.))
-                                .border_l_1()
-                                .border_color(rgb(DARK_HAIRLINE()))
-                                .pl(px(12.))
-                                .child(export_section(player, cx)),
-                        ),
+                        .child(match player.settings_tab {
+                            SettingsTab::Project => project_section(player, cx).into_any_element(),
+                            SettingsTab::Editor => editor_section(player, cx).into_any_element(),
+                            SettingsTab::Export => export_section(player, cx).into_any_element(),
+                        }),
                 ),
         )
 }
