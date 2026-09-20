@@ -795,6 +795,14 @@ const SETTINGS_EDGE: f32 = 24.;
 /// strip and a row under it -- the rows scroll from there.
 const SETTINGS_MIN_H: f32 = 160.;
 
+/// The rows' one measure, spent by every tab alike: the tallest section's own
+/// height (PROJECT's seven rows at [`CONTROL_H`], the sections' 2px gaps
+/// between them), so a tab switch swaps the rows and never resizes the plate
+/// under the hand (user 2026-09-20: "switching between them feels weird"). A
+/// shorter section leaves air below its last row; a short window still
+/// scrolls, the plate's `max_h` cap shrinking this from `min_h(0)`.
+pub(crate) const SETTINGS_ROWS_H: f32 = 7. * CONTROL_H + 6. * 2.;
+
 /// The page itself: a centred modal card, closed by a click away or `esc`
 /// through [`Player::close_card`] like every other card here.
 ///
@@ -913,10 +921,13 @@ pub(crate) fn render(
                 // column that began mid-screen. The strip above is the way
                 // between them; there is one section in the tree at a time, so
                 // a row that is not showing cannot be reached by a tab stroke
-                // or by the pointer either.
+                // or by the pointer either. The area's height is the tallest
+                // section's own ([`SETTINGS_ROWS_H`]), so a tab switch swaps
+                // the rows and never resizes the plate under the hand.
                 .child(
                     div()
                         .id("settings-rows")
+                        .h(px(SETTINGS_ROWS_H))
                         .min_h(px(0.))
                         .overflow_y_scroll()
                         .child(match player.settings_tab {
