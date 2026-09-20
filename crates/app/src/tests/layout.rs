@@ -4144,6 +4144,36 @@ fn the_settings_page_is_a_centred_modal_with_one_column_of_measure() {
              column with its rows scrolling"
         );
     }
+    // One measure for every tab (user 2026-09-20: "switching between them
+    // feels weird" -- the plate hugged its rows, so PROJECT's seven and
+    // EXPORT's four resized it under the hand). The rows area wears the
+    // tallest section's fixed height, and that height is PROJECT's own
+    // arithmetic: count the section's rows out of its body rather than
+    // trusting the constant's comment.
+    assert!(
+        body.contains(".h(px(SETTINGS_ROWS_H))"),
+        "the settings rows lost their fixed measure -- a tab switch resizes the plate again"
+    );
+    let project = &source[source
+        .find("fn project_section(")
+        .expect("the PROJECT section")..];
+    let project = &project[..project.find("\n}\n").map_or(project.len(), |at| at + 2)];
+    let rows = [
+        "row(",
+        "row_ink(",
+        "row_static(",
+        "row_keyed(",
+        "row_full(",
+        "row_chord(",
+    ]
+    .iter()
+    .map(|call| project.matches(call).count())
+    .sum::<usize>();
+    assert_eq!(
+        crate::ui::settings_stance::SETTINGS_ROWS_H,
+        rows as f32 * CONTROL_H + (rows - 1) as f32 * 2.,
+        "SETTINGS_ROWS_H no longer measures the PROJECT section's {rows} rows"
+    );
     assert!(
         body.contains("this.close_card()"),
         "the settings scrim swallows the press without closing the modal"
