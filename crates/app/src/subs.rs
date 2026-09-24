@@ -333,9 +333,7 @@ pub(crate) fn subtitle_tail(session: &mut PlaybackSession, subs: Subs) -> Option
     match subs {
         Ok(tracks) => match session.add_subtitle_tracks(tracks) {
             0 => None,
-            n => Some(format!(
-                " · {n} subtitle track(s)"
-            )),
+            n => Some(format!(" · {n} subtitle track(s)")),
         },
         Err(e) => Some(format!(" — SUBTITLES UNREAD: {e}")),
     }
@@ -705,17 +703,33 @@ pub(crate) fn cues_at(cues: &[engine::subtitle::Cue], at: f64) -> Vec<&engine::s
         .collect()
 }
 
-/// The sources a repaint has not asked about yet. A key that is already there
-/// means "asked", whatever state it is in, which is what stops a decode already
-/// running from being started again by the next of sixty repaints a second.
+/// How long a failed waveform decode is left alone before the next repaint asks
+/// again: long enough that sixty repaints a second do not become sixty decodes,
+/// short enough that a file which arrived mid-copy has its envelope a moment
+/// after it lands. The engine memoizes no failure for the same reason
+/// ([`engine::waveform`]): the reason one failed may have gone away.
+pub(crate) const WAVE_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The sources a repaint has not asked about yet, as of `now`. A key that is
+/// already there means "asked", whatever state it is in -- which is what stops
+/// a decode already running from being started again by the next of sixty
+/// repaints a second -- with one exception: a [`Wave::Failed`] older than
+/// [`WAVE_RETRY`] is asked again, because a decode that failed once is not an
+/// answer about the file, only about the moment it was tried. A file with no
+/// audio (`Wave::Silent`) is an answer like any other and is never re-asked.
 pub(crate) fn unseen_sources(
     sources: &[Source],
     waves: &HashMap<(PathBuf, usize), Wave>,
+    now: std::time::Instant,
 ) -> Vec<(PathBuf, usize)> {
     sources
         .iter()
         .map(|s| (s.path.clone(), s.audio_stream))
-        .filter(|key| !waves.contains_key(key))
+        .filter(|key| match waves.get(key) {
+            None => true,
+            Some(Wave::Failed(at)) => now.duration_since(*at) >= WAVE_RETRY,
+            Some(_) => false,
+        })
         .collect()
 }
 
