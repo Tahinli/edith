@@ -98,16 +98,30 @@ fn peaks_memo() -> &'static std::sync::Mutex<(PeaksMemo, usize)> {
     &MEMO
 }
 
-/// Test-only: how many times an ask had to decode rather than answer from what
-/// the memo already held. A second ask for the same source -- trackless or not
-/// -- must not move it, which is what makes "the memo answered" observable.
+/// Test-only: how many times an ask *for one key* had to decode rather than
+/// answer from what the memo already held. A second ask of the same source --
+/// trackless or not -- must not move it, which is what makes "the memo
+/// answered" observable.
+///
+/// Keyed by the ask rather than counted process-wide: a test's claim is about
+/// *its* source, the suite runs in parallel by default, and a decode another
+/// test made would otherwise land inside the delta -- failing the claim for a
+/// reason that has nothing to do with the code. Every reader's source is a
+/// private copy of a fixture, so its key is that test's alone.
 #[cfg(test)]
-static MEMO_DECODES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static MEMO_DECODES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<PeaksKey, usize>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
-/// [`MEMO_DECODES`], for a test that measures a delta across its own asks.
+/// [`MEMO_DECODES`] for one ask, for a test that measures a delta across its own.
 #[cfg(test)]
-fn memo_decodes() -> usize {
-    MEMO_DECODES.load(std::sync::atomic::Ordering::Relaxed)
+fn memo_decodes(path: &Path, stream: usize, buckets_per_sec: u32) -> usize {
+    MEMO_DECODES
+        .lock()
+        .unwrap()
+        .get(&PeaksKey::of(path, stream, buckets_per_sec))
+        .copied()
+        .unwrap_or(0)
 }
 
 /// What the memo holds for one key: an envelope, or the stable answer that the
@@ -170,7 +184,9 @@ fn peaks_shared_capped(
         return Ok(hit.envelope());
     }
     #[cfg(test)]
-    MEMO_DECODES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    {
+        *MEMO_DECODES.lock().unwrap().entry(key.clone()).or_insert(0) += 1;
+    }
     // A failure is *not* memoized: `?` leaves the map untouched, so a decode
     // that failed once -- a file caught mid-write, a busy device -- is retried
     // rather than frozen for the process's life. Only the two successful
@@ -966,8 +982,34 @@ mod tests {
         path
     }
 
+    /// One test at a time, for the whole module.
+    ///
+    /// Three of the seams these tests read -- [`MEMO_DECODES`], [`VIZ_DECODES`]
+    /// and [`VIZ_FOLDED`] -- are process-wide, so "the second ask decoded
+    /// nothing" is a claim about every test in this binary at once. Without this
+    /// lock it holds only when the suite is run the way it is documented to be
+    /// run (`--test-threads=1`); under `cargo test`'s own parallel default a
+    /// pass belonging to a test running beside this one lands inside the delta,
+    /// and the claim fails for a reason that has nothing to do with the code
+    /// ([`a_summary_pass_folds_the_file_once`] and the parent revision's
+    /// [`an_envelope_over_the_ceiling_is_not_held`] are both red that way).
+    ///
+    /// Every test in the module takes it, not only the readers: a test that
+    /// *decodes* moves the counters the readers are measuring. The cost is that
+    /// this module's tests do not run in parallel with each other -- they are the
+    /// fixture-heavy ones, and the suite runs them serially anyway. Keying each
+    /// counter by the file it was for would buy the parallelism back, and is the
+    /// upgrade path if this lock ever shows up in a profile.
+    fn counters_serial() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        // A poisoned lock is another test's panic, not this one's failure: the
+        // counters are still readable and mutual exclusion is the whole point.
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[test]
     fn peaks_follow_the_1hz_volume_pulse() {
+        let _serial = counters_serial();
         let peaks = peaks(asset("test_av.mp4"), 0, BPS)
             .expect("open")
             .expect("test_av.mp4 has an audio track");
@@ -1020,6 +1062,7 @@ mod tests {
     /// audio file on stream 0 as readily as an mp4's AAC track.
     #[test]
     fn a_standalone_audio_file_has_peaks_too() {
+        let _serial = counters_serial();
         let peaks = peaks(asset("test_tone.mp3"), 0, BPS)
             .expect("open")
             .expect("test_tone.mp3 is audio");
@@ -1047,6 +1090,7 @@ mod tests {
     /// flat -- rather than the empty band a silent file makes.
     #[test]
     fn a_five_one_aac_mkv_draws_an_envelope() {
+        let _serial = counters_serial();
         let peaks = peaks(asset("test_hevc10.mkv"), 0, BPS)
             .expect("the 5.1 AAC track decodes")
             .expect("test_hevc10.mkv has an audio track");
@@ -1074,6 +1118,7 @@ mod tests {
     /// waveform is still the film's.
     #[test]
     fn a_split_decode_draws_the_same_envelope() {
+        let _serial = counters_serial();
         let file = asset("test_av.mp4");
         let whole = peaks_over(&file, 0, BPS, Some(1))
             .expect("open")
@@ -1098,6 +1143,7 @@ mod tests {
 
     #[test]
     fn video_only_source_has_no_peaks() {
+        let _serial = counters_serial();
         assert!(peaks(asset("test_baseline.mp4"), 0, BPS)
             .expect("open")
             .is_none());
@@ -1109,6 +1155,7 @@ mod tests {
     /// stream 0's 4-second-long pulsed stereo pair.
     #[test]
     fn each_stream_of_a_file_has_its_own_envelope() {
+        let _serial = counters_serial();
         let multi = asset("test_multiaudio.mp4");
         let zero = peaks(&multi, 0, BPS).expect("open").expect("stream 0");
         let one = peaks(&multi, 1, BPS).expect("open").expect("stream 1");
@@ -1133,6 +1180,7 @@ mod tests {
     /// down, where the visualizer seat reads it.
     #[test]
     fn the_shared_memo_answers_per_stream() {
+        let _serial = counters_serial();
         let multi = asset("test_multiaudio.mp4");
         let zero = peaks_shared(&multi, 0, BPS)
             .expect("open")
@@ -1162,6 +1210,7 @@ mod tests {
     /// read-only for every other test in this binary.
     #[test]
     fn a_replaced_source_is_read_again() {
+        let _serial = counters_serial();
         let path =
             std::env::temp_dir().join(format!("edith-peaks-memo-{}.mp4", std::process::id()));
         let short = std::fs::read(asset("test_multiaudio.mp4")).expect("read the fixture");
@@ -1216,18 +1265,19 @@ mod tests {
     /// one. A copy is used so the key is this test's alone.
     #[test]
     fn a_trackless_source_is_memoized_too() {
+        let _serial = counters_serial();
         let path = copy_of("test_baseline.mp4", "none");
 
-        let before = memo_decodes();
+        let before = memo_decodes(&path, 0, BPS);
         let first = peaks_shared(&path, 0, BPS).expect("open");
         assert!(first.is_none(), "test_baseline.mp4 has no audio track");
-        let after_first = memo_decodes();
+        let after_first = memo_decodes(&path, 0, BPS);
         assert_eq!(after_first - before, 1, "the first ask did not decode");
 
         let second = peaks_shared(&path, 0, BPS).expect("open");
         assert!(second.is_none());
         assert_eq!(
-            memo_decodes(),
+            memo_decodes(&path, 0, BPS),
             after_first,
             "the second ask re-opened a trackless source"
         );
@@ -1240,6 +1290,7 @@ mod tests {
     /// the `NoTrack` entry for an envelope without stranding the old count.
     #[test]
     fn a_trackless_answer_holds_no_buckets() {
+        let _serial = counters_serial();
         let mut memo = PeaksMemo::new();
         let mut count = 0;
         let key = || PeaksKey::of(std::path::Path::new("edith-peaks-none-key"), 0, BPS);
@@ -1267,13 +1318,14 @@ mod tests {
     /// Does not cover: an end-to-end decode past eight million buckets.
     #[test]
     fn an_envelope_over_the_ceiling_is_not_held() {
+        let _serial = counters_serial();
         let file = copy_of("test_av.mp4", "over");
-        let before = memo_decodes();
+        let before = memo_decodes(&file, 0, BPS);
         let first = peaks_shared_capped(&file, 0, BPS, 10)
             .expect("open")
             .expect("test_av.mp4 has an audio track");
         assert!(first.len() > 10, "the fixture must exceed the test ceiling");
-        let mid = memo_decodes();
+        let mid = memo_decodes(&file, 0, BPS);
         assert_eq!(mid - before, 1, "the first ask did not decode");
 
         let second = peaks_shared_capped(&file, 0, BPS, 10)
@@ -1281,7 +1333,7 @@ mod tests {
             .expect("test_av.mp4 has an audio track");
         assert_eq!(*first, *second, "the caller did not get its envelope");
         assert_eq!(
-            memo_decodes() - mid,
+            memo_decodes(&file, 0, BPS) - mid,
             1,
             "an envelope over the ceiling was held"
         );
@@ -1300,6 +1352,7 @@ mod tests {
     /// 3 + 5 = 8.
     #[test]
     fn replacing_an_entry_subtracts_the_old_buckets() {
+        let _serial = counters_serial();
         let mut memo = PeaksMemo::new();
         let mut count = 0;
         let key = || PeaksKey::of(std::path::Path::new("edith-peaks-replace-key"), 0, BPS);
@@ -1339,6 +1392,7 @@ mod tests {
     /// ([`crate::decode::visualizer_i420`]).
     #[test]
     fn a_window_of_a_non_periodic_file_is_where_it_says_it_is() {
+        let _serial = counters_serial();
         let path =
             std::env::temp_dir().join(format!("edith-peaks-noise-{}.flac", std::process::id()));
         let generated = std::process::Command::new("ffmpeg")
@@ -1427,6 +1481,7 @@ mod tests {
     /// for nothing, on the critical path of the first look edit.
     #[test]
     fn a_summary_pass_folds_the_file_once() {
+        let _serial = counters_serial();
         let path =
             std::env::temp_dir().join(format!("edith-peaks-once-{}.flac", std::process::id()));
         let generated = std::process::Command::new("ffmpeg")
@@ -1468,6 +1523,7 @@ mod tests {
     /// guard, so this is the one arithmetic they both use.
     #[test]
     fn a_zero_sample_rate_still_buckets_samples() {
+        let _serial = counters_serial();
         // A rate of zero is read as one, and the rate is what divides either
         // way, so the arithmetic stays finite and positive.
         assert_eq!(super::per_bucket_of(0, 4000), 1.0 / 4000.0);
@@ -1496,6 +1552,7 @@ mod tests {
     /// route the eight-million-bucket ceiling takes for a film.
     #[test]
     fn a_window_of_an_over_the_ceiling_source_is_decoded_once() {
+        let _serial = counters_serial();
         let file = copy_of("test_av.mp4", "window");
         let plain = peaks(&file, 0, BPS).expect("open").expect("audio track");
 
@@ -1545,9 +1602,12 @@ mod tests {
     /// times from the file's first frame to past its last.
     #[test]
     fn a_window_paints_the_frame_the_whole_envelope_paints() {
+        let _serial = counters_serial();
         let file = asset("test_av.mp4");
-        // The painter's own rate: it indexes an envelope at
-        // [`VIZ_BUCKETS_PER_SEC`], whatever rate an ask drew it at.
+        // The painter's own rate: a view carries the rate its envelope
+        // was drawn at and indexes the slice by it, so this envelope is
+        // drawn at exactly the rate the painter reads it at -- the
+        // visualizer's own ([`crate::decode::VIZ_BUCKETS_PER_SEC`]).
         let per_sec = f64::from(crate::decode::VIZ_BUCKETS_PER_SEC);
         let whole = peaks(&file, 0, crate::decode::VIZ_BUCKETS_PER_SEC)
             .expect("open")
@@ -1606,6 +1666,7 @@ mod tests {
     /// Skipped, loudly, where ffmpeg is not installed.
     #[test]
     fn a_film_length_source_paints_the_same_frame_in_windows() {
+        let _serial = counters_serial();
         let path =
             std::env::temp_dir().join(format!("edith-peaks-long-{}.flac", std::process::id()));
         let generated = std::process::Command::new("ffmpeg")

@@ -4745,15 +4745,19 @@ mod tests {
         );
     }
 
-    /// The seat declares the canvas's own size and the painter masks the planes
-    /// it returns to even dimensions. An odd canvas (a `resolution 1921 1081`
-    /// line) or a one-pixel-high one leaves those two disagreeing by a row, and
-    /// the conversion then indexes a chroma plane the size it was told does not
-    /// have: `index out of bounds` on a zero-length slice, inside the seat's
-    /// worker, where nothing catches it and no frame ever arrives.
+    /// The seat declares the canvas's own size; the painter masks the planes it
+    /// returns to even dimensions, and a canvas the two disagree about used to
+    /// take the picture down between them. On the revision before the seat masked
+    /// what it declares, a 1920x1 canvas died *in the painter* -- `decode.rs`
+    /// clamped the zero line of an h of 0: `max = -1`, `min > max` -- and a
+    /// 321x181 one died in the conversion on the *canvas's* chroma plane, one row
+    /// past the masked source's: `index out of bounds: the len is 14400 but the
+    /// index is 14400`, a full plane and not an empty one.
     ///
-    /// An audio-only source, so the span really is a visualizer seat, and a
-    /// frame really is pulled out of it.
+    /// This drives the same path a front-end does (`set_resolution`, then frames
+    /// out of the session). It is a guard against the shape coming back rather
+    /// than a reproduction: a frame does still arrive on the parent revision
+    /// (which is why the masking, not this test, is the fix).
     #[test]
     fn a_visualizer_seat_paints_a_canvas_it_cannot_evenly_divide() {
         for (w, h) in [(1920, 1), (1921, 1081), (320, 1), (321, 181)] {
