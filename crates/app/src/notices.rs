@@ -64,6 +64,50 @@ pub(crate) fn audio_lost_line(reason: &str) -> String {
     format!("AUDIO LOST{}", audio_tail(reason))
 }
 
+/// What a frame of the sound watch decides, as a pure value: the cache's own
+/// session generation against the frame's says whether the two are even talking
+/// about the same session, and only then what the reason did.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum AudioStep {
+    /// The cache describes the session *before* this one
+    /// (`Player::session_swapped`): it is seeded and nothing is announced -- a
+    /// preview that opens or closes is not a device that came back.
+    Seed,
+    /// The same session's reason arrived, or changed to a new one.
+    Push,
+    /// ...and the same session's reason is gone: the line it earned is retracted.
+    Clear,
+    /// The ordinary frame.
+    Nothing,
+}
+
+/// [`Player::watch_audio`]'s whole decision, pure: `cached_gen` is the session
+/// generation the cache describes, `session_gen` the one the frame is serving, and
+/// two reasons are what the engine says the sound is (`None` for sound that is
+/// up).
+///
+/// The generation is what keeps another session's reason out of this session's
+/// cache: `pump` serves the preview while one is up and the timeline otherwise,
+/// so a flip reads a reason that was never about the cached session at all -- a
+/// live device on one side and a dead one on the other is not a change, it is
+/// two different questions.
+pub(crate) fn audio_step(
+    cached_gen: u64,
+    session_gen: u64,
+    was: Option<&str>,
+    now: Option<&str>,
+) -> AudioStep {
+    if cached_gen != session_gen {
+        return AudioStep::Seed;
+    }
+    match (was, now) {
+        (Some(was), Some(now)) if was == now => AudioStep::Nothing,
+        (_, Some(_)) => AudioStep::Push,
+        (Some(_), None) => AudioStep::Clear,
+        (None, None) => AudioStep::Nothing,
+    }
+}
+
 /// What a *change* in the engine's sound reason does to the notice queue, as a
 /// pure step: the death line pushed when a reason arrives, the same line taken
 /// back when the reason clears ([`PlaybackSession::audio_disabled_reason`]'s

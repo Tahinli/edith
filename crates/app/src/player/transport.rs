@@ -34,46 +34,51 @@ impl Player {
 
     /// The engine's word on the sound device, watched rather than asked once.
     /// A file that *opens* silent says so in its own open line
-    /// ([`audio_notice`], `library.rs`), but a device that dies mid-session used
-    /// to leave the window playing on in silence with nothing said at all: the
-    /// engine knew (it sets its reason to its lost-device word and clears it
-    /// again when its own re-arm takes) and no consumer ever looked.
+    /// ([`audio_notice`], `library.rs`); what used to reach no consumer at all is
+    /// a reason that changes *under* a session that is already up. This is the
+    /// reader of that state -- the writer of it is the engine's own
+    /// `PlaybackSession::audio_disabled_reason`, which this lane never spells.
     ///
     /// Called from [`Player::pump`] because that is the one place every frame
     /// passes through, and written to cost an ordinary frame nothing: one read of
-    /// an `Option<&str>` and one compare, with the strings built only on the
-    /// change itself.
+    /// an `Option<&str>` and one compare, with the strings built only on the step
+    /// the pure [`audio_step`] names.
+    ///
+    /// Keyed by session ([`Player::audio_watch_gen`] against `session_gen`):
+    /// `pump` serves the preview while one is up and the timeline otherwise, so
+    /// without the key a preview opening or closing would read the *other*
+    /// session's reason and announce a device loss that never happened.
     pub(crate) fn watch_audio(&mut self) {
-        if self.sound_reason() == self.audio_reason.as_deref() {
+        let step = audio_step(
+            self.audio_watch_gen,
+            self.session_gen,
+            self.audio_reason.as_deref(),
+            self.sound_reason(),
+        );
+        if step == AudioStep::Nothing {
             return;
         }
-        // Re-read rather than carry a borrow across the write: this line is only
-        // reached on the change, so the allocation it costs is the news itself.
-        let reason = self.sound_reason().map(str::to_owned);
-        let was = std::mem::replace(&mut self.audio_reason, reason);
+        let was = self.audio_reason.take();
+        self.audio_reason = self.sound_reason().map(str::to_owned);
+        self.audio_watch_gen = self.session_gen;
+        if step == AudioStep::Seed {
+            // A session swap is not a change: the new session's own open line
+            // carries its reason, so only a line left over from the session
+            // before is taken back -- and only when this one's sound is up.
+            if self.audio_reason.is_none() {
+                if let Some(was) = was {
+                    let line = audio_lost_line(&was);
+                    self.notices
+                        .retain(|notice| notice.as_ref() != line.as_str());
+                }
+            }
+            return;
+        }
         audio_change_notice(
             &mut self.notices,
             was.as_deref(),
             self.audio_reason.as_deref(),
         );
-    }
-
-    /// [`Player::watch_audio`]'s cache, seeded at the moment an open's own line
-    /// carried the same fact: a reason unchanged across the open is not news, so
-    /// only the *clearing* half runs here -- a line left over from the file
-    /// before it comes off the strip.
-    pub(crate) fn seed_audio_watch(&mut self, session: &PlaybackSession) {
-        let was = std::mem::replace(
-            &mut self.audio_reason,
-            session.audio_disabled_reason().map(str::to_owned),
-        );
-        if self.audio_reason.is_none() {
-            if let Some(was) = was {
-                let line = audio_lost_line(&was);
-                self.notices
-                    .retain(|notice| notice.as_ref() != line.as_str());
-            }
-        }
     }
 
     /// Catches the display up to the clock: everything already due is taken off

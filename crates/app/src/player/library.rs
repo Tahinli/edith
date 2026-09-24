@@ -716,6 +716,11 @@ impl Player {
                 cx.notify();
             }
         }
+        // The picture swaps back to the timeline's, so everything keyed to a
+        // session hears it (`Player::session_swapped`) -- the sound watch among
+        // them, or the timeline's own unchanged reason would read as a device
+        // that came back the moment the preview closed.
+        self.session_swapped();
         self.preview_playing = false;
     }
 
@@ -1481,11 +1486,6 @@ impl Player {
                 // Read before the session moves: a file that plays silent says
                 // so here or nowhere.
                 let silent = audio_notice(&session);
-                // The watch's own cache, seeded here rather than on the first
-                // pump after: this line already carried the fact, so a reason
-                // unchanged across the open is not announced a second time
-                // ([`Player::seed_audio_watch`]).
-                self.seed_audio_watch(&session);
                 // A file replaces the one that was open, and track 3 of that one
                 // is not track 3 of this.
                 self.sub_track = 0;
@@ -1800,11 +1800,6 @@ impl Player {
                 // As at the file door above: the window watches in real time.
                 session.drop_late_pictures(true);
                 let silent = audio_notice(&session);
-                // The watch's own cache, seeded here rather than on the first
-                // pump after: this line already carried the fact, so a reason
-                // unchanged across the open is not announced a second time
-                // ([`Player::seed_audio_watch`]).
-                self.seed_audio_watch(&session);
                 // A project is named after itself but still exports beside its
                 // media: that is the only place an export has ever landed.
                 self.export_path = retarget(&export_path(&session.sources()[0].path), self.format);
