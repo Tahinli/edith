@@ -650,15 +650,18 @@ impl DecodeSession {
         // the picture *is* the canvas, and whatever transform the clip
         // carries still reaches it through the render below.
         //
-        // Masked to even dimensions first, and floored at two: that is what the
-        // painter does to the planes it hands back, so a canvas it cannot divide
-        // evenly (an odd `resolution 1921 1081` line, or a one-pixel-high one)
-        // used to be *declared* at a size the picture never had -- and the
-        // conversion below then indexes a chroma plane that is not there
-        // (`index out of bounds` on a zero-length slice, in this worker, where
-        // no frame ever arrives and nothing catches it).
+        // Masked to even dimensions first: that is what the painter does to the
+        // planes it hands back, so a canvas it cannot divide evenly (an odd
+        // `resolution 1921 1081` line, or a one-pixel-high one) used to be
+        // *declared* at a size the picture never had -- and the conversion below
+        // then indexes a chroma plane that is not there (`index out of bounds`
+        // on a zero-length slice, in this worker, where no frame ever arrives
+        // and nothing catches it). No floor under the mask: a canvas with no
+        // size is asked for no picture, and the painter answers that with empty
+        // planes ([`visualizer_window_i420`]), which the declared size now
+        // matches.
         let (canvas_w, canvas_h) = canvas.dims();
-        let (width, height) = ((canvas_w & !1).max(2), (canvas_h & !1).max(2));
+        let (width, height) = (canvas_w & !1, canvas_h & !1);
         let worker_cancel = Arc::clone(&cancel);
         let path = path.to_path_buf();
         let handle = thread::Builder::new()
@@ -2883,9 +2886,12 @@ mod tests {
                 0,
             )
             .unwrap_or_else(|e| panic!("open the visualizer at {w}x{h}: {e}"));
-            let frame = stream.frames.recv_timeout(Duration::from_secs(30)).unwrap_or_else(|e| {
-                panic!("a picture for a {w}x{h} canvas, not a worker that died instead: {e}")
-            });
+            let frame = stream
+                .frames
+                .recv_timeout(Duration::from_secs(30))
+                .unwrap_or_else(|e| {
+                    panic!("a picture for a {w}x{h} canvas, not a worker that died instead: {e}")
+                });
             assert_eq!(
                 (frame.width, frame.height),
                 (w, h),
