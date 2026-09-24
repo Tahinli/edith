@@ -1663,13 +1663,20 @@ fn every_click_door_that_writes_the_project_arms_autosave() {
     // the door's own answer ("there was a step to take") is the gate, so `^z`
     // with an empty history leaves the flag -- and the close question -- clear.
     let act = fn_body("act");
-    for gate in ["if self.undo(cx) {", "if self.redo(cx) {"] {
-        let after = act
+    for (gate, next) in [
+        ("if self.undo(cx) {", "ActionId::Redo =>"),
+        ("if self.redo(cx) {", "ActionId::AddVideoLane =>"),
+    ] {
+        let arm = act
             .split_once(gate)
             .unwrap_or_else(|| panic!("{gate} is gone from the action table"))
             .1;
+        // Cut at the arm *after* this one: "everything from here on" is
+        // satisfied by the sibling's arm, so deleting Undo's own would ship
+        // green.
+        let arm = arm.split_once(next).map_or(arm, |(arm, _)| arm);
         assert!(
-            after.contains("mark_dirty()"),
+            arm.contains("mark_dirty()"),
             "the arm behind `{gate}` arms nothing, so a real step back is \
              invisible to autosave, the unsaved ghost and the close question"
         );
