@@ -56,7 +56,6 @@ pub enum Backend {
     /// A gap: black frames, nothing decoded at all.
     Gap,
     /// A waveform visualizer: the picture is painted from the audio's peaks
-    /// A waveform viz_paint: 0,
     /// ([`visualizer_i420`]), no decoder seat and no stream of pictures at all.
     Visualizer,
 }
@@ -1144,7 +1143,14 @@ fn run_span(
             backend.set(Backend::Software);
             run_av1(&mut opened.demuxer, &tx, start, end, &mut render, abort, speed);
         }
-        other => eprintln!("{}", other.needs_plugin()),
+        // Nothing decodes from here -- no software seat exists for this codec.
+        // Say so: the cell was left claiming the hardware session that opened
+        // and then produced nothing, and it reports what happened, not what
+        // was hoped for.
+        other => {
+            backend.set(Backend::Gap);
+            eprintln!("{}", other.needs_plugin());
+        }
     }
 }
 
@@ -1305,7 +1311,12 @@ impl Render {
             if let Some(tone) = &self.tone {
                 tone.map(gy, gu, gv, width as usize, height as usize);
             }
-            if !passthrough && !self.color.is_identity() {
+            // The same terms the branch was entered on: anywhere the fused
+            // conversion below will not apply the grade (a placement is
+            // happening, so the canvas conversion is plain), it lands here --
+            // including the passthrough-sized clip a transform moves, whose
+            // grade used to be dropped on the floor between these two guards.
+            if !skip_placement && !self.color.is_identity() {
                 crate::color::apply_yuv(&self.color, gy, gu, gv);
             }
             let desc = if self.tone.is_some() {
@@ -1476,19 +1487,6 @@ pub const VIZ_STYLE_RIBBON: u8 = 1;
 pub const VIZ_STYLE_RING: u8 = 2;
 pub const VIZ_STYLE_WAVE: u8 = 3;
 pub const VIZ_FAST: u8 = 1 << 3;
-/// High nibble of [`crate::project::Clip::visualizer`]: 16 inks. Zero is the
-/// timeline azure, then around the wheel in 22.5° steps.
-pub const VIZ_HUE_SHIFT: u8 = 4;
-
-/// The ink nibble stored in `flags`.
-pub fn viz_hue(flags: u8) -> u8 {
-    flags >> VIZ_HUE_SHIFT
-}
-
-/// Keep style bits, replace the ink nibble.
-pub fn with_viz_hue(flags: u8, hue: u8) -> u8 {
-    (flags & 0x0F) | ((hue & 15) << VIZ_HUE_SHIFT)
-}
 
 pub fn viz_style(flags: u8) -> u8 {
     (flags >> 1) & 3
@@ -1496,12 +1494,6 @@ pub fn viz_style(flags: u8) -> u8 {
 
 pub fn with_viz_style(flags: u8, style: u8) -> u8 {
     (flags & !0b0110) | ((style & 3) << 1)
-}
-
-/// Ink colour for the CLIP swatches and the painter. Hue 0 is the timeline
-/// azure (`0x4F8FD6`), then around the wheel.
-pub fn viz_ink_rgb(hue: u8) -> (u8, u8, u8) {
-    hsv_to_rgb(212.0 + f32::from(hue & 15) * 22.5, 0.63, 0.84)
 }
 
 /// Azure + sat 160 + 8 strands + glow 2. What `viz_paint == 0` means.
@@ -2113,6 +2105,16 @@ pub(crate) fn visualizer_i420(
 ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     let width = width & !1;
     let height = height & !1;
+    // A canvas with no size asks for no picture, and must be told so: the zero
+    // line's row is derived from the height (`h - 1`), and a height of zero has
+    // no row to put it on -- `clamp` answers that by panicking, which on this
+    // path is a dead worker thread and a span the export aborts on. A
+    // `Composer::passthrough()` canvas is exactly this size and says as much
+    // (`places_nothing`), and a 1-pixel-high canvas floors to it (planes are
+    // even), so both take the empty picture they asked for.
+    if width == 0 || height == 0 {
+        return (Vec::new(), Vec::new(), Vec::new());
+    }
     let (w, h) = (width as usize, height as usize);
     let (cw, ch) = crate::scale::chroma_dims(w, h);
     let (bg_y, bg_u, bg_v) = rgb_yuv(8, 12, 22);
@@ -2649,6 +2651,103 @@ mod tests {
             "dropping a parked stream deadlocked: it joined a decode thread \
              while still holding the receiver that thread is waiting on"
         );
+    }
+
+    /// The empty-peaks source -- a trackless file, or any peaks decode error
+    /// (`peaks_shared(..).ok().flatten().unwrap_or_default()`) -- must paint
+    /// the flat line, never panic: a visualizer frame always exists. The
+    /// `pair_at` interpolator indexes `peaks[len() - 1]`, which is only
+    /// reachable inside the `!peaks.is_empty()` guard, so the empty vec takes
+    /// the early flat-line path and no column ever samples a bucket.
+    #[test]
+    fn empty_peaks_paint_the_flat_line() {
+        let w = 320u32;
+        let h = 180u32;
+        let (y, _u, _v) = visualizer_i420(&mut VizScratch::default(), &[], 0.0, w, h, 1, 0);
+        assert_eq!((y.len(), _u.len(), _v.len()), (320 * 180, 160 * 90, 160 * 90));
+        // The ink's top and bottom row for a given peaks slice: one unbroken
+        // band, and where it sits.
+        let band = |peaks: &[(f32, f32)]| {
+            let (y, _, _) = visualizer_i420(&mut VizScratch::default(), peaks, 0.0, w, h, 1, 0);
+            let rows: Vec<usize> = (0..h as usize)
+                .filter(|&row| y[row * 320..(row + 1) * 320].iter().any(|&p| p > 40))
+                .collect();
+            assert!(
+                !rows.is_empty() && rows.len() == rows[rows.len() - 1] - rows[0] + 1,
+                "the ink must be one unbroken band, not scattered rows: {rows:?}"
+            );
+            (rows[0], rows[rows.len() - 1])
+        };
+        // Silence is the zero line and nothing else: the band is on the middle
+        // row and a line's thickness -- five rows here, the trace's own -- not
+        // a picture's.
+        let (first, last) = band(&[]);
+        let zero = h as usize / 2;
+        assert!(
+            first <= zero && zero <= last,
+            "the zero line itself must be inked: {first}..={last}"
+        );
+        assert!(
+            last - first <= (h as usize) / 8,
+            "a peaks-less source painted a {}-row band, not a line: {first}..={last}",
+            last - first + 1
+        );
+        // ...and the same seat over full-scale peaks is a picture, which is
+        // what makes the line above a claim about silence rather than about a
+        // painter that never draws anything.
+        let (loud_first, loud_last) = band(&[(-1.0, 1.0); 1200]);
+        assert!(
+            loud_last - loud_first > (last - first) * 3,
+            "full-scale peaks painted {loud_first}..={loud_last}, no taller than silence's {first}..={last}"
+        );
+    }
+
+    /// A canvas with no size has no row to draw the zero line on. The row index
+    /// is derived from the height (`h as isize - 1`), so a *height* of zero
+    /// underflows into `clamp`'s `min <= max` assert and takes the worker
+    /// thread with it. A `Composer::passthrough()` canvas is exactly this
+    /// (`dims()` is `(0, 0)`, `places_nothing()` is true for it), and a
+    /// one-pixel-high canvas floors to the same nothing, the planes being even.
+    #[test]
+    fn a_size_less_visualizer_canvas_paints_nothing() {
+        let size_less = visualizer_i420(&mut VizScratch::default(), &[], 0.0, 0, 0, 0, 0);
+        assert_eq!(size_less, (Vec::new(), Vec::new(), Vec::new()));
+        let thin = visualizer_i420(&mut VizScratch::default(), &[(0.0, 1.0)], 0.0, 2, 1, 0, 0);
+        assert!(
+            thin.0.is_empty() && thin.1.is_empty() && thin.2.is_empty(),
+            "a 2x1 canvas has no even-sized plane to paint on"
+        );
+    }
+
+    /// The same canvas, driven through the seat that really opens one: the
+    /// worker thread is where a panic *is* the defect -- it closes the frame
+    /// channel and the caller sees a span with no picture in it, which is what
+    /// the export then aborts on.
+    #[test]
+    fn a_pass_through_canvas_visualizer_paints_nothing_and_stays_alive() {
+        let transform = TransformParams {
+            pos_x: 0.25,
+            ..Default::default()
+        };
+        let stream = DecodeSession::open_visualizer(
+            &asset("test_opus_51.mka"),
+            0,
+            0,
+            2,
+            30.0,
+            ColorParams::default(),
+            transform,
+            Composer::passthrough(),
+            VIZ_STYLE_WAVE,
+            0,
+        )
+        .expect("open the visualizer");
+        let frame = stream
+            .frames
+            .recv_timeout(Duration::from_secs(30))
+            .expect("a picture, not a worker that died instead of painting one");
+        assert_eq!((frame.width, frame.height), (0, 0));
+        assert!(frame.bgra.is_empty());
     }
 
     #[test]
