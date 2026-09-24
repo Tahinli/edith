@@ -1456,12 +1456,15 @@ impl PlaybackSession {
     /// unlike [`remove_source`](Self::remove_source) this does not reseek. Rows
     /// past `idx` move down by one: a caller holding a picked row (the export's
     /// subtitle pick) has to fix it up or drop it; the placements on the lanes
-    /// are walked down with it and need no fixing. Not an undo step, for the
-    /// reason [`Project::remove_subtitles`] gives -- the way back is
-    /// [`import_subtitles`](Self::import_subtitles), which reads a file's
-    /// subtitles and touches nothing else on the timeline -- and it *empties*
-    /// the undo history, because the steps in it name the tracks by the indexes
-    /// this call just changed.
+    /// are walked down with it and need no fixing.
+    ///
+    /// One undo step, and the reindex with it ([`Project::remove_subtitles`]'s
+    /// own entry): every step in the history names its tracks by index into the
+    /// palette, so an entry carries the palette it was taken beside its lanes --
+    /// which is what lets a `z` put this row back, and every placement that
+    /// moved down with it. What that entry cannot bring back is the *pick*: it
+    /// is the caller's, and a caller holding one fixes it up or drops it
+    /// ([`crate::subs::sub_pick_after_restore`]).
     pub fn remove_subtitles(&mut self, idx: usize) -> crate::Result<()> {
         self.project.remove_subtitles(idx)
     }
@@ -3723,10 +3726,17 @@ impl PlaybackSession {
     /// ([`Self::adopt_settings`]). Reseeks both halves, so a canvas that moved
     /// is repainted and a proxy switch that flipped reopens the file.
     fn restored_step(&mut self, f: impl FnOnce(&mut Project) -> bool) -> bool {
-        if !self.edit(Dirty::Both, f) {
+        if !f(&mut self.project) {
             return false;
         }
+        // Adopted *before* the reseek below, never after it: everything the
+        // reseek reads is one of the settings the entry just put back --
+        // `landing` the rate and the frame count, `picture_path` the switches,
+        // the sound the sample rate -- so a landing computed from the values
+        // the step *undid* lands on the wrong frame of the right project (and
+        // reopens the file through the switch that just went back).
         self.adopt_settings();
+        self.invalidate(Dirty::Both);
         true
     }
 
@@ -5089,6 +5099,53 @@ mod tests {
 
         assert_eq!(before, s.restarts(), "a live transform edit must reuse the worker");
         assert_eq!(next.index, first.index, "paused: same timeline position before and after");
+    }
+
+    /// A rate undo lands the picture where the playhead is, in the rate that
+    /// came *back*: the entry a pick takes carries the old numbering beside the
+    /// old rate, so an undo restores both and the reseek has to be computed
+    /// after the restore. Computed before it, the landing is the pre-undo
+    /// rate's reading of the post-undo project -- `now` clamps to the pre-undo
+    /// rate's idea of the timeline's end and the worker is handed the last
+    /// frame of a five-second timeline for a playhead at three seconds.
+    #[test]
+    fn a_rate_undo_reseeks_at_the_rate_it_restored() {
+        let mut s = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+        s.set_gain(0.0);
+        let poll = |s: &mut PlaybackSession| -> crate::decode::Frame {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            loop {
+                if let Some(f) = s.try_frame() {
+                    return f;
+                }
+                assert!(std::time::Instant::now() < deadline, "no frame within 20s");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        let native = s.native_frame_rate();
+        s.seek(3.0);
+        assert_eq!(s.now(), 3.0, "the fixture is five seconds long");
+        assert!(s.set_frame_rate(native * 2.0), "the rate pick");
+        assert!(s.undo(), "the pick is one step");
+        assert_eq!(s.meta().frame_rate, native, "the rate came back");
+        assert_eq!(
+            s.now(),
+            3.0,
+            "the playhead is the seconds it was, read at the rate that came back"
+        );
+        // The worker's own landing, which is the half the clock alone cannot
+        // show: a frame 149 of 150 is exactly the pre-undo rate's clamp.
+        assert_eq!(
+            s.span.expect("a span for the picture").start,
+            secs_to_frame(3.0, native),
+            "the picture was asked for the playhead's own frame"
+        );
+        let frame = poll(&mut s);
+        assert_eq!(
+            frame.index,
+            secs_to_frame(3.0, native),
+            "and that is the frame that arrived"
+        );
     }
 
     /// The session's live look samples leave its history exactly where the

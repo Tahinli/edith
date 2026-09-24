@@ -116,6 +116,10 @@ pub(crate) struct SweepParts(
     pub(crate) usize,
     pub(crate) Vec<(LaneKind, Vec<Clip>)>,
     pub(crate) Vec<Vec<SubClip>>,
+    /// The palette, which the history holds beside the lanes and an undo
+    /// therefore restores ([`Project::undo`]). Left out of this shape, a
+    /// round-trip check passed with the palette restore deleted outright.
+    pub(crate) Vec<SubtitleTrack>,
     pub(crate) ProjectSettings,
 );
 
@@ -5083,6 +5087,7 @@ impl Project {
             self.sources.len(),
             self.lanes.iter().map(|l| (l.kind, l.clips.clone())).collect(),
             self.lanes.iter().map(|l| l.subs.clone()).collect(),
+            self.subtitles.clone(),
             self.settings.clone(),
         )
     }
@@ -10569,14 +10574,21 @@ fn removing_a_subtitle_column_undoes_with_its_reindex() {
         .with_subtitles(vec![track("one"), track("two"), track("three")]);
     assert_eq!(p.subtitles().len(), 3);
     let before = p.parts();
+    let palette = p.subtitles().to_vec();
     // Column 0 goes, which renumbers the two behind it.
     p.remove_subtitles(0).expect("a column with nothing on it");
     assert_eq!(p.subtitles().len(), 2);
     assert_eq!(p.subtitles()[0].label, "two");
     assert!(p.undo(), "the removal is a step like any other cut");
+    // The palette itself, and not only what `parts` happens to compare: this
+    // is the assertion that cannot go vacuous if the restore below it ever
+    // leaves a field of it behind.
+    assert_eq!(p.subtitles(), palette.as_slice(), "the palette itself, back");
     assert_eq!(p.parts(), before, "the palette and the lanes, both back");
     assert!(p.redo(), "and forward again");
+    assert_eq!(p.subtitles().len(), 2, "the column goes again");
     assert_eq!(p.subtitles()[0].label, "two");
+    assert_ne!(p.subtitles(), palette.as_slice(), "and it is not back");
 }
 
 }
