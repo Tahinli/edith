@@ -174,8 +174,8 @@ fn colr_nclx(colour: ColorDescription) -> [u8; 11] {
 /// `ptm`, silently, with a player's subtitle menu then offering a language
 /// nobody speaks. Matroska's `Language` is raw UTF-8 beside that and may carry
 /// a BCP-47 tag, so the tag is cut to its primary subtag here, mapped through
-/// [`crate::demux::ISO_639_1_TO_2`] where it is two letters, and left `und` -- the code that
-/// says *undetermined* -- where nothing names it.
+/// [`crate::demux::ISO_639_1_TO_2`] where it is two letters, and left `und`
+/// -- the code that says *undetermined* -- where nothing names it.
 ///
 /// Three lowercase letters are taken as they are: that is the code the field
 /// holds, and it is what an ISO 639-3 tag like `fil` and every language
