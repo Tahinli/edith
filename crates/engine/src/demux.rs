@@ -1384,16 +1384,19 @@ impl MkvDemuxer {
                 }
             }
         };
-        // The displayed shape, in the order the two facts compose: the aspect
-        // widens the *coded* frame (180x320 at SAR 4/3 is drawn 240x320 --
-        // ffprobe's own `display_aspect_ratio` of such a file, measured), then
-        // the quarter turn swaps that stretched pair the way it swaps the
-        // coded one. The other order is a different picture: 320x180 then
-        // widened by 4/3 lands at 426x180, and a pixel's drawn shape turns
-        // with the picture it belongs to. The SAR only ever widens a width,
-        // never a height; the displayed height is the coded one without a
-        // turn and the stretched coded width with one. The coded pair stays
-        // what the decoder hands back, and carries on to
+        // The displayed shape, in the order the two facts compose -- the same
+        // order the render applies them in
+        // ([`crate::decode::Render::frame`]): the aspect widens the *coded*
+        // frame (180x320 at SAR 4/3 is drawn 240x320 -- ffprobe's own
+        // `display_aspect_ratio` of such a file, measured), then the quarter
+        // turn swaps that stretched pair the way it swaps the coded one. The
+        // other order is a different picture: 320x180 then widened by 4/3
+        // lands at 426x180, and a rotated anamorphic file rendered that way
+        // lands a square raster in the 9:16 canvas its probe declares --
+        // letterboxed in the preview and in the export both. The SAR only
+        // ever widens a width, never a height; the displayed height is the
+        // coded one without a turn and the stretched coded width with one.
+        // The coded pair stays what the decoder hands back, and carries on to
         // [`VideoMeta::coded_width`]/[`VideoMeta::coded_height`].
         let (width, height) = match video.rotation.swaps_axes() {
             true => (video.height, video.pixel_aspect.width_factor(video.width)),

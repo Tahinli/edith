@@ -1293,40 +1293,19 @@ impl Render {
         width: u32,
         height: u32,
     ) -> Frame {
-        // The file's own turn, before anything else: a phone's portrait video
-        // arrives as landscape planes, and the grade, the canvas and the
-        // conversion below all have to see the picture the way it is meant to
-        // be seen. Nothing here at all for the ordinary file that states no
-        // turn -- `Rotation::None` takes the planes by reference and not one
-        // byte is copied.
-        let (y, u, v, width, height) = match self.rotation.is_none() {
-            true => (y, u, v, width, height),
-            false => {
-                let steps = self.rotation.steps();
-                let (rw, rh) = crate::scale::rotate_i420_90s_into(
-                    y,
-                    u,
-                    v,
-                    width,
-                    height,
-                    steps,
-                    &mut self.turned,
-                );
-                (
-                    &self.turned.0[..],
-                    &self.turned.1[..],
-                    &self.turned.2[..],
-                    rw,
-                    rh,
-                )
-            }
-        };
         // The pixel aspect, applied exactly once -- the single conversion to
         // the square-pixel raster this engine makes, where ffmpeg's swscale
-        // makes its own. Only a file whose samples are not square reaches the
-        // resample: a square one takes the branch by a bool and not one byte
-        // is touched, which is what keeps every existing picture identical to
-        // the day before anamorphic sources existed.
+        // makes its own -- *before* the display-matrix turn. The ratio belongs
+        // to the axis that was horizontal before the turn: the coded width is
+        // stretched by h/v and the turn then swaps the stretched pair, which
+        // is the composition the probe declares (a 1440x1080 SAR-4/3 file
+        // turned 90° displays 1080x1920, DAR 9:16). Stretching after the turn
+        // instead lands the ratio on the coded height and renders a
+        // 1440x1440 square into a 9:16 canvas -- letterboxed, and the bars
+        // baked into any export. Only a file whose samples are not square
+        // reaches the resample: a square one takes the branch by a bool and
+        // not one byte is touched, which is what keeps every existing picture
+        // identical to the day before anamorphic sources existed.
         let (y, u, v, width, height) = if self.pixel_aspect.is_square() {
             (y, u, v, width, height)
         } else {
@@ -1364,6 +1343,34 @@ impl Render {
                 display_width,
                 height,
             )
+        };
+        // The file's own turn, after the stretch: a phone's portrait video
+        // arrives as landscape planes, and the grade, the canvas and the
+        // conversion below all have to see the picture the way it is meant to
+        // be seen. Nothing here at all for the ordinary file that states no
+        // turn -- `Rotation::None` takes the planes by reference and not one
+        // byte is copied.
+        let (y, u, v, width, height) = match self.rotation.is_none() {
+            true => (y, u, v, width, height),
+            false => {
+                let steps = self.rotation.steps();
+                let (rw, rh) = crate::scale::rotate_i420_90s_into(
+                    y,
+                    u,
+                    v,
+                    width,
+                    height,
+                    steps,
+                    &mut self.turned,
+                );
+                (
+                    &self.turned.0[..],
+                    &self.turned.1[..],
+                    &self.turned.2[..],
+                    rw,
+                    rh,
+                )
+            }
         };
         let passthrough = self.canvas.is_passthrough(width, height);
         // A transform still has a picture to place even where the canvas

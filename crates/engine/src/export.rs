@@ -3344,30 +3344,12 @@ fn place_picture<'a>(
     transformed: &'a mut (Vec<u8>, Vec<u8>, Vec<u8>),
     canvas: &'a mut Composer,
 ) -> (&'a [u8], &'a [u8], &'a [u8], u32, u32) {
-    // The file's own turn, taken exactly as playback's decode funnel takes it
-    // ([`crate::decode`]): a phone's portrait video is landscape in the file,
-    // and the encoder must be fed what the preview showed. A file that states
-    // no turn skips this entirely -- the planes go on borrowed.
-    let (y, u, v, width, height) = match rotation.is_none() {
-        true => (y, u, v, width, height),
-        false => {
-            let (w, h) = crate::scale::rotate_i420_90s_into(
-                y,
-                u,
-                v,
-                width,
-                height,
-                rotation.steps(),
-                turned,
-            );
-            (&turned.0[..], &turned.1[..], &turned.2[..], w, h)
-        }
-    };
     // The pixel aspect, applied exactly once -- the same single conversion to
     // the square-pixel raster the decode funnel makes, in the same order
-    // (stretch after turn), so the encoder is fed the pixels the preview
-    // showed to the byte. A square-pixel file -- every file whose samples are
-    // one to one -- borrows the planes through.
+    // (stretch the coded width, *then* turn, [`crate::decode::Render::frame`]'s
+    // comment carries the 1440x1440 failure the other order produces). A
+    // square-pixel file -- every file whose samples are one to one -- borrows
+    // the planes through.
     let (y, u, v, width, height) = if pixel_aspect.is_square() {
         (y, u, v, width, height)
     } else {
@@ -3398,6 +3380,25 @@ fn place_picture<'a>(
             display_width,
             height,
         )
+    };
+    // The file's own turn, taken exactly as playback's decode funnel takes it
+    // ([`crate::decode`]): a phone's portrait video is landscape in the file,
+    // and the encoder must be fed what the preview showed. A file that states
+    // no turn skips this entirely -- the planes go on borrowed.
+    let (y, u, v, width, height) = match rotation.is_none() {
+        true => (y, u, v, width, height),
+        false => {
+            let (w, h) = crate::scale::rotate_i420_90s_into(
+                y,
+                u,
+                v,
+                width,
+                height,
+                rotation.steps(),
+                turned,
+            );
+            (&turned.0[..], &turned.1[..], &turned.2[..], w, h)
+        }
     };
     // The planes are borrowed from the decoder (and `Black::picture` hands the
     // same slice as both u and v), so a grade cannot be applied in place: it
