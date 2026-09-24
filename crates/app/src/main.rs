@@ -138,8 +138,11 @@ struct Player {
     /// The *lane* is half the key because the four PGS tracks of a remux are
     /// one film's subtitles in four languages: placed one over the other they
     /// start at the same microsecond, and a lane whose eye was shut would leave
-    /// the one before it on screen.
-    sub_image: Option<((Lane, i64), Arc<RenderImage>)>,
+    /// the one before it on screen. The other half is the cue itself
+    /// ([`crate::ui::preview::SubImageKey`]): two different cues can share a
+    /// lane and a start too, and a key of those two alone served one caption's
+    /// picture for another's.
+    sub_image: Option<(crate::ui::preview::SubImageKey, Arc<RenderImage>)>,
     /// A frame that arrived before its time; shown on the tick it comes due.
     /// The pump's buffer, not transport state -- but a frame waiting here is
     /// what keeps a finished decoder from reading as [`Transport::Ended`] one
