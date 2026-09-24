@@ -227,6 +227,14 @@ impl AoSession {
         DEVICES_OPENED.load(Ordering::Relaxed)
     }
 
+    /// Whether this session is the silent sink rather than a real stream --
+    /// what the `VE_NO_AO` pin buys, and the one form of that claim a caller can
+    /// own: [`AoSession::devices_opened`] is process-wide and moves under any
+    /// other session this process opens.
+    pub fn is_silent(&self) -> bool {
+        matches!(self.backend, Backend::Silent(_))
+    }
+
     /// Whether the plugin itself is loadable. Says nothing about the daemon --
     /// only [`AoSession::open`] answers that, and it is cheap enough to be the
     /// real probe.
@@ -354,12 +362,35 @@ unsafe impl Send for AoSession {}
 mod tests {
     use super::AoSession;
 
+    /// This module's counter assertions, one test at a time: the counters are
+    /// process-wide, so two of these tests measuring at once would see each
+    /// other's opens. Same shape as `waveform::counters_serial`, and for the
+    /// same reason -- the counters stay readable, and one at a time is the
+    /// whole point.
+    fn counters_serial() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[test]
     fn a_silent_pin_never_opens_a_device() {
+        let _serial = counters_serial();
         // SAFETY: this is the engine's own unit-test process.
         unsafe { std::env::set_var("VE_NO_AO", "1") };
+        let before = AoSession::devices_opened();
         let mut ao = AoSession::open(48_000, 2).expect("silent opens");
-        assert_eq!(AoSession::devices_opened(), 0);
+        // The pin's effect, on the session this test owns: no other test in
+        // this binary can open one for it, and no absolute claim is made on a
+        // counter *any* session in the process moves.
+        assert!(
+            ao.is_silent(),
+            "the pin must route the open to the silent sink"
+        );
+        assert_eq!(
+            AoSession::devices_opened(),
+            before,
+            "the silent open moved the process's device counter"
+        );
         assert!(ao.set_volume(0.0));
         assert!(!ao.set_volume(1.5));
         assert!(ao.set_active(true));
