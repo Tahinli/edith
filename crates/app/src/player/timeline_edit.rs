@@ -50,12 +50,21 @@ impl Player {
             // not that.
             let cut = session.cut_at(f64::from(at) / self.fps);
             if cut {
+                // Only a split that happened drops the selection: a refusal is
+                // "NOTHING TO SPLIT", and the clip in hand is still the clip the
+                // next Delete, `x` or menu acts on -- clearing it there left the
+                // user with nothing picked and told them nothing about it. A
+                // real split is the other way round: the cut it leaves makes the
+                // picked index name a different clip, so the mark has to go.
+                // [`Player::regroup`] below has always cleared inside its own
+                // success branch; this is the same rule on the other half of the
+                // pair.
+                self.selected.clear();
                 self.notify_user("SPLIT".into());
             } else {
                 self.notify_user("NOTHING TO SPLIT — the playhead is already on a cut".into());
             }
         }
-        self.selected.clear();
         cx.notify();
     }
 
@@ -72,10 +81,7 @@ impl Player {
             if session.regroup_at(session.now()) {
                 self.selected.clear();
             } else {
-                self.notify_user(
-                    "NOTHING TO REGROUP — no cut under the playhead"
-                        .into(),
-                );
+                self.notify_user("NOTHING TO REGROUP — no cut under the playhead".into());
             }
         }
         cx.notify();
@@ -97,9 +103,7 @@ impl Player {
                     );
                 }
             }
-            (Some(_), None) => {
-                self.notify_user("NOTHING DETACHED — nothing selected".into())
-            }
+            (Some(_), None) => self.notify_user("NOTHING DETACHED — nothing selected".into()),
             (None, _) => {}
         }
         cx.notify();
@@ -126,9 +130,7 @@ impl Player {
         // index (a stroke nobody saw) is not a thing to group.
         let picks = self.marks().0;
         match (&mut self.session, self.selected.anchor(), picks.len()) {
-            (_, None, _) => {
-                self.notify_user("NOTHING GROUPED — nothing selected".into())
-            }
+            (_, None, _) => self.notify_user("NOTHING GROUPED — nothing selected".into()),
             // The hand's group: every pick, one id.
             (Some(session), _, 2..) => {
                 if let Err(e) = session.group_all(&picks) {
@@ -146,10 +148,9 @@ impl Player {
                         self.notify_user(format!("NOT GROUPED — {e}").into());
                     }
                 }
-                None => self.notify_user(
-                    "NOTHING TO GROUP WITH — no clip covers these frames"
-                        .into(),
-                ),
+                None => {
+                    self.notify_user("NOTHING TO GROUP WITH — no clip covers these frames".into())
+                }
             },
             (None, ..) => {}
         }
@@ -237,9 +238,7 @@ impl Player {
                     self.notify_user("NOTHING LIFTED — that half is no longer there".into());
                 }
             }
-            (Some(_), None) => {
-                self.notify_user("NOTHING LIFTED — nothing selected".into())
-            }
+            (Some(_), None) => self.notify_user("NOTHING LIFTED — nothing selected".into()),
             (None, _) => {}
         }
         cx.notify();
@@ -409,11 +408,7 @@ impl Player {
             // Everything else that could refuse (a clip that is not there)
             // cannot be dragged.
             false if from.kind != to.kind => self.notify_user(
-                format!(
-                    "NOT ON {} — a {kind} clip takes a {lanes} lane",
-                    to.label()
-                )
-                .into(),
+                format!("NOT ON {} — a {kind} clip takes a {lanes} lane", to.label()).into(),
             ),
             // Picked up and put back down where it was: a click, and a click
             // says nothing.
@@ -535,10 +530,7 @@ impl Player {
             },
             // The row is greyed and says why in the list; here it says why at
             // the moment somebody tried to use it anyway.
-            (None, Some(_)) => Some(
-                "NOT PLACED — that subtitle track has no cues"
-                    .to_string(),
-            ),
+            (None, Some(_)) => Some("NOT PLACED — that subtitle track has no cues".to_string()),
             (_, None) => Some("NOT PLACED — no file open".to_string()),
         };
         match (text, marked) {
@@ -1293,12 +1285,7 @@ impl Player {
     /// a project can gain, and the one remove that applies to this lane's kind
     /// ([`oracle::lane_items`]). Nothing is selected -- a head owns no clip --
     /// which is [`Player::open_gap_menu`]'s rule on the other empty target.
-    pub(crate) fn open_head_menu(
-        &mut self,
-        lane: Lane,
-        at: Point<Pixels>,
-        cx: &mut Context<Self>,
-    ) {
+    pub(crate) fn open_head_menu(&mut self, lane: Lane, at: Point<Pixels>, cx: &mut Context<Self>) {
         if self.modal() || self.session.is_none() {
             return;
         }
@@ -1698,19 +1685,14 @@ impl Player {
             [a, b] if a.0 == b.0 && a.1.abs_diff(b.1) == 1 => Some((a.0, a.1.min(b.1))),
             _ => self.selected.anchor(),
         }) else {
-            self.notify_user(
-                "NOTHING TO CROSSFADE — no audio clip selected".into(),
-            );
+            self.notify_user("NOTHING TO CROSSFADE — no audio clip selected".into());
             cx.notify();
             return;
         };
         let frames = self.fps.round().max(1.) as u32;
         if let Some(session) = &mut self.session {
             if !session.crossfade(lane, idx, frames) {
-                self.notify_user(
-                    "NOTHING TO CROSSFADE — no neighbour end to end"
-                        .into(),
-                );
+                self.notify_user("NOTHING TO CROSSFADE — no neighbour end to end".into());
             }
         }
         cx.notify();
@@ -1730,9 +1712,7 @@ impl Player {
             [a, b] if a.0 == b.0 && a.1.abs_diff(b.1) == 1 => Some((a.0, a.1.min(b.1))),
             _ => self.selected.anchor(),
         }) else {
-            self.notify_user(
-                "NOTHING TO DISSOLVE — no video clip selected".into(),
-            );
+            self.notify_user("NOTHING TO DISSOLVE — no video clip selected".into());
             cx.notify();
             return;
         };
@@ -1747,10 +1727,7 @@ impl Player {
             self.fps.round().max(1.) as u32
         };
         if !session.set_transition_out(lane, idx, frames) {
-            self.notify_user(
-                "NOTHING TO DISSOLVE — no neighbour end to end"
-                    .into(),
-            );
+            self.notify_user("NOTHING TO DISSOLVE — no neighbour end to end".into());
         } else if removing {
             self.notify_user("DISSOLVE REMOVED — the clips cut again".into());
         }
