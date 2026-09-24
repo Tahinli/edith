@@ -25,12 +25,67 @@ impl Player {
             .map_or(self.fps, |s| s.meta().frame_rate)
     }
 
+    /// The engine's own word on the sound device, for the session the pump
+    /// serves ([`Player::active_session`]).
+    fn sound_reason(&self) -> Option<&str> {
+        self.active_session()
+            .and_then(PlaybackSession::audio_disabled_reason)
+    }
+
+    /// The engine's word on the sound device, watched rather than asked once.
+    /// A file that *opens* silent says so in its own open line
+    /// ([`audio_notice`], `library.rs`), but a device that dies mid-session used
+    /// to leave the window playing on in silence with nothing said at all: the
+    /// engine knew (it sets its reason to its lost-device word and clears it
+    /// again when its own re-arm takes) and no consumer ever looked.
+    ///
+    /// Called from [`Player::pump`] because that is the one place every frame
+    /// passes through, and written to cost an ordinary frame nothing: one read of
+    /// an `Option<&str>` and one compare, with the strings built only on the
+    /// change itself.
+    pub(crate) fn watch_audio(&mut self) {
+        if self.sound_reason() == self.audio_reason.as_deref() {
+            return;
+        }
+        // Re-read rather than carry a borrow across the write: this line is only
+        // reached on the change, so the allocation it costs is the news itself.
+        let reason = self.sound_reason().map(str::to_owned);
+        let was = std::mem::replace(&mut self.audio_reason, reason);
+        audio_change_notice(
+            &mut self.notices,
+            was.as_deref(),
+            self.audio_reason.as_deref(),
+        );
+    }
+
+    /// [`Player::watch_audio`]'s cache, seeded at the moment an open's own line
+    /// carried the same fact: a reason unchanged across the open is not news, so
+    /// only the *clearing* half runs here -- a line left over from the file
+    /// before it comes off the strip.
+    pub(crate) fn seed_audio_watch(&mut self, session: &PlaybackSession) {
+        let was = std::mem::replace(
+            &mut self.audio_reason,
+            session.audio_disabled_reason().map(str::to_owned),
+        );
+        if self.audio_reason.is_none() {
+            if let Some(was) = was {
+                let line = audio_lost_line(&was);
+                self.notices
+                    .retain(|notice| notice.as_ref() != line.as_str());
+            }
+        }
+    }
+
     /// Catches the display up to the clock: everything already due is taken off
     /// the channel and only the last of them is shown, which *is* the
     /// drop-when-behind policy. A frame that is not due yet waits in `held`, and
     /// while the clock is paused *nothing* is due -- a repaint re-presents the
     /// frame already on screen, whatever asked for the repaint.
     pub(crate) fn pump(&mut self, window: &mut Window) {
+        // Before the drain, on the one read that does not need the session
+        // mutably: the sound can die at any point in a frame, and the notice it
+        // earns is owed to the frame it died in.
+        self.watch_audio();
         // Where the transport was before this drain, so the crossing into
         // `Ended` can be recognised as the one transition it is.
         let was = self.transport();

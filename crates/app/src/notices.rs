@@ -46,9 +46,48 @@ fn is_completion(message: &str) -> bool {
 /// decode: it plays perfectly, in silence, and that is the one thing the window
 /// would otherwise never say (the engine's own word for it, verbatim).
 pub(crate) fn audio_notice(session: &PlaybackSession) -> Option<String> {
-    session
-        .audio_disabled_reason()
-        .map(|reason| format!(" — NO AUDIO: {reason}"))
+    session.audio_disabled_reason().map(audio_tail)
+}
+
+/// [`audio_notice`]'s own tail, for a reason already read -- the one place the
+/// engine's word is spelled into a line, so the open path and the mid-session
+/// one cannot drift apart.
+pub(crate) fn audio_tail(reason: &str) -> String {
+    format!(" — NO AUDIO: {reason}")
+}
+
+/// The same fact said on its own, for a device that dies *after* a file was
+/// opened: [`audio_notice`] is a tail to append to "OPENED x", and a death
+/// mid-session has no line to hang off -- so it leads with the state word the
+/// strip reads first, and the tail is the same one.
+pub(crate) fn audio_lost_line(reason: &str) -> String {
+    format!("AUDIO LOST{}", audio_tail(reason))
+}
+
+/// What a *change* in the engine's sound reason does to the notice queue, as a
+/// pure step: the death line pushed when a reason arrives, the same line taken
+/// back when the reason clears ([`PlaybackSession::audio_disabled_reason`]'s
+/// `AUDIO_LOST` and its own re-arm). [`Player::watch_audio`] is the only caller
+/// and owns the caching; this owns the queue, so a test can drive both
+/// directions without a window and without a device that dies on cue.
+pub(crate) fn audio_change_notice(
+    notices: &mut std::collections::VecDeque<SharedString>,
+    was: Option<&str>,
+    now: Option<&str>,
+) {
+    match (was, now) {
+        (_, Some(reason)) if was != Some(reason) => {
+            push_notice(notices, audio_lost_line(reason).into());
+        }
+        // The sound is back: the line goes with it, or the strip keeps saying NO
+        // AUDIO over a film that plays. Only that line -- whatever else is
+        // queued is none of this step's business.
+        (Some(was), None) => {
+            let line = audio_lost_line(was);
+            notices.retain(|notice| notice.as_ref() != line.as_str());
+        }
+        _ => {}
+    }
 }
 
 /// The strip's own width is finite and its message is one line: what a
@@ -121,12 +160,14 @@ mod tests {
     #[test]
     fn a_long_name_loses_its_middle_rather_than_the_state_word() {
         assert_eq!(ledger_line("SNAP OFF"), "SNAP OFF");
-        let long = ledger_line("OPENED he_is_not_the_only_one_at_all_here.mp4 · 1 subtitle track(s)");
+        let long =
+            ledger_line("OPENED he_is_not_the_only_one_at_all_here.mp4 · 1 subtitle track(s)");
         assert!(long.starts_with("OPENED "), "{long}");
         assert!(long.ends_with(" · 1 subtitle track(s)"), "{long}");
         assert!(long.contains('…'), "{long}");
         assert!(
-            long.split(' ').all(|w| w.chars().count() <= LEDGER_WORD_MAX),
+            long.split(' ')
+                .all(|w| w.chars().count() <= LEDGER_WORD_MAX),
             "{long}"
         );
     }

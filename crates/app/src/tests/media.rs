@@ -6,10 +6,74 @@ use crate::player::library::{
     auto_proxies_pref_path, load_auto_proxies_pref, save_auto_proxies_pref,
 };
 use crate::subs::{
-    SUB_SIZE_RANGE, audio_import_tail, load_subtitle_style, save_subtitle_style, sub_line_h_for,
-    subtitle_style_path,
+    audio_import_tail, load_subtitle_style, save_subtitle_style, sub_line_h_for,
+    subtitle_style_path, SUB_SIZE_RANGE,
 };
 use crate::ui::preview::{bgra_to_rgba, screenshot_path};
+
+/// The notice queue's own half of the sound watch, and the three words it is
+/// spelled with -- reached by name because the app's own glob does not carry
+/// them (`notices` is a private module re-exported for the window).
+use crate::notices::{audio_change_notice, audio_lost_line, audio_tail};
+
+/// A sound device that dies under a file that is already open says so, and stops
+/// saying so when the engine's own re-arm takes. The engine sets its
+/// `audio_disabled_reason` to its lost-device word on a death and clears it on a
+/// successful reopen, and nothing on this side ever looked at it: the two call
+/// sites were the *open* paths, so a mid-session death played on in silence with
+/// no message at all.
+///
+/// Driven through the queue step itself -- [`audio_change_notice`] is the whole
+/// of what a reason change does to the strip -- because a test cannot make a
+/// sound card fail on cue; the caching around it is the same comparison plus the
+/// source guard below.
+#[test]
+fn a_device_that_dies_under_an_open_file_says_so_and_unsays_it() {
+    let mut notices: std::collections::VecDeque<gpui::SharedString> =
+        ["OPENED take.mp4".into()].into_iter().collect();
+    let lost = audio_lost_line("AUDIO_LOST");
+    // The file was fine, and then the sound is gone: the reason arrives between
+    // two frames.
+    audio_change_notice(&mut notices, None, Some("AUDIO_LOST"));
+    assert_eq!(
+        notices.back().map(|notice| &***notice),
+        Some(lost.as_str()),
+        "a reason that arrives mid-session is never pushed"
+    );
+    assert!(
+        lost.starts_with("AUDIO LOST") && lost.ends_with(&audio_tail("AUDIO_LOST")),
+        "the standing line lost its state word, or stopped sharing \
+         `audio_notice`'s own tail"
+    );
+    // The same reason read again on the next frame is not news.
+    audio_change_notice(&mut notices, Some("AUDIO_LOST"), Some("AUDIO_LOST"));
+    assert_eq!(notices.len(), 2, "one death was announced twice");
+    // The re-arm takes: the line goes with it, and nothing else does.
+    audio_change_notice(&mut notices, Some("AUDIO_LOST"), None);
+    assert_eq!(
+        notices.iter().map(|notice| &***notice).collect::<Vec<_>>(),
+        vec!["OPENED take.mp4"],
+        "the NO AUDIO line is still on the strip over a film that plays"
+    );
+    // A second death later says so again.
+    audio_change_notice(&mut notices, None, Some("AUDIO_LOST"));
+    assert_eq!(notices.back().map(|notice| &***notice), Some(lost.as_str()));
+    // The wiring: the pump is the one place every frame passes through, and a
+    // watcher nothing calls is a message nobody reads.
+    assert!(
+        fn_body("pump").contains("self.watch_audio();"),
+        "the pump stopped watching the engine's sound reason, so a device that \
+         dies mid-session is silent again"
+    );
+    assert!(
+        src_text("player/library.rs")
+            .matches("self.seed_audio_watch(&session);")
+            .count()
+            == 2,
+        "an open path stopped seeding the watch, so its own NO AUDIO line comes \
+         back a frame later as a second one"
+    );
+}
 
 /// The toast tail an audio import earns: rate, channel count and rounded
 /// length, in the words the IMPORTED line appends them in
@@ -32,8 +96,8 @@ fn an_audio_import_names_its_rate_channels_and_length() {
 /// stuck read and never as a frozen window.
 #[test]
 fn an_import_line_says_a_stage_has_stopped_moving_and_only_then() {
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
+    use std::sync::Arc;
     let stage = Arc::new(AtomicU8::new(ImportStage::Header as u8));
     let started = Instant::now() - Duration::from_secs(9);
     let mut import = Import {
@@ -303,7 +367,10 @@ fn a_strand_slot_on_a_single_strand_clip_is_the_clip_s_own_colour() {
     // The clip's own slot is never redirected -- it is what the fallback
     // lands on.
     assert_eq!(VizSlot::Main.picked(one), VizSlot::Main);
-    assert_eq!(VizSlot::Strand.picked(with_viz_paint_strands(one, 2)), VizSlot::Strand);
+    assert_eq!(
+        VizSlot::Strand.picked(with_viz_paint_strands(one, 2)),
+        VizSlot::Strand
+    );
 }
 
 /// A seek says nothing until it has stood: an ordinary one is a flicker and
@@ -326,8 +393,8 @@ fn a_seek_says_so_only_once_it_has_stood() {
 /// fifty-one seconds on a 25 GB film.
 #[test]
 fn a_silence_card_is_up_while_its_scan_runs_and_says_where_it_has_got_to() {
-    use std::sync::Arc;
     use std::sync::atomic::Ordering::Relaxed;
+    use std::sync::Arc;
     let progress = Arc::new(engine::silence::Progress::default());
     // Two hours and eight minutes, as the header claims it.
     progress.total.store(7680, Relaxed);
@@ -757,11 +824,9 @@ fn every_codec_row_is_offered_or_says_why_not() {
         detail.contains("ec-vorbis"),
         "the row names the encoder like every other live one: {detail}"
     );
-    assert!(
-        FORMATS
-            .into_iter()
-            .any(|(row, _, _, detail)| row.contains(&Format::Hevc) && detail.contains("intra"))
-    );
+    assert!(FORMATS
+        .into_iter()
+        .any(|(row, _, _, detail)| row.contains(&Format::Hevc) && detail.contains("intra")));
     // The destination follows the format and keeps the stem, mp4 included.
     assert_eq!(
         retarget(std::path::Path::new("/a/take.export.mp4"), Format::Wav),

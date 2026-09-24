@@ -790,6 +790,12 @@ struct Player {
     /// The active session's identity, for the above: bumped by every door that
     /// swaps `session` or `preview_session`.
     session_gen: u64,
+    /// The engine's own word on the sound device, as the last pump saw it: the
+    /// cache [`Player::watch_audio`] compares each frame against so a reason is
+    /// announced once when it *changes* and taken back when it clears. `None`
+    /// while the sound is up, and seeded by `Player::seed_audio_watch` at every
+    /// open, whose own line already carries the same fact.
+    audio_reason: Option<String>,
     /// Which of the clip's two inks the look section's wheel and colour field
     /// act on ([`VizSlot`]): the clip's own colour, or the ring's dual half.
     /// The pick stays picked across clips, the way the dock tab's does.
@@ -1119,6 +1125,9 @@ fn main() {
                     picture_box: Rc::default(),
                     shot_pending: None,
                     session_gen: 0,
+                    // Nothing heard yet: the first pump seeds it off the session
+                    // it serves.
+                    audio_reason: None,
                     viz_slot: VizSlot::Main,
                     viz_hex_edit: None,
                     pending_viz: None,
