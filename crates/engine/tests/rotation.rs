@@ -92,7 +92,12 @@ fn corners(width: u32, height: u32, bgra: &[u8]) -> [&'static str; 4] {
         tint(&bgra[index..index + 4])
     };
     let (qx, qy) = (width / 4, height / 4);
-    [at(qx, qy), at(3 * qx, qy), at(3 * qx, 3 * qy), at(qx, 3 * qy)]
+    [
+        at(qx, qy),
+        at(3 * qx, qy),
+        at(3 * qx, 3 * qy),
+        at(qx, 3 * qy),
+    ]
 }
 
 /// What the coded picture holds, before anything turns it: this is the layout
@@ -112,17 +117,17 @@ fn first_frame(path: &Path) -> (u32, u32, Vec<u8>) {
 /// machine, which is the arbiter a display matrix is read against.
 fn expected(file: &str) -> ([u32; 2], Rotation, [&'static str; 4]) {
     match file {
-        "test_rotation90.mp4" => (
+        "test_rotation90.mp4" | "test_rotation90.mkv" => (
             [180, 320],
             Rotation::Cw270,
             ["green", "yellow", "blue", "red"],
         ),
-        "test_rotation180.mp4" => (
+        "test_rotation180.mp4" | "test_rotation180.mkv" => (
             [320, 180],
             Rotation::Cw180,
             ["yellow", "blue", "red", "green"],
         ),
-        "test_rotation270.mp4" => (
+        "test_rotation270.mp4" | "test_rotation270.mkv" => (
             [180, 320],
             Rotation::Cw90,
             ["blue", "red", "green", "yellow"],
@@ -135,10 +140,18 @@ fn expected(file: &str) -> ([u32; 2], Rotation, [&'static str; 4]) {
 /// displayed size and names the turn, and a half turn does neither.
 #[test]
 fn a_display_matrix_is_read_as_a_quarter_turn() {
+    // Both doors, the same turn: the mkv twins are the same quadrant source
+    // remuxed with the same rotation asked for (`scripts/gen_fixtures.sh`), one
+    // stating it in a `Projection` roll and one in a `tkhd` matrix, and a roll
+    // read the wrong way round is a file that plays on its side in exactly one
+    // of the two.
     for file in [
         "test_rotation90.mp4",
+        "test_rotation90.mkv",
         "test_rotation180.mp4",
+        "test_rotation180.mkv",
         "test_rotation270.mp4",
+        "test_rotation270.mkv",
     ] {
         let (size, rotation, _) = expected(file);
         let (meta, _) = engine::demux::Demuxer::open(&asset(file)).expect("open a fixture");
@@ -147,7 +160,10 @@ fn a_display_matrix_is_read_as_a_quarter_turn() {
             size,
             "{file}: the *displayed* size is what the engine reports"
         );
-        assert_eq!(meta.rotation, rotation, "{file}: which turn the file asks for");
+        assert_eq!(
+            meta.rotation, rotation,
+            "{file}: which turn the file asks for"
+        );
         assert_eq!(
             rotation.swaps_axes(),
             size == [180, 320],
@@ -168,10 +184,18 @@ fn a_display_matrix_is_read_as_a_quarter_turn() {
 #[test]
 fn the_preview_shows_a_turned_file_upright() {
     let _seat = pin_software();
+    // Both doors, the same turn: the mkv twins are the same quadrant source
+    // remuxed with the same rotation asked for (`scripts/gen_fixtures.sh`), one
+    // stating it in a `Projection` roll and one in a `tkhd` matrix, and a roll
+    // read the wrong way round is a file that plays on its side in exactly one
+    // of the two.
     for file in [
         "test_rotation90.mp4",
+        "test_rotation90.mkv",
         "test_rotation180.mp4",
+        "test_rotation180.mkv",
         "test_rotation270.mp4",
+        "test_rotation270.mkv",
     ] {
         let (size, _, corners_expected) = expected(file);
         let (width, height, bgra) = first_frame(&asset(file));
@@ -249,4 +273,34 @@ fn a_matrix_that_is_not_a_quarter_turn_is_refused_by_name() {
         said.contains("45.0°") && said.contains("quarter turn"),
         "the refusal names the angle it cannot make: {said}"
     );
+}
+
+/// An anamorphic file's own numbers decide the shape the engine reports: the
+/// pixels are 1440x1080 and the file says they are shown 1920x1080 wide, which is
+/// what a player shows -- so that is the shape this engine reports, and the shape
+/// the preview and the export must therefore place the coded pixels at. A
+/// squashed picture in a 4:3 frame is the same class of wrong as a portrait file
+/// on its side, and both are the file's own numbers being ignored.
+///
+/// **Both spellings**, because they are what the two doors read and a file
+/// remuxed from one to the other must not change shape: Matroska states the
+/// *display aspect ratio* in `DisplayWidth`/`DisplayHeight` -- ffmpeg writes the
+/// ratio unit, so `16x9` and not `1920x1080` (`DisplayUnit` 3) -- while an mp4
+/// states the *sample* aspect ratio in a `pasp` box beside its `avc1` (`4:3`).
+/// Both resolve to the coded height at that aspect.
+#[test]
+fn an_anamorphic_file_reports_the_shape_it_is_shown_at() {
+    for file in ["test_anamorphic.mp4", "test_anamorphic.mkv"] {
+        let (meta, _) = engine::demux::Demuxer::open(&asset(file)).expect("open a fixture");
+        assert_eq!(
+            [meta.width, meta.height],
+            [1920, 1080],
+            "{file}: the displayed shape, not the 1440x1080 the samples are stored at"
+        );
+        assert_eq!(
+            meta.rotation,
+            Rotation::None,
+            "{file}: no turn is asked for, and a non-square sample is not one"
+        );
+    }
 }
