@@ -1743,8 +1743,15 @@ struct CopyPlan {
     /// copy.
     private: Vec<u8>,
     colour: ColorDescription,
+    /// The coded shape the copied track declares: the samples under it are the
+    /// source's own, so the header names what they are stored at -- not the
+    /// shape they are drawn at.
     width: u32,
     height: u32,
+    /// The aspect the copied samples are drawn at, written into the file as
+    /// display metadata ([`CopyParams::pixel_aspect`]): square for every
+    /// ordinary source, so the header gains nothing.
+    pixel_aspect: crate::demux::PixelAspect,
 }
 
 /// A run of source blocks copied in one piece: what a cut leaves behind, and
@@ -1778,6 +1785,30 @@ pub fn exact_refusal(project: &Project, meta: &VideoMeta, settings: &ExportSetti
     if !settings.exact || CopyPlan::of(project, meta, settings).is_some() {
         return None;
     }
+    // An anamorphic source asked of a format that cannot state the aspect: the
+    // blocks would copy, but the sample entry this writer produces has no
+    // `pasp` box to carry it in, and a header that declares the coded pair
+    // while the pixels are drawn 4/3 wide is a file that lies about its own
+    // shape. Refused by name -- the sentence a reader is owed -- before the
+    // container's codec question, because this is the *nearer* reason: a
+    // Matroska copy needs no refusal at all (its track carries the aspect
+    // beside the blocks, [`CopyParams::pixel_aspect`], which is ffmpeg's own
+    // copy behaviour), so an anamorphic source's Exact row only ever dies on
+    // this for an mp4.
+    if !settings.format.is_mkv() {
+        let anamorphic = project.sources().iter().any(|source| {
+            Demuxer::open(&source.path)
+                .ok()
+                .is_some_and(|(source_meta, _)| !source_meta.pixel_aspect.is_square())
+        });
+        if anamorphic {
+            return Some(
+                "a copy would lose the pixel aspect — this format cannot state it beside the \
+                 coded picture, so the export re-encodes it into the square pixels it is drawn at"
+                    .to_string(),
+            );
+        }
+    }
     let codec = match settings.format {
         Format::Hevc => Codec::Hevc,
         Format::Av1 => Codec::Av1,
@@ -1788,6 +1819,12 @@ pub fn exact_refusal(project: &Project, meta: &VideoMeta, settings: &ExportSetti
             ));
         }
     };
+    // The turn-baking corner-cut (a copied packet is the source's own coded
+    // picture; this export bakes a display-matrix turn into the pixels) and
+    // the rest of the reasons a copy says something other than what the
+    // timeline says are [`CopyPlan::of`]'s own gates, so the container and
+    // edit sentences below are checked the same way rather than duplicated
+    // with different words.
     let carries = project.sources().iter().all(|source| {
         crate::demux::is_matroska(&source.path)
             && Demuxer::open(&source.path)
@@ -1817,7 +1854,7 @@ impl CopyPlan {
         };
         let entries = project.sources();
         let mut sources: Vec<Option<MkvDemuxer>> = (0..entries.len()).map(|_| None).collect();
-        let mut declared: Option<(Vec<u8>, ColorDescription)> = None;
+        let mut declared: Option<(Vec<u8>, ColorDescription, crate::demux::PixelAspect)> = None;
         let mut regions: Vec<CopyRegion> = Vec::new();
         let r_start = settings.range.map_or(0, |(s, _)| s);
         for span in export_spans(project, settings.range) {
@@ -1875,20 +1912,42 @@ impl CopyPlan {
                 // this export bakes the turn into the pixels -- so a copy would
                 // ship the file sideways. Re-encoding is the only honest
                 // answer here.
+                //
+                // The size the copy declares is the source's *coded* pair, so
+                // that is what the comparison asks: coded to coded. A display
+                // comparison would refuse every anamorphic source that happens
+                // to sit at the project's displayed shape and then write a
+                // track that lies about its own samples -- and a square
+                // source's coded pair is its display pair, so this asks nothing
+                // new of the ordinary file.
+                //
+                // A source whose samples are not square is the *other* kind of
+                // picture a copy cannot carry here: the blocks are its own
+                // coded pixels and this engine's Matroska writer can now state
+                // the aspect beside them -- but only this engine's
+                // ([`MkvMuxer::create_copy`] writes the `Display*` elements),
+                // and the copy's declared shape must stay the coded one. The
+                // aspect travels with the track instead of being baked in,
+                // which is ffmpeg's own copy behaviour, so an anamorphic
+                // source is copyable *into Matroska* and nowhere else.
                 if !source_meta.rotation.is_none()
                     || source_meta.codec != codec
-                    || source_meta.width != meta.width
-                    || source_meta.height != meta.height
+                    || source_meta.coded_width != meta.coded_width
+                    || source_meta.coded_height != meta.coded_height
                     || Rate::from_fps(source_meta.frame_rate, meta.frame_rate).ok()?
                         != Rate::REAL_TIME
                     || !demuxer.plain_blocks()
                 {
                     return None;
                 }
-                // One track, one configuration record and one `Colour`: two
-                // sources that disagree about either are two streams, and this
-                // writes one.
-                let declares = (demuxer.codec_private().to_vec(), source_meta.color);
+                // Two sources that disagree about their pixel aspect are two
+                // displayed pictures under one track; the copy declares one
+                // aspect or none.
+                let declares = (
+                    demuxer.codec_private().to_vec(),
+                    source_meta.color,
+                    source_meta.pixel_aspect,
+                );
                 if declared.get_or_insert(declares.clone()) != &declares {
                     return None;
                 }
@@ -1926,15 +1985,19 @@ impl CopyPlan {
                 }),
             }
         }
-        let (private, colour) = declared?;
+        let (private, colour, pixel_aspect) = declared?;
         Some(Self {
             sources,
             regions,
             codec_id,
             private,
             colour,
-            width: meta.width,
-            height: meta.height,
+            // The track the copy declares is the source's coded shape -- the
+            // samples under it are the source's own -- with the aspect beside
+            // it as the display metadata ([`CopyParams::pixel_aspect`]).
+            width: meta.coded_width,
+            height: meta.coded_height,
+            pixel_aspect,
         })
     }
 
@@ -1958,6 +2021,7 @@ impl CopyPlan {
                 codec_id: self.codec_id,
                 codec_private: &self.private,
                 colour: self.colour,
+                pixel_aspect: self.pixel_aspect,
             },
             audio,
             subs,
