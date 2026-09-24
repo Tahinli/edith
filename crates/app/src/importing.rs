@@ -18,10 +18,15 @@ pub(crate) enum Wave {
     Loading,
     /// The file has no audio track. An answer, not a miss.
     Silent,
-    /// The decode failed. Drawn as its own mark rather than as [`Self::Silent`]:
-    /// "this file's sound could not be read" and "this file has no sound" look
-    /// the same on a lane, and the first is a bug report waiting to happen.
-    Failed,
+    /// The decode failed, at the moment it did. Drawn as its own mark rather
+    /// than as [`Self::Silent`]: "this file's sound could not be read" and
+    /// "this file has no sound" look the same on a lane, and the first is a
+    /// bug report waiting to happen. It is *not* an answer, though: a failure
+    /// may have had a reason that has since gone away (a file still being
+    /// copied when it arrived), so [`crate::subs::unseen_sources`] asks again
+    /// once the stamp is older than its cooldown -- which is what the stamp is
+    /// for.
+    Failed(std::time::Instant),
     Peaks(Arc<Vec<(f32, f32)>>),
 }
 

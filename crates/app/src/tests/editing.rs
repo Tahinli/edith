@@ -109,11 +109,9 @@ fn a_song_opens_the_window_by_itself() {
     // ...and it places, on the audio lane, through the door `insert_source`
     // uses: a second copy of the song at the playhead.
     session.seek(1.0);
-    assert!(
-        session
-            .place_stream_at(1.0, &path, 0, Some(Lane::A1))
-            .expect("its own file is on this timeline")
-    );
+    assert!(session
+        .place_stream_at(1.0, &path, 0, Some(Lane::A1))
+        .expect("its own file is on this timeline"));
     assert_eq!(session.lane_clips(Lane::A1).len(), 2);
     assert!(session.lane_clips(Lane::V1).is_empty(), "still no picture");
 
@@ -345,13 +343,11 @@ fn a_caption_is_deleted_by_the_same_row_and_stroke_every_box_is() {
     );
     // ...and the same reading with a clip under it is the clip menu, untouched:
     // the flag is off wherever a `Clip` was clicked.
-    assert!(
-        menu_items(Ctx {
-            timeline: true,
-            ..Ctx::default()
-        })
-        .contains(&ActionId::Cut)
-    );
+    assert!(menu_items(Ctx {
+        timeline: true,
+        ..Ctx::default()
+    })
+    .contains(&ActionId::Cut));
 }
 
 /// A timeline with a subtitle palette and an empty subtitle lane: what a
@@ -939,16 +935,14 @@ fn the_clip_menu_dims_what_the_playhead_is_not_on_and_stays_in_the_window() {
     }
     assert!(!whole(ActionId::Delete, live).yes());
     assert!(!whole(ActionId::Paste, live).yes());
-    assert!(
-        whole(
-            ActionId::Paste,
-            Ctx {
-                clipboard: true,
-                ..live
-            }
-        )
-        .yes()
-    );
+    assert!(whole(
+        ActionId::Paste,
+        Ctx {
+            clipboard: true,
+            ..live
+        }
+    )
+    .yes());
     assert!(!whole(ActionId::CancelExport, live).yes());
     let busy = Ctx {
         exporting: true,
@@ -988,7 +982,10 @@ fn the_clip_menu_dims_what_the_playhead_is_not_on_and_stays_in_the_window() {
     assert_eq!(menu_at(point(px(10.), px(10.)), viewport, 150.), (10., 10.));
     assert_eq!(
         menu_at(point(px(700.), px(380.)), viewport, 150.),
-        (800. - crate::layout::MENU_EDGE - MENU_W, 400. - crate::layout::MENU_EDGE - 150.)
+        (
+            800. - crate::layout::MENU_EDGE - MENU_W,
+            400. - crate::layout::MENU_EDGE - 150.
+        )
     );
     // A window smaller than the menu loses its bottom, never its top: the
     // top-left margin wins over the bottom-right one, because the items are
@@ -1165,16 +1162,14 @@ fn a_menu_offers_only_what_applies_and_is_drawn_inside_the_window() {
     assert!(row_enable(RowItem::RemoveWithClips, placed).yes());
     let unplaced = row_items(live);
     assert!(unplaced.contains(&RowItem::Remove) && !unplaced.contains(&RowItem::RemoveWithClips));
-    assert!(
-        !row_enable(
-            RowItem::RemoveWithClips,
-            RowCtx {
-                exporting: true,
-                ..placed
-            }
-        )
-        .yes()
-    );
+    assert!(!row_enable(
+        RowItem::RemoveWithClips,
+        RowCtx {
+            exporting: true,
+            ..placed
+        }
+    )
+    .yes());
     assert!(!row_enable(RowItem::Add, RowCtx::default()).yes());
     // Every refusal is short enough to sit in the hint column beside its
     // label, the clip menu's rule.
@@ -1282,7 +1277,11 @@ fn the_hanging_menus_mount_at_the_room_root_and_their_rows_wear_chords_not_prose
         }
         // §9: no junk drawer. A label that fits the plate whole beside its
         // chord, and never a sentence.
-        assert!(item.label().split_whitespace().count() <= 4, "{}", item.label());
+        assert!(
+            item.label().split_whitespace().count() <= 4,
+            "{}",
+            item.label()
+        );
     }
     // The two removes must not read as the same verb now that the column
     // beside them is empty.
@@ -1604,11 +1603,9 @@ fn adding_a_row_drops_the_whole_source_in_at_the_playhead() {
     let frames = session.file_frames(&second);
     // Through the engine door `insert_source` uses, with the row's own
     // stream: the button, the drop and this are one call.
-    assert!(
-        session
-            .place_stream_at(2.0, &second, 0, None)
-            .expect("av2 is already on the timeline")
-    );
+    assert!(session
+        .place_stream_at(2.0, &second, 0, None)
+        .expect("av2 is already on the timeline"));
     // The whole of source 1 went in and nothing was painted over: the
     // timeline is longer by exactly that file.
     assert_eq!(session.timeline_duration(), 9.0);
@@ -1635,11 +1632,9 @@ fn adding_a_row_drops_the_whole_source_in_at_the_playhead() {
     let path = session.sources()[0].path.clone();
     let frames = session.file_frames(&path);
     let end = session.timeline_duration();
-    assert!(
-        session
-            .place_stream_at(end, &path, 1, None)
-            .expect("the French track shares the timeline's parameters")
-    );
+    assert!(session
+        .place_stream_at(end, &path, 1, None)
+        .expect("the French track shares the timeline's parameters"));
     assert_eq!(session.sources()[1].audio_stream, 1);
     assert_eq!(session.timeline_duration(), end * 2.0);
     // Both rows are the same file, so both rows are that file's length --
@@ -1689,11 +1684,9 @@ fn a_row_dropped_on_the_open_bed_lands_under_the_pointer() {
 
     // ...and what the release does with it: the frame back through the same
     // rate every box is drawn at, into the door the Add button uses too.
-    assert!(
-        session
-            .place_stream_at(f64::from(at) / fps, &second, 0, None)
-            .expect("av2 is already on this timeline")
-    );
+    assert!(session
+        .place_stream_at(f64::from(at) / fps, &second, 0, None)
+        .expect("av2 is already on this timeline"));
     let head = |lane| {
         session
             .lane_clips(lane)
@@ -1727,11 +1720,9 @@ fn removing_a_row_is_refused_while_it_plays_and_takes_the_row_away() {
     session.import(&asset("test_av2.mp4")).expect("av2 matches");
     let second = session.sources()[1].path.clone();
     let end = session.timeline_duration();
-    assert!(
-        session
-            .place_stream_at(end, &second, 0, None)
-            .expect("a file just imported is on this timeline")
-    );
+    assert!(session
+        .place_stream_at(end, &second, 0, None)
+        .expect("a file just imported is on this timeline"));
     let streams = HashMap::new();
     let rows = |session: &PlaybackSession| {
         library_rows(session.sources(), &streams, &HashMap::new(), None, |_| 0).len()
@@ -2058,11 +2049,9 @@ fn a_track_can_be_added_dropped_on_edited_and_taken_back() {
     // A library row let go over that row: the same door the Add button
     // uses, told which lane it was let go over.
     let path = session.sources()[0].path.clone();
-    assert!(
-        session
-            .place_stream_at(1.0, &path, 0, Some(v2))
-            .expect("its own file is on this timeline")
-    );
+    assert!(session
+        .place_stream_at(1.0, &path, 0, Some(v2))
+        .expect("its own file is on this timeline"));
     assert_eq!(session.lane_clips(v2).len(), 1, "the drop landed on V2");
     assert_eq!(session.lane_clips(v2)[0].start, 30, "at the playhead");
     // ...with the sound it came with, on the row of its own the drop added:
@@ -2149,22 +2138,18 @@ fn a_selection_drag_moves_every_pick_by_the_same_delta() {
 
     // clip0 on V1 at the fixture's own start; clip1 on V1 ten seconds in,
     // appended to the open bed and rippling nothing.
-    assert!(
-        session
-            .place_stream_at(10.0, &second, 0, None)
-            .expect("av2 is on this timeline")
-    );
+    assert!(session
+        .place_stream_at(10.0, &second, 0, None)
+        .expect("av2 is on this timeline"));
     let clip0 = session.lane_clips(Lane::V1)[0];
     let clip1 = session.lane_clips(Lane::V1)[1];
     assert_eq!((clip0.start, clip1.start), (0, 300));
 
     // clipC on a second video row, well past both of the above.
     let v2 = session.add_lane(LaneKind::Video);
-    assert!(
-        session
-            .place_stream_at(20.0, &path, 0, Some(v2))
-            .expect("test_av.mp4 is on this timeline")
-    );
+    assert!(session
+        .place_stream_at(20.0, &path, 0, Some(v2))
+        .expect("test_av.mp4 is on this timeline"));
     let clip_c = session.lane_clips(v2)[0];
     assert_eq!(clip_c.start, 600);
 
@@ -2217,28 +2202,22 @@ fn a_selection_drag_refuses_as_one_set_when_any_pick_cannot_land() {
     session.import(&asset("test_av2.mp4")).expect("av2 matches");
     let second = session.sources()[1].path.clone();
 
-    assert!(
-        session
-            .place_stream_at(10.0, &second, 0, None)
-            .expect("av2 is on this timeline")
-    );
+    assert!(session
+        .place_stream_at(10.0, &second, 0, None)
+        .expect("av2 is on this timeline"));
     let clip0 = session.lane_clips(Lane::V1)[0];
     let clip1 = session.lane_clips(Lane::V1)[1];
 
     let v2 = session.add_lane(LaneKind::Video);
-    assert!(
-        session
-            .place_stream_at(0.0, &path, 0, Some(v2))
-            .expect("test_av.mp4 is on this timeline")
-    );
+    assert!(session
+        .place_stream_at(0.0, &path, 0, Some(v2))
+        .expect("test_av.mp4 is on this timeline"));
     let clip_c = session.lane_clips(v2)[0];
     // A clip clip1 is not picked, blocking the road on V2 the drag is about
     // to try: clip1 dragged onto V2 lands its head inside this one.
-    assert!(
-        session
-            .place_stream_at(10.0, &second, 0, Some(v2))
-            .expect("av2 is on this timeline")
-    );
+    assert!(session
+        .place_stream_at(10.0, &second, 0, Some(v2))
+        .expect("av2 is on this timeline"));
     let blocker = session.lane_clips(v2)[1];
     assert_eq!(blocker.start, 300);
 
@@ -2293,20 +2272,16 @@ fn a_three_pick_copy_paste_preserves_gaps_and_lane_assignment() {
     session.import(&asset("test_av2.mp4")).expect("av2 matches");
     let second = session.sources()[1].path.clone();
 
-    assert!(
-        session
-            .place_stream_at(10.0, &second, 0, None)
-            .expect("av2 is on this timeline")
-    );
+    assert!(session
+        .place_stream_at(10.0, &second, 0, None)
+        .expect("av2 is on this timeline"));
     let clip0 = session.lane_clips(Lane::V1)[0];
     let clip1 = session.lane_clips(Lane::V1)[1];
 
     let v2 = session.add_lane(LaneKind::Video);
-    assert!(
-        session
-            .place_stream_at(20.0, &path, 0, Some(v2))
-            .expect("test_av.mp4 is on this timeline")
-    );
+    assert!(session
+        .place_stream_at(20.0, &path, 0, Some(v2))
+        .expect("test_av.mp4 is on this timeline"));
     let clip_c = session.lane_clips(v2)[0];
 
     // Copied in click order, out of the lanes each was clicked in -- exactly
@@ -2354,20 +2329,16 @@ fn a_colliding_set_paste_refuses_whole() {
     session.import(&asset("test_av2.mp4")).expect("av2 matches");
     let second = session.sources()[1].path.clone();
 
-    assert!(
-        session
-            .place_stream_at(10.0, &second, 0, None)
-            .expect("av2 is on this timeline")
-    );
+    assert!(session
+        .place_stream_at(10.0, &second, 0, None)
+        .expect("av2 is on this timeline"));
     let clip0 = session.lane_clips(Lane::V1)[0];
     let clip1 = session.lane_clips(Lane::V1)[1];
 
     let v2 = session.add_lane(LaneKind::Video);
-    assert!(
-        session
-            .place_stream_at(20.0, &path, 0, Some(v2))
-            .expect("test_av.mp4 is on this timeline")
-    );
+    assert!(session
+        .place_stream_at(20.0, &path, 0, Some(v2))
+        .expect("test_av.mp4 is on this timeline"));
     let clip_c = session.lane_clips(v2)[0];
 
     let items = [(Lane::V1, clip0), (Lane::V1, clip1), (v2, clip_c)];
@@ -2422,11 +2393,9 @@ fn a_grouped_clip_on_an_added_lane_closes_its_hole_with_its_caption() {
     let (mut session, sub_lane) = with_subtitle_lane();
     let v2 = session.add_lane(LaneKind::Video);
     let path = session.sources()[0].path.clone();
-    assert!(
-        session
-            .place_stream_at(0.0, &path, 0, Some(v2))
-            .expect("its own file is on this timeline")
-    );
+    assert!(session
+        .place_stream_at(0.0, &path, 0, Some(v2))
+        .expect("its own file is on this timeline"));
     session
         .place_sub(sub_lane, 0, one_second(0))
         .expect("the caption goes down");
@@ -2486,20 +2455,38 @@ fn a_source_is_only_ever_asked_for_its_peaks_once() {
             .collect::<Vec<_>>()
     };
     let mut waves: HashMap<(PathBuf, usize), Wave> = HashMap::new();
-    assert_eq!(unseen_sources(&sources, &waves), keys(&sources));
+    assert_eq!(
+        unseen_sources(&sources, &waves, std::time::Instant::now()),
+        keys(&sources)
+    );
     // The entry goes in when the decode *starts*, so the sixty repaints a
     // second that happen while it runs must not start it again -- which is
     // what this asserts about a key whose value is not an answer yet.
     waves.insert((a.clone(), 0), Wave::Loading);
     assert_eq!(
-        unseen_sources(&sources, &waves),
+        unseen_sources(&sources, &waves, std::time::Instant::now()),
         keys(&sources[1..]),
         "the file's other stream is a key of its own"
     );
     // A file with no audio is an answer like any other: never re-asked.
     waves.insert((a, 1), Wave::Silent);
     waves.insert((b.clone(), 0), Wave::Silent);
-    assert!(unseen_sources(&sources, &waves).is_empty());
+    assert!(unseen_sources(&sources, &waves, std::time::Instant::now()).is_empty());
+    // A decode that *failed* is not an answer: the reason may have gone away
+    // (the file was still being copied when it arrived), so it is asked again
+    // -- once the stamp is older than the cooldown, so sixty repaints a second
+    // do not become sixty decodes.
+    let now = std::time::Instant::now();
+    waves.insert((b.clone(), 0), Wave::Failed(now));
+    assert!(
+        unseen_sources(&sources, &waves, now).is_empty(),
+        "a failure that just landed is not re-asked at once"
+    );
+    assert_eq!(
+        unseen_sources(&sources, &waves, now + crate::subs::WAVE_RETRY),
+        keys(&sources[2..]),
+        "and is asked again once the cooldown is out"
+    );
     // The stream probe is per *file*: the two entries of `a` ask once.
     let mut streams: HashMap<PathBuf, Vec<StreamInfo>> = HashMap::new();
     assert_eq!(
@@ -2802,13 +2789,21 @@ fn every_verb_the_spine_carried_is_a_right_click_row() {
     // Every menu is a list of actions the keyboard already reaches, so every
     // row can wear its chord (DESIGN §4): a row built here out of an id the
     // registry never files would print an empty column.
-    for action in MENU_ITEMS.into_iter().chain(BENCH_ITEMS).chain(heads.iter().copied()) {
+    for action in MENU_ITEMS
+        .into_iter()
+        .chain(BENCH_ITEMS)
+        .chain(heads.iter().copied())
+    {
         assert!(
             ActionId::ALL.contains(&action),
             "{action:?} is a menu row and not a registered action"
         );
     }
-    for list in [MENU_ITEMS.to_vec(), BENCH_ITEMS.to_vec(), lane_items(Lane::A1)] {
+    for list in [
+        MENU_ITEMS.to_vec(),
+        BENCH_ITEMS.to_vec(),
+        lane_items(Lane::A1),
+    ] {
         let first = list.iter().position(|&a| destructive(a));
         if let Some(first) = first {
             assert!(
