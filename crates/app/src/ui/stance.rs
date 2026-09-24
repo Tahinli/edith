@@ -68,6 +68,55 @@ pub(crate) fn is_focus_exit_key(key: &str) -> bool {
     key == "escape"
 }
 
+/// The room-wide chords an open card does not take.
+///
+/// A card owns the keyboard for its own *values* -- the arrows on a slider, `r`
+/// for reset, `m` for maximize, the digits on the equalizer, `enter` to apply
+/// ([`Player::param_card_key`]'s branch list) -- and every one of those is a
+/// *bare* stroke its own branch claims. These five are not: each acts on the
+/// document rather than on the card the hand is looking at, and while a card is
+/// open the room must still answer them. It is the equalizer card's own comment
+/// that says so from the inside: "Nothing to undo: every change is already at
+/// the clip, and undo is undo's own key".
+///
+/// - `Undo`/`Redo`: the edit history. The one chord a hand reaches for *while*
+///   looking at what it just changed, which is exactly when a card is open.
+/// - `Save`: the project file. Its chord is `ctrl+s`, and no card's branch
+///   answers a ctrl chord on purpose (`param_card_key` is handed the shift
+///   modifier alone).
+/// - `Copy`/`Paste`: the clip clipboard, the pair beside the history keys.
+///
+/// Asked against the [`keymap::ActionId`] the stroke resolved to, never against
+/// a key literal: a rebind moves the chord and this list follows it.
+///
+/// Deliberately *not* here, in three kinds:
+///
+/// 1. The strokes a card's own branch list claims, which the card must keep:
+///    escape (every card's way out, and `Deselect`'s own stroke), the arrows
+///    (`StepBack`/`StepForward`/`JumpBack`/`JumpForward` -- the branch reads
+///    them with or without ctrl), `m` (`ToggleMute`) and the digits, plus the
+///    bare letters the cards' verbs sit on -- `r` (`Loop`, `Resolution`), `f`
+///    (`Mix`, `Crossfade`), `a` (`AddAudioLane`, `SelectAll`), `s`
+///    (`Cut` -- the EQ card's spectrum), `x` (`Delete`, `Dissolve` -- the
+///    band's removal), `k` (`Color`), `j`, `u`, `y` (`SubtitleStyle`), `enter`
+///    (the silence card's apply).
+/// 2. The chords that open a card: `Export`/`Settings`/`Color`/`Transform`/
+///    `Speed`/`Silence`/`Mix`/`Equalizer`/`SubtitleStyle`. They own the very
+///    modal slot the open card is sitting in, and swapping the surface under a
+///    hand mid-stroke is not a chord this fix is for.
+/// 3. Everything else the keymap binds (the odometer, the trims, the zoom, the
+///    lane add/remove pair, the theme, the screenshot...). They are left to the
+///    card on purpose, the way [`Player::param_card_key`] left them before this:
+///    the defect is a card swallowing the *history* while the user edits through
+///    it, and each of these is one press away again the moment the card closes.
+pub(crate) fn card_safe_action(action: crate::keymap::ActionId) -> bool {
+    use crate::keymap::ActionId;
+    matches!(
+        action,
+        ActionId::Undo | ActionId::Redo | ActionId::Save | ActionId::Copy | ActionId::Paste
+    )
+}
+
 /// The dock mounts only one of its two tabs at a time
 /// (`dock_stance::render`'s `match src_active`), so `focus_dock` only has a
 /// tree node under Sources and `focus_inspector` only under Clip -- focusing
@@ -1068,6 +1117,25 @@ pub(crate) fn render(
                 cx.notify();
                 return;
             }
+            // A card is not a key-eating black box. The room-wide chords that
+            // act on the document rather than on the card -- the edit history,
+            // the project file, the clipboard ([`card_safe_action`]) -- run
+            // here, ahead of the cards' own key branches below and ahead of the
+            // blanket modal guard under them, so an open card cannot swallow
+            // the stroke a hand reaches for while looking at what it changed.
+            // `param_card_key` answers `true` for every stroke once a card is
+            // open, so this has to stand in front of *it*, not only in front of
+            // the guard: `ctrl+z` never reached `keymap.lookup` at all, and the
+            // card's own comment says undo was always meant to be undo's key.
+            //
+            // Asked through the keymap rather than as a table of key literals:
+            // a rebind moves the chord and this follows.
+            if let Some(action) = this.keymap.lookup(key, ctrl)
+                && card_safe_action(action)
+            {
+                this.act(action, window, cx);
+                return;
+            }
             // The param cards' own key branches (arrows nudge the focused
             // slider, digits pick an EQ band, `r` resets, card verbs) --
             // `Player::param_card_key` (`player/cards.rs`), the same
@@ -1125,6 +1193,12 @@ pub(crate) fn render(
                 // clip_menu/row_menu/list chain follows (`render.rs`): this is
                 // the fix for "no state may make the room modal without
                 // showing anything", not only the source-dot's menu.
+                //
+                // Except the document chords, which were answered *above* and
+                // left the menu standing: a menu is a visible surface with
+                // escape and any other key still shutting it, and losing an
+                // undo to a square of the screen a right-click left open would
+                // be the black box this handler no longer is.
                 this.context_menu = None;
                 this.library_menu = None;
                 this.picker = None;
