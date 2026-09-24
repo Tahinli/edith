@@ -750,5 +750,24 @@ for deg in 90 180 270 45; do
 done
 rm -f assets/.rotation_src.mp4
 
+# The one fixture where the coded and the displayed height disagree about what the
+# material is: `test_rotation90tall` is 1280x640 as stored and 640x1280 as shown,
+# and neither container tags its colour (the mkv's `Colour` element carries only
+# chroma siting, the mp4 has no `colr` box), so the 720-line rule an untagged
+# stream's matrix is guessed from reads a different side of itself depending on
+# which height a door feeds it.
+ffmpeg -y -f lavfi -i "color=c=red:s=640x320:d=1:r=30,format=yuv420p" \
+    -f lavfi -i "color=c=green:s=640x320:d=1:r=30,format=yuv420p" \
+    -f lavfi -i "color=c=blue:s=640x320:d=1:r=30,format=yuv420p" \
+    -f lavfi -i "color=c=yellow:s=640x320:d=1:r=30,format=yuv420p" \
+    -filter_complex "[0:v][1:v]hstack[top];[2:v][3:v]hstack[bot];[top][bot]vstack[v]" \
+    -map "[v]" -frames:v 30 -c:v libx264 -profile:v baseline -pix_fmt yuv420p \
+    assets/.rotation_tall_src.mp4
+for ext in mp4 mkv; do
+    ffmpeg -y -display_rotation 90 -i assets/.rotation_tall_src.mp4 \
+        -c copy "assets/test_rotation90tall.$ext"
+done
+rm -f assets/.rotation_tall_src.mp4
+
 
 echo "fixtures written to assets/"

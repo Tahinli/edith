@@ -219,38 +219,48 @@ fn the_preview_shows_a_turned_file_upright() {
 #[test]
 fn an_export_of_a_turned_file_is_upright_and_portrait() {
     let _seat = pin_software();
-    let source = asset("test_rotation90.mp4");
-    let mut session = PlaybackSession::open(&source).expect("open the fixture");
-    session.pause();
-    assert_eq!(
-        [session.meta().width, session.meta().height],
-        [180, 320],
-        "the timeline is the displayed shape, not the coded one"
-    );
-    let out = out_path("upright");
-    let handle = session.export_to_with(&out, &ExportSettings::default());
-    wait(&handle, Duration::from_secs(60)).expect("export");
+    // Both doors, because the turn reaches the export through exactly one number
+    // -- the source's `Rotation` in the export's rate table -- and an mkv states
+    // it with a `Projection` roll where an mp4 states a `tkhd` matrix: a door
+    // that read its own spelling into that number differently would bake a
+    // different turn into the pixels, and nothing but this test would show it.
+    for file in ["test_rotation90.mp4", "test_rotation90.mkv"] {
+        let source = asset(file);
+        let mut session = PlaybackSession::open(&source).expect("open the fixture");
+        session.pause();
+        assert_eq!(
+            [session.meta().width, session.meta().height],
+            [180, 320],
+            "{file}: the timeline is the displayed shape, not the coded one"
+        );
+        let out = out_path(&file.replace('.', "_"));
+        let handle = session.export_to_with(&out, &ExportSettings::default());
+        wait(&handle, Duration::from_secs(60)).expect("export");
 
-    let (meta, _) = engine::demux::Demuxer::open(&out).expect("reopen the export");
-    assert_eq!(
-        [meta.width, meta.height],
-        [180, 320],
-        "the written file is portrait"
-    );
-    assert_eq!(
-        meta.rotation,
-        Rotation::None,
-        "and states no matrix: the turn is in the pixels"
-    );
-    assert_eq!(meta.frame_count, 30, "every timeline frame was written");
+        let (meta, _) = engine::demux::Demuxer::open(&out).expect("reopen the export");
+        assert_eq!(
+            [meta.width, meta.height],
+            [180, 320],
+            "{file}: the written file is portrait"
+        );
+        assert_eq!(
+            meta.rotation,
+            Rotation::None,
+            "{file}: and states no matrix: the turn is in the pixels"
+        );
+        assert_eq!(
+            meta.frame_count, 30,
+            "{file}: every timeline frame was written"
+        );
 
-    let (width, height, bgra) = first_frame(&out);
-    assert_eq!([width, height], [180, 320]);
-    assert_eq!(
-        corners(width, height, &bgra),
-        ["green", "yellow", "blue", "red"],
-        "the exported pixels are the ones the preview showed"
-    );
+        let (width, height, bgra) = first_frame(&out);
+        assert_eq!([width, height], [180, 320]);
+        assert_eq!(
+            corners(width, height, &bgra),
+            ["green", "yellow", "blue", "red"],
+            "{file}: the exported pixels are the ones the preview showed"
+        );
+    }
 }
 
 /// A turn that is not a quarter turn is refused by name at the door, with the
@@ -280,6 +290,35 @@ fn a_turn_that_is_not_a_quarter_turn_is_refused_by_name() {
         assert!(
             said.contains("45.0°") && said.contains("quarter turn"),
             "{file}: the refusal names the angle it cannot make: {said}"
+        );
+    }
+}
+
+/// A rotated file whose *coded* height and *displayed* height sit on opposite
+/// sides of the 720-line rule an untagged stream's matrix is guessed from
+/// ([`engine::colorspace::ColorDescription::resolve`]): `test_rotation90tall` is
+/// 1280x640 as stored and 640x1280 as shown, and neither container tags it (the
+/// mkv's `Colour` element carries only chroma siting, the mp4 has no `colr`
+/// box), so that guess is the only thing deciding bt601 against bt709.
+///
+/// Both doors must feed the height the picture is *shown* at -- bt709 here -- and
+/// this is the assertion that fails if a door reads the coded height instead
+/// (`video.height`, 640, is bt601). The two doors agreeing is the whole point of
+/// resolving the size the same way in both.
+#[test]
+fn a_turned_file_guesses_its_matrix_from_the_height_it_is_shown_at() {
+    for file in ["test_rotation90tall.mp4", "test_rotation90tall.mkv"] {
+        let (meta, _) = engine::demux::Demuxer::open(&asset(file)).expect("open a fixture");
+        assert_eq!(
+            [meta.width, meta.height],
+            [640, 1280],
+            "{file}: the shown shape -- 1280x640 as stored, turned by the file"
+        );
+        assert_eq!(
+            meta.color.matrix,
+            engine::colorspace::Matrix::Bt709,
+            "{file}: the 1280-line *displayed* height is HD material; the 640-line coded one \
+             would guess bt601, so this is the coded-height bug showing"
         );
     }
 }
