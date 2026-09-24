@@ -58,10 +58,15 @@ const DISSOLVE_B_TIMEOUT: Duration = Duration::from_millis(200);
 /// inside it, and short enough that a play pressed after one does not wait.
 const AUDIO_REARM_AFTER: Duration = Duration::from_secs(1);
 
-/// What a session says when its output dies ([`PlaybackSession::tick`]): the
-/// one line a front-end shows for a session that has gone quiet, through the
-/// same door a file's own refusal reaches it by
-/// ([`PlaybackSession::audio_disabled_reason`]).
+/// The reason a session gives for having gone quiet when its output dies
+/// ([`PlaybackSession::tick`]), through the same door a file's own refusal
+/// reaches a front-end by ([`PlaybackSession::audio_disabled_reason`]).
+///
+/// That door is read where a notice is *built* -- at open and at load -- so this
+/// is fetchable rather than announced: the engine sets the reason and clears it
+/// again when the output comes back, and a front-end that reads the door after
+/// the session is open (a per-frame check, or one at the next load) is what
+/// shows it. Nothing here pushes a notice.
 const AUDIO_LOST: &str = "output device went away -- reconnecting the timeline's sound";
 
 /// The timeline a file with no picture scaffolds: 1080p at 30 fps, H.264 --
@@ -4738,6 +4743,37 @@ mod tests {
             None,
             "the notice was left standing over a session that is playing again"
         );
+    }
+
+    /// The seat declares the canvas's own size and the painter masks the planes
+    /// it returns to even dimensions. An odd canvas (a `resolution 1921 1081`
+    /// line) or a one-pixel-high one leaves those two disagreeing by a row, and
+    /// the conversion then indexes a chroma plane the size it was told does not
+    /// have: `index out of bounds` on a zero-length slice, inside the seat's
+    /// worker, where nothing catches it and no frame ever arrives.
+    ///
+    /// An audio-only source, so the span really is a visualizer seat, and a
+    /// frame really is pulled out of it.
+    #[test]
+    fn a_visualizer_seat_paints_a_canvas_it_cannot_evenly_divide() {
+        for (w, h) in [(1920, 1), (1921, 1081), (320, 1), (321, 181)] {
+            let mut session =
+                PlaybackSession::open(asset("test_tone.mp3")).expect("open the audio fixture");
+            assert!(
+                session.set_resolution(w, h),
+                "{w}x{h} should be a resolution this session takes"
+            );
+            let mut frame = None;
+            for _ in 0..400 {
+                if let Some(f) = session.try_frame() {
+                    frame = Some(f);
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            let frame = frame.unwrap_or_else(|| panic!("no frame from a {w}x{h} canvas"));
+            assert_eq!((frame.width, frame.height), (w, h), "a frame at the canvas's own size");
+        }
     }
 
     /// `blend_bgra` at the two ends and the midpoint of its weight -- `t=0` is
