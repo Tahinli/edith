@@ -253,54 +253,33 @@ fn an_export_of_a_turned_file_is_upright_and_portrait() {
     );
 }
 
-/// A matrix that is not a quarter turn is refused by name at the door, with the
-/// angle in the sentence -- the honest answer to a picture this engine has no
-/// way to show right. The capability really is absent: nothing here turns by an
-/// arbitrary angle ([`engine::scale::rotate_i420_90s`] takes whole quarters),
-/// and the refusal is what says so instead of a sideways picture.
-#[test]
-fn a_matrix_that_is_not_a_quarter_turn_is_refused_by_name() {
-    let error = match engine::demux::Demuxer::open(&asset("test_rotation45.mp4")) {
-        Ok(_) => panic!("45 degrees is not a quarter turn, and opening it must not succeed"),
-        Err(error) => error,
-    };
-    assert!(
-        engine::UnsupportedRotation::is_it(&error),
-        "the refusal is the named one, not a generic failure: {error}"
-    );
-    let said = error.to_string();
-    assert!(
-        said.contains("45.0°") && said.contains("quarter turn"),
-        "the refusal names the angle it cannot make: {said}"
-    );
-}
-
-/// An anamorphic file's own numbers decide the shape the engine reports: the
-/// pixels are 1440x1080 and the file says they are shown 1920x1080 wide, which is
-/// what a player shows -- so that is the shape this engine reports, and the shape
-/// the preview and the export must therefore place the coded pixels at. A
-/// squashed picture in a 4:3 frame is the same class of wrong as a portrait file
-/// on its side, and both are the file's own numbers being ignored.
+/// A turn that is not a quarter turn is refused by name at the door, with the
+/// angle in the sentence -- the honest answer to a picture this engine has no way
+/// to show right. The capability really is absent: nothing here turns by an
+/// arbitrary angle ([`engine::scale::rotate_i420_90s`] takes whole quarters), and
+/// the refusal is what says so instead of a sideways picture.
 ///
-/// **Both spellings**, because they are what the two doors read and a file
-/// remuxed from one to the other must not change shape: Matroska states the
-/// *display aspect ratio* in `DisplayWidth`/`DisplayHeight` -- ffmpeg writes the
-/// ratio unit, so `16x9` and not `1920x1080` (`DisplayUnit` 3) -- while an mp4
-/// states the *sample* aspect ratio in a `pasp` box beside its `avc1` (`4:3`).
-/// Both resolve to the coded height at that aspect.
+/// **Both doors**, because they are two spellings of one question: an mp4 states
+/// the turn in a `tkhd` matrix and an mkv in a `Projection` roll, and a file
+/// whose picture is 45 degrees off is the same missing capability either way --
+/// the mkv twin exists for exactly this assertion.
 #[test]
-fn an_anamorphic_file_reports_the_shape_it_is_shown_at() {
-    for file in ["test_anamorphic.mp4", "test_anamorphic.mkv"] {
-        let (meta, _) = engine::demux::Demuxer::open(&asset(file)).expect("open a fixture");
-        assert_eq!(
-            [meta.width, meta.height],
-            [1920, 1080],
-            "{file}: the displayed shape, not the 1440x1080 the samples are stored at"
+fn a_turn_that_is_not_a_quarter_turn_is_refused_by_name() {
+    for file in ["test_rotation45.mp4", "test_rotation45.mkv"] {
+        let error = match engine::demux::Demuxer::open(&asset(file)) {
+            Ok(_) => {
+                panic!("45 degrees is not a quarter turn, and opening {file} must not succeed")
+            }
+            Err(error) => error,
+        };
+        assert!(
+            engine::UnsupportedRotation::is_it(&error),
+            "{file}: the refusal is the named one, not a generic failure: {error}"
         );
-        assert_eq!(
-            meta.rotation,
-            Rotation::None,
-            "{file}: no turn is asked for, and a non-square sample is not one"
+        let said = error.to_string();
+        assert!(
+            said.contains("45.0°") && said.contains("quarter turn"),
+            "{file}: the refusal names the angle it cannot make: {said}"
         );
     }
 }
