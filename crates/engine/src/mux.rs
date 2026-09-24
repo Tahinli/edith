@@ -164,6 +164,99 @@ fn colr_nclx(colour: ColorDescription) -> [u8; 11] {
     out
 }
 
+/// The language an mp4 track states, from whatever a caller said the track is
+/// in.
+///
+/// `mdhd` packs exactly three ISO 639-2 letters into its 16-bit field, and the
+/// `mp4` crate's own `language_code` (`vendor/mp4/src/mp4box/mdhd.rs:157`)
+/// masks the three UTF-16 units it is handed with `0x1F` and drops the rest --
+/// so a two-letter `en` is written as `en` and a backtick, and a `pt-BR` tag as
+/// `ptm`, silently, with a player's subtitle menu then offering a language
+/// nobody speaks. Matroska's `Language` is raw UTF-8 beside that and may carry
+/// a BCP-47 tag, so the tag is cut to its primary subtag here, mapped through
+/// [`ISO_639_1_TO_2`] where it is two letters, and left `und` -- the code that
+/// says *undetermined* -- where nothing names it.
+///
+/// Three lowercase letters are taken as they are: that is the code the field
+/// holds, and it is what an ISO 639-3 tag like `fil` and every language
+/// `crate::demux::mkv_language` hands over already are.
+fn mp4_language(language: &str) -> String {
+    let primary = language
+        .split('-')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let code = match primary.len() {
+        2 => ISO_639_1_TO_2
+            .iter()
+            .find(|(two, _)| *two == primary)
+            .map(|(_, three)| *three),
+        3 if primary.bytes().all(|b| b.is_ascii_lowercase()) => Some(primary.as_str()),
+        _ => None,
+    };
+    code.unwrap_or("und").to_owned()
+}
+
+/// Every ISO 639-1 code and the 639-2 (terminology) one it names the same
+/// language with -- what [`mp4_language`] maps a BCP-47 primary subtag through.
+///
+/// corner-cut: the same standard's table `crate::demux` reads a Matroska
+/// `TrackEntry` through, carried here as well because that one is private to
+/// its module and this file owns no other file's visibility. The two must not
+/// drift, so a change belongs in both; the upgrade path is one table with
+/// `pub(crate)` on it, and a muxer that calls the demuxer's. Whole standard and
+/// not the languages a test happened to use, generated from `iso-codes`'
+/// `iso_639-2.json` like that one.
+#[rustfmt::skip]
+const ISO_639_1_TO_2: &[(&str, &str)] = &[
+    ("aa", "aar"), ("ab", "abk"), ("ae", "ave"), ("af", "afr"),
+    ("ak", "aka"), ("am", "amh"), ("an", "arg"), ("ar", "ara"),
+    ("as", "asm"), ("av", "ava"), ("ay", "aym"), ("az", "aze"),
+    ("ba", "bak"), ("be", "bel"), ("bg", "bul"), ("bi", "bis"),
+    ("bm", "bam"), ("bn", "ben"), ("bo", "bod"), ("br", "bre"),
+    ("bs", "bos"), ("ca", "cat"), ("ce", "che"), ("ch", "cha"),
+    ("co", "cos"), ("cr", "cre"), ("cs", "ces"), ("cu", "chu"),
+    ("cv", "chv"), ("cy", "cym"), ("da", "dan"), ("de", "deu"),
+    ("dv", "div"), ("dz", "dzo"), ("ee", "ewe"), ("el", "ell"),
+    ("en", "eng"), ("eo", "epo"), ("es", "spa"), ("et", "est"),
+    ("eu", "eus"), ("fa", "fas"), ("ff", "ful"), ("fi", "fin"),
+    ("fj", "fij"), ("fo", "fao"), ("fr", "fra"), ("fy", "fry"),
+    ("ga", "gle"), ("gd", "gla"), ("gl", "glg"), ("gn", "grn"),
+    ("gu", "guj"), ("gv", "glv"), ("ha", "hau"), ("he", "heb"),
+    ("hi", "hin"), ("ho", "hmo"), ("hr", "hrv"), ("ht", "hat"),
+    ("hu", "hun"), ("hy", "hye"), ("hz", "her"), ("ia", "ina"),
+    ("id", "ind"), ("ie", "ile"), ("ig", "ibo"), ("ii", "iii"),
+    ("ik", "ipk"), ("io", "ido"), ("is", "isl"), ("it", "ita"),
+    ("iu", "iku"), ("ja", "jpn"), ("jv", "jav"), ("ka", "kat"),
+    ("kg", "kon"), ("ki", "kik"), ("kj", "kua"), ("kk", "kaz"),
+    ("kl", "kal"), ("km", "khm"), ("kn", "kan"), ("ko", "kor"),
+    ("kr", "kau"), ("ks", "kas"), ("ku", "kur"), ("kv", "kom"),
+    ("kw", "cor"), ("ky", "kir"), ("la", "lat"), ("lb", "ltz"),
+    ("lg", "lug"), ("li", "lim"), ("ln", "lin"), ("lo", "lao"),
+    ("lt", "lit"), ("lu", "lub"), ("lv", "lav"), ("mg", "mlg"),
+    ("mh", "mah"), ("mi", "mri"), ("mk", "mkd"), ("ml", "mal"),
+    ("mn", "mon"), ("mr", "mar"), ("ms", "msa"), ("mt", "mlt"),
+    ("my", "mya"), ("na", "nau"), ("nb", "nob"), ("nd", "nde"),
+    ("ne", "nep"), ("ng", "ndo"), ("nl", "nld"), ("nn", "nno"),
+    ("no", "nor"), ("nr", "nbl"), ("nv", "nav"), ("ny", "nya"),
+    ("oc", "oci"), ("oj", "oji"), ("om", "orm"), ("or", "ori"),
+    ("os", "oss"), ("pa", "pan"), ("pi", "pli"), ("pl", "pol"),
+    ("ps", "pus"), ("pt", "por"), ("qu", "que"), ("rm", "roh"),
+    ("rn", "run"), ("ro", "ron"), ("ru", "rus"), ("rw", "kin"),
+    ("sa", "san"), ("sc", "srd"), ("sd", "snd"), ("se", "sme"),
+    ("sg", "sag"), ("si", "sin"), ("sk", "slk"), ("sl", "slv"),
+    ("sm", "smo"), ("sn", "sna"), ("so", "som"), ("sq", "sqi"),
+    ("sr", "srp"), ("ss", "ssw"), ("st", "sot"), ("su", "sun"),
+    ("sv", "swe"), ("sw", "swa"), ("ta", "tam"), ("te", "tel"),
+    ("tg", "tgk"), ("th", "tha"), ("ti", "tir"), ("tk", "tuk"),
+    ("tl", "tgl"), ("tn", "tsn"), ("to", "ton"), ("tr", "tur"),
+    ("ts", "tso"), ("tt", "tat"), ("tw", "twi"), ("ty", "tah"),
+    ("ug", "uig"), ("uk", "ukr"), ("ur", "urd"), ("uz", "uzb"),
+    ("ve", "ven"), ("vi", "vie"), ("vo", "vol"), ("wa", "wln"),
+    ("wo", "wol"), ("xh", "xho"), ("yi", "yid"), ("yo", "yor"),
+    ("za", "zha"), ("zh", "zho"), ("zu", "zul"),
+];
+
 const VIDEO_TRACK: u32 = 1;
 const AUDIO_TRACK: u32 = 2;
 
@@ -585,15 +678,16 @@ impl Mp4Muxer {
             self.writer.add_track(&TrackConfig {
                 track_type: TrackType::Subtitle,
                 timescale: SUB_TIMESCALE,
-                // `und` and not an empty string where the source states no
-                // language: an mp4 packs the three letters into a 16-bit field
-                // and has no way to leave it out, and `und` is the code that
-                // says *undetermined* -- while three zero bits would spell a
-                // language nobody speaks.
-                language: match subs.language.is_empty() {
-                    true => "und".to_string(),
-                    false => subs.language.clone(),
-                },
+                // The field's own contract, enforced here rather than trusted:
+                // an mp4 packs exactly three ISO 639-2 letters into 16 bits, and
+                // the `mp4` crate's own `language_code` masks whatever it is
+                // handed into that shape without a word -- a two-letter `en`
+                // comes out as `en` and a backtick, a `pt-BR` tag as `ptm` --
+                // while Matroska may state a BCP-47 tag for the same track.
+                // `mp4_language` is the one place a tag becomes a code, and
+                // `und` (the code that means *undetermined*) is what a tag
+                // nothing names leaves as, rather than a language nobody speaks.
+                language: mp4_language(&subs.language),
                 media_conf: MediaConfig::TtxtConfig(TtxtConfig {}),
             })?;
             for (bytes, duration) in timed_text(&subs.cues, end)? {
@@ -623,6 +717,13 @@ impl Mp4Muxer {
         // is coming for either to wait on, so this drains both fully rather
         // than leaving a video-only tail queued.
         self.drain_all()?;
+        // Both containers refuse a file nobody put a picture in, by name and in
+        // their own container's words ([`MkvMuxer::finish`] is the twin): an mp4
+        // whose picture track holds no sample is a file that opens on a blank
+        // window with nothing said, which is worse than an export that fails.
+        if self.frames == 0 {
+            return Err("no frames were written to the mp4 file".into());
+        }
         self.writer.write_end()?;
         let Self {
             writer,
@@ -940,8 +1041,9 @@ const TIMESTAMP_SCALE_NS: u64 = 1_000_000;
 /// at the first keyframe past this -- a ceiling on what the muxer holds, not a
 /// target.
 const CLUSTER_BYTES: usize = 4 << 20;
-/// ...and on how far a block's timestamp may sit from its cluster's: the field
-/// is a signed 16-bit millisecond count.
+/// ...and on how far a block's timestamp may sit from its cluster's, *either*
+/// way: the field is a signed 16-bit millisecond count, and a copy's backwards
+/// steps over a group of pictures are the direction nothing else bounds.
 const CLUSTER_MS: i64 = 30_000;
 
 /// The fixed four bytes of an `AV1CodecConfigurationRecord` for what both encode
@@ -1022,6 +1124,12 @@ pub struct SubParams {
     /// where the source states none -- and *only* then, because a `TrackEntry`
     /// without a `Language` means `eng` by spec, so a French track that leaves
     /// this empty leaves as an English one.
+    ///
+    /// Matroska carries whatever bytes this holds, and a file may state a
+    /// BCP-47 tag in them (`pt-BR`); an mp4 has one 16-bit field of exactly
+    /// three ISO 639-2 letters, so [`Mp4Muxer::write_subtitles`] turns a tag
+    /// into a code -- or into `und`, where nothing names it -- rather than
+    /// letting the container mangle it.
     pub language: String,
     /// What the track is *called*, where it has a title of its own beside its
     /// language (`Signs`, `Forced`). Empty where it has none.
@@ -1349,7 +1457,9 @@ impl MkvMuxer {
     /// re-timing those blocks one frame apart would play the group in the order
     /// it was coded in. Matroska times every block in presentation and the
     /// relative timestamp in a block header is signed, so what a copy writes
-    /// here is exactly what its source said.
+    /// here is exactly what its source said -- and a step back wider than that
+    /// signed field reaches opens a cluster of its own rather than being
+    /// truncated into an instant nobody asked for ([`Self::cluster_holds`]).
     pub fn write_block(&mut self, payload: &[u8], key: bool, ts_ns: i64) -> crate::Result<()> {
         if payload.is_empty() {
             return Err("an empty coded block".into());
@@ -1363,24 +1473,53 @@ impl MkvMuxer {
         // A new cluster at every keyframe -- a seek lands on one, so a cluster
         // is a whole GOP -- and at the two limits a cluster has whatever the
         // encoder keys: what it may weigh, and how far a 16-bit relative
-        // timestamp reaches.
+        // timestamp reaches, either way.
         if self.cluster.is_empty()
             || key
             || self.cluster.len() >= CLUSTER_BYTES
-            || ts - self.cluster_ts >= CLUSTER_MS
+            || !self.cluster_holds(ts)
         {
-            self.flush()?;
-            self.cluster_ts = ts;
-            uint(&mut self.cluster, CLUSTER_TIMESTAMP, ts as u64);
+            self.open_cluster(ts)?;
         }
         // The sound this picture plays under goes in first, into the cluster the
         // picture opened: a player reads the two together. The cue over it with
         // them, for the same reason.
         self.drain_audio(ts)?;
         self.drain_subs(ts)?;
-        self.block(1, ts, key, payload);
+        // ...unless a track lagged this picture by more than a cluster reaches
+        // and opened one of its own behind it, in which case the picture gets a
+        // cluster named after its own instant rather than a distance its block
+        // header cannot state.
+        if !self.cluster_holds(ts) {
+            self.open_cluster(ts)?;
+        }
+        self.block(1, ts, key, payload)?;
         self.frames += 1;
         self.last_ts = self.last_ts.max(ts);
+        Ok(())
+    }
+
+    /// Whether the open cluster can hold a block at `ts`. A cluster is buffered
+    /// whole and its blocks are timed *relative* to it, in a signed 16-bit
+    /// millisecond field ([`CLUSTER_MS`]), so a block further from the cluster's
+    /// own timestamp than that -- in **either** direction -- needs a cluster of
+    /// its own. The backwards one is the side a copy really takes: a stream with
+    /// B-frames is stored in decode order, so its presentation times step back
+    /// over a group of pictures.
+    ///
+    /// This is what keeps every distance written inside the field, which is what
+    /// makes [`Self::relative_ms`]'s checked cast a guard of last resort rather
+    /// than the place a real block lands.
+    fn cluster_holds(&self, ts: i64) -> bool {
+        !self.cluster.is_empty() && (ts - self.cluster_ts).unsigned_abs() < CLUSTER_MS as u64
+    }
+
+    /// Opens a cluster stating `ts`, closing whatever was open: a cluster's size
+    /// is a header field, so it is written whole or not at all.
+    fn open_cluster(&mut self, ts: i64) -> crate::Result<()> {
+        self.flush()?;
+        self.cluster_ts = ts;
+        uint(&mut self.cluster, CLUSTER_TIMESTAMP, ts as u64);
         Ok(())
     }
 
@@ -1408,14 +1547,12 @@ impl MkvMuxer {
             let bytes = std::mem::take(&mut packet.bytes);
             audio.samples += u64::from(packet.samples);
             audio.next += 1;
-            // A cluster of its own where the sound has run past what a 16-bit
-            // relative timestamp reaches, which only the tail drain can do.
-            if self.cluster.is_empty() || ts - self.cluster_ts >= CLUSTER_MS {
-                self.flush()?;
-                self.cluster_ts = ts;
-                uint(&mut self.cluster, CLUSTER_TIMESTAMP, ts as u64);
+            // A cluster of its own where the sound has run further from the open
+            // one than a 16-bit relative timestamp reaches, either way.
+            if !self.cluster_holds(ts) {
+                self.open_cluster(ts)?;
             }
-            self.block(2, ts, true, &bytes);
+            self.block(2, ts, true, &bytes)?;
         }
     }
 
@@ -1444,14 +1581,13 @@ impl MkvMuxer {
                 let text = std::mem::take(&mut cue.text);
                 subs.next += 1;
                 let track_no = subs.track_no;
-                // A cluster of its own where the text has run past what a 16-bit
-                // relative timestamp reaches, exactly as the sound's drain does.
-                if self.cluster.is_empty() || ts - self.cluster_ts >= CLUSTER_MS {
-                    self.flush()?;
-                    self.cluster_ts = ts;
-                    uint(&mut self.cluster, CLUSTER_TIMESTAMP, ts as u64);
+                // A cluster of its own where the text has run further from the
+                // open one than a 16-bit relative timestamp reaches, either way,
+                // exactly as the sound's drain does.
+                if !self.cluster_holds(ts) {
+                    self.open_cluster(ts)?;
                 }
-                self.block_group(track_no, ts, ms, text.as_bytes());
+                self.block_group(track_no, ts, ms, text.as_bytes())?;
             }
         }
         Ok(())
@@ -1459,23 +1595,52 @@ impl MkvMuxer {
 
     /// One `SimpleBlock` of `track`, timed against the open cluster. Every AAC
     /// packet is a keyframe; a picture is one when the encoder said so.
-    fn block(&mut self, track: u8, ts: i64, key: bool, payload: &[u8]) {
+    fn block(&mut self, track: u8, ts: i64, key: bool, payload: &[u8]) -> crate::Result<()> {
+        let relative = self.relative_ms(ts)?;
         let mut block = Vec::with_capacity(payload.len() + 4);
         block.push(0x80 | track); // the track number as a one-byte EBML integer
-        block.extend_from_slice(&((ts - self.cluster_ts) as i16).to_be_bytes());
+        block.extend_from_slice(&relative);
         block.push(if key { 0x80 } else { 0 });
         block.extend_from_slice(payload);
         elem(&mut self.cluster, SIMPLE_BLOCK, &block);
+        Ok(())
+    }
+
+    /// A block's own timestamp less its cluster's, in the signed 16-bit
+    /// milliseconds the block header carries.
+    ///
+    /// Checked and not cast: a distance that does not fit is a block at an
+    /// instant nobody asked for -- `as i16` of a step back wider than the field
+    /// lands as a *positive* offset, 65.536 s past its cluster -- and the error
+    /// names the distance instead. Both callers keep the open cluster within
+    /// [`CLUSTER_MS`] of every block they write ([`Self::cluster_holds`]), so
+    /// this is the guard of last resort rather than a case a file reaches.
+    fn relative_ms(&self, ts: i64) -> crate::Result<[u8; 2]> {
+        let ms = ts - self.cluster_ts;
+        i16::try_from(ms).map(i16::to_be_bytes).map_err(|_| {
+            format!(
+                "a block {ms} ms from its cluster's timestamp does not fit the 16-bit \
+                 relative field"
+            )
+            .into()
+        })
     }
 
     /// One `BlockGroup`: a `Block` and the `BlockDuration` beside it. That pair
     /// is how a cue says when it goes away -- a `SimpleBlock` has nowhere to put
     /// a duration, and a subtitle without one stays up until whatever a player
     /// decides, which is what a subtitle must never do.
-    fn block_group(&mut self, track: u8, ts: i64, duration_ms: u64, payload: &[u8]) {
+    fn block_group(
+        &mut self,
+        track: u8,
+        ts: i64,
+        duration_ms: u64,
+        payload: &[u8],
+    ) -> crate::Result<()> {
+        let relative = self.relative_ms(ts)?;
         let mut block = Vec::with_capacity(payload.len() + 4);
         block.push(0x80 | track); // the track number as a one-byte EBML integer
-        block.extend_from_slice(&((ts - self.cluster_ts) as i16).to_be_bytes());
+        block.extend_from_slice(&relative);
         // No flags a text block can carry: not lacing, and "keyframe" is a
         // `SimpleBlock` field that a plain `Block` does not have at all.
         block.push(0);
@@ -1484,6 +1649,7 @@ impl MkvMuxer {
         elem(&mut group, BLOCK, &block);
         uint(&mut group, BLOCK_DURATION, duration_ms);
         elem(&mut self.cluster, BLOCK_GROUP, &group);
+        Ok(())
     }
 
     fn flush(&mut self) -> crate::Result<()> {
@@ -1825,8 +1991,8 @@ pub fn hvcc_record(annex_b: &[u8]) -> Option<Vec<u8>> {
     rec.push(0xF8); // bit_depth_luma_minus8 = 0
     rec.push(0xF8); // bit_depth_chroma_minus8 = 0
     rec.extend_from_slice(&0u16.to_be_bytes()); // avgFrameRate: unstated
-    // constantFrameRate 0, numTemporalLayers 1, temporalIdNested 1,
-    // lengthSizeMinusOne 3 -- the same 4-byte prefix `annex_b_to_hvcc` writes.
+                                                // constantFrameRate 0, numTemporalLayers 1, temporalIdNested 1,
+                                                // lengthSizeMinusOne 3 -- the same 4-byte prefix `annex_b_to_hvcc` writes.
     rec.push(0b00_001_1_11);
     rec.push(3); // numOfArrays
     for (kind, nal) in [(HEVC_VPS, vps), (HEVC_SPS, sps), (HEVC_PPS, pps)] {
@@ -2112,17 +2278,15 @@ mod tests {
             .is_err(),
             "SPS too short for avcC"
         );
-        assert!(
-            Mp4Muxer::create(
-                &out,
-                &VideoParams {
-                    frame_rate: 0.0,
-                    ..ok
-                },
-                None
-            )
-            .is_err()
-        );
+        assert!(Mp4Muxer::create(
+            &out,
+            &VideoParams {
+                frame_rate: 0.0,
+                ..ok
+            },
+            None
+        )
+        .is_err());
         assert!(
             Mp4Muxer::create(&out, &VideoParams { width: 0, ..ok }, None).is_err(),
             "zero width"
@@ -2405,7 +2569,9 @@ mod tests {
             );
             let (audio, chunks) = crate::audio::AudioSession::open(&out)
                 .unwrap()
-                .unwrap_or_else(|| panic!("{name}: track decodes through the project's own reader"));
+                .unwrap_or_else(|| {
+                    panic!("{name}: track decodes through the project's own reader")
+                });
             assert_eq!(
                 (audio.sample_rate, audio.channels),
                 (48_000, want),
@@ -2430,7 +2596,10 @@ mod tests {
                     .sum::<f32>()
                     / n as f32)
                     .sqrt();
-                assert!(rms > 0.05, "{name}: channel {c} came back silent (rms {rms})");
+                assert!(
+                    rms > 0.05,
+                    "{name}: channel {c} came back silent (rms {rms})"
+                );
             }
             std::fs::remove_file(&out).unwrap();
         }
@@ -2555,20 +2724,18 @@ mod tests {
 
         // A track with no sequence header to declare is refused where the
         // message still means something, rather than written unplayable.
-        assert!(
-            MkvMuxer::create(
-                &out,
-                &Av1Params {
-                    width: 640,
-                    height: 360,
-                    frame_rate: 30.0,
-                    config: &[],
-                },
-                None,
-                Vec::new(),
-            )
-            .is_err()
-        );
+        assert!(MkvMuxer::create(
+            &out,
+            &Av1Params {
+                width: 640,
+                height: 360,
+                frame_rate: 30.0,
+                config: &[],
+            },
+            None,
+            Vec::new(),
+        )
+        .is_err());
         assert!(av1_sequence_header(&inter).is_none(), "no sequence header");
         std::fs::remove_file(&out).unwrap();
     }
@@ -2612,6 +2779,168 @@ mod tests {
             "read back as {} fps, not {NTSC}",
             meta.frame_rate
         );
+        std::fs::remove_file(&out).unwrap();
+    }
+
+    /// A block further from its cluster's own timestamp than the 16-bit
+    /// *signed* relative field reaches gets a cluster of its own, backwards as
+    /// well as forwards: a copied stream is stored in decode order, so its
+    /// presentation times step back over a group of pictures
+    /// ([`MkvMuxer::write_block`]), and `as i16` of a distance that does not
+    /// fit lands as a *positive* offset -- the third block here used to be
+    /// written 25.536 s past the cluster that holds it, a picture at 65.536 s
+    /// the source put at 0. What is asserted is what a reader sees: every block
+    /// at the instant its own source said.
+    #[test]
+    fn a_block_far_behind_its_cluster_gets_one_rather_than_wrapping() {
+        let sequence = obu(1, &[0x11, 0x22, 0x33]);
+        let mut key = sequence.clone();
+        key.extend_from_slice(&obu(6, &[0xAA; 8]));
+        let inter = obu(6, &[0xBB; 5]);
+        let out = Scratch::file("ve_mkv_backward", "mkv");
+        let mut muxer = MkvMuxer::create(
+            &out,
+            &Av1Params {
+                width: 640,
+                height: 360,
+                frame_rate: 30.0,
+                config: av1_sequence_header(&key).unwrap(),
+            },
+            None,
+            Vec::new(),
+        )
+        .unwrap();
+        // A keyframe opens the file at 0, the next picture is 40 s later --
+        // past the forward bound, so a cluster of its own -- and the third is a
+        // non-key block back at the start, which is the second one's reorder
+        // depth and the direction nothing checked.
+        muxer.write_block(&key, true, 0).unwrap();
+        muxer.write_block(&inter, false, 40_000_000_000).unwrap();
+        muxer.write_block(&inter, false, 0).unwrap();
+        muxer.finish().unwrap();
+
+        let (meta, demuxer) = crate::demux::Demuxer::open(&out).expect("reopen");
+        assert_eq!(meta.frame_count, 3);
+        let crate::demux::Demuxer::Mkv(mut demuxer) = demuxer else {
+            panic!("an mkv file");
+        };
+        let times: Vec<i64> = (0..3)
+            .map(|i| {
+                demuxer
+                    .coded_block(i)
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("block {i}"))
+                    .ts_ns
+            })
+            .collect();
+        assert_eq!(
+            times,
+            [0, 40_000_000_000, 0],
+            "each block at the instant its source said, not wrapped"
+        );
+        std::fs::remove_file(&out).unwrap();
+    }
+
+    /// A tag Matroska permits where an mp4 has one 16-bit field of three ISO
+    /// 639-2 letters: `mp4`'s own `language_code` masks the three UTF-16 units
+    /// it is handed with `0x1F` and drops the rest without a word
+    /// (`vendor/mp4/src/mp4box/mdhd.rs:157`), so a `pt-BR` track used to be
+    /// written as `ptm` -- a language nobody speaks, offered by a player's
+    /// subtitle menu as the language the track is not in.
+    #[test]
+    fn a_tagged_subtitle_track_states_a_language_the_field_can_hold() {
+        let out = Scratch::file("ve_mp4_language", "mp4");
+        let mut muxer = Mp4Muxer::create(
+            &out,
+            &VideoParams {
+                width: 640,
+                height: 360,
+                frame_rate: 30.0,
+                sps: SPS,
+                pps: PPS,
+            },
+            None,
+        )
+        .unwrap();
+        // A second of picture, so the text track has a film to run over.
+        for _ in 0..30 {
+            muxer
+                .write_video_au(&au(&[SPS, PPS, &[0x65, 0x01]]))
+                .unwrap();
+        }
+        muxer
+            .write_subtitles(&[SubParams {
+                language: "pt-BR".into(),
+                name: "Signs".into(),
+                cues: vec![cue(0, 1_000, "hello")],
+            }])
+            .unwrap();
+        muxer.finish().unwrap();
+
+        let file = File::open(&out).unwrap();
+        let size = file.metadata().unwrap().len();
+        let reader = mp4::Mp4Reader::read_header(BufReader::new(file), size).unwrap();
+        let text = 2; // no audio track: the text is the track after the picture
+        assert_eq!(
+            reader.tracks()[&text].language(),
+            "por",
+            "the tag's own language, not a mangling of it"
+        );
+        std::fs::remove_file(&out).unwrap();
+    }
+
+    /// The four shapes a language can arrive in, and what the container is
+    /// handed for each: the code the field already holds, a tag cut to its
+    /// primary subtag and mapped, and `und` -- never a string whose first three
+    /// UTF-16 units the `mp4` crate would mask into a language nobody speaks.
+    #[test]
+    fn a_language_is_a_code_before_it_reaches_the_mp4_field() {
+        assert_eq!(mp4_language("eng"), "eng", "three letters are the code");
+        assert_eq!(mp4_language("tur"), "tur");
+        assert_eq!(mp4_language("pt-BR"), "por", "the tag's primary subtag");
+        assert_eq!(mp4_language("zh-Hans"), "zho");
+        assert_eq!(mp4_language("en"), "eng", "two letters are mapped");
+        assert_eq!(
+            mp4_language("JA"),
+            "jpn",
+            "a tag's case is not its language"
+        );
+        assert_eq!(mp4_language("fil"), "fil", "639-3 is three letters too");
+        assert_eq!(mp4_language(""), "und", "nothing stated, undetermined");
+        assert_eq!(mp4_language("x-pig-latin"), "und", "a tag nothing maps");
+    }
+
+    /// A file nobody put a picture in is refused by name rather than written:
+    /// [`MkvMuxer::finish`] has always refused the same way, and an mp4 whose
+    /// picture track holds no sample comes out as a player's blank window with
+    /// nothing said. One picture is all it takes to make the same file finish.
+    #[test]
+    fn an_mp4_with_no_picture_is_refused_by_name() {
+        let params = VideoParams {
+            width: 320,
+            height: 240,
+            frame_rate: 30.0,
+            sps: SPS,
+            pps: PPS,
+        };
+        let out = Scratch::file("ve_mp4_no_picture", "mp4");
+        let err = Mp4Muxer::create(&out, &params, None)
+            .unwrap()
+            .finish()
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "no frames were written to the mp4 file",
+            "the Matroska muxer's refusal, in this container's own name"
+        );
+        std::fs::remove_file(&out).unwrap();
+
+        let out = Scratch::file("ve_mp4_one_picture", "mp4");
+        let mut muxer = Mp4Muxer::create(&out, &params, None).unwrap();
+        muxer
+            .write_video_au(&au(&[SPS, PPS, &[0x65, 0x01]]))
+            .unwrap();
+        muxer.finish().unwrap();
         std::fs::remove_file(&out).unwrap();
     }
 }
