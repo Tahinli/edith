@@ -2861,6 +2861,120 @@ mod tests {
         assert!(frame.bgra.is_empty());
     }
 
+    /// The same seat, at the two canvas sizes whose *declared* dims used to
+    /// disagree with the planes the painter handed back: one pixel high (the
+    /// planes floor to nothing) and odd (they floor to the even size below).
+    /// The worker declares the size it renders at -- masked and floored the way
+    /// the painter masks -- so the conversion below always has the chroma plane
+    /// it indexes, and a picture arrives at the canvas's own size.
+    #[test]
+    fn a_thin_and_an_odd_visualizer_canvas_paint_through_the_seat() {
+        for (w, h) in [(1920u32, 1u32), (1921, 1081)] {
+            let stream = DecodeSession::open_visualizer(
+                &asset("test_opus_51.mka"),
+                0,
+                0,
+                2,
+                30.0,
+                ColorParams::default(),
+                TransformParams::default(),
+                Composer::new(w, h, crate::scale::FitPolicy::Fit),
+                VIZ_STYLE_WAVE,
+                0,
+            )
+            .unwrap_or_else(|e| panic!("open the visualizer at {w}x{h}: {e}"));
+            let frame = stream.frames.recv_timeout(Duration::from_secs(30)).unwrap_or_else(|e| {
+                panic!("a picture for a {w}x{h} canvas, not a worker that died instead: {e}")
+            });
+            assert_eq!(
+                (frame.width, frame.height),
+                (w, h),
+                "a {w}x{h} canvas is handed back at its own size"
+            );
+            assert_eq!(
+                frame.bgra.len(),
+                (w * h * 4) as usize,
+                "and converted across the whole canvas at {w}x{h}"
+            );
+        }
+    }
+
+    /// The `VE_SW=1` pin, borrowed for one test and put back as it was: it is
+    /// process-wide, and this file's unit tests share one process.
+    struct SwPin(Option<std::ffi::OsString>);
+
+    impl SwPin {
+        fn set() -> Self {
+            let had = std::env::var_os("VE_SW");
+            unsafe { std::env::set_var("VE_SW", "1") };
+            Self(had)
+        }
+    }
+
+    impl Drop for SwPin {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(was) => unsafe { std::env::set_var("VE_SW", was) },
+                None => unsafe { std::env::remove_var("VE_SW") },
+            }
+        }
+    }
+
+    /// A span whose codec has no seat at all -- the plugin never opened one and
+    /// there is no software decoder for these bytes -- must report the *gap* it
+    /// is. The cell used to be left claiming `Hardware`: the arm below the
+    /// software fallback set it before the session that produced nothing, and
+    /// the front-end then named a decoder that had decoded no frame.
+    ///
+    /// Driven through [`run_span`] itself, which is the only door that reaches
+    /// the arm: every public one refuses a plugin-only codec at `hw_decodes`
+    /// before a span exists (VP8, VP9 and HEVC all refuse on this machine), and
+    /// the arm is for the box where the plugin was there and then was not.
+    /// `VE_SW=1` is what makes that box-independent; see [`SwPin`].
+    #[test]
+    fn a_span_with_no_seat_at_all_reports_the_gap() {
+        let _pin = SwPin::set();
+        let path = asset("test_vp8.mp4");
+        let mut source = None;
+        let cancel = AtomicBool::new(false);
+        let generation = AtomicU64::new(0);
+        let floor = AtomicU32::new(0);
+        let abort = Abort {
+            cancel: &cancel,
+            generation: &generation,
+            mine: 0,
+            floor: &floor,
+        };
+        let (tx, rx) = sync_channel(2);
+        let cell = BackendCell::new(Backend::Opening);
+        run_span(
+            &path,
+            &mut source,
+            SpanCmd {
+                generation: 0,
+                start: 0,
+                end: 2,
+                color: ColorParams::default(),
+                transform: TransformParams::default(),
+                canvas: Composer::passthrough(),
+                tone: tonemap::Preset::default(),
+                speed: Speed::NORMAL,
+                tx,
+            },
+            &abort,
+            &cell,
+        );
+        assert_eq!(
+            cell.get(),
+            Backend::Gap,
+            "a VP8 span with no hardware must report the gap, not a hardware seat"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a gap decodes nothing: no picture may come down the channel"
+        );
+    }
+
     #[test]
     fn visualizer_default_is_a_blue_envelope() {
         let mut peaks = vec![(0.0, 0.0); 12_000];
