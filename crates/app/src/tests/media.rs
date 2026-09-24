@@ -6,8 +6,8 @@ use crate::player::library::{
     auto_proxies_pref_path, load_auto_proxies_pref, save_auto_proxies_pref,
 };
 use crate::subs::{
-    SUB_SIZE_RANGE, audio_import_tail, load_subtitle_style, save_subtitle_style, sub_line_h_for,
-    subtitle_style_path,
+    audio_import_tail, load_subtitle_style, save_subtitle_style, sub_line_h_for,
+    subtitle_style_path, SUB_SIZE_RANGE,
 };
 use crate::ui::preview::{bgra_to_rgba, screenshot_path};
 
@@ -32,8 +32,8 @@ fn an_audio_import_names_its_rate_channels_and_length() {
 /// stuck read and never as a frozen window.
 #[test]
 fn an_import_line_says_a_stage_has_stopped_moving_and_only_then() {
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
+    use std::sync::Arc;
     let stage = Arc::new(AtomicU8::new(ImportStage::Header as u8));
     let started = Instant::now() - Duration::from_secs(9);
     let mut import = Import {
@@ -303,7 +303,10 @@ fn a_strand_slot_on_a_single_strand_clip_is_the_clip_s_own_colour() {
     // The clip's own slot is never redirected -- it is what the fallback
     // lands on.
     assert_eq!(VizSlot::Main.picked(one), VizSlot::Main);
-    assert_eq!(VizSlot::Strand.picked(with_viz_paint_strands(one, 2)), VizSlot::Strand);
+    assert_eq!(
+        VizSlot::Strand.picked(with_viz_paint_strands(one, 2)),
+        VizSlot::Strand
+    );
 }
 
 /// A seek says nothing until it has stood: an ordinary one is a flicker and
@@ -326,8 +329,8 @@ fn a_seek_says_so_only_once_it_has_stood() {
 /// fifty-one seconds on a 25 GB film.
 #[test]
 fn a_silence_card_is_up_while_its_scan_runs_and_says_where_it_has_got_to() {
-    use std::sync::Arc;
     use std::sync::atomic::Ordering::Relaxed;
+    use std::sync::Arc;
     let progress = Arc::new(engine::silence::Progress::default());
     // Two hours and eight minutes, as the header claims it.
     progress.total.store(7680, Relaxed);
@@ -757,11 +760,9 @@ fn every_codec_row_is_offered_or_says_why_not() {
         detail.contains("ec-vorbis"),
         "the row names the encoder like every other live one: {detail}"
     );
-    assert!(
-        FORMATS
-            .into_iter()
-            .any(|(row, _, _, detail)| row.contains(&Format::Hevc) && detail.contains("intra"))
-    );
+    assert!(FORMATS
+        .into_iter()
+        .any(|(row, _, _, detail)| row.contains(&Format::Hevc) && detail.contains("intra")));
     // The destination follows the format and keeps the stem, mp4 included.
     assert_eq!(
         retarget(std::path::Path::new("/a/take.export.mp4"), Format::Wav),

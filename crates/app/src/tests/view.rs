@@ -891,7 +891,7 @@ fn the_zoom_button_says_how_much_is_on_the_bed() {
 /// lives.
 #[test]
 fn tab_cycles_dock_bench_inspector_and_wraps() {
-    use crate::ui::stance::{Surface, next_surface};
+    use crate::ui::stance::{next_surface, Surface};
 
     assert_eq!(next_surface(Surface::Dock, false), Surface::Bench);
     assert_eq!(next_surface(Surface::Bench, false), Surface::Inspector);
@@ -912,7 +912,7 @@ fn tab_cycles_dock_bench_inspector_and_wraps() {
 /// surface being entered is always the one mounted.
 #[test]
 fn surface_wants_src_active_mounts_the_tab_before_focus_lands_on_it() {
-    use crate::ui::stance::{Surface, surface_wants_src_active};
+    use crate::ui::stance::{surface_wants_src_active, Surface};
 
     assert_eq!(surface_wants_src_active(Surface::Dock), Some(true));
     assert_eq!(surface_wants_src_active(Surface::Inspector), Some(false));
