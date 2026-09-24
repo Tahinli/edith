@@ -1934,6 +1934,167 @@ fn trim_to_playhead_moves_the_selected_clips_edge_and_undoes_in_one_step() {
     assert_eq!(session.lane_clips(Lane::V1)[0], whole, "the tail is back");
 }
 
+/// The window's own copy of the rate and the two switches follows the
+/// *session* across `^z` and `^y`: a history entry carries the project's
+/// settings beside its lanes ([`engine::Project::snapshot`]), so a step puts
+/// them back -- and a window that kept its old copies counts every cut, step
+/// and fade in the rate it just undid, keeps showing a switch the session no
+/// longer has (`settings_stance`), and pushes that switch at the next session
+/// it makes.
+#[test]
+fn the_windows_settings_caches_follow_the_session_across_undo_and_redo() {
+    use crate::player::actions::{history_step, HistoryBefore, SessionCaches};
+
+    let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+    session.set_gain(0.0);
+    let native = session.meta().frame_rate;
+    let (proxies, auto) = (!session.proxies(), !session.auto_proxies());
+
+    // The three picks as the window makes them, with the copies it keeps beside
+    // them (`Player::apply_frame_rate`'s own write, both toggle doors').
+    assert!(session.set_frame_rate(native * 2.0), "the rate pick");
+    session.set_proxies(proxies);
+    session.set_auto_proxies(auto);
+    let mut caches = SessionCaches {
+        fps: session.meta().frame_rate,
+        proxies_on: proxies,
+        auto_proxies_on: auto,
+    };
+    assert_ne!(
+        caches.fps, native,
+        "the test needs a rate that really moved"
+    );
+
+    // Back, one step at a time: after each one the window's copies are the
+    // session's, never the pick's.
+    for step in 0..3 {
+        let before = HistoryBefore::of(session.subtitles(), 0);
+        let out = history_step(&before, &mut caches, &mut session, PlaybackSession::undo)
+            .expect("a pick behind this one");
+        assert_eq!(
+            caches.fps,
+            session.meta().frame_rate,
+            "undo {step}: the rate"
+        );
+        assert_eq!(
+            caches.proxies_on,
+            session.proxies(),
+            "undo {step}: the switch"
+        );
+        assert_eq!(
+            caches.auto_proxies_on,
+            session.auto_proxies(),
+            "undo {step}: the auto switch"
+        );
+        assert!(!out.drop_sub_image, "undo {step}: no palette moved");
+    }
+    assert_eq!(caches.fps, native, "the rate pick is undone");
+    assert_eq!(
+        (caches.proxies_on, caches.auto_proxies_on),
+        (!proxies, !auto),
+        "and both switches are back where they were"
+    );
+
+    // ...and forward again, where the picks come home.
+    for step in 0..3 {
+        let before = HistoryBefore::of(session.subtitles(), 0);
+        history_step(&before, &mut caches, &mut session, PlaybackSession::redo)
+            .expect("a pick in front of this one");
+        assert_eq!(
+            caches.fps,
+            session.meta().frame_rate,
+            "redo {step}: the rate"
+        );
+        assert_eq!(
+            caches.proxies_on,
+            session.proxies(),
+            "redo {step}: the switch"
+        );
+    }
+    assert_eq!(caches.fps, native * 2.0, "the pick's own rate is back");
+    assert_eq!(caches.proxies_on, proxies, "and its switch");
+}
+
+/// Rows above the picked subtitle move the pick down with them
+/// ([`sub_pick_after_removal`]), and a `^z` of that removal has to move it back
+/// up: the palette comes home out of the entry, the pick is an *index* into it,
+/// and an index left where it was names a different track -- the plate over the
+/// picture would change language on its own, and the one already drawn was
+/// drawn through the pick that no longer stands.
+#[test]
+fn the_subtitle_pick_follows_its_track_across_an_undo_of_a_removal() {
+    use crate::player::actions::{history_step, HistoryBefore, SessionCaches};
+
+    let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+    session.set_gain(0.0);
+    assert_eq!(
+        session.add_subtitle_tracks(vec![
+            sub("/subs/one.srt", None, "one.srt"),
+            sub("/subs/two.srt", None, "two.srt"),
+            sub("/subs/three.srt", None, "three.srt"),
+        ]),
+        3,
+        "the palette"
+    );
+    let mut caches = SessionCaches {
+        fps: session.meta().frame_rate,
+        proxies_on: session.proxies(),
+        auto_proxies_on: session.auto_proxies(),
+    };
+    // The last row picked, which is where a click on it leaves the pick.
+    let pick = 2;
+    let picked = sub_pick_name(session.subtitles(), pick).expect("a name for the pick");
+
+    // The row *above* it goes, through the removal door's own fixup.
+    session
+        .remove_subtitles(0)
+        .expect("a row with nothing on it");
+    let pick = sub_pick_after_removal(pick, 0, session.subtitles().len());
+    assert_eq!(pick, 1, "the pick slid down with the rows");
+    assert_eq!(
+        sub_pick_name(session.subtitles(), pick).as_deref(),
+        Some(picked.as_str()),
+        "and still names the same track"
+    );
+
+    let before = HistoryBefore::of(session.subtitles(), pick);
+    let out = history_step(&before, &mut caches, &mut session, PlaybackSession::undo)
+        .expect("the removal is a step like any other cut");
+    assert_eq!(session.subtitles().len(), 3, "the palette is back");
+    assert_eq!(
+        out.sub_track, 2,
+        "the row came back above the pick, so the pick moves up"
+    );
+    assert_eq!(
+        sub_pick_name(session.subtitles(), out.sub_track).as_deref(),
+        Some(picked.as_str()),
+        "and still names the same track"
+    );
+    assert_ne!(
+        sub_pick_name(session.subtitles(), pick).as_deref(),
+        Some(picked.as_str()),
+        "which is what the index left where it was would have named"
+    );
+    assert!(
+        out.drop_sub_image,
+        "the drawn plate went through the pick that moved"
+    );
+
+    // ...and forward again: the removal, with the fixup it does at its own door.
+    let before = HistoryBefore::of(session.subtitles(), out.sub_track);
+    let out = history_step(&before, &mut caches, &mut session, PlaybackSession::redo)
+        .expect("the removal is in front of this one");
+    assert_eq!(
+        out.sub_track, 1,
+        "the removal slides the pick down with the rows"
+    );
+    assert_eq!(
+        sub_pick_name(session.subtitles(), out.sub_track).as_deref(),
+        Some(picked.as_str())
+    );
+    assert!(out.drop_sub_image, "and the plate goes with it");
+}
+
 /// The oracle side of trim-to-playhead (debt #42): needs a subject cut *and*
 /// the playhead actually resting on it, unlike the nudge pair above it which
 /// only needs a cut -- the "spot" a keyless drag would snap to has to be on

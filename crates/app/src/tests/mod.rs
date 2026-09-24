@@ -10,56 +10,55 @@ mod media;
 mod view;
 
 use super::{
-    ACCENT_PRIMARY, AUDIO_KBPS, BG_RAISED, COLOR_BANDS, COLOR_BAR_W, COLOR_STEP, COLOR_W,
-    ColorEdit, CONTROL_H, Clip, Ctx, DEFAULT_AUDIO_KBPS, EQ_BANDS_MAX, EQ_CURVE_STEPS, EQ_FFT,
-    EQ_FREQ_HIGH,
-    EQ_FREQ_LOW, EQ_FREQ_STEP, EQ_GAIN_LIMIT, EQ_GRAPH_H, EQ_HANDLE, EQ_Q_HIGH, EQ_Q_LOW,
-    EQ_Q_STEP, EQ_SPECTRUM_DB, EQ_TICKS, EQ_W_MAX, ESCAPE, EXPORT_DONE, Enable,
-    BPS_COARSE, BPS_FINE, BPS_MAX, BPS_MIN, EXPORT_MOMENT_H, EncoderSeat, FORMATS, Format, HEADER_H, HIST_BINS, HIST_H, HIST_SAMPLES, HIT_MIN,
-    KEYS_ROW_H, KEYS_W, KeyRow, LABEL_H, LANE_H, LANES_MAX, LATE_RESYNC, LIBRARY_MAX_W,
-    BENCH_ITEMS, LIBRARY_MIN_W, Lane, MB_FLOOR, MENU_ITEMS, MENU_PAD,
-    MENU_ROW_H, MENU_W, NO_FILE, NOTICES_MAX, NumberEdit, OVERLAID, PANEL_H, RESYNC_GAP,
-    ROW_ITEMS, RULER_HIT_H, RowCtx, RowItem, SCROLL_NOTCH_SHARE, SILENCE_ROWS, SOURCE_TINTS,
+    active_lane, auto_bps, band_label, bitrate_detail, clipboard_after_remove, color_snap,
+    containers, destructive, enable, enable_lane, envelope, eq_card_w, eq_freq, eq_freq_label,
+    eq_graph_h, eq_spectrum, eq_x, eq_y, estimated_bytes, export_path, export_settings,
+    format_refusal, fps_choices, fps_label, frac_along, frac_down, frame_at, frame_rate_ladder,
+    histogram, inserted_band, is_project, keymap, keys_rows, keys_rows_matching, lane_items,
+    lanes_h, marked, menu_at, menu_items, menu_rows_h, next_container, normalise, nothing_to_play,
+    notice_tone, panel_h, parse_budget, project_path, proxies_to_start, push_notice, px_below,
+    range_word, rate_label, retarget, row_enable, row_items, scrub_due, secs_label, should_resync,
+    silence_rate, size_label, snap_cue, snap_marks, snapped, source_tint, span_partner, speed_at,
+    sub_pick_after_removal, sub_pick_after_restore, subtitle_plan, timecode, timeline_fixed_h,
+    tip_may_paint, transport, typed, unseen_paths, unseen_sources, viz_held_paint, whole_take,
+    window_title, Clip, ColorEdit, Ctx, Enable, EncoderSeat, Format, KeyRow, Lane, NumberEdit,
+    RowCtx, RowItem, Source, Speed, StreamInfo, SubPickKey, Transport, VizSlot, Volume, Wave,
+    ACCENT_PRIMARY, AUDIO_KBPS, BENCH_ITEMS, BG_RAISED, BPS_COARSE, BPS_FINE, BPS_MAX, BPS_MIN,
+    COLOR_BANDS, COLOR_BAR_W, COLOR_STEP, COLOR_W, CONTROL_H, DEFAULT_AUDIO_KBPS, EQ_BANDS_MAX,
+    EQ_CURVE_STEPS, EQ_FFT, EQ_FREQ_HIGH, EQ_FREQ_LOW, EQ_FREQ_STEP, EQ_GAIN_LIMIT, EQ_GRAPH_H,
+    EQ_HANDLE, EQ_Q_HIGH, EQ_Q_LOW, EQ_Q_STEP, EQ_SPECTRUM_DB, EQ_TICKS, EQ_W_MAX, ESCAPE,
+    EXPORT_DONE, EXPORT_MOMENT_H, FORMATS, HEADER_H, HIST_BINS, HIST_H, HIST_SAMPLES, HIT_MIN,
+    KEYS_ROW_H, KEYS_W, LABEL_H, LANES_MAX, LANE_H, LATE_RESYNC, LIBRARY_MAX_W, LIBRARY_MIN_W,
+    MB_FLOOR, MENU_ITEMS, MENU_PAD, MENU_ROW_H, MENU_W, NOTICES_MAX, NO_FILE, OVERLAID, PANEL_H,
+    RESYNC_GAP, ROW_ITEMS, RULER_HIT_H, SCROLL_NOTCH_SHARE, SILENCE_ROWS, SOURCE_TINTS,
     SPEED_PRESETS, SPEED_STEP, STATUS_ERROR, STATUS_SUCCESS, STATUS_WARNING, SUB_PLAN_CHARS,
-    Source, Speed, StreamInfo, TIMELINE_SHARE, Transport, VOLUME_W, Volume, WAVE_BPS, WAVE_COL,
-    WAVE_COLS_MAX, Wave, ZOOM_MIN_FRAMES, active_lane, auto_bps, band_label, bitrate_detail,
-    clipboard_after_remove, color_snap, containers, destructive, enable, enable_lane, envelope, eq_card_w,
-    eq_freq, eq_freq_label, eq_graph_h, eq_spectrum, eq_x, eq_y, estimated_bytes, export_path,
-    export_settings, format_refusal, fps_choices, fps_label, frac_along, frac_down,
-    frame_at, frame_rate_ladder, histogram, inserted_band, is_project, keymap, keys_rows, keys_rows_matching, lanes_h,
-    lane_items, marked, menu_at, menu_items, menu_rows_h, next_container, normalise, nothing_to_play,
-    notice_tone, panel_h, parse_budget, project_path, range_word, proxies_to_start, push_notice, px_below, retarget,
-    row_enable, row_items, scrub_due, secs_label, should_resync, silence_rate, size_label,
-    rate_label, snap_cue, snap_marks, snapped, source_tint, span_partner, speed_at, sub_pick_after_removal,
-    subtitle_plan, timecode, timeline_fixed_h, tip_may_paint,
-    transport, typed, unseen_paths, unseen_sources, viz_held_paint, VizSlot, whole_take,
-    window_title,
+    TIMELINE_SHARE, VOLUME_W, WAVE_BPS, WAVE_COL, WAVE_COLS_MAX, ZOOM_MIN_FRAMES,
 };
 
 use super::{
-    ActionId, Choice, EDGE_W, ETA_SPAN, Edge, FITS, FRAME_RATES, IMPORT_STALL, Import, ImportStage,
-    Landing, LaneKind, PPS_DEFAULT, PPS_MIN, Preset, RESOLUTIONS, Repeat, SAMPLE_RATES, SEEK_STALL,
-    Scale, ScanKey, ScanPlan, SilenceScan, SubClip, View, ZOOM_OUT_MARGIN, ZOOM_STEP, arrival,
-    audio_rate_choices, av1_hw_warning, clip_width, clock, encoder_choices, encoder_label,
+    arrival, audio_rate_choices, av1_hw_warning, clip_width, clock, encoder_choices, encoder_label,
     eta_secs, file_name, file_uri, fit_choices, frames_of_us, full_scan_key, import_line, landing,
     lane_refuses, launch_queue, library_rows, live_idx, next_fit, next_resolution, note_progress,
     pending_fps_choices, pending_resolution_choices, px_along, read_ahead, repeats,
     resolution_choices, resolution_ladder, sample_rate_choices, scan_plan, seek_line,
     silence_cached, silence_line, slice_whole_levels, source_secs, stash_or_write, tone_choices,
-    tone_label, trimmed_clip, trimmed_sub, trims, unscannable, unusable,
+    tone_label, trimmed_clip, trimmed_sub, trims, unscannable, unusable, ActionId, Choice, Edge,
+    Import, ImportStage, Landing, LaneKind, Preset, Repeat, Scale, ScanKey, ScanPlan, SilenceScan,
+    SubClip, View, EDGE_W, ETA_SPAN, FITS, FRAME_RATES, IMPORT_STALL, PPS_DEFAULT, PPS_MIN,
+    RESOLUTIONS, SAMPLE_RATES, SEEK_STALL, ZOOM_OUT_MARGIN, ZOOM_STEP,
 };
 
 use super::{
-    SUB_BOTTOM, SUB_CUE_MIN_W, SUB_LINE_H, SUB_TEXT, Subs, carries_subtitles, cue_box, cues_at,
-    file_tint, is_subtitle, lang_human, sub_bottom, sub_pick_name, subtitle_detail,
-    subtitle_notice, subtitle_rows, subtitle_tail, subtitle_toggle_notice, walk_subtitles,
+    carries_subtitles, cue_box, cues_at, file_tint, is_subtitle, lang_human, sub_bottom,
+    sub_pick_name, subtitle_detail, subtitle_notice, subtitle_rows, subtitle_tail,
+    subtitle_toggle_notice, walk_subtitles, Subs, SUB_BOTTOM, SUB_CUE_MIN_W, SUB_LINE_H, SUB_TEXT,
 };
 
 use engine::PlaybackSession;
 
 use engine::scale::FitPolicy;
 
-use gpui::{Bounds, Pixels, point, px, size};
+use gpui::{point, px, size, Bounds, Pixels};
 
 use std::collections::HashMap;
 

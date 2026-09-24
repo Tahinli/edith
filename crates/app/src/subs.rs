@@ -636,6 +636,65 @@ pub(crate) fn sub_pick_after_removal(picked: usize, removed: usize, left: usize)
     picked.min(left.saturating_sub(1))
 }
 
+/// What a palette row *is*, apart from where it sits: the file it came out of,
+/// which track of it, and the two words a row shows. Cloned out of the palette
+/// once per history step -- a path and three short strings, against a palette
+/// whose cues are the whole film's subtitles. Not [`SubRow`], which is a row as
+/// the column *draws* it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SubPickKey {
+    path: PathBuf,
+    track: Option<u64>,
+    language: String,
+    label: String,
+}
+
+impl SubPickKey {
+    /// The row `track` of this palette names, `None` for an index no track
+    /// answers to -- the same silence [`sub_pick_name`] gives.
+    pub(crate) fn of(tracks: &[engine::subtitle::SubtitleTrack], track: usize) -> Option<Self> {
+        let track = tracks.get(track)?;
+        Some(Self {
+            path: track.path.clone(),
+            track: track.track,
+            language: track.language.clone(),
+            label: track.label.clone(),
+        })
+    }
+
+    /// Whether `track` is this row: the four fields a palette would have had to
+    /// change for a pick left where it was to name a different track.
+    fn is(&self, track: &engine::subtitle::SubtitleTrack) -> bool {
+        track.path == self.path
+            && track.track == self.track
+            && track.language == self.language
+            && track.label == self.label
+    }
+}
+
+/// Where the pick lands once a *restored* palette is back in place: the row
+/// that was picked, found by what it is rather than by where it sat.
+///
+/// A history step moves rows without saying which one moved -- an undo of a
+/// removal puts a column back above the pick as often as below it -- so an
+/// index left where it was names a different track, which is the desync
+/// [`sub_pick_after_removal`] prevents at the door where the row that moved is
+/// known. That door's arithmetic is this map's one-row-moved case.
+///
+/// A row the restored palette does not have (it went again, or the pick named
+/// nothing) falls back to the old index clamped into the new list -- that same
+/// door's own fallback, and the zero the section is not drawn at all for an
+/// emptied palette.
+pub(crate) fn sub_pick_after_restore(
+    picked: usize,
+    before: Option<&SubPickKey>,
+    after: &[engine::subtitle::SubtitleTrack],
+) -> usize {
+    before
+        .and_then(|was| after.iter().position(|track| was.is(track)))
+        .unwrap_or_else(|| picked.min(after.len().saturating_sub(1)))
+}
+
 pub(crate) fn sub_pick_name(
     tracks: &[engine::subtitle::SubtitleTrack],
     track: usize,

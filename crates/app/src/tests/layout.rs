@@ -351,7 +351,7 @@ fn a_lane_row_is_a_fixed_header_and_a_bed_that_can_be_hit() {
 /// strip's row at the zoom boundary without the strip to show for it.
 #[test]
 fn the_scroll_strip_row_comes_and_goes_with_the_zoom() {
-    use crate::{SCROLL_HIT, Split, lanes_h, split_size, timeline_fixed_h, timeline_h};
+    use crate::{lanes_h, split_size, timeline_fixed_h, timeline_h, Split, SCROLL_HIT};
     use gpui::{px, size};
 
     // The strip's row, and only the strip's row, is what the two faces differ
@@ -398,8 +398,8 @@ fn the_scroll_strip_row_comes_and_goes_with_the_zoom() {
 /// on the track, the time axis's own thumb turned through a right angle.
 #[test]
 fn the_lane_thumb_is_the_visible_share_of_the_stack() {
-    use crate::SCROLL_THUMB_MIN;
     use crate::lanes_thumb;
+    use crate::SCROLL_THUMB_MIN;
 
     // Whole stack on screen: the track fills and there is nothing to scroll.
     assert_eq!(lanes_thumb(200., 104., 200., 0.), (0., 200.));
@@ -1301,7 +1301,7 @@ fn the_darkroom_subtitle_palette_drags_tracks_to_subtitle_lanes() {
 /// arrival order, at the end.
 #[test]
 fn a_file_subtitle_group_follows_its_own_row() {
-    use crate::ui::dock_stance::{Slot, source_list_order};
+    use crate::ui::dock_stance::{source_list_order, Slot};
     let film = PathBuf::from("/films/a.mkv");
     let other = PathBuf::from("/rec/b.mp4");
     let loose = PathBuf::from("/subs/late.srt");
@@ -1320,7 +1320,12 @@ fn a_file_subtitle_group_follows_its_own_row() {
             &[film.clone(), other.clone(), film.clone()],
             &[film.clone()]
         ),
-        [Slot::Media(0), Slot::Media(1), Slot::Media(2), Slot::Subs(0)],
+        [
+            Slot::Media(0),
+            Slot::Media(1),
+            Slot::Media(2),
+            Slot::Subs(0)
+        ],
     );
     // Nobody's `.srt`: still a top-level row, still last.
     assert_eq!(
@@ -1366,7 +1371,9 @@ fn same_named_files_are_told_apart_on_the_metadata_line() {
         .collect();
     let rows = library_rows(&three, &HashMap::new(), &HashMap::new(), None, |_| 90);
     assert_eq!(
-        rows.iter().map(|row| row.detail.as_str()).collect::<Vec<_>>(),
+        rows.iter()
+            .map(|row| row.detail.as_str())
+            .collect::<Vec<_>>(),
         ["a", "b", ""],
         "twins say which folder they came out of"
     );
@@ -1379,7 +1386,9 @@ fn same_named_files_are_told_apart_on_the_metadata_line() {
         .collect();
     let rows = library_rows(&twins, &HashMap::new(), &HashMap::new(), None, |_| 90);
     assert_eq!(
-        rows.iter().map(|row| row.detail.as_str()).collect::<Vec<_>>(),
+        rows.iter()
+            .map(|row| row.detail.as_str())
+            .collect::<Vec<_>>(),
         ["#1", "#2"],
         "one folder, one stem: arrival order tells them apart"
     );
@@ -1481,6 +1490,45 @@ fn removing_a_subtitle_row_carries_the_pick_with_it() {
     // The last row of all: an emptied list is legal for subtitles, and the
     // section is not drawn at all at that point.
     assert_eq!(sub_pick_after_removal(0, 0, 0), 0);
+}
+
+/// A `^z` moves rows without saying which one moved, so the pick is followed by
+/// what it *names* ([`sub_pick_after_restore`]) rather than by its index: the
+/// same three rows as the removal test above, restored instead of taken away,
+/// where the index is the wrong answer in the first case and the right one in
+/// the second.
+#[test]
+fn a_restored_palette_carries_the_pick_by_what_it_names() {
+    let palette = [
+        sub("/films/a.mkv", Some(1), "eng"),
+        sub("/films/a.mkv", Some(2), "fre"),
+        sub("/films/a.mkv", Some(3), "ger"),
+    ];
+    // The pick on "ger" at index 1 of the two rows a removal of the first left.
+    let short = [palette[1].clone(), palette[2].clone()];
+    let picked = SubPickKey::of(&short, 1).expect("a row the pick names");
+    assert_eq!(
+        sub_pick_after_restore(1, Some(&picked), &palette),
+        2,
+        "the row above it came back"
+    );
+    // The row that came back *below* the pick leaves it where it was.
+    let short = [palette[0].clone(), palette[1].clone()];
+    let picked = SubPickKey::of(&short, 1).expect("a row the pick names");
+    assert_eq!(
+        sub_pick_after_restore(1, Some(&picked), &palette),
+        1,
+        "a row after it is not its business"
+    );
+    // The picked row itself gone from the restored palette: the old index
+    // clamped into it, which is the removal door's own fallback.
+    let picked = SubPickKey::of(&palette, 2).expect("a row the pick names");
+    assert_eq!(sub_pick_after_restore(2, Some(&picked), &palette[..2]), 1);
+    assert_eq!(
+        sub_pick_after_restore(0, None, &[]),
+        0,
+        "an emptied palette is a state, not a panic"
+    );
 }
 
 /// The same claim from the click's end, on the order imports actually
@@ -1707,7 +1755,11 @@ fn darkroom_lane_header_verbs_are_targeted_and_visible() {
     // `overlays.rs` routes those rows through the same `act_lane` door the
     // head's buttons used.
     let bench = src_text("ui/bench_stance.rs");
-    for gone in ["\"bench-mix-lane\"", "\"bench-remove-lane\"", "lane.{}.remove"] {
+    for gone in [
+        "\"bench-mix-lane\"",
+        "\"bench-remove-lane\"",
+        "lane.{}.remove",
+    ] {
         assert!(!bench.contains(gone), "the lane head still wears {gone}");
     }
     for door in ["\"bench-show-sub-lane\"", "this.show_sub_lane(lane, cx)"] {
@@ -1746,8 +1798,8 @@ fn darkroom_lane_header_verbs_are_targeted_and_visible() {
 fn a_dragged_divider_stops_before_either_panel_disappears() {
     use crate::ui::theme::INSPECTOR_MIN_W;
     use crate::{
-        SIDE_MAX_FRAC, SPLIT_W, Split, TIMELINE_MAX_SHARE, TOOLBAR_H, inspector_w, library_w,
-        split_drag_size, split_size, timeline_fixed_h, timeline_h,
+        inspector_w, library_w, split_drag_size, split_size, timeline_fixed_h, timeline_h, Split,
+        SIDE_MAX_FRAC, SPLIT_W, TIMELINE_MAX_SHARE, TOOLBAR_H,
     };
     use gpui::{point, px, size};
 
@@ -1867,7 +1919,7 @@ fn a_dragged_divider_stops_before_either_panel_disappears() {
 fn the_darkroom_seams_stop_before_either_side_disappears() {
     use crate::ui::theme::INSPECTOR_MIN_W;
     use crate::{
-        BENCH_MIN_H, SIDE_MAX_FRAC, SPLIT_W, Split, split_bounds, split_drag_size, split_size,
+        split_bounds, split_drag_size, split_size, Split, BENCH_MIN_H, SIDE_MAX_FRAC, SPLIT_W,
     };
     use gpui::{point, px, size};
 
@@ -1926,9 +1978,9 @@ fn the_darkroom_seams_stop_before_either_side_disappears() {
 /// ~2px at the old `BENCH_MIN_H = 80.`).
 #[test]
 fn both_default_lanes_fit_the_bench_at_its_floor() {
-    use crate::BENCH_MIN_H;
-    use crate::ui::bench_stance::{LANE_MIN_H, ROW_GAP, RULER_H, row_h};
+    use crate::ui::bench_stance::{row_h, LANE_MIN_H, ROW_GAP, RULER_H};
     use crate::ui::stance::BENCH_CHROME_H;
+    use crate::BENCH_MIN_H;
 
     let box_h = BENCH_MIN_H - BENCH_CHROME_H;
     let avail = box_h - RULER_H - ROW_GAP;
@@ -1968,9 +2020,9 @@ fn both_default_lanes_fit_the_bench_at_its_floor() {
 /// painted bounds back, so it stays geometry-only, same as its neighbours.
 #[test]
 fn the_whole_bench_stack_fits_its_own_floor_with_the_ledger_seam_clear() {
-    use crate::BENCH_MIN_H;
     use crate::ui::bench_stance::{LANE_MIN_H, ROW_GAP, RULER_H};
     use crate::ui::stance::BENCH_CHROME_H;
+    use crate::BENCH_MIN_H;
 
     const BENCH_BORDER_T: f32 = 1.;
     const BENCH_PY_TOP: f32 = 4.;
@@ -2040,9 +2092,9 @@ fn a_lane_row_fits_what_its_own_head_draws() {
 #[test]
 fn a_saved_seam_survives_a_reload() {
     use crate::{
-        BENCH_MIN_H, SIDE_MAX_FRAC, Split, Splits, load_stance_splits_from, save_stance_splits_to,
+        load_stance_splits_from, save_stance_splits_to, Split, Splits, BENCH_MIN_H, SIDE_MAX_FRAC,
     };
-    use gpui::{Pixels, Size, px, size};
+    use gpui::{px, size, Pixels, Size};
 
     let dir = engine::scratch::Scratch::dir("edith-stance-splits");
     let path = dir.join("stance-splits");
@@ -2085,7 +2137,7 @@ fn a_saved_seam_survives_a_reload() {
 /// drag that never started (`None`) owes nothing.
 #[test]
 fn only_the_persisted_seams_owe_a_save_when_a_drag_loses_the_window() {
-    use crate::{Split, player::timeline_edit::split_drag_owes_save};
+    use crate::{player::timeline_edit::split_drag_owes_save, Split};
 
     assert!(split_drag_owes_save(Some(Split::Dock)));
     assert!(split_drag_owes_save(Some(Split::Bench)));
@@ -2099,8 +2151,8 @@ fn only_the_persisted_seams_owe_a_save_when_a_drag_loses_the_window() {
 /// `load_stance_splits`'s doc comment promises.
 #[test]
 fn a_missing_stance_splits_file_leaves_every_region_at_its_default() {
-    use crate::{Split, load_stance_splits_from};
-    use gpui::{Pixels, Size, px, size};
+    use crate::{load_stance_splits_from, Split};
+    use gpui::{px, size, Pixels, Size};
 
     let dir = engine::scratch::Scratch::dir("edith-stance-splits-missing");
     let window: Size<Pixels> = size(px(1280.), px(720.));
@@ -2182,13 +2234,7 @@ fn the_stance_renders_its_five_regions_in_the_documented_order() {
     // Open paren only, no close: DESIGN §12 steps 3 and 4 hand most of the
     // regions player/window state to read, so their call sites carry
     // arguments now. Order is what this asserts, not arity.
-    let calls = [
-        "screen(",
-        "time_band(",
-        "bench(",
-        "ledger(",
-        "dock(",
-    ];
+    let calls = ["screen(", "time_band(", "bench(", "ledger(", "dock("];
     let composed: Vec<usize> = calls
         .iter()
         .map(|c| {
@@ -2662,12 +2708,13 @@ fn every_action_has_a_darkroom_widget_home_or_explicit_owner() {
         text.lines()
             .filter(|l| !l.contains("=> format!(\"{full} (global)\")"))
             .any(|line| {
-                line.match_indices(&format!("ActionId::{name}")).any(|(i, m)| {
-                    !line[i + m.len()..]
-                        .chars()
-                        .next()
-                        .is_some_and(|c| c.is_alphanumeric() || c == '_')
-                })
+                line.match_indices(&format!("ActionId::{name}"))
+                    .any(|(i, m)| {
+                        !line[i + m.len()..]
+                            .chars()
+                            .next()
+                            .is_some_and(|c| c.is_alphanumeric() || c == '_')
+                    })
             })
     }
     let darkroom = [
@@ -2946,7 +2993,7 @@ fn the_bench_answers_a_wheel_notch_anywhere_over_it() {
 /// kept beside the first ([`Splits::clear`]).
 #[test]
 fn a_double_pressed_divider_forgets_the_size_it_was_dragged_to() {
-    use crate::layout::{Split, Splits, split_size};
+    use crate::layout::{split_size, Split, Splits};
     use gpui::{px, size};
 
     let window = size(px(1280.), px(720.));
@@ -3007,7 +3054,8 @@ fn the_seam_paints_nothing_until_a_pointer_finds_it() {
     // gets after it no longer needs it (his `bench=207` -- a press with no
     // drag in it -- beside a `dock=277` he did drag).
     assert!(
-        body.find(".group(group.clone())").expect("the band's group")
+        body.find(".group(group.clone())")
+            .expect("the band's group")
             < body.find("border_t_1()").expect("the hairline"),
         "the hairline is painted outside the band: {body}"
     );
@@ -3030,13 +3078,12 @@ fn the_bench_seam_reaches_no_further_than_every_other_seam() {
     );
 }
 
-
 /// The clamp table, driven: the seam refuses exactly two things, and neither
 /// is anywhere near where a hand drags. Measured live at 2560x1440 --
 /// `bench=105` at the floor, `bench=1164` at the ceiling.
 #[test]
 fn the_bench_seam_stops_at_its_floor_and_its_ceiling() {
-    use crate::{BENCH_MIN_H, Split, split_bounds, split_size};
+    use crate::{split_bounds, split_size, Split, BENCH_MIN_H};
     use gpui::{px, size};
 
     let window = size(px(2560.), px(1440.));
@@ -3065,8 +3112,11 @@ fn the_bench_seam_stops_at_its_floor_and_its_ceiling() {
 fn the_lane_bed_clips_its_clips_at_the_pinned_heads() {
     let src = src_text("ui/bench_stance.rs");
     let start = src.find(r#".id(("bench-bed""#).expect("the bed");
-    let bed =
-        &src[start..start + src[start..].find(".bg(rgb(DARK_CANVAS()))").expect("its fill")];
+    let bed = &src[start
+        ..start
+            + src[start..]
+                .find(".bg(rgb(DARK_CANVAS()))")
+                .expect("its fill")];
     assert!(
         bed.contains(".overflow_hidden()"),
         "the bed lets its clips paint outside itself, straight over the \
@@ -3130,7 +3180,10 @@ fn a_source_row_shows_its_name_before_anything_else() {
         "the metadata line no longer drops the decoder seat"
     );
     let usage = &dock[dock.find("fn usage_line(").expect("the usage line")..start];
-    assert!(!usage.contains("use{}"), "the metadata line still counts uses");
+    assert!(
+        !usage.contains("use{}"),
+        "the metadata line still counts uses"
+    );
     // DESIGN §8: the permanent footer telling the editor how to use a list
     // ("drag · ↵ add · double-click plays") is instructional copy and is gone.
     assert!(
@@ -3183,7 +3236,10 @@ fn every_dock_body_mounts_the_ring_it_is_standing_in_for() {
         "the dock's key handler stops a stroke outside its tab/escape branches"
     );
     for branch in ["is_focus_cycle_key(key)", "is_focus_exit_key(key)"] {
-        assert!(body.contains(branch), "{branch} left the dock's key handler");
+        assert!(
+            body.contains(branch),
+            "{branch} left the dock's key handler"
+        );
     }
 }
 
@@ -3299,7 +3355,10 @@ fn a_room_ghost_wears_no_chord_that_repeats_its_name() {
 fn the_ledger_carries_the_rooms_four_verbs_and_no_rail_remains() {
     let src = src_text("ui/stance.rs");
     for gone in ["stance-spine", "spine_stance", "SPINE_W", "fn spine("] {
-        assert!(!src.contains(gone), "the rail is still in the stance: {gone}");
+        assert!(
+            !src.contains(gone),
+            "the rail is still in the stance: {gone}"
+        );
     }
     let ledger = &src[src.find("fn ledger(").expect("the ledger strip")
         ..src.find("/// The dock:").expect("the dock frame")];
@@ -3341,8 +3400,8 @@ fn the_ledger_carries_the_rooms_four_verbs_and_no_rail_remains() {
 /// deletion.
 #[test]
 fn select_all_left_the_ruler_for_the_rulers_own_menu() {
-    use crate::ActionId;
     use crate::menus::BENCH_ITEMS;
+    use crate::ActionId;
     let bench = src_text("ui/bench_stance.rs");
     for gone in ["bench-select-all", "select_all_band", "SELECT_ALL_PAD"] {
         assert!(!bench.contains(gone), "the ruler still carries {gone}");
@@ -3431,7 +3490,10 @@ fn one_name_per_source_one_stem_helper_and_one_save_door() {
     // a path with no name at all still reads as something.
     use crate::files::{file_name, stem};
     use std::path::Path;
-    assert_eq!(stem(Path::new("/x/he_is_not_the_only_one.mp4")), "he_is_not_the_only_one");
+    assert_eq!(
+        stem(Path::new("/x/he_is_not_the_only_one.mp4")),
+        "he_is_not_the_only_one"
+    );
     assert_eq!(stem(Path::new("/x/untitled")), "untitled");
     assert_eq!(stem(Path::new("/x/a.b.edith")), "a.b");
     assert_eq!(stem(Path::new("/")), file_name(Path::new("/")));
@@ -3461,7 +3523,6 @@ fn the_ruler_plate_shows_the_timecode_only_while_a_scrub_is_live() {
     );
 }
 
-
 /// The band overflowed its own column at 1280x720 (`$EDITH_HITMAP`:
 /// `action.Export x=1113 w=80` with the column ending at x=995, the contact
 /// strip measured `w=0`), so the Export chip was invisible under the dock and
@@ -3471,8 +3532,14 @@ fn the_ruler_plate_shows_the_timecode_only_while_a_scrub_is_live() {
 #[test]
 fn the_time_band_never_paints_outside_its_own_column() {
     let src = src_text("ui/timeband_stance.rs");
-    let start = src.find(r#".id("stance-time-band-row")"#).expect("the band row");
-    let row = &src[start..start + src[start..].find(".child(hero_timecode(").expect("the timecode")];
+    let start = src
+        .find(r#".id("stance-time-band-row")"#)
+        .expect("the band row");
+    let row = &src[start
+        ..start
+            + src[start..]
+                .find(".child(hero_timecode(")
+                .expect("the timecode")];
     assert!(
         row.contains(".overflow_hidden()"),
         "the band row lets its children paint (and be clicked) under the dock: {row}"
@@ -3518,9 +3585,16 @@ fn the_band_sheds_its_chords_and_nothing_else() {
 fn every_ghost_in_the_time_band_carries_a_full_hit_area() {
     let src = src_text("ui/timeband_stance.rs");
     let start = src.find("fn ghost(").expect("the band's ghost");
-    let ghost = &src[start..start + src[start..].find(".child(glyph.into())").expect("its glyph")];
+    let ghost = &src[start
+        ..start
+            + src[start..]
+                .find(".child(glyph.into())")
+                .expect("its glyph")];
     for needle in [".min_w(px(HIT_MIN))", ".min_h(px(HIT_MIN))"] {
-        assert!(ghost.contains(needle), "the band's ghost lost {needle}: {ghost}");
+        assert!(
+            ghost.contains(needle),
+            "the band's ghost lost {needle}: {ghost}"
+        );
     }
     assert!(HIT_MIN >= 24.);
 }
@@ -3532,8 +3606,15 @@ fn every_ghost_in_the_time_band_carries_a_full_hit_area() {
 #[test]
 fn the_band_writes_no_monitoring_level() {
     let src = src_text("ui/timeband_stance.rs");
-    for gone in ["player.volume.percent()", "fn volume_readout(", "fn volume_slider("] {
-        assert!(!src.contains(gone), "the monitoring cluster is back in the band: {gone}");
+    for gone in [
+        "player.volume.percent()",
+        "fn volume_readout(",
+        "fn volume_slider(",
+    ] {
+        assert!(
+            !src.contains(gone),
+            "the monitoring cluster is back in the band: {gone}"
+        );
     }
 }
 
@@ -3552,7 +3633,11 @@ fn transport_verbs_differ_by_shape_not_only_by_chord() {
     let mut seen = shapes.to_vec();
     seen.sort();
     seen.dedup();
-    assert_eq!(seen.len(), shapes.len(), "two transport verbs share one glyph: {shapes:?}");
+    assert_eq!(
+        seen.len(),
+        shapes.len(),
+        "two transport verbs share one glyph: {shapes:?}"
+    );
 }
 
 /// DESIGN §6: "the cut readout is the odometer". Keyed off the selection it
@@ -3745,7 +3830,9 @@ fn the_export_section_is_four_rows_and_no_fifth() {
         .find("fn export_section(")
         .expect("the export section");
     let body = &source[start..];
-    let end = body.find("\n/// The page itself").expect("the page's render fn");
+    let end = body
+        .find("\n/// The page itself")
+        .expect("the page's render fn");
     let body = &body[..end];
     let rows = [
         "settings-export-picture",
@@ -3760,10 +3847,16 @@ fn the_export_section_is_four_rows_and_no_fifth() {
     // unrated one's readout, never both at once -- so the count is by label,
     // not by id.
     for label in ["\"Picture\"", "\"Sound\"", "\"Encoder\"", "\"Range\""] {
-        assert!(body.contains(label), "the EXPORT section has no {label} row");
+        assert!(
+            body.contains(label),
+            "the EXPORT section has no {label} row"
+        );
     }
     let ids = body.match_indices("\"settings-export-").count();
-    assert_eq!(ids, 5, "the EXPORT section grew a row past the four (the two Sound rows are one row's two shapes)");
+    assert_eq!(
+        ids, 5,
+        "the EXPORT section grew a row past the four (the two Sound rows are one row's two shapes)"
+    );
     assert!(
         source.contains("what a delivery is written as"),
         "the section lost its head"
@@ -3780,7 +3873,7 @@ fn the_export_section_is_four_rows_and_no_fifth() {
 /// cannot write, because [`Player::set_format`] would only refuse it back.
 #[test]
 fn the_picture_row_cycles_codec_and_container_together_and_skips_a_refusal() {
-    use crate::ui::settings_stance::{PICTURE_CYCLE, next_picture, picture_label};
+    use crate::ui::settings_stance::{next_picture, picture_label, PICTURE_CYCLE};
     assert_eq!(
         PICTURE_CYCLE,
         [
@@ -4017,7 +4110,6 @@ fn no_region_root_wears_a_focus_ring() {
     }
 }
 
-
 /// The user could not find the three columns (2026-09-10: "I couldn't realize
 /// them when I look at"), because their heads were 12px `ink3` -- the room's
 /// quietest type -- with a prose tail running on after each one. The page's
@@ -4187,9 +4279,13 @@ fn the_settings_page_is_a_centred_modal_with_one_column_of_measure() {
 #[test]
 fn the_picture_row_tail_is_the_current_format_alone() {
     let source = src_text("ui/settings_stance.rs");
-    let start = source.find("fn export_section(").expect("the export section");
+    let start = source
+        .find("fn export_section(")
+        .expect("the export section");
     let body = &source[start..];
-    let body = &body[..body.find("\n/// The page itself").expect("the page's render fn")];
+    let body = &body[..body
+        .find("\n/// The page itself")
+        .expect("the page's render fn")];
     assert!(
         !body.contains("PICTURE_CYCLE"),
         "the Picture row walks the whole cycle to build its tail again"
