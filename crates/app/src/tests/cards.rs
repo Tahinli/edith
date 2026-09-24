@@ -914,7 +914,10 @@ fn the_budget_is_the_one_number_the_engine_gets() {
     // put on screen.
     assert_eq!(auto_bps(1920, 1080, 30.), 6_220_800);
     assert_eq!(auto_bps(160, 120, 15.), BPS_MIN, "a tiny picture floors");
-    assert!(auto_bps(7680, 4320, 60.) <= 20_000_000, "and a huge one caps");
+    assert!(
+        auto_bps(7680, 4320, 60.) <= 20_000_000,
+        "and a huge one caps"
+    );
     for bps in [auto_bps(1920, 1080, 30.), auto_bps(320, 240, 24.)] {
         assert!((BPS_MIN..=BPS_MAX).contains(&bps));
     }
@@ -1067,11 +1070,25 @@ fn a_chord_the_export_moment_answers_never_reaches_the_room() {
     let (typing, closed) = rest
         .split_once("return true;")
         .expect("the typing branch returns before the chords below it");
-    assert!(typing.contains("self.budget_edit = None"), "esc leaves the field");
-    assert!(closed.contains("self.close_card()"), "then esc closes the moment");
+    assert!(
+        typing.contains("self.budget_edit = None"),
+        "esc leaves the field"
+    );
+    assert!(
+        closed.contains("self.close_card()"),
+        "then esc closes the moment"
+    );
     // Its chords, all of them consumed here rather than by the keymap.
     for chord in [
-        "\"d\"", "\"n\"", "\"e\"", "\"enter\"", "\"up\"", "\"down\"", "\"c\"", "\"b\"", "\"g\"",
+        "\"d\"",
+        "\"n\"",
+        "\"e\"",
+        "\"enter\"",
+        "\"up\"",
+        "\"down\"",
+        "\"c\"",
+        "\"b\"",
+        "\"g\"",
         "\",\"",
     ] {
         assert!(closed.contains(chord), "{chord} is not the moment's own");
@@ -1086,7 +1103,11 @@ fn a_chord_the_export_moment_answers_never_reaches_the_room() {
 fn row_three_wears_the_encode_options_and_the_door_to_the_rest() {
     let cards = src_text("ui/cards.rs");
     let start = cards.find("fn export_card(").expect("the moment");
-    let body = &cards[start..start + cards[start..].find("\n    /// ").unwrap_or(cards.len() - start)];
+    let body = &cards[start
+        ..start
+            + cards[start..]
+                .find("\n    /// ")
+                .unwrap_or(cards.len() - start)];
     // A segment is the setter it names, not a readout of it.
     for (id, chord, setter) in [
         ("moment-picture", "\"c\"", "cycle_export_picture"),
@@ -1098,7 +1119,10 @@ fn row_three_wears_the_encode_options_and_the_door_to_the_rest() {
         assert!(body.contains(setter), "the {id} segment changes nothing");
     }
     // The door, wearing the room's own chord rather than a hand-typed one.
-    assert!(body.contains("moment-settings"), "row 3 has no settings door");
+    assert!(
+        body.contains("moment-settings"),
+        "row 3 has no settings door"
+    );
     assert!(
         body.contains("self.keymap.chord(ActionId::Settings)"),
         "the door's chord is not read from the keymap"
@@ -1113,7 +1137,10 @@ fn row_three_wears_the_encode_options_and_the_door_to_the_rest() {
         .map(|at| &cards[at..at + 1900])
         .expect("the segment atom");
     assert!(seg.contains("INK3()") && seg.contains("INK4()"));
-    assert!(seg.contains("DARK_RAISED()"), "a segment does not answer hover");
+    assert!(
+        seg.contains("DARK_RAISED()"),
+        "a segment does not answer hover"
+    );
     // The readouts he asked to see: the project's picture size and rate, and
     // a sound rate that is on the line whether or not it is pressable.
     assert!(
@@ -1126,13 +1153,18 @@ fn row_three_wears_the_encode_options_and_the_door_to_the_rest() {
     );
     // The picture segment is a child, not a `has_video` maybe: hidden on the
     // sound-only formats it left `c` pressing nothing and no way back.
-    let at = body.find("\"moment-picture\"").expect("the picture segment");
+    let at = body
+        .find("\"moment-picture\"")
+        .expect("the picture segment");
     assert!(
         !body[at - 240..at].contains("has_video"),
         "the picture segment is gated on has_video again -- the dead end"
     );
     // Wrapped, never cut: the readouts made row 3 longer than 1280 wide.
-    assert!(body.contains(".flex_wrap()"), "row 3 truncates instead of wrapping");
+    assert!(
+        body.contains(".flex_wrap()"),
+        "row 3 truncates instead of wrapping"
+    );
 }
 
 /// The dead end the user hit: the cycle walked into the sound-only formats
@@ -1140,15 +1172,22 @@ fn row_three_wears_the_encode_options_and_the_door_to_the_rest() {
 /// and can't turn it back to video"). One cycle, and it wraps.
 #[test]
 fn the_picture_cycle_wraps_out_of_the_sound_only_formats() {
-    use crate::ui::settings_stance::{PICTURE_CYCLE, next_picture};
+    use crate::ui::settings_stance::{next_picture, PICTURE_CYCLE};
     // Nothing refused: every stop is the next one, and the last wraps to the
     // first -- OGG, the tail of the list, back to MP4.
     let mut at = PICTURE_CYCLE[0];
-    for &want in PICTURE_CYCLE.iter().skip(1).chain(std::iter::once(&PICTURE_CYCLE[0])) {
+    for &want in PICTURE_CYCLE
+        .iter()
+        .skip(1)
+        .chain(std::iter::once(&PICTURE_CYCLE[0]))
+    {
         at = next_picture(at, |_| false);
         assert_eq!(at, want, "the cycle stopped walking");
     }
-    assert_eq!(at, PICTURE_CYCLE[0], "a full walk is a wrap, not a dead end");
+    assert_eq!(
+        at, PICTURE_CYCLE[0],
+        "a full walk is a wrap, not a dead end"
+    );
     assert_eq!(next_picture(Format::Ogg, |_| false), Format::Mp4);
     // A timeline with no picture refuses every video format, and the cycle
     // still moves: the sound-only stops are what is left of it.
@@ -1278,12 +1317,18 @@ fn the_moment_and_the_settings_room_wear_the_same_export_chords() {
         assert!(settings.contains(chord), "the EXPORT rows lost {chord}");
         assert!(moment.contains(chord), "row 3 lost {chord}");
         assert!(handler.contains(chord), "the moment answers no {chord}");
-        assert!(player.contains(chord), "the settings page answers no {chord}");
+        assert!(
+            player.contains(chord),
+            "the settings page answers no {chord}"
+        );
     }
     // `e` stays the Export press: the encoder seat took `g` rather than a
     // shifted letter, which no ghost wears.
     assert!(handler.contains("\"e\" | \"enter\" => self.start_export"));
-    assert!(!settings.contains("\n            \"e\","), "the Encoder row took `e` back");
+    assert!(
+        !settings.contains("\n            \"e\","),
+        "the Encoder row took `e` back"
+    );
 }
 
 /// The Sound row: what it offers, and that the pick travels to the engine
@@ -1401,9 +1446,15 @@ fn a_typed_colour_is_read_in_every_spelling_and_anything_else_is_refused() {
     edit.typed('z');
     assert_eq!(edit.commit(), None);
     let why = edit.refusal.clone().expect("a refusal, not a silence");
-    assert!(why.contains("#RRGGBB"), "the refusal says what a colour is: {why}");
+    assert!(
+        why.contains("#RRGGBB"),
+        "the refusal says what a colour is: {why}"
+    );
     assert_eq!(edit.text, "zz", "the refusal keeps the text it refused");
-    assert!(edit.detail().contains("zz▏"), "the caret stays in the buffer");
+    assert!(
+        edit.detail().contains("zz▏"),
+        "the caret stays in the buffer"
+    );
     // ...and the next stroke clears it: that reason described the text that is
     // no longer there.
     edit.typed('0');
@@ -1560,6 +1611,81 @@ fn every_click_door_that_writes_the_project_arms_autosave() {
         assert!(
             after.contains("mark_dirty()"),
             "{name} arms outside its gate, so a no-op pick would dirty the project"
+        );
+    }
+    // The drag-and-drop family on the timeline: the same class, and the same
+    // rule. Every one of these doors can answer "nothing happened" -- a clip let
+    // go where it was picked up, a caption dragged back to the frame it started
+    // on, a trim, a fade or a `[`/`]` nudge released against the wall the edge
+    // already stood on, a subtitle row dropped on an overlap ("NOT PLACED") or a
+    // caption that is not there any more ("NOTHING LIFTED") -- and each one used
+    // to arm the flag *before* the door was asked, so the ledger's `unsaved`
+    // ghost, the autosave sidecar and the save-on-close question described a
+    // project whose content was byte-for-byte what it was.
+    //
+    // Each arm now rides its own door's answer, or the one reading the door's
+    // answer cannot give: a caption's own window before and after the trim
+    // (`Project::trim_sub` answers `Ok` for an edge released at a wall it already
+    // stood against) and the ramp's own value before and after the fade
+    // (`set_fade_*` answer `true` for any index that exists).
+    for (name, gate) in [
+        ("move_clip", "match moved {"),
+        (
+            "place_sub",
+            "let text = match (self.sub_of_track(track), &mut self.session) {",
+        ),
+        ("move_sub", "Some(Ok(())) => {"),
+        ("lift_sub", "if lifted {"),
+        ("commit_trim", "if trim.lane.kind == LaneKind::Subtitle {"),
+        ("commit_fade", "if set {"),
+        ("nudge_cut", "let to = nudge_edge(current, dir, lo, hi);"),
+        (
+            "trim_cut_to_playhead",
+            "let to = frame_at(session.now(), self.fps);",
+        ),
+    ] {
+        let body = fn_body(name);
+        let (before, after) = body
+            .split_once(gate)
+            .unwrap_or_else(|| panic!("{name} lost the gate its arm rides"));
+        assert!(
+            after.contains("mark_dirty()"),
+            "{name} arms outside its gate, so a stroke that changed nothing \
+             would dirty the project"
+        );
+        assert!(
+            !before.contains("mark_dirty()"),
+            "{name} still arms ahead of its gate, so a refusal -- or a drag let \
+             go where it started -- leaves the project looking edited"
+        );
+    }
+    // The history pair is the one place the action table does not arm early:
+    // the door's own answer ("there was a step to take") is the gate, so `^z`
+    // with an empty history leaves the flag -- and the close question -- clear.
+    let act = fn_body("act");
+    for gate in ["if self.undo(cx) {", "if self.redo(cx) {"] {
+        let after = act
+            .split_once(gate)
+            .unwrap_or_else(|| panic!("{gate} is gone from the action table"))
+            .1;
+        assert!(
+            after.contains("mark_dirty()"),
+            "the arm behind `{gate}` arms nothing, so a real step back is \
+             invisible to autosave, the unsaved ghost and the close question"
+        );
+    }
+    // ...and the answer the arm reads is the door's own: the session's bool, not
+    // a bare call that would arm for an undo with nothing to undo.
+    for name in ["undo", "redo"] {
+        let body = fn_body(name);
+        assert!(
+            body.contains("PlaybackSession::") && body.contains("stepped"),
+            "Player::{name} no longer answers whether there was a step to take"
+        );
+        assert!(
+            !body.contains("mark_dirty"),
+            "Player::{name} arms its own flag, so the arm in `act` is a second \
+             one for the same step"
         );
     }
 }
@@ -1780,11 +1906,9 @@ fn a_choice_list_offers_every_value_and_fits_the_smallest_window() {
     assert!(native_detail.ends_with(" source"), "{native_detail}");
     // A project at a size nobody listed still gets the whole list, with
     // nothing marked rather than a wrong row marked.
-    assert!(
-        resolution_choices((1000, 1000), native)
-            .iter()
-            .all(|(.., picked)| !picked)
-    );
+    assert!(resolution_choices((1000, 1000), native)
+        .iter()
+        .all(|(.., picked)| !picked));
     // Picking a row means that row, and stepping means the next one: the
     // list and the stroke read the same ladder.
     assert_eq!(next_resolution(ladder[1], native), ladder[2]);
@@ -1883,7 +2007,10 @@ fn a_choice_list_offers_every_value_and_fits_the_smallest_window() {
     assert!(tall <= 360., "the list is taller than the floor");
     assert_eq!(
         menu_at(point(px(600.), px(340.)), size(px(640.), px(360.)), tall),
-        (640. - crate::layout::MENU_EDGE - MENU_W, 360. - crate::layout::MENU_EDGE - tall),
+        (
+            640. - crate::layout::MENU_EDGE - MENU_W,
+            360. - crate::layout::MENU_EDGE - tall
+        ),
         "the list would hang off the smallest window"
     );
 }
@@ -2238,8 +2365,8 @@ fn maximizing_a_card_grows_its_box_without_moving_where_a_value_sits_in_it() {
 /// inside the dock, or hands it the dock's width again, fails this.
 #[test]
 fn a_maximized_cards_room_is_bigger_than_the_docked_rooms_not_smaller() {
+    use crate::layout::{split_size, Split};
     use crate::SPLIT_W;
-    use crate::layout::{Split, split_size};
 
     // `layout::SPLIT_W` is the one divider between `stance-centre` and the
     // dock; the 56px rail that used to eat the centre's left edge is gone
@@ -2286,7 +2413,7 @@ fn a_maximized_cards_room_is_bigger_than_the_docked_rooms_not_smaller() {
 /// assumption.
 #[test]
 fn a_maximized_card_can_never_rise_above_the_picture_no_matter_the_bench_height() {
-    use crate::ui::stance::{LEDGER_H, TIME_BAND_H, below_picture_floor};
+    use crate::ui::stance::{below_picture_floor, LEDGER_H, TIME_BAND_H};
     let viewport_h = 1080.;
     for bench_h in [140., 200., 400.] {
         assert_eq!(

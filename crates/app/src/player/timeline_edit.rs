@@ -350,7 +350,6 @@ impl Player {
         if self.exporting().is_some() {
             return;
         }
-        self.mark_dirty();
         let (Some((start, _)), Some(was)) = (
             self.drop_frame(from, idx, x),
             self.session
@@ -385,6 +384,14 @@ impl Player {
         };
         match moved {
             true => {
+                // The arm rides the door's own answer: `move_clip_to` /
+                // `move_selection_to` answer `false` for a clip let go where it
+                // was picked up (`Project::move_selection` refuses before its
+                // snapshot) and for a lane of the wrong kind, and the arms below
+                // say both in words. Armed before the call it dirtied a project
+                // nobody had touched -- the ledger's `unsaved` ghost and the
+                // save-on-close question over an unchanged file.
+                self.mark_dirty();
                 // Every pick named a `(lane, ...)` by index into that lane's
                 // clips, sorted by start -- exactly what an insert or a lane
                 // change reorders. Re-read by the frame each pick's clip now
@@ -512,7 +519,6 @@ impl Player {
         if self.exporting().is_some() {
             return;
         }
-        self.mark_dirty();
         self.snap_cue = None;
         self.ghost.clear();
         let at = self.place_frame(x).0;
@@ -533,6 +539,15 @@ impl Player {
             (None, Some(_)) => Some("NOT PLACED — that subtitle track has no cues".to_string()),
             (_, None) => Some("NOT PLACED — no file open".to_string()),
         };
+        // The arm rides the door's own answer: `text` is `None` exactly when
+        // `Project::place_sub` took the track, and every refusal -- an overlap,
+        // a lane that is not a subtitle lane, "no file open", "no cues" --
+        // leaves the project byte-for-byte what it was. Armed ahead of the
+        // answer it wrote an autosave sidecar, the ledger's `unsaved` ghost and
+        // the save-on-close question over a project nobody had changed.
+        if text.is_none() {
+            self.mark_dirty();
+        }
         match (text, marked) {
             (Some(text), _) => self.notify_user(text.into()),
             // It went down, and a lane holds its captions in start order
@@ -597,12 +612,19 @@ impl Player {
         if self.exporting().is_some() {
             return;
         }
-        self.mark_dirty();
         self.snap_cue = None;
         self.ghost.clear();
         let Some(idx) = self.dragged_sub(drag) else {
             return;
         };
+        // Where the caption stands *now*, so the arm below can tell a move from
+        // a drag let go where it began: `Project::move_sub` answers `Ok` for a
+        // pick-up-put-back too ("`Ok`, and no undo step, because nothing
+        // changed"), so its own answer is not a change report.
+        let was = self
+            .session
+            .as_ref()
+            .and_then(|session| session.sub_lane(drag.lane).get(idx).map(|sub| sub.start));
         // Asked before the edit, on the indices the press captured: the
         // engine's own grouped-with-clips answer, which is exactly when its
         // move reseeks -- a caption grouped only with other captions moves no
@@ -640,6 +662,20 @@ impl Player {
                     .as_ref()
                     .and_then(|session| sub_mark(session.sub_lane(to), start))
                     .map(|i| (to, i));
+                // The arm rides the caption's own place having moved -- the
+                // engine's `Ok` covers the put-back that takes no undo step at
+                // all (`Project::move_sub`), and a project nobody has touched
+                // must not light the `unsaved` ghost.
+                let landed = mark.and_then(|(lane, i)| {
+                    self.session
+                        .as_ref()?
+                        .sub_lane(lane)
+                        .get(i)
+                        .map(|sub| (lane, sub.start))
+                });
+                if landed != was.map(|start| (drag.lane, start)) {
+                    self.mark_dirty();
+                }
                 self.selected = match mark {
                     Some(mark) => {
                         let mut sel = Selection::new();
@@ -670,7 +706,6 @@ impl Player {
         if self.exporting().is_some() {
             return;
         }
-        self.mark_dirty();
         let lifted = self
             .session
             .as_mut()
@@ -683,6 +718,11 @@ impl Player {
             false => "NOTHING LIFTED — that caption is not there any more".to_string(),
         };
         if lifted {
+            // The arm rides the door's own answer: `false` is "NOTHING LIFTED —
+            // that caption is not there any more", and the project is exactly
+            // what it was, so the flag, the autosave sidecar and the
+            // save-on-close question must stay off it.
+            self.mark_dirty();
             // Everything after it on that lane slid down one ([`Vec::remove`]),
             // so a mark or an open menu left at or past it names a *different*
             // caption now -- and the next Delete would take that one. Both go
@@ -1537,7 +1577,11 @@ impl Player {
         let Some(trim) = self.trim.take() else {
             return;
         };
-        self.mark_dirty();
+        // The arm rides each door's own answer or the caption's own edges --
+        // never the call: a trim released where the edge already stood is
+        // `Ok`/`true` with no undo step, and it must not leave the project
+        // looking edited to autosave, the `unsaved` ghost or the close
+        // question.
         // A caption's edge reaches the engine through its own door, at this
         // timeline's rate. An `Ok` is *not* "something changed" -- an edge that
         // stopped at a wall it already stood against is `Ok` with no undo step
@@ -1552,14 +1596,33 @@ impl Player {
                 .session
                 .as_ref()
                 .is_some_and(|session| session.caption_grouped_with_clips(trim.lane, trim.idx));
+            // The caption's own window, before and after: the only reading that
+            // can tell a trim from an edge released against the wall it already
+            // stood on.
+            let edges = |player: &Self| {
+                player.session.as_ref().and_then(|session| {
+                    session
+                        .sub_lane(trim.lane)
+                        .get(trim.idx)
+                        .map(|sub| (sub.start, sub.frames, sub.in_us, sub.out_us))
+                })
+            };
+            let before = edges(self);
             let trimmed = self
                 .session
                 .as_mut()
                 .map(|session| session.trim_sub(trim.lane, trim.idx, trim.edge, trim.to));
             match trimmed {
                 Some(Err(e)) => self.notify_user(format!("NOT TRIMMED — {e}").into()),
-                Some(Ok(())) if grouped => self.reset_after_reseek(),
-                _ => {}
+                Some(Ok(())) => {
+                    if edges(self) != before {
+                        self.mark_dirty();
+                    }
+                    if grouped {
+                        self.reset_after_reseek();
+                    }
+                }
+                None => {}
             }
             cx.notify();
             return;
@@ -1569,6 +1632,10 @@ impl Player {
             .as_mut()
             .is_some_and(|session| session.trim_clip(trim.lane, trim.idx, trim.edge, trim.to));
         if trimmed {
+            // The arm rides the door's own answer: `trim_clip` is `false` for an
+            // edge already where it was asked to go, which is no undo step and
+            // no edit.
+            self.mark_dirty();
             self.reset_after_reseek();
         }
         cx.notify();
@@ -1643,7 +1710,20 @@ impl Player {
         let Some(fade) = self.fade_drag.take() else {
             return;
         };
-        self.mark_dirty();
+        // The ramp the clip is carrying *now*, so the arm below can tell a drag
+        // from a press-and-release that left the handle where it was: `set_fade_in`
+        // / `set_fade_out` answer `true` for any index that exists and take an
+        // undo step either way, so their own answer is not a change report.
+        let was = match fade.is_in {
+            true => self
+                .session
+                .as_ref()
+                .map(|session| session.fade_in_of(fade.lane, fade.idx)),
+            false => self
+                .session
+                .as_ref()
+                .map(|session| session.fade_out_of(fade.lane, fade.idx)),
+        };
         let set = self
             .session
             .as_mut()
@@ -1652,6 +1732,19 @@ impl Player {
                 false => session.set_fade_out(fade.lane, fade.idx, fade.to),
             });
         if set {
+            let now = match fade.is_in {
+                true => self
+                    .session
+                    .as_ref()
+                    .map(|session| session.fade_in_of(fade.lane, fade.idx)),
+                false => self
+                    .session
+                    .as_ref()
+                    .map(|session| session.fade_out_of(fade.lane, fade.idx)),
+            };
+            if now != was {
+                self.mark_dirty();
+            }
             cx.notify();
         }
     }
