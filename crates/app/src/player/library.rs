@@ -716,6 +716,11 @@ impl Player {
                 cx.notify();
             }
         }
+        // The picture swaps back to the timeline's, so everything keyed to a
+        // session hears it (`Player::session_swapped`) -- the sound watch among
+        // them, or the timeline's own unchanged reason would read as a device
+        // that came back the moment the preview closed.
+        self.session_swapped();
         self.preview_playing = false;
     }
 

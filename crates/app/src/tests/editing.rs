@@ -613,6 +613,20 @@ fn the_playhead_actions_still_work_with_a_caption_marked() {
     let clips = session.lane_clips(Lane::V1).len();
     assert!(session.cut_at(2.0), "the playhead splits the clip under it");
     assert_eq!(session.lane_clips(Lane::V1).len(), clips + 1);
+    // The refusal is a real state and not a defence against nothing: the
+    // playhead is standing on the seam the split just left, which is exactly the
+    // stroke `Player::cut` words as "NOTHING TO SPLIT — the playhead is already
+    // on a cut".
+    assert!(
+        !session.cut_at(2.0),
+        "a second split on the seam is refused, which is the state the door's \
+         selection gate is about"
+    );
+    assert_eq!(
+        session.lane_clips(Lane::V1).len(),
+        clips + 1,
+        "and adds none"
+    );
     assert!(session.regroup_at(2.0), "and the seam rejoins");
     assert_eq!(session.lane_clips(Lane::V1).len(), clips);
     assert_eq!(session.sub_lane(lane).len(), 1, "the caption is untouched");
@@ -2912,6 +2926,49 @@ fn escape_closes_a_card_before_it_can_ever_reach_deselect() {
              clear the selection before this card ever got a look at the key"
         );
     }
+}
+
+/// A refused split is not an edit, so it may not drop the clip in hand: the
+/// refused stroke is worded ("NOTHING TO SPLIT — the playhead is already on a
+/// cut") and the pick is still what the next `x`, `delete` or clip-menu row acts
+/// on. The clear rides the door's own answer, the way [`Player::regroup`]'s
+/// always has -- a split that happened is the other way round: the seam it
+/// leaves renumbers the lane, so a pick kept across it names the wrong clip.
+///
+/// A scan and not a drive: `self.selected` lives on `Player`, which needs a gpui
+/// `Context` this binary has no harness for. The state itself is driven in
+/// `the_playhead_actions_still_work_with_a_caption_marked`, which holds the real
+/// `cut_at` refusal this gate is about.
+#[test]
+fn a_refused_split_keeps_the_clip_in_hand() {
+    let body = fn_body("cut");
+    let (before, after) = body
+        .split_once("if cut {")
+        .expect("the split door no longer gates anything on its own answer");
+    // The door's own branch, cut apart at its `else`: "runs after `if cut {`" is
+    // satisfied by the shape this fix replaced as well, because the clear sat
+    // below the whole if/else and so inside everything that followed the gate --
+    // a revert of the fix would have shipped green. What the arm has to be is
+    // inside the then-branch, and nothing that follows the branch may hold one.
+    let then = after
+        .split_once("} else {")
+        .expect("the split door no longer branches on what the cut answered")
+        .0;
+    // One arm's worth of clear, counted with `matches`: `split(..).count()`
+    // counts the pieces *between* matches, so a single occurrence reads as two
+    // there and the guard fails on the fix it is guarding.
+    let extra_clear = after.matches("self.selected.clear()").count() > 1;
+    assert!(
+        !before.contains("self.selected.clear()"),
+        "the split drops the selection before it knows the cut happened, so a \
+         refused split leaves the user with nothing picked and nothing told"
+    );
+    assert!(
+        then.contains("self.selected.clear()") && !extra_clear,
+        "the clear does not ride the split's own success branch: a split that \
+         happened leaves the mark naming a different clip across the seam, and a \
+         refused one must leave it naming the clip it named"
+    );
 }
 
 /// The other half: with nothing on screen to claim the key, bare escape falls

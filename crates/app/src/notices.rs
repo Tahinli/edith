@@ -46,9 +46,98 @@ fn is_completion(message: &str) -> bool {
 /// decode: it plays perfectly, in silence, and that is the one thing the window
 /// would otherwise never say (the engine's own word for it, verbatim).
 pub(crate) fn audio_notice(session: &PlaybackSession) -> Option<String> {
-    session
-        .audio_disabled_reason()
-        .map(|reason| format!(" — NO AUDIO: {reason}"))
+    session.audio_disabled_reason().map(audio_tail)
+}
+
+/// [`audio_notice`]'s own tail, for a reason already read -- the one place the
+/// engine's word is spelled into a line, so the open path and the mid-session
+/// one cannot drift apart.
+pub(crate) fn audio_tail(reason: &str) -> String {
+    format!(" — NO AUDIO: {reason}")
+}
+
+/// The same fact said on its own, for a device that dies *after* a file was
+/// opened: [`audio_notice`] is a tail to append to "OPENED x", and a death
+/// mid-session has no line to hang off -- so it leads with the state word the
+/// strip reads first, and the tail is the same one.
+pub(crate) fn audio_lost_line(reason: &str) -> String {
+    format!("AUDIO LOST{}", audio_tail(reason))
+}
+
+/// What a frame of the sound watch decides, as a pure value: the cache's own
+/// session generation against the frame's says whether the two are even talking
+/// about the same session, and only then what the reason did.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum AudioStep {
+    /// The cache describes the session *before* this one
+    /// (`Player::session_swapped`): it is seeded and nothing is announced -- a
+    /// preview that opens or closes is not a device that came back.
+    Seed,
+    /// The same session's reason arrived, or changed to a new one.
+    Push,
+    /// ...and the same session's reason is gone: the line it earned is retracted.
+    Clear,
+    /// The ordinary frame.
+    Nothing,
+}
+
+/// [`Player::watch_audio`]'s whole decision, pure: `cached_gen` is the session
+/// generation the cache describes, `session_gen` the one the frame is serving, and
+/// two reasons are what the engine says the sound is (`None` for sound that is
+/// up).
+///
+/// The generation is what keeps another session's reason out of this session's
+/// cache: `pump` serves the preview while one is up and the timeline otherwise,
+/// so a flip reads a reason that was never about the cached session at all -- a
+/// live device on one side and a dead one on the other is not a change, it is
+/// two different questions.
+pub(crate) fn audio_step(
+    cached_gen: u64,
+    session_gen: u64,
+    was: Option<&str>,
+    now: Option<&str>,
+) -> AudioStep {
+    if cached_gen != session_gen {
+        return AudioStep::Seed;
+    }
+    match (was, now) {
+        (Some(was), Some(now)) if was == now => AudioStep::Nothing,
+        (_, Some(_)) => AudioStep::Push,
+        (Some(_), None) => AudioStep::Clear,
+        (None, None) => AudioStep::Nothing,
+    }
+}
+
+/// What a *change* in the engine's sound reason does to the notice queue, as a
+/// pure step: the line pushed when a reason arrives, the same line taken back
+/// when the reason clears. [`Player::watch_audio`] is the only caller and owns
+/// the caching; this owns the queue, so a test can drive both directions without
+/// a window and without a device that dies on cue.
+///
+/// The reason is the engine's to write, and the engine's writer is the wave
+/// branch's: `tick`'s dead branch sets the lost-device reason and `rearm_audio`
+/// clears it (its own test observes both). This side is the reader and never
+/// spells the engine's words, so the end-to-end flip is asserted on the merged
+/// tree while this lane drives the same step through the seam below -- on this
+/// lane's base engine no path flips the reason at all.
+pub(crate) fn audio_change_notice(
+    notices: &mut std::collections::VecDeque<SharedString>,
+    was: Option<&str>,
+    now: Option<&str>,
+) {
+    match (was, now) {
+        (_, Some(reason)) if was != Some(reason) => {
+            push_notice(notices, audio_lost_line(reason).into());
+        }
+        // The sound is back: the line goes with it, or the strip keeps saying NO
+        // AUDIO over a film that plays. Only that line -- whatever else is
+        // queued is none of this step's business.
+        (Some(was), None) => {
+            let line = audio_lost_line(was);
+            notices.retain(|notice| notice.as_ref() != line.as_str());
+        }
+        _ => {}
+    }
 }
 
 /// The strip's own width is finite and its message is one line: what a
@@ -121,12 +210,14 @@ mod tests {
     #[test]
     fn a_long_name_loses_its_middle_rather_than_the_state_word() {
         assert_eq!(ledger_line("SNAP OFF"), "SNAP OFF");
-        let long = ledger_line("OPENED he_is_not_the_only_one_at_all_here.mp4 · 1 subtitle track(s)");
+        let long =
+            ledger_line("OPENED he_is_not_the_only_one_at_all_here.mp4 · 1 subtitle track(s)");
         assert!(long.starts_with("OPENED "), "{long}");
         assert!(long.ends_with(" · 1 subtitle track(s)"), "{long}");
         assert!(long.contains('…'), "{long}");
         assert!(
-            long.split(' ').all(|w| w.chars().count() <= LEDGER_WORD_MAX),
+            long.split(' ')
+                .all(|w| w.chars().count() <= LEDGER_WORD_MAX),
             "{long}"
         );
     }
