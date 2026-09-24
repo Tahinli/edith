@@ -18,7 +18,7 @@ use ec_h264::H264Decoder;
 use crate::color::ColorParams;
 use crate::colorspace::{ColorDescription, Matrix, Transfer};
 use crate::convert::{i420_to_bgra, i420_to_bgra_with};
-use crate::demux::{Codec, Demuxer, Rotation, VideoMeta};
+use crate::demux::{Codec, Demuxer, PixelAspect, Rotation, VideoMeta};
 use crate::hw::HwSession;
 use crate::project::Speed;
 use crate::scale::Composer;
@@ -562,6 +562,8 @@ impl DecodeSession {
             transform,
             // A still has no display matrix: what the file holds is what it is.
             Rotation::None,
+            // ...and no sample aspect either: a still is authored square.
+            PixelAspect::SQUARE,
             ColorDescription::default(),
             canvas,
             tonemap::Preset::default(),
@@ -691,6 +693,9 @@ impl DecodeSession {
                     transform,
                     // Painted here, at the canvas's own size: nothing turned it.
                     Rotation::None,
+                    // ...and nothing drew it anamorphic: it is square by
+                    // construction.
+                    PixelAspect::SQUARE,
                     ColorDescription::default(),
                     canvas,
                     tonemap::Preset::default(),
@@ -1108,6 +1113,7 @@ fn run_span(
         color,
         transform,
         opened.meta.rotation,
+        opened.meta.pixel_aspect,
         opened.meta.color,
         canvas,
         tone,
@@ -1197,6 +1203,12 @@ struct Render {
     /// every file that states no turn, which is the whole of an ordinary
     /// library.
     rotation: Rotation,
+    /// The ratio one coded pixel is drawn at ([`crate::demux::PixelAspect`]):
+    /// the file's sample aspect ratio, applied exactly once, at this one
+    /// conversion to the square-pixel raster -- the same place ffmpeg's swscale
+    /// applies it, and nowhere else. Square for every file that states no
+    /// aspect, which takes the branch by a bool and touches no byte.
+    pixel_aspect: PixelAspect,
     /// What the source's samples mean -- the stream's own matrix and range,
     /// which is what the conversion below is done in rather than the BT.601 it
     /// used to assume of every file.
@@ -1215,6 +1227,10 @@ struct Render {
     /// asks for none, and resized once for one that does -- a steady-state
     /// buffer rather than three plane allocations per decoded frame.
     turned: (Vec<u8>, Vec<u8>, Vec<u8>),
+    /// The same, for the pixel-aspect stretch: the coded picture widened to
+    /// the displayed width, empty for every square-pixel file and sized once
+    /// for one that is not.
+    stretched: (Vec<u8>, Vec<u8>, Vec<u8>),
     /// Where [`Composer::place_transformed`]'s owned picture lands, so a
     /// transformed frame's planes live as long as `self` -- matching what
     /// [`Composer::place`] already hands back by borrowing `self.canvas`.
@@ -1238,6 +1254,7 @@ impl Render {
         color: ColorParams,
         transform: TransformParams,
         rotation: Rotation,
+        pixel_aspect: PixelAspect,
         desc: ColorDescription,
         canvas: Composer,
         preset: tonemap::Preset,
@@ -1247,6 +1264,7 @@ impl Render {
             color,
             transform,
             rotation,
+            pixel_aspect,
             desc,
             canvas,
             // corner-cut: the ceiling is that the map reads limited-range codes
@@ -1261,6 +1279,7 @@ impl Render {
             },
             graded: (Vec::new(), Vec::new(), Vec::new()),
             turned: (Vec::new(), Vec::new(), Vec::new()),
+            stretched: (Vec::new(), Vec::new(), Vec::new()),
             placed: (Vec::new(), Vec::new(), Vec::new()),
         }
     }
@@ -1301,6 +1320,40 @@ impl Render {
                     rh,
                 )
             }
+        };
+        // The pixel aspect, applied exactly once -- the single conversion to
+        // the square-pixel raster this engine makes, where ffmpeg's swscale
+        // makes its own. Only a file whose samples are not square reaches the
+        // resample: a square one takes the branch by a bool and not one byte
+        // is touched, which is what keeps every existing picture identical to
+        // the day before anamorphic sources existed.
+        let (y, u, v, width, height) = if self.pixel_aspect.is_square() {
+            (y, u, v, width, height)
+        } else {
+            // The aspect widens the *width*, always: 4:3 SAR over 1440x1080
+            // shows 1920x1080. `width_factor` lands on the even grid 4:2:0
+            // composes on, and a height is never touched by it.
+            let display_width = self.pixel_aspect.width_factor(width);
+            let (sy, su, sv) = &mut self.stretched;
+            crate::scale::scale_i420(
+                y,
+                u,
+                v,
+                width as usize,
+                height as usize,
+                sy,
+                su,
+                sv,
+                display_width as usize,
+                height as usize,
+            );
+            (
+                &sy[..display_width as usize * height as usize],
+                &su[..display_width.div_ceil(2) as usize * height.div_ceil(2) as usize],
+                &sv[..display_width.div_ceil(2) as usize * height.div_ceil(2) as usize],
+                display_width,
+                height,
+            )
         };
         let passthrough = self.canvas.is_passthrough(width, height);
         // A transform still has a picture to place even where the canvas
