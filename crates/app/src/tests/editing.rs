@@ -2018,9 +2018,9 @@ fn the_windows_settings_caches_follow_the_session_across_undo_and_redo() {
 /// Rows above the picked subtitle move the pick down with them
 /// ([`sub_pick_after_removal`]), and a `^z` of that removal has to move it back
 /// up: the palette comes home out of the entry, the pick is an *index* into it,
-/// and an index left where it was names a different track -- the plate over the
-/// picture would change language on its own, and the one already drawn was
-/// drawn through the pick that no longer stands.
+/// and an index left where it was highlights one row and names another. The
+/// plate over the picture goes too, not because it is keyed by the pick -- it is
+/// keyed by where a cue sits -- but because the step moves the cues under it.
 #[test]
 fn the_subtitle_pick_follows_its_track_across_an_undo_of_a_removal() {
     use crate::player::actions::{history_step, HistoryBefore, SessionCaches};
@@ -2093,6 +2093,50 @@ fn the_subtitle_pick_follows_its_track_across_an_undo_of_a_removal() {
         Some(picked.as_str())
     );
     assert!(out.drop_sub_image, "and the plate goes with it");
+}
+
+/// The app-level write-back of a history step is not reachable from this binary
+/// -- `Player` needs a `TestAppContext` this one has none of -- so the wiring is
+/// pinned where it can be read: both keyboard doors route through
+/// [`Player::step_history`], and its body still keeps the three session caches
+/// and the pick, and still drops the plate. What those values *are* is pinned
+/// against a real session by the two tests above ([`history_step`] is the free
+/// function they drive); this is the copy back into the window's own fields,
+/// which no test can call.
+#[test]
+fn a_history_step_still_takes_its_settings_and_its_pick_back_up() {
+    let actions = src_text("player/actions.rs");
+    for needle in [
+        "self.step_history(PlaybackSession::undo);",
+        "self.step_history(PlaybackSession::redo);",
+    ] {
+        assert!(
+            actions.contains(needle),
+            "a history door stopped routing through Player::step_history: {needle}"
+        );
+    }
+    let body = fn_body("step_history");
+    // The state the step is asked about, and the answer taken back up: every one
+    // of these deleted leaves a cache or the pick stale for the next cut, the
+    // next frame count, or the next repaint.
+    for needle in [
+        "let mut caches = SessionCaches {",
+        "HistoryBefore::of(",
+        "self.fps = caches.fps;",
+        "self.proxies_on = caches.proxies_on;",
+        "self.auto_proxies_on = caches.auto_proxies_on;",
+        "self.sub_track = outcome.sub_track;",
+        "if outcome.drop_sub_image {",
+        "self.sub_image = None;",
+        "self.reset_after_reseek();",
+    ] {
+        assert!(
+            body.contains(needle),
+            "Player::step_history no longer carries `{needle}` -- a history step \
+             leaves it behind (the app suite cannot see this: it has no \
+             TestAppContext to call the door)"
+        );
+    }
 }
 
 /// The oracle side of trim-to-playhead (debt #42): needs a subject cut *and*

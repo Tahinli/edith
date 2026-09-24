@@ -1751,8 +1751,12 @@ impl Player {
                     .as_ref()
                     .map_or(0, |session| session.subtitles().len());
                 self.sub_track = sub_pick_after_removal(self.sub_track, track, left);
-                // The drawn cue is keyed by that index ([`Player::sub_picture`])
-                // and the index now stands for another track.
+                // The cue over the picture goes with the pick: its tile is
+                // keyed by *where* the cue sits ([`Player::sub_picture`]'s
+                // `(lane, start_us)`) and never by the track it shows, so the
+                // index that moved here is not something that cache can be
+                // asked about. Conservative, and the same drop a history step
+                // makes for the same reason ([`Player::step_history`]).
                 //
                 // corner-cut: its atlas tile is not released -- `close_session`'s
                 // note, for its reason and with its upgrade path.

@@ -774,9 +774,14 @@ impl HistoryBefore {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct HistoryOutcome {
     pub(crate) sub_track: usize,
-    /// The plate the pick drew (`Player::sub_image`) was drawn through a pick
-    /// that no longer stands -- the palette moved under it, or it names another
-    /// row -- so it has to go.
+    /// The plate over the picture (`Player::sub_image`) has to go. Its tile is
+    /// keyed by *where* a cue sits ([`Player::sub_picture`]'s `(lane,
+    /// start_us)`) and carries no track, so a step that moves captions, takes
+    /// one off, or renumbers the track a placement names
+    /// ([`engine::Project::remove_subtitles`] walks `SubClip::track` down)
+    /// cannot be asked of that cache -- the tile at a key can be served for a
+    /// cue it was not drawn from. Conservative on purpose: at most one plate is
+    /// redrawn by the next repaint.
     pub(crate) drop_sub_image: bool,
 }
 
