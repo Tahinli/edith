@@ -2370,7 +2370,7 @@ fn mkv_language(legacy: &str, bcp47: &str) -> String {
 /// from `iso-codes`' own `iso_639-2.json`, so a Kannada track is as readable as
 /// an English one.
 #[rustfmt::skip]
-const ISO_639_1_TO_2: &[(&str, &str)] = &[
+pub(crate) const ISO_639_1_TO_2: &[(&str, &str)] = &[
     ("aa", "aar"), ("ab", "abk"), ("ae", "ave"), ("af", "afr"),
     ("ak", "aka"), ("am", "amh"), ("an", "arg"), ("ar", "ara"),
     ("as", "asm"), ("av", "ava"), ("ay", "aym"), ("az", "aze"),
