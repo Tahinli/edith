@@ -25,12 +25,73 @@ impl Player {
             .map_or(self.fps, |s| s.meta().frame_rate)
     }
 
+    /// The engine's own word on the sound device, for the session the pump
+    /// serves ([`Player::active_session`]).
+    fn sound_reason(&self) -> Option<&str> {
+        self.active_session()
+            .and_then(PlaybackSession::audio_disabled_reason)
+    }
+
+    /// The engine's word on the sound device, watched rather than asked once.
+    /// A file that *opens* silent says so in its own open line
+    /// ([`audio_notice`], `library.rs`); what used to reach no consumer at all is
+    /// a reason that changes *under* a session that is already up. This is the
+    /// reader of that state: the writer is the engine's (the wave branch's
+    /// `tick` dead branch sets the lost-device reason, `rearm_audio` clears it),
+    /// and this lane spells none of its words.
+    ///
+    /// Called from [`Player::pump`] because that is the one place every frame
+    /// passes through, and written to cost an ordinary frame nothing: one read of
+    /// an `Option<&str>` and one compare, with the strings built only on the step
+    /// the pure [`audio_step`] names.
+    ///
+    /// Keyed by session ([`Player::audio_watch_gen`] against `session_gen`):
+    /// `pump` serves the preview while one is up and the timeline otherwise, so
+    /// without the key a preview opening or closing would read the *other*
+    /// session's reason and announce a device loss that never happened.
+    pub(crate) fn watch_audio(&mut self) {
+        let step = audio_step(
+            self.audio_watch_gen,
+            self.session_gen,
+            self.audio_reason.as_deref(),
+            self.sound_reason(),
+        );
+        if step == AudioStep::Nothing {
+            return;
+        }
+        let was = self.audio_reason.take();
+        self.audio_reason = self.sound_reason().map(str::to_owned);
+        self.audio_watch_gen = self.session_gen;
+        if step == AudioStep::Seed {
+            // A session swap is not a change: the new session's own open line
+            // carries its reason, so only a line left over from the session
+            // before is taken back -- and only when this one's sound is up.
+            if self.audio_reason.is_none() {
+                if let Some(was) = was {
+                    let line = audio_lost_line(&was);
+                    self.notices
+                        .retain(|notice| notice.as_ref() != line.as_str());
+                }
+            }
+            return;
+        }
+        audio_change_notice(
+            &mut self.notices,
+            was.as_deref(),
+            self.audio_reason.as_deref(),
+        );
+    }
+
     /// Catches the display up to the clock: everything already due is taken off
     /// the channel and only the last of them is shown, which *is* the
     /// drop-when-behind policy. A frame that is not due yet waits in `held`, and
     /// while the clock is paused *nothing* is due -- a repaint re-presents the
     /// frame already on screen, whatever asked for the repaint.
     pub(crate) fn pump(&mut self, window: &mut Window) {
+        // Before the drain, on the one read that does not need the session
+        // mutably: the sound can die at any point in a frame, and the notice it
+        // earns is owed to the frame it died in.
+        self.watch_audio();
         // Where the transport was before this drain, so the crossing into
         // `Ended` can be recognised as the one transition it is.
         let was = self.transport();

@@ -3,6 +3,63 @@
 
 use super::*;
 
+/// The preview's one cached cue picture is keyed by the *cue* and not only by
+/// where it happens to sit: a lane and a start microsecond are not an identity --
+/// lift a bitmap caption off a lane, drop another track's caption at the same
+/// frame, and a key of those two matched the cache, painting the picture of the
+/// cue that is gone over the one that is up. The picture's own allocation is the
+/// rest of the key, and an identical repeat still hits, which is the whole cache.
+#[test]
+fn a_cached_cue_picture_is_keyed_by_the_cue_not_only_its_moment() {
+    use crate::ui::preview::sub_image_key;
+    let (lane, other) = (Lane::S1, Lane::A1);
+    // Two cues that share the lane and the start, and nothing else: one lifted,
+    // one placed at the same frame.
+    let a = sub_image_key(lane, 1_000_000, 3_000_000, 0x1000);
+    let b = sub_image_key(lane, 1_000_000, 3_000_000, 0x2000);
+    assert_ne!(
+        a, b,
+        "two different cues at one moment on one lane are one cache key again, so \
+         the second paints the first's picture"
+    );
+    // The same cue repainted: still a hit.
+    assert_eq!(
+        a,
+        sub_image_key(lane, 1_000_000, 3_000_000, 0x1000),
+        "the cache misses on every repaint of the same cue, so it decodes an 8 MB \
+         display set per frame"
+    );
+    // The same picture recut over the same start is a different cue.
+    assert_ne!(
+        a,
+        sub_image_key(lane, 1_000_000, 2_500_000, 0x1000),
+        "a cue's own end is no part of the key, so a recut cue serves the old window"
+    );
+    // And the other half of the old key still holds: the four PGS tracks of a
+    // remux start at the same microsecond, so the lane separates them.
+    assert_ne!(
+        a,
+        sub_image_key(other, 1_000_000, 3_000_000, 0x1000),
+        "the lane is no longer part of the key, so a lane's eye shut leaves the \
+         other lane's caption on screen"
+    );
+    // And the door builds its key this way, out of the cue's own picture: the
+    // cache is only keyed by the cue while the lookup goes through this
+    // constructor, and a test of the constructor alone would pass with the door
+    // still keying on `(lane, start_us)`.
+    let preview_rs = src_text("ui/preview.rs");
+    assert!(
+        preview_rs.contains(
+            "let key = sub_image_key(lane, start_us, end_us, Arc::as_ptr(image) as usize);"
+        ),
+        "the cue picture is cached under a key that is not the cue's own"
+    );
+    assert!(
+        preview_rs.contains("*up == key"),
+        "the cache no longer compares the key it built"
+    );
+}
+
 /// What a drop reads: the frame under the pointer, through the same scale
 /// the boxes are drawn through. Zoomed in, the same pixel is a different
 /// frame -- which is the whole reason `Player::frame_under` goes through
@@ -975,4 +1032,106 @@ fn focus_panels_is_bound_and_lands_on_the_dock() {
     // Bare Tab must still mean Select at the root -- FocusPanels must not
     // have stolen it.
     assert_eq!(k.lookup("tab", false), Some(ActionId::Select));
+}
+
+/// A card is not a key-eating black box: the room-wide chords that act on the
+/// document -- the edit history, the project file, the clipboard -- must reach
+/// `Player::act` while any card is open. `param_card_key` answers `true` for
+/// *every* stroke once one of the seven is up, so the dispatch has to stand in
+/// front of it, not only in front of the blanket modal guard under it; and the
+/// blanket guard's own `card_open()` has to read after that dispatch too, or a
+/// chord that got past `param_card_key` (a menu dismiss comes to mind) would
+/// still never reach the keymap.
+///
+/// A scan of the handler's own source, for the reason every handler scan here
+/// gives: this binary has no window harness to press `ctrl+z` through.
+#[test]
+fn an_open_card_does_not_swallow_the_document_chords() {
+    use crate::ui::stance::card_safe_action;
+    use keymap::ActionId;
+    // The five the room answers through a card, and the reason each is on the
+    // list: history, file, clipboard.
+    for action in [
+        ActionId::Undo,
+        ActionId::Redo,
+        ActionId::Save,
+        ActionId::Copy,
+        ActionId::Paste,
+    ] {
+        assert!(
+            card_safe_action(action),
+            "{action:?} is a document chord and a card must not eat it"
+        );
+    }
+    // ...and the strokes the cards' own branch list claims stay theirs:
+    // escape is every card's way out, `s` is the equalizer's spectrum, `x` its
+    // band removal, `m` every card's maximize, and the digits pick a band.
+    for action in [
+        ActionId::Deselect,
+        ActionId::Cut,
+        ActionId::Delete,
+        ActionId::ToggleMute,
+        ActionId::Equalizer,
+        ActionId::Color,
+        ActionId::Loop,
+        ActionId::TrimIn,
+    ] {
+        assert!(
+            !card_safe_action(action),
+            "{action:?} is a card's own stroke and the card must keep it"
+        );
+    }
+    // The chords are real bindings, not a list of actions nothing reaches.
+    let keys = keymap::Keymap::defaults();
+    for (key, ctrl, action) in [
+        ("z", true, ActionId::Undo),
+        ("y", true, ActionId::Redo),
+        ("s", true, ActionId::Save),
+        ("c", true, ActionId::Copy),
+        ("v", true, ActionId::Paste),
+    ] {
+        assert_eq!(
+            keys.lookup(key, ctrl),
+            Some(action),
+            "the keymap no longer binds {action:?}"
+        );
+    }
+    // And the dispatch stands where it has to: inside the root handler, ahead
+    // of the cards' own branches and ahead of the blanket modal guard.
+    let stance_rs = src_text("ui/stance.rs");
+    let dispatch = stance_rs.find("card_safe_action(action)").expect(
+        "the root key handler no longer asks which chords a card does not take -- an open card \
+             eats every stroke again",
+    );
+    assert!(
+        stance_rs[..dispatch].contains("this.keymap.lookup(key, ctrl)"),
+        "the dispatch no longer goes through the keymap, so a rebind would leave it behind"
+    );
+    // The *statement* that dispatches, not just some `keymap.lookup` before it:
+    // the hold gate at the top of the handler resolves the same pair, so a needle
+    // that only asks for the lookup is satisfied by a dispatch resolving the
+    // action some other way entirely.
+    let resolve = stance_rs
+        .find("if let Some(action) = this.keymap.lookup(key, ctrl)")
+        .expect("the dispatch no longer resolves an action through the keymap");
+    let stmt = &stance_rs[resolve..];
+    let stmt = &stmt[..stmt.find('{').expect("the dispatch statement has no block")];
+    assert!(
+        stmt.contains("card_safe_action("),
+        "the dispatch resolves an action and never asks whether a card may take \
+         it, so an open card eats the document chords again"
+    );
+    for (guard, label) in [
+        ("if this.param_card_key(", "the cards' own key branches"),
+        ("if this.card_open()", "the blanket modal guard"),
+    ] {
+        let at = stance_rs
+            .find(guard)
+            .unwrap_or_else(|| panic!("{label} moved or was renamed"));
+        assert!(
+            dispatch < at,
+            "{label} reads before the document dispatch -- an open card would \
+             swallow undo, redo, save and the clipboard pair again"
+        );
+    }
 }

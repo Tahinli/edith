@@ -36,6 +36,12 @@ impl Player {
         // costs nothing a real edit would not have earned anyway, and one list
         // here is the whole answer instead of fifteen scattered calls.
         //
+        // The two exceptions are the history pair, whose doors answer "there was
+        // a step to take" and are gated in their own arms below: `^z` with
+        // nothing to undo is not a stroke that earned an autosave, and the
+        // save-on-close question over a project nobody has touched is exactly
+        // what the card doors' own gate exists to prevent.
+        //
         // This list is the *action* doors only, and that is the class to mind
         // when adding an edit: a control that reaches the session from a
         // *click* -- the Clip tab's look chips and wheel, the settings rows,
@@ -54,8 +60,6 @@ impl Player {
                 | ActionId::Group
                 | ActionId::Delete
                 | ActionId::Lift
-                | ActionId::Undo
-                | ActionId::Redo
                 | ActionId::AddVideoLane
                 | ActionId::RemoveVideoLane
                 | ActionId::AddAudioLane
@@ -130,8 +134,16 @@ impl Player {
             ActionId::ZoomIn => self.zoom(ZOOM_STEP, None, cx),
             ActionId::ZoomOut => self.zoom(1. / ZOOM_STEP, None, cx),
             ActionId::ZoomFit => self.zoom_fit(cx),
-            ActionId::Undo => self.undo(cx),
-            ActionId::Redo => self.redo(cx),
+            ActionId::Undo => {
+                if self.undo(cx) {
+                    self.mark_dirty();
+                }
+            }
+            ActionId::Redo => {
+                if self.redo(cx) {
+                    self.mark_dirty();
+                }
+            }
             ActionId::AddVideoLane => self.add_lane(LaneKind::Video, cx),
             ActionId::AddAudioLane => self.add_lane(LaneKind::Audio, cx),
             // The last track of that kind: the one the add key put there, so the
@@ -611,12 +623,17 @@ impl Player {
             return;
         };
         let to = nudge_edge(current, dir, lo, hi);
-        self.mark_dirty();
         let trimmed = self
             .session
             .as_mut()
             .is_some_and(|s| s.trim_clip(lane, idx, edge, to));
         if trimmed {
+            // The arm rides the door's own answer: `trim_clip` is `false` for an
+            // edge already where it was asked to go -- the `[`/`]` pressed
+            // against the wall the edge is already on -- so the flag, the
+            // autosave sidecar and the save-on-close question stay off a
+            // project nobody has changed.
+            self.mark_dirty();
             self.reset_after_reseek();
             // Loop-trim follows the edge it is trimming: the whole point of
             // the mode is hearing the cut as it moves.
@@ -643,12 +660,15 @@ impl Player {
             return;
         };
         let to = frame_at(session.now(), self.fps);
-        self.mark_dirty();
         let trimmed = self
             .session
             .as_mut()
             .is_some_and(|s| s.trim_clip(lane, idx, edge, to));
         if trimmed {
+            // The door's own answer again: an edge the playhead is already on is
+            // `false`, no undo step, and nothing for the unsaved ghost to be
+            // about.
+            self.mark_dirty();
             self.reset_after_reseek();
             // Loop-trim follows the edge it is trimming, same as the nudge
             // pair above.
@@ -684,16 +704,33 @@ impl Player {
         cx.notify();
     }
 
-    pub(crate) fn undo(&mut self, cx: &mut Context<Self>) {
-        self.step_history(PlaybackSession::undo);
-        self.selected.clear();
+    /// Whether there was a step to take, for the reason the action table arms
+    /// nothing on its own: a `^z` with an empty history is not an edit, and it
+    /// may not raise the save-on-close question over a project nobody has
+    /// touched. The selection goes with the step for the same reason it used to
+    /// go every time: a step back puts the indices on different clips, while a
+    /// refused one leaves them naming exactly what they named.
+    ///
+    /// The step itself goes through [`Player::step_history`], which is what
+    /// takes the window's own copy of the rate, the two proxy switches, the
+    /// palette's pick and the plate over the picture back up with it.
+    pub(crate) fn undo(&mut self, cx: &mut Context<Self>) -> bool {
+        let stepped = self.step_history(PlaybackSession::undo);
+        if stepped {
+            self.selected.clear();
+        }
         cx.notify();
+        stepped
     }
 
-    pub(crate) fn redo(&mut self, cx: &mut Context<Self>) {
-        self.step_history(PlaybackSession::redo);
-        self.selected.clear();
+    /// [`Player::undo`]'s twin, the same answer and the same gate.
+    pub(crate) fn redo(&mut self, cx: &mut Context<Self>) -> bool {
+        let stepped = self.step_history(PlaybackSession::redo);
+        if stepped {
+            self.selected.clear();
+        }
         cx.notify();
+        stepped
     }
 
     /// One step of the session's own history through the door both `^z` and
@@ -705,7 +742,11 @@ impl Player {
     /// the frame owed to the screen is cleared
     /// ([`Player::reset_after_reseek`]): an undo reseeks inside the engine, and
     /// a picture left where it was is the frame before the step.
-    fn step_history(&mut self, step: fn(&mut PlaybackSession) -> bool) {
+    ///
+    /// `false` where there was nothing to step: no session at all, or a history
+    /// step that refused ([`PlaybackSession::undo`]'s own answer), in which case
+    /// nothing in the window moves either.
+    fn step_history(&mut self, step: fn(&mut PlaybackSession) -> bool) -> bool {
         let mut caches = SessionCaches {
             fps: self.fps,
             proxies_on: self.proxies_on,
@@ -720,7 +761,7 @@ impl Player {
             .as_mut()
             .and_then(|session| history_step(&before, &mut caches, session, step))
         else {
-            return;
+            return false;
         };
         self.fps = caches.fps;
         self.proxies_on = caches.proxies_on;
@@ -732,6 +773,7 @@ impl Player {
             self.sub_image = None;
         }
         self.reset_after_reseek();
+        true
     }
 }
 

@@ -11,6 +11,126 @@ use crate::subs::{
 };
 use crate::ui::preview::{bgra_to_rgba, screenshot_path};
 
+/// The notice queue's own half of the sound watch, and the three words it is
+/// spelled with -- reached by name because the app's own glob does not carry
+/// them (`notices` is a private module re-exported for the window).
+use crate::notices::{audio_change_notice, audio_lost_line, audio_tail};
+
+/// A reason that changes under a session that is already open says so, and stops
+/// saying so when it clears. This side is the *reader*: the writer of a reason is
+/// the engine's own `audio_disabled_reason`, and the app's two call sites were
+/// the *open* paths -- so a reason that arrived mid-session reached no consumer
+/// at all and the window played on in silence with nothing said. The engine's
+/// writer is the wave branch's, so the flip is driven through the seam here and
+/// asserted end to end on the merged tree; nothing below depends on when the
+/// engine's `tick` sets it.
+///
+/// Driven through the queue step itself -- [`audio_change_notice`] is the whole
+/// of what a reason change does to the strip -- because a test cannot make a
+/// sound card fail on cue; the caching around it is the same comparison plus the
+/// source guard below.
+#[test]
+fn a_device_that_dies_under_an_open_file_says_so_and_unsays_it() {
+    let mut notices: std::collections::VecDeque<gpui::SharedString> =
+        ["OPENED take.mp4".into()].into_iter().collect();
+    let lost = audio_lost_line("AUDIO_LOST");
+    // The file was fine, and then the sound is gone: the reason arrives between
+    // two frames.
+    audio_change_notice(&mut notices, None, Some("AUDIO_LOST"));
+    assert_eq!(
+        notices.back().map(|notice| &***notice),
+        Some(lost.as_str()),
+        "a reason that arrives mid-session is never pushed"
+    );
+    assert!(
+        lost.starts_with("AUDIO LOST") && lost.ends_with(&audio_tail("AUDIO_LOST")),
+        "the standing line lost its state word, or stopped sharing \
+         `audio_notice`'s own tail"
+    );
+    // The same reason read again on the next frame is not news.
+    audio_change_notice(&mut notices, Some("AUDIO_LOST"), Some("AUDIO_LOST"));
+    assert_eq!(notices.len(), 2, "one death was announced twice");
+    // The re-arm takes: the line goes with it, and nothing else does.
+    audio_change_notice(&mut notices, Some("AUDIO_LOST"), None);
+    assert_eq!(
+        notices.iter().map(|notice| &***notice).collect::<Vec<_>>(),
+        vec!["OPENED take.mp4"],
+        "the NO AUDIO line is still on the strip over a film that plays"
+    );
+    // A second death later says so again.
+    audio_change_notice(&mut notices, None, Some("AUDIO_LOST"));
+    assert_eq!(notices.back().map(|notice| &***notice), Some(lost.as_str()));
+    // The wiring: the pump is the one place every frame passes through, and a
+    // watcher nothing calls is a message nobody reads.
+    assert!(
+        fn_body("pump").contains("self.watch_audio();"),
+        "the pump stopped watching the engine's sound reason, so a device that \
+         dies mid-session is silent again"
+    );
+    // ...and the watch keys its cache to the session it is a statement about:
+    // the two generations are what the *step call* is asked, so a preview flip
+    // cannot be answered as if it were the cached session's own change.
+    let watch = fn_body("watch_audio");
+    let args = watch
+        .split_once("audio_step(")
+        .expect(
+            "the watch decides for itself instead of through the pure step the flip test drives",
+        )
+        .1;
+    let args = args.split_once(')').map_or(args, |(args, _)| args);
+    assert!(
+        args.contains("self.audio_watch_gen") && args.contains("self.session_gen"),
+        "the watch asks the step about something other than the session it serves, \
+         so a preview opening or closing announces the other session's device"
+    );
+    assert!(
+        fn_body("sound_reason").contains("self.active_session()"),
+        "the watch reads a reason off a session the pump is not serving, so its \
+         cache and the frame disagree the moment a preview is up"
+    );
+    // ...and every door that installs or drops a session says so, the preview's
+    // two among them (the one the flip was missed on).
+    for door in ["close_session", "open_preview", "close_preview"] {
+        assert!(
+            fn_body(door).contains("self.session_swapped();"),
+            "{door} installs or drops a session without telling anything keyed to \
+             one, so a flip reads as news"
+        );
+    }
+}
+
+/// The flip logic itself, pure: a preview opening or closing is a *different*
+/// session, so the reason it reports is not news about the cached one -- the
+/// phantom device loss the verifier caught, and the reason the cache carries a
+/// generation at all. A change on the session the cache describes is the one that
+/// speaks.
+#[test]
+fn a_preview_flip_is_not_a_device_that_came_back() {
+    use crate::notices::{audio_step, AudioStep};
+    // A swap, every way round: seeded, never announced.
+    assert_eq!(audio_step(7, 8, None, Some("AUDIO_LOST")), AudioStep::Seed);
+    assert_eq!(audio_step(7, 8, Some("AUDIO_LOST"), None), AudioStep::Seed);
+    assert_eq!(
+        audio_step(7, 8, Some("AUDIO_LOST"), Some("AUDIO_LOST")),
+        AudioStep::Seed,
+        "a flip whose reason reads the same on both sides is still a flip"
+    );
+    // The same session, the reason arriving, changing, and going.
+    assert_eq!(audio_step(7, 7, None, Some("AUDIO_LOST")), AudioStep::Push);
+    assert_eq!(
+        audio_step(7, 7, Some("AUDIO_LOST"), Some("device gone")),
+        AudioStep::Push
+    );
+    assert_eq!(audio_step(7, 7, Some("AUDIO_LOST"), None), AudioStep::Clear);
+    assert_eq!(
+        audio_step(7, 7, Some("AUDIO_LOST"), Some("AUDIO_LOST")),
+        AudioStep::Nothing,
+        "the same reason read again on the next frame is not news"
+    );
+    assert_eq!(audio_step(7, 7, None, None), AudioStep::Nothing);
+    assert_eq!(audio_step(0, 0, None, None), AudioStep::Nothing);
+}
+
 /// The toast tail an audio import earns: rate, channel count and rounded
 /// length, in the words the IMPORTED line appends them in
 /// ([`Player::take_import`], [`Player::install_media`]). A film gets none of

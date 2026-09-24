@@ -5,6 +5,44 @@ use crate::ui::type_scale::{self, Typeset};
 use crate::*;
 use std::path::{Path, PathBuf};
 
+/// What the preview's one cached cue picture is *of*: the lane, the moment,
+/// the cue's own end, and the picture itself.
+///
+/// The lane and the start microsecond alone are not a cue. Two bitmap cues can
+/// share both -- lift a caption off a lane and drop another track's caption at
+/// the same frame -- and with those two as the whole key the cache's `up == key`
+/// test matched, painting the picture of the cue that is gone over the one that
+/// is up.
+///
+/// The picture's own allocation ([`Arc::as_ptr`]) is the identity: the cue list
+/// a repaint is handed holds the same `Arc` for as long as that cue is in it, so
+/// two repaints of one cue compare equal -- which is the whole cache hit -- while
+/// two different cues never do. The bytes are never compared: a display set is
+/// tens of kilobytes and this test runs on every frame.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct SubImageKey {
+    pub(crate) lane: Lane,
+    pub(crate) start_us: i64,
+    /// The cue's own end, so the same picture recut over the same start reads as
+    /// a different cue here too.
+    pub(crate) end_us: i64,
+    /// Where that picture lives -- [`Arc::as_ptr`] of the cue's image.
+    pub(crate) picture: usize,
+}
+
+/// [`SubImageKey`] for one cue's picture: the one place the key is built, so the
+/// lookup that trusts a hit and the test that pins what a hit means cannot drift
+/// apart. `picture` is where the cue's image lives -- the caller passes
+/// `Arc::as_ptr` of it, and nothing about the bytes is ever read here.
+pub(crate) fn sub_image_key(lane: Lane, start_us: i64, end_us: i64, picture: usize) -> SubImageKey {
+    SubImageKey {
+        lane,
+        start_us,
+        end_us,
+        picture,
+    }
+}
+
 impl Player {
     /// The darkroom's own preview indicator (MOCK-SPEC.md): a plate
     /// (canvas-on-panel, §4), mono for what the film says, and a ghost
@@ -314,8 +352,10 @@ impl Player {
         // lane is all there is here.
         let picture = cues
             .iter()
-            .find_map(|cue| Some((cue.start_us, cue.image.as_ref()?)))
-            .and_then(|(start_us, image)| self.sub_picture(lane, start_us, image, window));
+            .find_map(|cue| Some((cue.start_us, cue.end_us, cue.image.as_ref()?)))
+            .and_then(|(start_us, end_us, image)| {
+                self.sub_picture(lane, start_us, end_us, image, window)
+            });
         // A picture is fitted onto the whole region and a plate hangs off the
         // bottom of it, and a track is one or the other -- so they are two
         // shapes and not one with the parts switched off.
@@ -386,10 +426,10 @@ impl Player {
         )
     }
 
-    /// The cue `lane` starts at `start_us` as a drawable picture, decoded on the
-    /// first repaint it is up for and kept until another cue takes its place
-    /// ([`Player::sub_image`]). `None` for a display set the decoder refuses,
-    /// which draws nothing rather than failing the frame.
+    /// The cue `lane` plays from `start_us` to `end_us` as a drawable picture,
+    /// decoded on the first repaint it is up for and kept until another cue
+    /// takes its place ([`Player::sub_image`]). `None` for a display set the
+    /// decoder refuses, which draws nothing rather than failing the frame.
     ///
     /// Its atlas tile is released as the video's is: every [`RenderImage`] gets
     /// a fresh id and its own tile, so a film's worth of cues would grow the
@@ -398,10 +438,11 @@ impl Player {
         &mut self,
         lane: Lane,
         start_us: i64,
-        image: &engine::subtitle::CueImage,
+        end_us: i64,
+        image: &Arc<engine::subtitle::CueImage>,
         window: &mut Window,
     ) -> Option<Arc<RenderImage>> {
-        let key = (lane, start_us);
+        let key = sub_image_key(lane, start_us, end_us, Arc::as_ptr(image) as usize);
         if let Some((up, ready)) = &self.sub_image
             && *up == key
         {

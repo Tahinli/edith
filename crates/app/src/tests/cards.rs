@@ -1628,6 +1628,88 @@ fn every_click_door_that_writes_the_project_arms_autosave() {
             "{name} arms outside its gate, so a no-op pick would dirty the project"
         );
     }
+    // The drag-and-drop family on the timeline: the same class, and the same
+    // rule. Every one of these doors can answer "nothing happened" -- a clip let
+    // go where it was picked up, a caption dragged back to the frame it started
+    // on, a trim, a fade or a `[`/`]` nudge released against the wall the edge
+    // already stood on, a subtitle row dropped on an overlap ("NOT PLACED") or a
+    // caption that is not there any more ("NOTHING LIFTED") -- and each one used
+    // to arm the flag *before* the door was asked, so the ledger's `unsaved`
+    // ghost, the autosave sidecar and the save-on-close question described a
+    // project whose content was byte-for-byte what it was.
+    //
+    // Each arm now rides its own door's answer, or the one reading the door's
+    // answer cannot give: a caption's own window before and after the trim
+    // (`Project::trim_sub` answers `Ok` for an edge released at a wall it already
+    // stood against) and the ramp's own value before and after the fade
+    // (`set_fade_*` answer `true` for any index that exists).
+    for (name, gate) in [
+        ("move_clip", "match moved {"),
+        (
+            "place_sub",
+            "let text = match (self.sub_of_track(track), &mut self.session) {",
+        ),
+        ("move_sub", "Some(Ok(())) => {"),
+        ("lift_sub", "if lifted {"),
+        ("commit_trim", "if trim.lane.kind == LaneKind::Subtitle {"),
+        ("commit_fade", "if set {"),
+        ("nudge_cut", "let to = nudge_edge(current, dir, lo, hi);"),
+        (
+            "trim_cut_to_playhead",
+            "let to = frame_at(session.now(), self.fps);",
+        ),
+    ] {
+        let body = fn_body(name);
+        let (before, after) = body
+            .split_once(gate)
+            .unwrap_or_else(|| panic!("{name} lost the gate its arm rides"));
+        assert!(
+            after.contains("mark_dirty()"),
+            "{name} arms outside its gate, so a stroke that changed nothing \
+             would dirty the project"
+        );
+        assert!(
+            !before.contains("mark_dirty()"),
+            "{name} still arms ahead of its gate, so a refusal -- or a drag let \
+             go where it started -- leaves the project looking edited"
+        );
+    }
+    // The history pair is the one place the action table does not arm early:
+    // the door's own answer ("there was a step to take") is the gate, so `^z`
+    // with an empty history leaves the flag -- and the close question -- clear.
+    let act = fn_body("act");
+    for (gate, next) in [
+        ("if self.undo(cx) {", "ActionId::Redo =>"),
+        ("if self.redo(cx) {", "ActionId::AddVideoLane =>"),
+    ] {
+        let arm = act
+            .split_once(gate)
+            .unwrap_or_else(|| panic!("{gate} is gone from the action table"))
+            .1;
+        // Cut at the arm *after* this one: "everything from here on" is
+        // satisfied by the sibling's arm, so deleting Undo's own would ship
+        // green.
+        let arm = arm.split_once(next).map_or(arm, |(arm, _)| arm);
+        assert!(
+            arm.contains("mark_dirty()"),
+            "the arm behind `{gate}` arms nothing, so a real step back is \
+             invisible to autosave, the unsaved ghost and the close question"
+        );
+    }
+    // ...and the answer the arm reads is the door's own: the session's bool, not
+    // a bare call that would arm for an undo with nothing to undo.
+    for name in ["undo", "redo"] {
+        let body = fn_body(name);
+        assert!(
+            body.contains("PlaybackSession::") && body.contains("stepped"),
+            "Player::{name} no longer answers whether there was a step to take"
+        );
+        assert!(
+            !body.contains("mark_dirty"),
+            "Player::{name} arms its own flag, so the arm in `act` is a second \
+             one for the same step"
+        );
+    }
 }
 
 /// [`crate::ui::dock_stance::transition_of`]: the dock's duration row
