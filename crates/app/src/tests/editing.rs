@@ -2722,15 +2722,26 @@ fn a_refused_split_keeps_the_clip_in_hand() {
     let (before, after) = body
         .split_once("if cut {")
         .expect("the split door no longer gates anything on its own answer");
+    // The door's own branch, cut apart at its `else`: "runs after `if cut {`" is
+    // satisfied by the shape this fix replaced as well, because the clear sat
+    // below the whole if/else and so inside everything that followed the gate --
+    // a revert of the fix would have shipped green. What the arm has to be is
+    // inside the then-branch, and nothing that follows the branch may hold one.
+    let then = after
+        .split_once("} else {")
+        .expect("the split door no longer branches on what the cut answered")
+        .0;
+    let cleared_twice = after.split("self.selected.clear()").count() > 1;
     assert!(
         !before.contains("self.selected.clear()"),
         "the split drops the selection before it knows the cut happened, so a \
          refused split leaves the user with nothing picked and nothing told"
     );
     assert!(
-        after.contains("self.selected.clear()"),
-        "a split that happened no longer drops the selection, so the mark names \
-         a different clip on the far side of the seam"
+        then.contains("self.selected.clear()") && !cleared_twice,
+        "the clear does not ride the split's own success branch: a split that \
+         happened leaves the mark naming a different clip across the seam, and a \
+         refused one must leave it naming the clip it named"
     );
 }
 
