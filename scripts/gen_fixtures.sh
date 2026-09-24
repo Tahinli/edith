@@ -730,6 +730,49 @@ for deg in 90 180 270 45; do
     ffmpeg -y -display_rotation "$deg" -i assets/.rotation_src.mp4 \
         -c copy "assets/test_rotation$deg.mp4"
 done
+# ...and the very same turn asked for inside a Matroska, from the very same
+# source: one set of expected layouts then covers both containers
+# (`tests/rotation.rs`), which is the point -- a roll read the wrong way round is
+# a file that plays on its side in exactly one of the two.
+#
+# What the muxer actually writes, byte-verified by walking the header rather than
+# taken off a table: a `Projection` master (`0x7670`) holding one
+# `ProjectionPoseRoll` (`0x7675`), an 8-byte big-endian float -- `+90.0`, `+180.0`
+# and *`-90.0`* for `-display_rotation 90/180/270` -- and no `ProjectionType`
+# element at all, which is the spec's default of 0 (rectangular). `ffprobe`
+# reports the same display matrix as the mp4 twin, which is what makes the
+# layouts above ffmpeg's own autorotation of either file. The roll counts
+# counter-clockwise where the matrix counts clockwise turns, which is why the
+# engine negates it.
+for deg in 90 180 270 45; do
+    ffmpeg -y -display_rotation "$deg" -i assets/.rotation_src.mp4 \
+        -c copy "assets/test_rotation$deg.mkv"
+done
 rm -f assets/.rotation_src.mp4
+
+# Anamorphic: the same four coloured quadrants in a frame whose samples are not
+# square, so the file's own numbers say the picture is 1920x1080 while the pixels
+# it carries are 1440x1080 -- exactly HDV, and the shape `tests/rotation.rs`
+# asserts the engine reports and places the pixels at. Both containers state it
+# and neither door used to read either spelling, so an anamorphic source probed,
+# previewed and exported squashed.
+#
+# The two spellings, byte-verified the same way: Matroska in `DisplayWidth`
+# (`0x54B0`) / `DisplayHeight` (`0x54BA`) / `DisplayUnit` (`0x54B2`), where ffmpeg
+# writes the *display aspect ratio* unit (3) and therefore `16x9` rather than
+# `1920x1080`; mp4 in a `pasp` box beside the `avc1` sample entry, holding the
+# *sample* aspect ratio (`4:3`). Read the same way round out of both: the coded
+# height is kept and the width is the one the file's ratio makes it.
+ffmpeg -y -f lavfi -i "color=c=red:s=720x540:d=1:r=30,format=yuv420p" \
+    -f lavfi -i "color=c=green:s=720x540:d=1:r=30,format=yuv420p" \
+    -f lavfi -i "color=c=blue:s=720x540:d=1:r=30,format=yuv420p" \
+    -f lavfi -i "color=c=yellow:s=720x540:d=1:r=30,format=yuv420p" \
+    -filter_complex "[0:v][1:v]hstack[top];[2:v][3:v]hstack[bot];[top][bot]vstack[v]" \
+    -map "[v]" -frames:v 30 -c:v libx264 -profile:v baseline -pix_fmt yuv420p \
+    assets/.anamorphic_src.mp4
+ffmpeg -y -i assets/.anamorphic_src.mp4 -vf "setsar=4/3" -c:v libx264 \
+    -profile:v baseline -pix_fmt yuv420p assets/test_anamorphic.mp4
+ffmpeg -y -i assets/test_anamorphic.mp4 -c copy assets/test_anamorphic.mkv
+rm -f assets/.anamorphic_src.mp4
 
 echo "fixtures written to assets/"
