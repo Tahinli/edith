@@ -1107,6 +1107,20 @@ fn an_open_card_does_not_swallow_the_document_chords() {
         stance_rs[..dispatch].contains("this.keymap.lookup(key, ctrl)"),
         "the dispatch no longer goes through the keymap, so a rebind would leave it behind"
     );
+    // The *statement* that dispatches, not just some `keymap.lookup` before it:
+    // the hold gate at the top of the handler resolves the same pair, so a needle
+    // that only asks for the lookup is satisfied by a dispatch resolving the
+    // action some other way entirely.
+    let resolve = stance_rs
+        .find("if let Some(action) = this.keymap.lookup(key, ctrl)")
+        .expect("the dispatch no longer resolves an action through the keymap");
+    let stmt = &stance_rs[resolve..];
+    let stmt = &stmt[..stmt.find('{').expect("the dispatch statement has no block")];
+    assert!(
+        stmt.contains("card_safe_action("),
+        "the dispatch resolves an action and never asks whether a card may take \
+         it, so an open card eats the document chords again"
+    );
     for (guard, label) in [
         ("if this.param_card_key(", "the cards' own key branches"),
         ("if this.card_open()", "the blanket modal guard"),
