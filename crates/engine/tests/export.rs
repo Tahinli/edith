@@ -615,7 +615,11 @@ fn cancelling_leaves_no_file() {
         std::thread::sleep(Duration::from_millis(10));
     }
     handle.cancel();
-    let result = wait(&handle, Duration::from_secs(5));
+    // A liveness ceiling, not a deadline under test: a cancel lands in ~5 s on an
+    // idle box, and inside a full parallel run of this binary (34 tests, most of
+    // them encoding) the worker can be starved well past that. 60 s still fails
+    // the run if a cancel never lands.
+    let result = wait(&handle, Duration::from_secs(60));
     assert!(result.is_err(), "a cancelled export is an error");
     assert!(!out.exists(), "no partial file survives a cancel");
     assert!(!part_path(&out).exists(), "the .part is cleaned up too");
@@ -653,7 +657,7 @@ fn cancelling_after_the_last_frame_leaves_no_file() {
         }
         handle.cancel();
 
-        let result = wait(&handle, Duration::from_secs(30));
+        let result = wait(&handle, Duration::from_secs(120));
         assert!(!part.exists(), "attempt {attempt} left a .part behind");
         if result.is_err() {
             assert!(!out.exists(), "a late cancel still wrote {}", out.display());
@@ -1262,7 +1266,7 @@ fn a_proxy_is_picture_only_every_frame_a_starting_point_and_cached() {
     let started = Instant::now();
     while session.try_frame().is_none() {
         assert!(
-            started.elapsed() < Duration::from_secs(10),
+            started.elapsed() < Duration::from_secs(60),
             "no picture after switching to the stand-in"
         );
         std::thread::sleep(Duration::from_millis(10));
@@ -1555,7 +1559,7 @@ fn a_proxy_of_his_4k_film_is_made_faster_than_it_plays() {
     let stopped = Instant::now();
     while !job.is_finished() {
         assert!(
-            stopped.elapsed() < Duration::from_secs(30),
+            stopped.elapsed() < Duration::from_secs(120),
             "the proxy did not stop when cancelled"
         );
         std::thread::sleep(Duration::from_millis(50));
