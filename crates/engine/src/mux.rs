@@ -174,7 +174,7 @@ fn colr_nclx(colour: ColorDescription) -> [u8; 11] {
 /// `ptm`, silently, with a player's subtitle menu then offering a language
 /// nobody speaks. Matroska's `Language` is raw UTF-8 beside that and may carry
 /// a BCP-47 tag, so the tag is cut to its primary subtag here, mapped through
-/// [`ISO_639_1_TO_2`] where it is two letters, and left `und` -- the code that
+/// [`crate::demux::ISO_639_1_TO_2`] where it is two letters, and left `und` -- the code that
 /// says *undetermined* -- where nothing names it.
 ///
 /// Three lowercase letters are taken as they are: that is the code the field
@@ -187,7 +187,7 @@ fn mp4_language(language: &str) -> String {
         .unwrap_or_default()
         .to_ascii_lowercase();
     let code = match primary.len() {
-        2 => ISO_639_1_TO_2
+        2 => crate::demux::ISO_639_1_TO_2
             .iter()
             .find(|(two, _)| *two == primary)
             .map(|(_, three)| *three),
@@ -196,66 +196,6 @@ fn mp4_language(language: &str) -> String {
     };
     code.unwrap_or("und").to_owned()
 }
-
-/// Every ISO 639-1 code and the 639-2 (terminology) one it names the same
-/// language with -- what [`mp4_language`] maps a BCP-47 primary subtag through.
-///
-/// corner-cut: the same standard's table `crate::demux` reads a Matroska
-/// `TrackEntry` through, carried here as well because that one is private to
-/// its module and this file owns no other file's visibility. The two must not
-/// drift, so a change belongs in both; the upgrade path is one table with
-/// `pub(crate)` on it, and a muxer that calls the demuxer's. Whole standard and
-/// not the languages a test happened to use, generated from `iso-codes`'
-/// `iso_639-2.json` like that one.
-#[rustfmt::skip]
-const ISO_639_1_TO_2: &[(&str, &str)] = &[
-    ("aa", "aar"), ("ab", "abk"), ("ae", "ave"), ("af", "afr"),
-    ("ak", "aka"), ("am", "amh"), ("an", "arg"), ("ar", "ara"),
-    ("as", "asm"), ("av", "ava"), ("ay", "aym"), ("az", "aze"),
-    ("ba", "bak"), ("be", "bel"), ("bg", "bul"), ("bi", "bis"),
-    ("bm", "bam"), ("bn", "ben"), ("bo", "bod"), ("br", "bre"),
-    ("bs", "bos"), ("ca", "cat"), ("ce", "che"), ("ch", "cha"),
-    ("co", "cos"), ("cr", "cre"), ("cs", "ces"), ("cu", "chu"),
-    ("cv", "chv"), ("cy", "cym"), ("da", "dan"), ("de", "deu"),
-    ("dv", "div"), ("dz", "dzo"), ("ee", "ewe"), ("el", "ell"),
-    ("en", "eng"), ("eo", "epo"), ("es", "spa"), ("et", "est"),
-    ("eu", "eus"), ("fa", "fas"), ("ff", "ful"), ("fi", "fin"),
-    ("fj", "fij"), ("fo", "fao"), ("fr", "fra"), ("fy", "fry"),
-    ("ga", "gle"), ("gd", "gla"), ("gl", "glg"), ("gn", "grn"),
-    ("gu", "guj"), ("gv", "glv"), ("ha", "hau"), ("he", "heb"),
-    ("hi", "hin"), ("ho", "hmo"), ("hr", "hrv"), ("ht", "hat"),
-    ("hu", "hun"), ("hy", "hye"), ("hz", "her"), ("ia", "ina"),
-    ("id", "ind"), ("ie", "ile"), ("ig", "ibo"), ("ii", "iii"),
-    ("ik", "ipk"), ("io", "ido"), ("is", "isl"), ("it", "ita"),
-    ("iu", "iku"), ("ja", "jpn"), ("jv", "jav"), ("ka", "kat"),
-    ("kg", "kon"), ("ki", "kik"), ("kj", "kua"), ("kk", "kaz"),
-    ("kl", "kal"), ("km", "khm"), ("kn", "kan"), ("ko", "kor"),
-    ("kr", "kau"), ("ks", "kas"), ("ku", "kur"), ("kv", "kom"),
-    ("kw", "cor"), ("ky", "kir"), ("la", "lat"), ("lb", "ltz"),
-    ("lg", "lug"), ("li", "lim"), ("ln", "lin"), ("lo", "lao"),
-    ("lt", "lit"), ("lu", "lub"), ("lv", "lav"), ("mg", "mlg"),
-    ("mh", "mah"), ("mi", "mri"), ("mk", "mkd"), ("ml", "mal"),
-    ("mn", "mon"), ("mr", "mar"), ("ms", "msa"), ("mt", "mlt"),
-    ("my", "mya"), ("na", "nau"), ("nb", "nob"), ("nd", "nde"),
-    ("ne", "nep"), ("ng", "ndo"), ("nl", "nld"), ("nn", "nno"),
-    ("no", "nor"), ("nr", "nbl"), ("nv", "nav"), ("ny", "nya"),
-    ("oc", "oci"), ("oj", "oji"), ("om", "orm"), ("or", "ori"),
-    ("os", "oss"), ("pa", "pan"), ("pi", "pli"), ("pl", "pol"),
-    ("ps", "pus"), ("pt", "por"), ("qu", "que"), ("rm", "roh"),
-    ("rn", "run"), ("ro", "ron"), ("ru", "rus"), ("rw", "kin"),
-    ("sa", "san"), ("sc", "srd"), ("sd", "snd"), ("se", "sme"),
-    ("sg", "sag"), ("si", "sin"), ("sk", "slk"), ("sl", "slv"),
-    ("sm", "smo"), ("sn", "sna"), ("so", "som"), ("sq", "sqi"),
-    ("sr", "srp"), ("ss", "ssw"), ("st", "sot"), ("su", "sun"),
-    ("sv", "swe"), ("sw", "swa"), ("ta", "tam"), ("te", "tel"),
-    ("tg", "tgk"), ("th", "tha"), ("ti", "tir"), ("tk", "tuk"),
-    ("tl", "tgl"), ("tn", "tsn"), ("to", "ton"), ("tr", "tur"),
-    ("ts", "tso"), ("tt", "tat"), ("tw", "twi"), ("ty", "tah"),
-    ("ug", "uig"), ("uk", "ukr"), ("ur", "urd"), ("uz", "uzb"),
-    ("ve", "ven"), ("vi", "vie"), ("vo", "vol"), ("wa", "wln"),
-    ("wo", "wol"), ("xh", "xho"), ("yi", "yid"), ("yo", "yor"),
-    ("za", "zha"), ("zh", "zho"), ("zu", "zul"),
-];
 
 const VIDEO_TRACK: u32 = 1;
 const AUDIO_TRACK: u32 = 2;
