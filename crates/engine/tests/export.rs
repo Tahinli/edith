@@ -29,16 +29,16 @@ use std::time::{Duration, Instant};
 /// a cancel in one deletes what the other is asserting about. One at a time.
 static PROXY_FILM: Mutex<()> = Mutex::new(());
 
+use ec_core::registry::{CodecId, CodecParameters, Decoder as _};
+use ec_core::{Packet, TimeBase};
+use ec_h264::H264Decoder;
 use engine::export::ExportSettings;
 use engine::hw::HwEncoder;
-use engine::mux::{AudioParams, Mp4Muxer, VideoParams, parameter_sets};
+use engine::mux::{parameter_sets, AudioParams, Mp4Muxer, VideoParams};
 use engine::project::{Lane, Source, Speed};
 use engine::scale::FitPolicy;
 use engine::scratch::Scratch;
 use engine::{DecodeSession, ExportHandle, PlaybackSession, Project, Rotation};
-use ec_core::registry::{CodecId, CodecParameters, Decoder as _};
-use ec_core::{Packet, TimeBase};
-use ec_h264::H264Decoder;
 
 const FPS: f64 = 30.0;
 
@@ -443,7 +443,13 @@ fn multi_source_round_trip(name: &str, limit: Duration) {
     let out = out_path(name);
 
     let started = Instant::now();
-    let handle = engine::export::start(project.clone(), meta, &out, &ExportSettings::default(), None);
+    let handle = engine::export::start(
+        project.clone(),
+        meta,
+        &out,
+        &ExportSettings::default(),
+        None,
+    );
     wait(&handle, limit).expect("export");
     println!(
         "{name}: {total} frames of two sources in {:.2} s",
@@ -904,7 +910,11 @@ fn assert_no_single_stream_span_over(path: &Path, seconds: f64) {
             (pos, stream, pts)
         })
         .collect();
-    assert!(packets.len() > 10, "ffprobe saw only {} packets", packets.len());
+    assert!(
+        packets.len() > 10,
+        "ffprobe saw only {} packets",
+        packets.len()
+    );
     packets.sort_by_key(|&(pos, ..)| pos);
 
     let streams: std::collections::HashSet<u32> = packets.iter().map(|&(_, s, _)| s).collect();
@@ -988,14 +998,21 @@ fn mp4_audio_interleaves_with_the_picture() {
     // A/V sync: the first audio sample starts at movie time zero either way --
     // interleaving moves *where in the file* a packet sits, never what `stts`
     // says it plays at.
-    assert_eq!(first_pts(&out, "a"), 0.0, "first audio pts is media time zero");
+    assert_eq!(
+        first_pts(&out, "a"),
+        0.0,
+        "first audio pts is media time zero"
+    );
 
     assert_no_single_stream_span_over(&out, 2.0);
 
     // Nothing else about the file moved: same duration, same sample counts,
     // to within the packet the two sibling tests above already allow.
     let (video_meta, _) = engine::demux::Demuxer::open(&out).unwrap();
-    assert_eq!(video_meta.frame_count, 150, "video track unaffected by interleaving");
+    assert_eq!(
+        video_meta.frame_count, 150,
+        "video track unaffected by interleaving"
+    );
     let (audio_meta, chunks) = engine::AudioSession::open(&out)
         .unwrap()
         .expect("export has an audio track");
@@ -1264,7 +1281,10 @@ fn a_proxy_is_picture_only_every_frame_a_starting_point_and_cached() {
     let again = engine::proxy::generate(&source).expect("ask again");
     assert!(again.is_finished(), "a cached proxy is done on the spot");
     assert_eq!(
-        again.outcome().expect("cached outcome").expect("cached path"),
+        again
+            .outcome()
+            .expect("cached outcome")
+            .expect("cached path"),
         out
     );
     assert_eq!(engine::proxy::cached(&source), Some(out.clone()));
@@ -1426,7 +1446,11 @@ fn a_hardware_proxy_is_every_frame_a_starting_point_too() {
     );
     let (meta, _) = engine::demux::Demuxer::open(&made).expect("open the proxy");
     let syncs = engine::demux::sync_points(&made);
-    println!("{} of {} frames are starting points", syncs.len(), meta.frame_count);
+    println!(
+        "{} of {} frames are starting points",
+        syncs.len(),
+        meta.frame_count
+    );
     assert_eq!(
         syncs.len() as u32,
         meta.frame_count,
@@ -1440,7 +1464,11 @@ fn a_hardware_proxy_is_every_frame_a_starting_point_too() {
     // refused the stream, while this test stayed green. So decode it, all of
     // it, and let an outside decoder say the same.
     let frames = decode_all(&made);
-    println!("decoded back {} of {} pictures", frames.len(), meta.frame_count);
+    println!(
+        "decoded back {} of {} pictures",
+        frames.len(),
+        meta.frame_count
+    );
     assert_eq!(
         frames.len() as u32,
         meta.frame_count,
@@ -1533,7 +1561,10 @@ fn a_proxy_of_his_4k_film_is_made_faster_than_it_plays() {
         "a cancelled proxy left {} behind",
         out.display()
     );
-    assert!(!part_path(&out).exists(), "a cancelled proxy left its .part");
+    assert!(
+        !part_path(&out).exists(),
+        "a cancelled proxy left its .part"
+    );
     assert_eq!(engine::proxy::cached(&film), None);
 }
 
@@ -1578,7 +1609,9 @@ fn injected_with<T>(
     timeout_ms: Option<&str>,
     body: impl FnOnce() -> T,
 ) -> T {
-    let _exclusive = SEAT.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _exclusive = SEAT
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let restore = std::env::var_os("VE_SW_ENC");
     unsafe {
         std::env::set_var("VE_SW", "1");
@@ -1960,4 +1993,261 @@ fn a_dead_encoder_answers_every_later_call_the_same_way() {
             "a dead seat answered only after waiting"
         );
     });
+}
+
+/// A whole-clip template on one source: the shape `exports_the_audio_stream_
+/// the_timeline_plays` builds, parameterised by the fade and the length the
+/// clip claims.
+fn one_source_clip(source: &Path, fade_in: u32, out_frame: u32) -> (Project, engine::VideoMeta) {
+    let (meta, _) = engine::demux::Demuxer::open(source).expect("open the fixture");
+    let whole = engine::Clip {
+        fade_in,
+        fade_out: 0,
+        transition_out: 0,
+        visualizer: 0,
+        viz_paint: 0,
+        start: 0,
+        in_frame: 0,
+        out_frame,
+        source: 0,
+        link: Some(0),
+        eq: None,
+        color: None,
+        transform: None,
+        fit: FitPolicy::default(),
+        speed: Speed::NORMAL,
+    };
+    let project = Project::from_parts(
+        vec![Source {
+            path: source.to_path_buf(),
+            audio_stream: 0,
+        }],
+        vec![
+            (engine::project::LaneKind::Video, vec![whole.clone()]),
+            (engine::project::LaneKind::Audio, vec![whole]),
+        ],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    )
+    .expect("a one-source project");
+    (project, meta)
+}
+
+/// Interleaved-stereo RMS of `samples`.
+fn rms(samples: &[f32]) -> f64 {
+    let sum: f64 = samples
+        .chunks_exact(2)
+        .map(|c| f64::from(c[0]) * f64::from(c[0]) + f64::from(c[1]) * f64::from(c[1]))
+        .sum();
+    (sum / samples.len().max(1) as f64).sqrt()
+}
+
+/// D1: a fade is gain on decoded samples, which a packet copy cannot carry --
+/// so a clip with a fade must leave through the encode even where the rest of
+/// the timeline could copy, and the fade must reach the file: the head of the
+/// output ramps in by the fade's own dB, where a copy writes the source flat.
+#[test]
+fn a_faded_clip_encodes_and_the_fade_reaches_the_file() {
+    let _seat = pin_software();
+    let source = asset("test_multiaudio.mp4"); // flat -21 dB tone, 60 frames
+    let (project, meta) =
+        one_source_clip(&source, (FPS * 3.0 / 2.0) as u32, meta_frame_count(&source));
+    let out = out_path("faded");
+    let handle = engine::export::start(project, meta, &out, &ExportSettings::default(), None);
+    wait(&handle, Duration::from_secs(600)).expect("export");
+
+    let line = handle.encoders().expect("the seats were published");
+    assert!(
+        line.contains("ec-aac"),
+        "the sound left through the copy, not the encode: {line}"
+    );
+
+    let (audio, rx) = engine::AudioSession::open(&out)
+        .expect("reopen export audio")
+        .expect("the export has audio");
+    // Quarter of a second of interleaved stereo, and the fade-in is 1.5 s of
+    // an equal-power ramp ([`engine::project::Fade::gain_at`]'s `sin`), so the
+    // windows below sit deep in the ramp, either side of where it ends, and
+    // past it.
+    let quarter = audio.sample_rate as usize * 2 / 4;
+    let mut samples = Vec::new();
+    for chunk in rx {
+        samples.extend_from_slice(&chunk.samples);
+    }
+    let envelope: Vec<f64> = samples.chunks_exact(quarter).take(6).map(rms).collect();
+    let flat = rms(&samples[samples.len() - quarter..]);
+    assert!(
+        flat > 0.05,
+        "the fixture's own tone is not in the file at all: tail rms {flat}"
+    );
+    assert!(
+        envelope[0] < 0.4 * flat,
+        "the fade-in is absent -- a copy writes the source flat: {envelope:?} against {flat}"
+    );
+    assert!(
+        envelope[0] > 0.02 * flat,
+        "the head is silence, so what is missing is the sound, not the fade: {envelope:?}"
+    );
+    assert!(
+        envelope[..4].windows(2).all(|w| w[1] > w[0]),
+        "the level does not ramp through the fade's own 1.5 s: {envelope:?}"
+    );
+    assert!(
+        (envelope[4] - flat).abs() < 0.15 * flat && (envelope[5] - flat).abs() < 0.15 * flat,
+        "the ramp never reaches unity past the fade, so this is not it: {envelope:?} against {flat}"
+    );
+    std::fs::remove_file(&out).unwrap();
+}
+
+fn meta_frame_count(source: &Path) -> u32 {
+    engine::demux::Demuxer::open(source)
+        .expect("open the fixture")
+        .0
+        .frame_count
+}
+
+/// D4: a clip asking for more pictures than its file has used to end the span
+/// with no notice -- the export completed as if the whole edit were in the
+/// file. The seat line now carries the count.
+#[test]
+fn a_clip_that_outlives_its_source_says_so_on_the_card() {
+    let _seat = pin_software();
+    let source = asset("test_multiaudio.mp4"); // 60 frames
+    let count = meta_frame_count(&source);
+    let (project, meta) = one_source_clip(&source, 0, count + 40);
+    let out = out_path("truncated");
+    let handle = engine::export::start(project, meta, &out, &ExportSettings::default(), None);
+    wait(&handle, Duration::from_secs(600)).expect("export");
+    let line = handle.encoders().expect("the seats were published");
+    assert!(
+        line.contains("40 frames of the edit past the last picture"),
+        "the truncation is silent: {line}"
+    );
+    std::fs::remove_file(&out).unwrap();
+}
+
+/// Two whole-clip spans of one source, both lanes: an edit whose first take is
+/// short and whose second one is whole. Both clips read the file from its own
+/// first frame, so the walk keeps two spans rather than fusing them into one
+/// window -- a span is continued only where the source window continues.
+fn two_clip_edit(source: &Path, first: u32, second: u32) -> (Project, engine::VideoMeta) {
+    let (meta, _) = engine::demux::Demuxer::open(source).expect("open the fixture");
+    let clip = |start: u32, out_frame: u32| engine::Clip {
+        fade_in: 0,
+        fade_out: 0,
+        transition_out: 0,
+        visualizer: 0,
+        viz_paint: 0,
+        start,
+        in_frame: 0,
+        out_frame,
+        source: 0,
+        link: None,
+        eq: None,
+        color: None,
+        transform: None,
+        fit: FitPolicy::default(),
+        speed: Speed::NORMAL,
+    };
+    let clips = vec![clip(0, first), clip(first, second)];
+    let project = Project::from_parts(
+        vec![Source {
+            path: source.to_path_buf(),
+            audio_stream: 0,
+        }],
+        vec![
+            (engine::project::LaneKind::Video, clips.clone()),
+            (engine::project::LaneKind::Audio, clips),
+        ],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    )
+    .expect("a two-clip project");
+    (project, meta)
+}
+
+/// D4, the half the single-clip test cannot see: the walk carries on with the
+/// spans *after* a file runs out, so what went missing is that span's own tail
+/// and not everything the edit still had. Counting the rest would put 100 on
+/// the line for a file that holds 120 of the edit's 160 pictures.
+#[test]
+fn a_two_clip_timeline_reports_only_the_pictures_that_were_skipped() {
+    let _seat = pin_software();
+    let source = asset("test_multiaudio.mp4"); // 60 frames
+    let count = meta_frame_count(&source);
+    // The first take asks for 40 pictures the file has not got; the second one
+    // is whole and is written after the break.
+    let (project, meta) = two_clip_edit(&source, count + 40, count);
+    let out = out_path("truncated_two_clip");
+    let handle = engine::export::start(project, meta, &out, &ExportSettings::default(), None);
+    wait(&handle, Duration::from_secs(900)).expect("export");
+    let line = handle.encoders().expect("the seats were published");
+    assert!(
+        line.contains("40 frames of the edit past the last picture"),
+        "the notice counts more than the file lost: {line}"
+    );
+    // ...and the file really holds both spans' pictures, which is what makes
+    // this the count of a tail and not of the whole rest of the edit: 60 of the
+    // short take plus all 60 of the second one.
+    assert_eq!(
+        decode_all(&out).len(),
+        (count * 2) as usize,
+        "the span after the break was not written"
+    );
+    std::fs::remove_file(&out).unwrap();
+}
+
+/// D4's control: an edit whose every span ends on a picture its file really has
+/// carries no notice at all -- the count must never be invented.
+#[test]
+fn a_healthy_two_clip_timeline_carries_no_truncation_notice() {
+    let _seat = pin_software();
+    let source = asset("test_multiaudio.mp4"); // 60 frames
+    let count = meta_frame_count(&source);
+    let (project, meta) = two_clip_edit(&source, count, count);
+    let out = out_path("truncated_control");
+    let handle = engine::export::start(project, meta, &out, &ExportSettings::default(), None);
+    wait(&handle, Duration::from_secs(900)).expect("export");
+    let line = handle.encoders().expect("the seats were published");
+    let notice = line.contains("past the last picture");
+    assert_eq!(
+        notice, false,
+        "a whole export says it was truncated: {line}"
+    );
+    assert_eq!(
+        decode_all(&out).len(),
+        (count * 2) as usize,
+        "both spans were written"
+    );
+    std::fs::remove_file(&out).unwrap();
+}
+
+/// D3: the catch_unwind branch settled the worker's slot but left the `.part`
+/// on disk, against the module promise that every error path deletes it. The
+/// panic is injected at the first coded picture, so the `.part` is provably
+/// on disk when the worker dies.
+#[test]
+fn a_panicking_worker_deletes_the_part_file() {
+    let _exclusive = SEAT.write().unwrap_or_else(|p| p.into_inner());
+    let source = asset("test_baseline.mp4");
+    let (project, meta) = short_edit(&source, 20);
+    let out = out_path("panic");
+    let part = part_path(&out);
+    unsafe {
+        std::env::set_var("VE_EXPORT_TEST_PANIC", part.as_os_str().to_owned());
+    }
+    let handle = engine::export::start(project, meta, &out, &ExportSettings::default(), None);
+    let result = wait(&handle, Duration::from_secs(120));
+    unsafe {
+        std::env::remove_var("VE_EXPORT_TEST_PANIC");
+    }
+    let error = result.expect_err("the injected panic is the outcome");
+    assert!(
+        error.to_string().contains("export worker panicked"),
+        "the panic is the outcome: {error}"
+    );
+    assert!(!out.exists(), "a panicked export wrote {}", out.display());
+    assert!(!part.exists(), "the .part outlived the panic");
 }

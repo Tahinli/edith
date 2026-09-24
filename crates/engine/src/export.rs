@@ -106,7 +106,15 @@ pub(crate) const AUDIO_BAND: u32 = PROGRESS_SCALE / 20;
 /// band is already behind it ([`AUDIO_BAND`]), so the picture fills what is
 /// left rather than starting again from zero.
 fn picture_progress(done: u32, total: u32) -> u32 {
-    AUDIO_BAND + done.min(total) * (PROGRESS_SCALE - AUDIO_BAND) / total.max(1)
+    // In `u64`: this is a picture count times a permille, and a film past
+    // ~4.5 M pictures (42 hours at 30 fps) overflowed the `u32` this used to be
+    // computed in -- a panic in debug inside the export thread, which a caller
+    // reads as `export worker panicked` on a file that was never written, and a
+    // bar that thrashed in release. The result is under the scale by
+    // construction, so the narrowing back is exact.
+    let band = u64::from(PROGRESS_SCALE - AUDIO_BAND);
+    let done = u64::from(done.min(total));
+    AUDIO_BAND + (done * band / u64::from(total.max(1))) as u32
 }
 
 /// D2 rate control: bits per pixel per second, then a sane range. 720p30 lands
@@ -453,8 +461,17 @@ struct Shared {
     outcome: Mutex<Option<crate::Result<()>>>,
     /// The encoders this job really opened, published the moment they are
     /// chosen and never changed after -- one seat for the whole file, which is
-    /// what [`Enc`] states. `None` until then.
+    /// what [`Enc`] states. `None` until then. The one thing that joins it
+    /// afterwards is how much of the edit never got a picture
+    /// ([`Shared::truncated`]), and [`ExportHandle::encoders`] does that
+    /// joining, so a notice cannot land on the line twice.
     encoders: Mutex<Option<String>>,
+    /// Timeline frames of the edit the walk could not write because a file ran
+    /// out before its clip did ([`run`]'s break). The bar reaches its end
+    /// whatever happens, so without this a truncated file reads as a whole one.
+    /// Published the moment the walk gives up and read by
+    /// [`ExportHandle::encoders`] beside the seat line.
+    truncated: AtomicU32,
 }
 
 /// A running export. Poll [`is_finished`](ExportHandle::is_finished) once per
@@ -486,8 +503,17 @@ impl ExportHandle {
     /// What this export is encoding with -- the video seat and what the sound
     /// is doing -- as the worker chose them, hardware fallback included.
     /// `None` for the first instants of a job, before the encoder is open.
+    ///
+    /// ...and, where a file ran out under its clip, how much of the edit never
+    /// got a picture. Composed here rather than written into the stored line,
+    /// because that line is published more than once on a rerun (a hardware
+    /// seat that died) and a notice appended at the write site lands twice.
     pub fn encoders(&self) -> Option<String> {
-        self.shared.encoders.lock().unwrap().clone()
+        let line = self.shared.encoders.lock().unwrap().clone()?;
+        Some(match self.shared.truncated.load(Ordering::Relaxed) {
+            0 => line,
+            past => format!("{line} · {past} frames of the edit past the last picture"),
+        })
     }
 
     /// The outcome, once — taken out of the handle, so a caller that already
@@ -515,6 +541,7 @@ pub fn start(
         finished: AtomicBool::new(false),
         outcome: Mutex::new(None),
         encoders: Mutex::new(None),
+        truncated: AtomicU32::new(0),
     });
     let worker = Arc::clone(&shared);
     // A second handle to the same slot, held outside the caught body below --
@@ -621,6 +648,12 @@ pub fn start(
                 .or_else(|| payload.downcast_ref::<String>().cloned())
                 .unwrap_or_else(|| "unknown panic".to_string());
             if !panic_worker.finished.load(Ordering::Acquire) {
+                // ...and the `.part` the body left behind is deleted here: the
+                // module promises every failure path removes it, and the only
+                // path that did was the body's own `result.is_err()` arm, which
+                // a panic never reaches. Done inside this branch only -- a body
+                // that *did* settle has already renamed or deleted the file.
+                let _ = std::fs::remove_file(&part);
                 settle(&panic_worker, Err(format!("export worker panicked: {message}").into()));
             }
         }
@@ -807,28 +840,41 @@ fn video_label(format: Format, hw: bool) -> &'static str {
     }
 }
 
-/// The cheap half of "does this timeline's sound have to be re-encoded": what
-/// the *edit* says, with no file opened. Two lanes are a mix and a mix is not a
-/// copy; a speeded lane is resampled; an equalizer is sample math. The other
-/// half -- whether the sources can be copied out of at all -- costs a file open
-/// each and belongs to [`copy_audio`], which may re-encode where this says copy.
-fn forces_encode(project: &Project, ranged: bool) -> bool {
-    let lanes: Vec<_> = project
-        .audio_lanes()
-        .into_iter()
-        .filter(|&lane| !project.lane(lane).is_empty())
-        .collect();
-    // A ranged export needs an exact offset and an exact length, which a copy
-    // of the source's own packets cannot give it ([`copy_audio`]) -- so a
-    // range marked at all always encodes, whatever the lanes look like.
-    ranged
-        || lanes.len() > 1
+/// Whether the *edit* has touched the samples a copy would carry out: the one
+/// predicate both copy-or-encode decisions ask, with `lanes` the sound's own
+/// list as the caller has it -- every audio lane for the question a card asks
+/// before the button ([`forces_encode`]), and the single lane the segments have
+/// already narrowed a copy to ([`copy_audio`]).
+///
+/// One function and not two lists of the same conditions, which is what they
+/// were: `faded` reached [`forces_encode`] and not [`copy_audio`]'s gate, so an
+/// mp4 whose lane carried a fade wrote the source's own packets with the fade
+/// nowhere, while the card had promised a re-encode -- and the WAV, FLAC and
+/// MP3 exports of the same project applied it. Two gates that cannot be given
+/// two answers is the fix; the drift was the defect.
+fn sample_altered(project: &Project, lanes: &[Lane]) -> bool {
+    // Two lanes are a mix and a mix is not a copy; a speeded lane is resampled;
+    // an equalizer, a fade and the mix itself are gain math on decoded samples
+    // ([`equalized`], [`faded`], [`mastered`]). None of them is inside a packet.
+    lanes.len() > 1
         || lanes
             .iter()
             .any(|&lane| project.lane(lane).iter().any(|c| !c.speed.is_normal()))
         || equalized(project)
         || mastered(project)
         || faded(project)
+}
+
+/// The cheap half of "does this timeline's sound have to be re-encoded": what
+/// the *edit* says, with no file opened ([`sample_altered`], asked of every
+/// audio lane). The other half -- whether the sources can be copied out of at
+/// all -- costs a file open each and belongs to [`copy_audio`], which may
+/// re-encode where this says copy.
+fn forces_encode(project: &Project, ranged: bool) -> bool {
+    // A ranged export needs an exact offset and an exact length, which a copy
+    // of the source's own packets cannot give it ([`copy_audio`]) -- so a
+    // range marked at all always encodes, whatever the lanes look like.
+    ranged || sample_altered(project, &project.audio_lanes())
 }
 
 /// What the sound is written by. Every audio encoder here is software -- there
@@ -1614,8 +1660,12 @@ fn copy_audio(
     // ...and whether the mix itself does anything a packet never went through:
     // a lane volume is applied at the sum and a limiter over it, so copying
     // such a lane would write it at unity and unlimited, silently.
-    let speeded = project.lane(lane).iter().any(|c| !c.speed.is_normal());
-    if speeded || equalized(project) || mastered(project) {
+    // ...asked as the very predicate [`forces_encode`] is, over the one lane
+    // the segments came off, so what a card predicted and what this decides are
+    // one answer. `lane` here is that lane, and not `A1` by assumption:
+    // [`Project::audio_lanes`] is the list built for, and filtered by, these
+    // very segments.
+    if sample_altered(project, &[lane]) {
         return encode_audio(project, meta, kbps, mkv, shared, sample_rate, None);
     }
     // What is left is a copy the *sources* may still not be able to give: AAC
@@ -2734,6 +2784,9 @@ fn run(
     let mut audio_fed = false;
     let mut muxer = None;
     let mut done = 0u32;
+    // ...and how many of the edit's frames a file could not give, summed over
+    // the spans that ran out under their clip ([`Shared::truncated`]).
+    let mut skipped = 0u32;
     let black = Black::new(meta);
     // Spans, not clips: a gap in the video is part of the timeline and gets
     // encoded too, as black frames. The picture count is therefore
@@ -2963,6 +3016,20 @@ fn run(
                 }
             };
             let Some(frame) = picture else {
+                // The file ran out before its clip did: this span's tail never
+                // gets a picture -- and *only* this span's tail, because the
+                // span loop this break sits in carries on with the spans after
+                // it and writes every picture they have. Counted, not
+                // swallowed: the bar reaches its end whatever happens, so
+                // without this a truncated file reads as a whole one. The same
+                // sentence `planned_subtitles` gives cues that hang past the
+                // last picture, said after the fact here because how many
+                // pictures a *file* holds is only known by opening it.
+                //
+                // `span.len > done_here` holds by the loop's own condition, and
+                // the sum over every break is exactly `total - done` at the end
+                // of the walk: the spans are disjoint and cover the whole edit.
+                skipped += span.len - done_here;
                 break; // source ran out early; the clip list outlives the file
             };
             // A picture still on the GPU has nothing waiting for it here: the
@@ -3049,6 +3116,7 @@ fn run(
                     // mix that lands before it (a short film, or a slow first
                     // frame) has nothing to hand it to until now.
                     feed_late_audio(&mut muxer, &late, &mut audio_fed)?;
+                    inject_export_test_panic(out);
                 }
                 done += 1;
                 // Forwards only: an audio pass still running beside this one
@@ -3062,6 +3130,12 @@ fn run(
             done_here += repeats;
         }
     }
+    // The whole walk is over, so what it could not write is known to the frame
+    // and is published once. `fetch_max` and not `fetch_add`, because a
+    // hardware seat that died has the *whole* walk run again from its first
+    // frame ([`start`]): the same project and the same picture counts, so a
+    // second run must not double a number that is already on the line.
+    shared.truncated.fetch_max(skipped, Ordering::Relaxed);
     while let Some((au, key)) = encoder.drain()? {
         write_video(
             &mut muxer,
@@ -3686,6 +3760,16 @@ impl Muxer {
             Self::Mp4(mp4) => mp4.finish(),
             Self::Mkv(mkv) => mkv.finish(),
         }
+    }
+}
+
+/// Test-only panic point, so the worker's own `catch_unwind` branch in
+/// [`start`] is reachable without a codec parser that actually panics: the
+/// variable names the one `.part` whose export dies, and no export but that
+/// one ever matches it, so a concurrent export in the same process is safe.
+fn inject_export_test_panic(out: &Path) {
+    if std::env::var_os("VE_EXPORT_TEST_PANIC").is_some_and(|target| target == out.as_os_str()) {
+        panic!("export test panic: the .part is on disk");
     }
 }
 
@@ -4905,6 +4989,37 @@ mod tests {
     }
 
     use super::*;
+
+    /// The bar of a *feature film*: a picture count times a permille is a
+    /// product that has to be computed in `u64`, or a timeline past ~4.5 M
+    /// pictures (42 hours at 30 fps) overflowed the `u32` this used to be --
+    /// a panic in debug inside the export thread, and a bar that thrashed in
+    /// release. Every value here is a fraction of the whole, so none of them
+    /// may leave the scale, and the counts straddle the old overflow point.
+    #[test]
+    fn a_films_frame_count_does_not_overflow_the_bar() {
+        // The straddle, in the very product the old shape computed: `boundary`
+        // is the largest picture count whose `done * band` still fitted a
+        // `u32`, and one more is where it began to wrap -- a panic in debug,
+        // inside the export thread.
+        let band = u64::from(PROGRESS_SCALE - AUDIO_BAND);
+        let boundary = u64::from(u32::MAX) / band;
+        assert!(boundary * band <= u64::from(u32::MAX));
+        assert!((boundary + 1) * band > u64::from(u32::MAX));
+        for total in [boundary as u32 + 1, 21_600_000, u32::MAX] {
+            assert_eq!(picture_progress(total, total), PROGRESS_SCALE, "{total}");
+            assert_eq!(picture_progress(0, total), AUDIO_BAND, "{total}");
+            let half = picture_progress(total / 2, total);
+            assert!(
+                (AUDIO_BAND..PROGRESS_SCALE).contains(&half),
+                "half of {total} is {half}"
+            );
+            assert!(
+                picture_progress(total - 1, total) <= PROGRESS_SCALE,
+                "{total}"
+            );
+        }
+    }
 
     /// How a decode thread ended is never guessed from the channel being shut.
     /// A source that genuinely ran out says so, and the span ends on it; a
