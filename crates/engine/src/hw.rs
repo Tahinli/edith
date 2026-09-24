@@ -15,7 +15,7 @@
 //! path -- the same "no" it gives for an unsupported profile, and the caller's
 //! honest [`crate::demux::Codec::needs_plugin`] refusal covers both.
 
-use std::ffi::{CString, c_char, c_void};
+use std::ffi::{c_char, c_void, CString};
 use std::os::fd::FromRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -26,7 +26,18 @@ use crate::colorspace::ColorDescription;
 
 const LIB_NAME: &str = "libengine_hw.so";
 
-/// Stream metadata, C layout. Mirrors [`crate::VideoMeta`].
+/// Stream metadata, C layout. Mirrors [`crate::VideoMeta`]'s picture half --
+/// the four fields a session was opened with, plus the coded pair and the
+/// sample aspect a display size can now differ from the coded one by.
+///
+/// `width`/`height` are the *displayed* shape, exactly as [`crate::VideoMeta`]
+/// promises: a plugin opened on a rotated file has always been handed a
+/// swapped pair here, and the pictures it hands back are sized by its own
+/// decoder's output, which is the coded pair. `coded_width`/`coded_height`
+/// name that pair explicitly, and `pixel_aspect_h`/`_v` carry the ratio one
+/// coded pixel is drawn at, so a caller that needs the stored shape (a copy
+/// declaring a track, an encoder agreeing on a surface) asks the coded one and
+/// a caller that draws asks the display one -- both answered, neither derived.
 #[repr(C)]
 #[derive(Default)]
 pub struct VhMeta {
@@ -34,6 +45,13 @@ pub struct VhMeta {
     pub height: u32,
     pub frame_rate: f64,
     pub frame_count: u32,
+    /// What the samples are stored at, before any turn or stretch.
+    pub coded_width: u32,
+    pub coded_height: u32,
+    /// The sample aspect ratio, h over v, square as 1 and 1 -- or 0 and 0,
+    /// which is `Default` and reads square ([`crate::demux::PixelAspect`]).
+    pub pixel_aspect_h: u32,
+    pub pixel_aspect_v: u32,
 }
 
 /// One decoded picture as planar I420. Pointers belong to the plugin and stay
@@ -371,7 +389,9 @@ impl HwSession {
     /// for a few pictures only: encode it before asking this for a few more.
     pub fn next_frame_dma(&mut self, want: DmaWant) -> crate::Result<Option<HwPicture<'_>>> {
         let Some(next_dma) = self.plugin.next_frame_dma else {
-            return Ok(self.next_frame()?.map(|(y, u, v, w, h)| HwPicture::Pixels(y, u, v, w, h)));
+            return Ok(self
+                .next_frame()?
+                .map(|(y, u, v, w, h)| HwPicture::Pixels(y, u, v, w, h)));
         };
         let mut frame = VhFrame::default();
         let mut dma = VhDma::default();
@@ -482,8 +502,9 @@ struct EncPlugin {
     /// neither and every picture reaches it as bytes, which is what it always
     /// did.
     dma_geometry: Option<unsafe extern "C" fn(*mut c_void, *mut u32, *mut u32) -> i32>,
-    frame_dma:
-        Option<unsafe extern "C" fn(*mut c_void, *const VhDma, i32, *mut *const u8, *mut usize) -> i32>,
+    frame_dma: Option<
+        unsafe extern "C" fn(*mut c_void, *const VhDma, i32, *mut *const u8, *mut usize) -> i32,
+    >,
     drain: unsafe extern "C" fn(*mut c_void, *mut *const u8, *mut usize) -> i32,
     close: unsafe extern "C" fn(*mut c_void),
     // Never dropped (lives in a static), so the fn pointers above stay valid.
