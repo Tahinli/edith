@@ -2127,6 +2127,103 @@ fn a_clip_that_outlives_its_source_says_so_on_the_card() {
     std::fs::remove_file(&out).unwrap();
 }
 
+/// Two whole-clip spans of one source, both lanes: an edit whose first take is
+/// short and whose second one is whole. Both clips read the file from its own
+/// first frame, so the walk keeps two spans rather than fusing them into one
+/// window -- a span is continued only where the source window continues.
+fn two_clip_edit(source: &Path, first: u32, second: u32) -> (Project, engine::VideoMeta) {
+    let (meta, _) = engine::demux::Demuxer::open(source).expect("open the fixture");
+    let clip = |start: u32, out_frame: u32| engine::Clip {
+        fade_in: 0,
+        fade_out: 0,
+        transition_out: 0,
+        visualizer: 0,
+        viz_paint: 0,
+        start,
+        in_frame: 0,
+        out_frame,
+        source: 0,
+        link: None,
+        eq: None,
+        color: None,
+        transform: None,
+        fit: FitPolicy::default(),
+        speed: Speed::NORMAL,
+    };
+    let clips = vec![clip(0, first), clip(first, second)];
+    let project = Project::from_parts(
+        vec![Source {
+            path: source.to_path_buf(),
+            audio_stream: 0,
+        }],
+        vec![
+            (engine::project::LaneKind::Video, clips.clone()),
+            (engine::project::LaneKind::Audio, clips),
+        ],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    )
+    .expect("a two-clip project");
+    (project, meta)
+}
+
+/// D4, the half the single-clip test cannot see: the walk carries on with the
+/// spans *after* a file runs out, so what went missing is that span's own tail
+/// and not everything the edit still had. Counting the rest would put 100 on
+/// the line for a file that holds 120 of the edit's 160 pictures.
+#[test]
+fn a_two_clip_timeline_reports_only_the_pictures_that_were_skipped() {
+    let _seat = pin_software();
+    let source = asset("test_multiaudio.mp4"); // 60 frames
+    let count = meta_frame_count(&source);
+    // The first take asks for 40 pictures the file has not got; the second one
+    // is whole and is written after the break.
+    let (project, meta) = two_clip_edit(&source, count + 40, count);
+    let out = out_path("truncated_two_clip");
+    let handle = engine::export::start(project, meta, &out, &ExportSettings::default(), None);
+    wait(&handle, Duration::from_secs(900)).expect("export");
+    let line = handle.encoders().expect("the seats were published");
+    assert!(
+        line.contains("40 frames of the edit past the last picture"),
+        "the notice counts more than the file lost: {line}"
+    );
+    // ...and the file really holds both spans' pictures, which is what makes
+    // this the count of a tail and not of the whole rest of the edit: 60 of the
+    // short take plus all 60 of the second one.
+    assert_eq!(
+        decode_all(&out).len(),
+        (count * 2) as usize,
+        "the span after the break was not written"
+    );
+    std::fs::remove_file(&out).unwrap();
+}
+
+/// D4's control: an edit whose every span ends on a picture its file really has
+/// carries no notice at all -- the count must never be invented.
+#[test]
+fn a_healthy_two_clip_timeline_carries_no_truncation_notice() {
+    let _seat = pin_software();
+    let source = asset("test_multiaudio.mp4"); // 60 frames
+    let count = meta_frame_count(&source);
+    let (project, meta) = two_clip_edit(&source, count, count);
+    let out = out_path("truncated_control");
+    let handle = engine::export::start(project, meta, &out, &ExportSettings::default(), None);
+    wait(&handle, Duration::from_secs(900)).expect("export");
+    let line = handle.encoders().expect("the seats were published");
+    let notice = line.contains("past the last picture");
+    assert_eq!(
+        notice, false,
+        "a whole export says it was truncated: {line}"
+    );
+    assert_eq!(
+        decode_all(&out).len(),
+        (count * 2) as usize,
+        "both spans were written"
+    );
+    std::fs::remove_file(&out).unwrap();
+}
+
 /// D3: the catch_unwind branch settled the worker's slot but left the `.part`
 /// on disk, against the module promise that every error path deletes it. The
 /// panic is injected at the first coded picture, so the `.part` is provably
