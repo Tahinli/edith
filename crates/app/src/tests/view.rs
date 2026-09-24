@@ -891,7 +891,7 @@ fn the_zoom_button_says_how_much_is_on_the_bed() {
 /// lives.
 #[test]
 fn tab_cycles_dock_bench_inspector_and_wraps() {
-    use crate::ui::stance::{Surface, next_surface};
+    use crate::ui::stance::{next_surface, Surface};
 
     assert_eq!(next_surface(Surface::Dock, false), Surface::Bench);
     assert_eq!(next_surface(Surface::Bench, false), Surface::Inspector);
@@ -912,7 +912,7 @@ fn tab_cycles_dock_bench_inspector_and_wraps() {
 /// surface being entered is always the one mounted.
 #[test]
 fn surface_wants_src_active_mounts_the_tab_before_focus_lands_on_it() {
-    use crate::ui::stance::{Surface, surface_wants_src_active};
+    use crate::ui::stance::{surface_wants_src_active, Surface};
 
     assert_eq!(surface_wants_src_active(Surface::Dock), Some(true));
     assert_eq!(surface_wants_src_active(Surface::Inspector), Some(false));
@@ -975,4 +975,92 @@ fn focus_panels_is_bound_and_lands_on_the_dock() {
     // Bare Tab must still mean Select at the root -- FocusPanels must not
     // have stolen it.
     assert_eq!(k.lookup("tab", false), Some(ActionId::Select));
+}
+
+/// A card is not a key-eating black box: the room-wide chords that act on the
+/// document -- the edit history, the project file, the clipboard -- must reach
+/// `Player::act` while any card is open. `param_card_key` answers `true` for
+/// *every* stroke once one of the seven is up, so the dispatch has to stand in
+/// front of it, not only in front of the blanket modal guard under it; and the
+/// blanket guard's own `card_open()` has to read after that dispatch too, or a
+/// chord that got past `param_card_key` (a menu dismiss comes to mind) would
+/// still never reach the keymap.
+///
+/// A scan of the handler's own source, for the reason every handler scan here
+/// gives: this binary has no window harness to press `ctrl+z` through.
+#[test]
+fn an_open_card_does_not_swallow_the_document_chords() {
+    use crate::ui::stance::card_safe_action;
+    use keymap::ActionId;
+    // The five the room answers through a card, and the reason each is on the
+    // list: history, file, clipboard.
+    for action in [
+        ActionId::Undo,
+        ActionId::Redo,
+        ActionId::Save,
+        ActionId::Copy,
+        ActionId::Paste,
+    ] {
+        assert!(
+            card_safe_action(action),
+            "{action:?} is a document chord and a card must not eat it"
+        );
+    }
+    // ...and the strokes the cards' own branch list claims stay theirs:
+    // escape is every card's way out, `s` is the equalizer's spectrum, `x` its
+    // band removal, `m` every card's maximize, and the digits pick a band.
+    for action in [
+        ActionId::Deselect,
+        ActionId::Cut,
+        ActionId::Delete,
+        ActionId::ToggleMute,
+        ActionId::Equalizer,
+        ActionId::Color,
+        ActionId::Loop,
+        ActionId::TrimIn,
+    ] {
+        assert!(
+            !card_safe_action(action),
+            "{action:?} is a card's own stroke and the card must keep it"
+        );
+    }
+    // The chords are real bindings, not a list of actions nothing reaches.
+    let keys = keymap::Keymap::defaults();
+    for (key, ctrl, action) in [
+        ("z", true, ActionId::Undo),
+        ("y", true, ActionId::Redo),
+        ("s", true, ActionId::Save),
+        ("c", true, ActionId::Copy),
+        ("v", true, ActionId::Paste),
+    ] {
+        assert_eq!(
+            keys.lookup(key, ctrl),
+            Some(action),
+            "the keymap no longer binds {action:?}"
+        );
+    }
+    // And the dispatch stands where it has to: inside the root handler, ahead
+    // of the cards' own branches and ahead of the blanket modal guard.
+    let stance_rs = src_text("ui/stance.rs");
+    let dispatch = stance_rs.find("card_safe_action(action)").expect(
+        "the root key handler no longer asks which chords a card does not take -- an open card \
+             eats every stroke again",
+    );
+    assert!(
+        stance_rs[..dispatch].contains("this.keymap.lookup(key, ctrl)"),
+        "the dispatch no longer goes through the keymap, so a rebind would leave it behind"
+    );
+    for (guard, label) in [
+        ("if this.param_card_key(", "the cards' own key branches"),
+        ("if this.card_open()", "the blanket modal guard"),
+    ] {
+        let at = stance_rs
+            .find(guard)
+            .unwrap_or_else(|| panic!("{label} moved or was renamed"));
+        assert!(
+            dispatch < at,
+            "{label} reads before the document dispatch -- an open card would \
+             swallow undo, redo, save and the clipboard pair again"
+        );
+    }
 }
