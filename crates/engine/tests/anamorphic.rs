@@ -135,13 +135,15 @@ fn the_container_aspect_is_probed_off_both_doors() {
         );
     }
     // The rotation still swaps on an anamorphic file whose *matrix* asks for
-    // a turn: `turn_and_stretch` is the composed order -- the aspect widens
-    // the coded frame, then the quarter turn swaps the stretched pair -- the
-    // same composition ffmpeg's own probe reports for such a file.
+    // a turn: the composition is stretch the coded width, then swap -- the
+    // order the render applies ([`crate::decode::Render::frame`]). The
+    // fixture carries a REAL display matrix (a `-display_rotation 90` remux,
+    // the gen_fixtures pattern), because a `setsar`-only file asserts nothing
+    // about the turn -- the case this whole block exists for.
     let turned = asset(".anamorphic_turned.mp4");
-    if std::process::Command::new("ffmpeg")
+    let made = std::process::Command::new("ffmpeg")
         .args(["-y", "-v", "error", "-f", "lavfi", "-i"])
-        .arg("testsrc2=size=180x320:rate=30:duration=1")
+        .arg("testsrc2=size=1440x1080:rate=30:duration=1")
         .args([
             "-vf",
             "setsar=4/3",
@@ -154,21 +156,73 @@ fn the_container_aspect_is_probed_off_both_doors() {
         ])
         .arg(&turned)
         .status()
-        .is_ok_and(|s| s.success())
-    {
-        let (meta, _) = Demuxer::open(&turned).expect("open the turned fixture");
-        // 180x320 at SAR 4/3 draws 240x320; a 270-degree matrix turns it.
-        assert_eq!(
-            (meta.coded_width, meta.coded_height),
-            (180, 320),
-            "the turned fixture's samples"
-        );
-        assert_eq!(
-            (meta.width, meta.height),
-            (240, 320),
-            "the aspect widens the coded frame before the turn swaps it"
-        );
+        .is_ok_and(|s| s.success());
+    if made {
+        // The same file with a 90-degree display matrix asked of it.
+        let matrix_on = asset(".anamorphic_turned90.mp4");
+        let remuxed = std::process::Command::new("ffmpeg")
+            .args(["-y", "-v", "error", "-display_rotation", "90", "-i"])
+            .arg(&turned)
+            .args(["-c", "copy"])
+            .arg(&matrix_on)
+            .status()
+            .is_ok_and(|s| s.success());
+        if remuxed {
+            let (meta, _) = Demuxer::open(&matrix_on).expect("open the turned fixture");
+            // The probe: coded 1440x1080 stays; the SAR-4/3 widen of the
+            // coded width (1920) is what the turn swaps into the height, so
+            // the displayed pair is 1080x1920 -- DAR 9:16, the ratio ffprobe
+            // reports for the same file turned. A turn-then-stretch probe
+            // would declare 1440x1440 here; a stretch-on-the-wrong-axis
+            // render paints exactly that square into this 9:16 canvas.
+            assert_eq!(
+                (meta.coded_width, meta.coded_height),
+                (1440, 1080),
+                "the turned fixture's samples"
+            );
+            assert_eq!(
+                meta.rotation,
+                engine::Rotation::Cw270,
+                "the matrix was read as a quarter turn"
+            );
+            assert_eq!(
+                (meta.width, meta.height),
+                (1080, 1920),
+                "the aspect widens the coded width; the turn swaps the stretched pair"
+            );
+            // ...and the render agrees with the probe: the composed picture
+            // is handed out at the displayed pair, filled to the corners --
+            // the 1440x1440 failure the other order produces would fail both
+            // assertions.
+            let (_, frames, _) =
+                engine::DecodeSession::open_at(&matrix_on, 0).expect("open for a frame");
+            let frame = frames.recv().expect("a first frame");
+            assert_eq!(
+                (frame.width, frame.height),
+                (1080, 1920),
+                "the rendered picture is the displayed pair"
+            );
+            let (w, h) = (frame.width as usize, frame.height as usize);
+            let at = |x: usize, y: usize| {
+                let i = (y * w + x) * 4;
+                (frame.bgra[i], frame.bgra[i + 1], frame.bgra[i + 2])
+            };
+            let m = w / 10;
+            let corners = [
+                at(m, m),
+                at(w - 1 - m, m),
+                at(w - 1 - m, h - 1 - m),
+                at(m, h - 1 - m),
+            ];
+            assert!(
+                corners
+                    .iter()
+                    .all(|&(b, g, r)| u32::from(r) + u32::from(g) + u32::from(b) > 48),
+                "the corners are picture, not black: {corners:?}"
+            );
+        }
         let _ = std::fs::remove_file(&turned);
+        let _ = std::fs::remove_file(&matrix_on);
     }
 }
 
@@ -268,6 +322,78 @@ fn an_export_of_an_anamorphic_file_is_drawn_and_square() {
         mean < 2.0,
         "the export is {mean:.2} mean codes from the preview -- not the same picture"
     );
+
+    // The same contract for a ROTATED anamorphic source: the fixture carries a
+    // real display matrix, the probe declares 1080x1920, and the export must
+    // be that shape with the picture the preview showed -- the case a
+    // turn-then-stretch render filled with 1440x1440 and baked bars into.
+    let plain = asset(".anamorphic_export_src.mp4");
+    let matrix_on = asset(".anamorphic_export_rot.mp4");
+    let made = std::process::Command::new("ffmpeg")
+        .args(["-y", "-v", "error", "-f", "lavfi", "-i"])
+        .arg("testsrc2=size=1440x1080:rate=30:duration=1")
+        .args([
+            "-vf",
+            "setsar=4/3",
+            "-c:v",
+            "libx264",
+            "-profile:v",
+            "baseline",
+            "-pix_fmt",
+            "yuv420p",
+        ])
+        .arg(&plain)
+        .status()
+        .is_ok_and(|s| s.success())
+        && std::process::Command::new("ffmpeg")
+            .args(["-y", "-v", "error", "-display_rotation", "90", "-i"])
+            .arg(&plain)
+            .args(["-c", "copy"])
+            .arg(&matrix_on)
+            .status()
+            .is_ok_and(|s| s.success());
+    if made {
+        let mut session = PlaybackSession::open(&matrix_on).expect("open the turned fixture");
+        session.pause();
+        let preview = loop {
+            if let Some(frame) = session.try_frame() {
+                break frame;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!((preview.width, preview.height), (1080, 1920));
+        let out = Scratch::file("ve_anamorphic_rot_export", "mp4");
+        let handle = session.export_to_with(&out, &ExportSettings::default());
+        wait(&handle, Duration::from_secs(120)).expect("export");
+        let (meta, _) = Demuxer::open(&out).expect("reopen the export");
+        assert_eq!(
+            (meta.coded_width, meta.coded_height),
+            (1080, 1920),
+            "the rotated export is coded at the displayed shape"
+        );
+        assert!(meta.pixel_aspect.is_square(), "no aspect left to state");
+        let mut reopened = PlaybackSession::open(&out).expect("reopen the export");
+        let exported = loop {
+            if let Some(frame) = reopened.try_frame() {
+                break frame;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!((exported.width, exported.height), (1080, 1920));
+        let moved = preview
+            .bgra
+            .iter()
+            .zip(&exported.bgra)
+            .map(|(a, b)| u32::from(a.abs_diff(*b)))
+            .sum::<u32>();
+        let mean = moved as f64 / preview.bgra.len() as f64;
+        assert!(
+            mean < 2.0,
+            "the rotated export is {mean:.2} mean codes from the preview"
+        );
+        let _ = std::fs::remove_file(&plain);
+        let _ = std::fs::remove_file(&matrix_on);
+    }
 }
 
 /// The copy door, Matroska side: an anamorphic source's Exact row copies the
