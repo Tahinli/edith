@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering}
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::ao::AoSession;
 use crate::audio::{AudioChunk, AudioSession};
@@ -51,6 +51,23 @@ const FLUSH_WAIT: Duration = Duration::from_millis(1);
 /// almost never actually waits the full budget; a source B cannot decode at
 /// all pays this once per span rather than freezing the preview outright.
 const DISSOLVE_B_TIMEOUT: Duration = Duration::from_millis(200);
+
+/// How long a dead output is left alone before another open is attempted. A
+/// PipeWire daemon restart takes a moment, and the ask that makes the attempt
+/// runs once per rendered frame: a second is long enough that a restart lands
+/// inside it, and short enough that a play pressed after one does not wait.
+const AUDIO_REARM_AFTER: Duration = Duration::from_secs(1);
+
+/// The reason a session gives for having gone quiet when its output dies
+/// ([`PlaybackSession::tick`]), through the same door a file's own refusal
+/// reaches a front-end by ([`PlaybackSession::audio_disabled_reason`]).
+///
+/// That door is read where a notice is *built* -- at open and at load -- so this
+/// is fetchable rather than announced: the engine sets the reason and clears it
+/// again when the output comes back, and a front-end that reads the door after
+/// the session is open (a per-frame check, or one at the next load) is what
+/// shows it. Nothing here pushes a notice.
+const AUDIO_LOST: &str = "output device went away -- reconnecting the timeline's sound";
 
 /// The timeline a file with no picture scaffolds: 1080p at 30 fps, H.264 --
 /// nothing was shot on it, so it is the canvas a *later* import meets rather
@@ -149,6 +166,13 @@ struct Audio {
     /// at once -- which is precisely what
     /// [`live_workers`](PlaybackSession::live_workers) is asked about.
     feeders: Arc<AtomicUsize>,
+    /// When this device was last opened *again* after dying
+    /// ([`PlaybackSession::rearm_audio`]). A dead output is offered one open a
+    /// second and no more, because the ask that makes the attempt runs once per
+    /// rendered frame: a daemon restart takes a moment, and a device that is
+    /// gone for good must not be opened sixty times a second for the rest of
+    /// the session.
+    rearm_at: Arc<Mutex<Option<Instant>>>,
 }
 
 /// How much of the played signal the tap keeps. A power of two, because what
@@ -2672,7 +2696,12 @@ impl PlaybackSession {
     /// ([`Self::seek`]'s own `switch_to_audio`), which is the seek a front-end
     /// makes as it places the file it just imported.
     fn arm_audio(&mut self) {
-        if self.audio.is_some() {
+        // A device that is there but *dead* is not a device: the walk below
+        // opens another one, which is also what clears the notice a death put up
+        // ([`Self::tick`]).
+        if let Some(audio) = &self.audio
+            && !audio.died.load(Ordering::Acquire)
+        {
             return;
         }
         for source in self
@@ -2688,6 +2717,63 @@ impl PlaybackSession {
                 return;
             }
         }
+    }
+
+    /// Opens the output again for a stream that died, at the rate and channel
+    /// count it carried, and clears the flag that stopped the session feeding.
+    ///
+    /// An output that goes away -- a PipeWire daemon restarting, a sink node
+    /// removed and put back -- leaves every stream that was open on it dead for
+    /// good: its position is frozen, so the clock can only fall to wall time, and
+    /// a session that never opens another device is silent for the rest of its
+    /// life, through every seek and every pause/play, with nothing said about it.
+    ///
+    /// The device *only*, never the file: the feeder is [`Self::start_audio`]'s,
+    /// at the seek that follows. That is what lets [`Self::tick`] call this too,
+    /// once a frame -- a tick is not a seek and must not reseek the timeline. The
+    /// clock is on wall time by then and stays there until a seek comes, which is
+    /// the seek whose feeder opens in step with the picture.
+    ///
+    /// `if_idle_for` is the cooldown: a tick passes [`AUDIO_REARM_AFTER`], because
+    /// sixty opens a second against a device that is gone for good is a spin; a
+    /// seek passes zero, because that one is a person asking.
+    ///
+    /// `false` when there is nothing to open, nothing came back, or the cooldown
+    /// has not passed -- and the flag stays standing for the next attempt.
+    fn rearm_audio(&mut self, if_idle_for: Duration) -> bool {
+        let Some(audio) = &self.audio else {
+            return false;
+        };
+        if !audio.died.load(Ordering::Acquire) {
+            return true;
+        }
+        {
+            let mut at = audio.rearm_at.lock().unwrap();
+            if at.is_some_and(|at| at.elapsed() < if_idle_for) {
+                return false;
+            }
+            *at = Some(Instant::now());
+        }
+        let Some(ao) = AoSession::open(audio.sample_rate, audio.channels as u32) else {
+            return false;
+        };
+        // A stream comes up streaming and a session starts paused: the fresh one
+        // is silenced until the seek that feeds it says otherwise, which is the
+        // same two steps [`open_audio`] takes on the way in.
+        ao.set_active(false);
+        // Replacing the session is what closes the dead stream, so it is done
+        // under the device lock the feeder writes through.
+        *audio.ao.lock().unwrap() = ao;
+        // The clock anchor and the played-out arithmetic both belong to the
+        // stream that died: the new one stamps its own first sample
+        // ([`Audio::content_at`]), and `start_audio` re-bases the count from the
+        // device's own position.
+        audio.content_at.store(-1, Ordering::Release);
+        audio.died.store(false, Ordering::Release);
+        if self.audio_disabled.as_deref() == Some(AUDIO_LOST) {
+            self.audio_disabled = None;
+        }
+        true
     }
 
     /// The rate noted for whichever source plays `path`, by
@@ -3910,6 +3996,12 @@ impl PlaybackSession {
         let fps = self.meta.frame_rate;
         let mut audio_running = false;
         let mut live = None;
+        // A dead output gets an attempt here without waiting out the cooldown: a
+        // seek is a person asking, and this is the one moment the sound can come
+        // back into step with the picture, because the feeder opened below starts
+        // at the target. If it does not come back the flag stands and the guard
+        // under it leaves the clock on wall time.
+        self.rearm_audio(Duration::ZERO);
         if let Some(audio) = &self.audio
             && !audio.died.load(Ordering::Acquire)
         {
@@ -4079,17 +4171,35 @@ impl PlaybackSession {
         // still be moving it -- otherwise the queue fills with pictures whose
         // moment passed while nobody was taking them.
         self.publish_playhead();
+        // Before the clock-source guard below, and not after it: a dead output is
+        // what *puts* the clock on wall time, so this branch has to keep running
+        // while it is there -- the one attempt that can bring the sound back is
+        // in it.
+        if self
+            .audio
+            .as_ref()
+            .is_some_and(|audio| audio.died.load(Ordering::Acquire))
+        {
+            // Output died mid-stream: its position will never reach `fed`, so the
+            // EOF comparison below is unreachable. Wall time takes over from
+            // wherever the clock last stood, and the session says so rather than
+            // going silent for good without a word: a front-end already has a
+            // line for a silent session ([`Self::audio_disabled_reason`]).
+            if self.audio_disabled.is_none() {
+                self.audio_disabled = Some(AUDIO_LOST.to_string());
+            }
+            self.clock.switch_to_wall();
+            // ...and the output is offered another open, once a second: a
+            // restarting daemon takes a moment, and this runs once a frame. A
+            // re-arm that takes is what clears the notice, and the next seek
+            // feeds it.
+            self.rearm_audio(AUDIO_REARM_AFTER);
+            return;
+        }
         let Some(audio) = &self.audio else {
             return; // wall time from the start, nothing to poll
         };
         if self.clock.source() != ClockSource::Audio {
-            return;
-        }
-        if audio.died.load(Ordering::Acquire) {
-            // Output died mid-stream: its position will never reach `fed`, so
-            // the EOF comparison below is unreachable. Wall time takes over
-            // from wherever the clock last stood.
-            self.clock.switch_to_wall();
             return;
         }
         // `None` until the device's first callback: the clock holds at its
@@ -4420,6 +4530,7 @@ fn open_audio(path: &Path, stream: usize) -> (Option<Audio>, Option<String>) {
         wants_active: Arc::new(AtomicBool::new(false)),
         tap: Arc::new(Mutex::new(Vec::with_capacity(TAP_SAMPLES))),
         feeders: Arc::new(AtomicUsize::new(0)),
+        rearm_at: Arc::new(Mutex::new(None)),
     };
     (audio.spawn_feeder(rx).then_some(audio), None)
 }
@@ -4553,13 +4664,120 @@ fn blend_bgra(a: &[u8], b: &[u8], t: f32) -> Vec<u8> {
 mod tests {
     use super::{
         Edge, Lane, PlaybackSession, Source, TransformParams, audio_source_of, blend_bgra, secs_to_frame,
+        AUDIO_LOST,
     };
     use std::path::PathBuf;
+    use std::sync::atomic::Ordering;
 
     fn asset(name: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../assets")
             .join(name)
+    }
+
+    /// A dead output is not the end of a session's sound.
+    ///
+    /// The stream is stopped the way a seek stops one and then flagged the way a
+    /// failed write flags it ([`feed`]): nothing is feeding and nothing will. The
+    /// session must say so -- a dead output used to hand the clock to wall time
+    /// in silence, for the rest of the session's life, through every seek -- and
+    /// the play (and the seek after it) must put the output back, which is read
+    /// off the tap: the samples that actually reached the device. A session that
+    /// only switched the clock leaves the tap empty.
+    ///
+    /// The tick below runs with the cooldown already spent (an attempt stamped
+    /// just now), which is what makes the notice observable at all *and* what
+    /// proves the one thing a frame-rate poll must not do: open a device that is
+    /// gone for good sixty times a second.
+    #[test]
+    fn a_dead_output_is_rearmed_and_the_sound_comes_back() {
+        let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+        assert!(
+            session.audio_tap().is_some(),
+            "test_av.mp4 carries an audio track, which is what this drives"
+        );
+
+        session.stop_audio();
+        let audio = session.audio.as_ref().expect("audio");
+        audio.died.store(true, Ordering::Release);
+        *audio.rearm_at.lock().unwrap() = Some(std::time::Instant::now());
+
+        session.tick();
+        assert_eq!(
+            session.audio_disabled_reason(),
+            Some(AUDIO_LOST),
+            "a dead output went to wall time without a word"
+        );
+        assert!(
+            session.audio.as_ref().expect("audio").died.load(Ordering::Acquire),
+            "a tick opened the output again inside the cooldown"
+        );
+        assert!(
+            session.audio_tap().expect("audio").0.is_empty(),
+            "something was still feeding the device"
+        );
+
+        // Playing is the ask that is not throttled: the output is opened again,
+        // the flag clears and a feeder fills the device -- asynchronously, so the
+        // tap is waited on.
+        session.play();
+        session.seek(1.0);
+        let mut fed = Vec::new();
+        for _ in 0..200 {
+            fed = session.audio_tap().expect("audio").0;
+            if !fed.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            !fed.is_empty(),
+            "playing after a dead output fed nothing: the session cannot come back"
+        );
+        assert!(
+            !session.audio.as_ref().expect("audio").died.load(Ordering::Acquire),
+            "the death flag stood after the output was replaced"
+        );
+        assert_eq!(
+            session.audio_disabled_reason(),
+            None,
+            "the notice was left standing over a session that is playing again"
+        );
+    }
+
+    /// The seat declares the canvas's own size; the painter masks the planes it
+    /// returns to even dimensions, and a canvas the two disagree about used to
+    /// take the picture down between them. On the revision before the seat masked
+    /// what it declares, a 1920x1 canvas died *in the painter* -- `decode.rs`
+    /// clamped the zero line of an h of 0: `max = -1`, `min > max` -- and a
+    /// 321x181 one died in the conversion on the *canvas's* chroma plane, one row
+    /// past the masked source's: `index out of bounds: the len is 14400 but the
+    /// index is 14400`, a full plane and not an empty one.
+    ///
+    /// This drives the same path a front-end does (`set_resolution`, then frames
+    /// out of the session). It is a guard against the shape coming back rather
+    /// than a reproduction: a frame does still arrive on the parent revision
+    /// (which is why the masking, not this test, is the fix).
+    #[test]
+    fn a_visualizer_seat_paints_a_canvas_it_cannot_evenly_divide() {
+        for (w, h) in [(1920, 1), (1921, 1081), (320, 1), (321, 181)] {
+            let mut session =
+                PlaybackSession::open(asset("test_tone.mp3")).expect("open the audio fixture");
+            assert!(
+                session.set_resolution(w, h),
+                "{w}x{h} should be a resolution this session takes"
+            );
+            let mut frame = None;
+            for _ in 0..400 {
+                if let Some(f) = session.try_frame() {
+                    frame = Some(f);
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            let frame = frame.unwrap_or_else(|| panic!("no frame from a {w}x{h} canvas"));
+            assert_eq!((frame.width, frame.height), (w, h), "a frame at the canvas's own size");
+        }
     }
 
     /// `blend_bgra` at the two ends and the midpoint of its weight -- `t=0` is

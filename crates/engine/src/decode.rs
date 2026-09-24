@@ -649,22 +649,33 @@ impl DecodeSession {
         // Painted at the canvas's own size, so the composite places nothing:
         // the picture *is* the canvas, and whatever transform the clip
         // carries still reaches it through the render below.
-        let (width, height) = canvas.dims();
+        //
+        // Masked to even dimensions first, and floored at two: that is what the
+        // painter does to the planes it hands back, so a canvas it cannot divide
+        // evenly (an odd `resolution 1921 1081` line, or a one-pixel-high one)
+        // used to be *declared* at a size the picture never had -- and the
+        // conversion below then indexes a chroma plane that is not there
+        // (`index out of bounds` on a zero-length slice, in this worker, where
+        // no frame ever arrives and nothing catches it).
+        let (canvas_w, canvas_h) = canvas.dims();
+        let (width, height) = ((canvas_w & !1).max(2), (canvas_h & !1).max(2));
         let worker_cancel = Arc::clone(&cancel);
         let path = path.to_path_buf();
         let handle = thread::Builder::new()
             .name("viz".into())
             .spawn(move || {
-                // The one decode this seat ever does: the whole envelope,
-                // off the render thread, and abandoned at once if the caller
-                // is already gone. A file that will not open -- and one with
-                // no track at all -- paints the flat line, which is what its
-                // silence looks like anyway: a visualizer frame always
-                // exists, and is never worth failing a span over.
-                let peaks = crate::waveform::peaks_shared(&path, stream, VIZ_BUCKETS_PER_SEC)
-                    .ok()
-                    .flatten()
-                    .unwrap_or_default();
+                // The envelope this span paints from, asked for once for the
+                // whole span: the memo's own handle when it holds one, and
+                // otherwise a *window* of the file's envelope per frame --
+                // which is what makes a rebuild cheap for a source whose whole
+                // envelope does not fit the memo at all ([`viz_envelope`]). A
+                // file that will not open -- and one with no track at all --
+                // paints the flat line, which is what its silence looks like
+                // anyway: a visualizer frame always exists, and is never worth
+                // failing a span over.
+                let mut envelope =
+                    crate::waveform::viz_envelope(&path, stream, VIZ_BUCKETS_PER_SEC)
+                        .unwrap_or(crate::waveform::VizEnvelope::Silent);
                 if worker_cancel.load(Ordering::Relaxed) {
                     return;
                 }
@@ -687,8 +698,14 @@ impl DecodeSession {
                         return;
                     }
                     let t = f64::from(start_frame + index) / fps;
-                    let (y, u, v) =
-                        visualizer_i420(&mut scratch, &peaks, t, width, height, flags, paint);
+                    // One window of the envelope about this frame's own time:
+                    // the same window for every frame a sliding paint asks of
+                    // the same thirty seconds, and no decode at all for the
+                    // rebuilds of a look edit.
+                    let view = envelope.view_at(t);
+                    let (y, u, v) = visualizer_window_i420(
+                        &mut scratch, &view, t, width, height, flags, paint,
+                    );
                     let frame = render.frame(start_frame + index, &y, &u, &v, width, height);
                     if tx.send(frame).is_err() {
                         return; // caller moved on
@@ -2094,9 +2111,98 @@ fn viz_chain(
 /// [`viz_style`]: a bipolar sample trace (Audacity), a filled min/max
 /// envelope at pixel resolution, or a multi-strand ribbon. Ink is
 /// [`viz_ink_from_paint`]. A frame always exists; silence is the zero line.
+///
+/// This is the whole-envelope entry: it is handed the file's envelope and
+/// paints from it ([`VizView::whole`]). The seat paints from a *window* of one
+/// instead ([`visualizer_window_i420`], [`crate::waveform::viz_envelope`]).
 pub(crate) fn visualizer_i420(
     scratch: &mut VizScratch,
     peaks: &[(f32, f32)],
+    t_secs: f64,
+    width: u32,
+    height: u32,
+    flags: u8,
+    paint: u64,
+) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    visualizer_window_i420(scratch, &VizView::whole(peaks), t_secs, width, height, flags, paint)
+}
+
+/// The envelope a visualizer frame is painted from: the whole file, or one
+/// *window* of it -- which is what the seat holds, because a film's own
+/// envelope is past the memo's ceiling ([`crate::waveform::viz_envelope`]).
+///
+/// `peaks[i]` is the bucket at absolute index `first + i`, so the painter's
+/// index arithmetic is the same whether it was handed a slice of thirty
+/// seconds or of two hours. `total` is the *file's* own bucket count, which is
+/// what "past the end of the file" is measured against -- a window that
+/// measured it against itself would draw the file's end wherever the window
+/// ended -- and `peak` is the file's loudest bucket, which every column is
+/// scaled by: no window can derive that from itself.
+///
+/// `per_sec` is the rate *this* envelope was drawn at, in buckets per second,
+/// and it is carried rather than assumed: the slice is indexed at it, so an
+/// envelope drawn at another rate under a painter that hard-coded the
+/// visualizer's own would read a tenth of a second of sound as a second. The
+/// whole-file constructor is the one place the visualizer's rate is named.
+pub(crate) struct VizView<'a> {
+    pub(crate) peaks: &'a [(f32, f32)],
+    pub(crate) first: usize,
+    pub(crate) total: usize,
+    pub(crate) peak: f32,
+    pub(crate) per_sec: f64,
+}
+
+impl<'a> VizView<'a> {
+    /// The whole envelope, which is what every caller but the seat has.
+    pub(crate) fn whole(peaks: &'a [(f32, f32)]) -> Self {
+        Self {
+            peaks,
+            first: 0,
+            total: peaks.len(),
+            peak: crate::waveform::peak_of(peaks),
+            per_sec: f64::from(VIZ_BUCKETS_PER_SEC),
+        }
+    }
+
+    /// One window of an envelope: `peaks` starts at absolute bucket `first`,
+    /// `total` and `peak` are the whole file's, and `per_sec` is the rate the
+    /// file's envelope was drawn at.
+    pub(crate) fn window(
+        peaks: &'a [(f32, f32)],
+        first: usize,
+        total: usize,
+        peak: f32,
+        per_sec: f64,
+    ) -> Self {
+        Self {
+            peaks,
+            first,
+            total,
+            peak,
+            per_sec,
+        }
+    }
+
+    /// The bucket at absolute index `abs`, when this view carries it: the
+    /// window's own edges are not the file's, and a frame asked for one of
+    /// them draws silence rather than a bucket that is only half decoded.
+    pub(crate) fn at(&self, abs: usize) -> Option<(f32, f32)> {
+        abs.checked_sub(self.first)
+            .and_then(|i| self.peaks.get(i))
+            .copied()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.peaks.is_empty()
+    }
+}
+
+/// [`visualizer_i420`] from a view, which is how the seat paints: `peaks` may
+/// be a window rather than the file's own envelope, and `t_secs` is the
+/// frame's own time either way -- the view knows where its slice starts.
+pub(crate) fn visualizer_window_i420(
+    scratch: &mut VizScratch,
+    view: &VizView,
     t_secs: f64,
     width: u32,
     height: u32,
@@ -2138,9 +2244,9 @@ pub(crate) fn visualizer_i420(
     scratch.hi.resize(w, 0.0);
     scratch.sig.clear();
     scratch.sig.resize(w, 0.0);
-    if !peaks.is_empty() {
-        let duration = peaks.len() as f64 / f64::from(VIZ_BUCKETS_PER_SEC);
-        let per_sec = f64::from(VIZ_BUCKETS_PER_SEC);
+    if !view.is_empty() && view.total != 0 {
+        let duration = view.total as f64 / view.per_sec;
+        let per_sec = view.per_sec;
         let window = if flags & VIZ_FAST != 0 {
             VIZ_FAST_SECS
         } else {
@@ -2155,11 +2261,17 @@ pub(crate) fn visualizer_i420(
             if !t.is_finite() || t < 0.0 || t > duration {
                 return (0.0, 0.0);
             }
-            let pos = (t * per_sec).clamp(0.0, (peaks.len() - 1) as f64);
+            let pos = (t * per_sec).clamp(0.0, (view.total - 1) as f64);
             let i = pos.floor() as usize;
             let f = (pos - i as f64) as f32;
-            let (lo0, hi0) = peaks[i];
-            let (lo1, hi1) = peaks[(i + 1).min(peaks.len() - 1)];
+            // Silence where the slice does not reach: a view that is a window
+            // is only handed the buckets the frame can ask for, so this is the
+            // file's own ends and nothing else.
+            let (Some((lo0, hi0)), Some((lo1, hi1))) =
+                (view.at(i), view.at((i + 1).min(view.total - 1)))
+            else {
+                return (0.0, 0.0);
+            };
             (
                 (lo0 + (lo1 - lo0) * f).clamp(-1.0, 0.0),
                 (hi0 + (hi1 - hi0) * f).clamp(0.0, 1.0),
@@ -2186,11 +2298,10 @@ pub(crate) fn visualizer_i420(
         }
         // Whole-file peak, not the window's: a 2s window that gains or loses
         // a loud hit used to rescale every column, so the same bump changed
-        // height as it entered and left the picture.
-        let peak = peaks
-            .iter()
-            .map(|&(l, h)| l.abs().max(h.abs()))
-            .fold(0.0f32, f32::max);
+        // height as it entered and left the picture. A view carries that peak
+        // with it ([`VizView`]), because a window of a film could not compute
+        // it from the megabyte it holds.
+        let peak = view.peak;
         if peak > 1e-4 {
             for i in 0..w {
                 scratch.lo[i] /= peak;
