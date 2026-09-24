@@ -109,11 +109,16 @@ pub(crate) fn audio_step(
 }
 
 /// What a *change* in the engine's sound reason does to the notice queue, as a
-/// pure step: the death line pushed when a reason arrives, the same line taken
-/// back when the reason clears ([`PlaybackSession::audio_disabled_reason`]'s
-/// `AUDIO_LOST` and its own re-arm). [`Player::watch_audio`] is the only caller
-/// and owns the caching; this owns the queue, so a test can drive both
-/// directions without a window and without a device that dies on cue.
+/// pure step: the line pushed when a reason arrives, the same line taken back
+/// when the reason clears. [`Player::watch_audio`] is the only caller and owns
+/// the caching; this owns the queue, so a test can drive both directions without
+/// a window and without a device that dies on cue.
+///
+/// The reason itself is the engine's to write
+/// ([`PlaybackSession::audio_disabled_reason`]): this side never spells its
+/// words, so a lost-device reason the engine lane teaches the death path to set
+/// needs nothing here -- and a death that sets nothing stays unsaid, which is
+/// what the engine side of this defect is.
 pub(crate) fn audio_change_notice(
     notices: &mut std::collections::VecDeque<SharedString>,
     was: Option<&str>,
