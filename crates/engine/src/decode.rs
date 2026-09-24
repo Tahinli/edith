@@ -1335,6 +1335,16 @@ impl Render {
             // composes on, and a height is never touched by it.
             let display_width = self.pixel_aspect.width_factor(width);
             let (sy, su, sv) = &mut self.stretched;
+            // Sized for `scale_i420`'s exact-planes assertion, once for the
+            // worker's whole range: steady-state buffers, not per-frame
+            // allocations ([`turned`]'s reason).
+            let (dcw, dch) = (
+                display_width.div_ceil(2) as usize,
+                height.div_ceil(2) as usize,
+            );
+            sy.resize(display_width as usize * height as usize, 0);
+            su.resize(dcw * dch, 0);
+            sv.resize(dcw * dch, 0);
             crate::scale::scale_i420(
                 y,
                 u,

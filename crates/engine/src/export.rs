@@ -3308,6 +3308,13 @@ fn place_picture<'a>(
         (y, u, v, width, height)
     } else {
         let display_width = pixel_aspect.width_factor(width);
+        let (dcw, dch) = (
+            display_width.div_ceil(2) as usize,
+            height.div_ceil(2) as usize,
+        );
+        stretched.0.resize(display_width as usize * height as usize, 0);
+        stretched.1.resize(dcw * dch, 0);
+        stretched.2.resize(dcw * dch, 0);
         crate::scale::scale_i420(
             y,
             u,
