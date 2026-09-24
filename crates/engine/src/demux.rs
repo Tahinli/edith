@@ -374,10 +374,14 @@ pub struct VideoMeta {
     /// How far the picture must be turned to be seen right, off the container's
     /// display matrix: an mp4 `tkhd` matrix, or a Matroska `Projection` roll on
     /// a rectangular projection -- the same quarter turns read off either.
-    /// [`Rotation::None`] for everything whose container states no turn, and a
-    /// turn that is not a quarter turn (or a mirror, a shear, a spherical
-    /// projection) is refused at the door ([`UnsupportedRotation`]) rather than
-    /// shown wrong.
+    /// [`Rotation::None`] for everything whose container states no turn, and for
+    /// a projection that is not rectangular: on a spherical or cubemap one those
+    /// same pose elements describe how the *sphere* is oriented, which is no turn
+    /// of the picture, so the pose is deliberately not applied and the file
+    /// paints as a flat frame -- what every player does with a 360 clip, and
+    /// cheaper than a refusal that would cost a file that plays. A turn that is
+    /// not a quarter turn -- a mirror, a shear, an angle in between -- is refused
+    /// at the door ([`UnsupportedRotation`]) rather than shown wrong.
     pub rotation: Rotation,
 }
 
@@ -1326,10 +1330,15 @@ impl MkvDemuxer {
             // `config` is the parameter sets by now -- Annex-B for H.264 and
             // HEVC, the sequence header OBU for AV1 -- which is what the
             // bitstream tier reads.
+            // The height the picture is *shown* at, which is what the mp4 door
+            // feeds here and the whole reason both doors resolve their size the
+            // same way: the 720-line rule below is a guess about the material, and
+            // the material is the picture as displayed -- a device-held `.mkv` is
+            // 640 coded but 1280 shown, and the two sides of that rule disagree.
             color: ColorDescription::resolve(
                 video.tags,
                 bitstream_tags(video.codec, &mkv.config),
-                video.height,
+                height,
             ),
             // The turn off the track's `Projection` element ([`projection_rotation`]),
             // which is where a Matroska muxer states what an mp4 states with its
@@ -3223,7 +3232,7 @@ fn mkv_cluster(
         if block.number != number {
             continue;
         }
-        let ts = cluster_ts + i64::from(block.rel);
+        let ts = block_ticks(cluster_ts, block.rel)?;
         if block.flags & 0x06 == 0 {
             blocks.push(Block {
                 at: block.at,
@@ -4497,13 +4506,12 @@ fn mkv_subtitle_blocks(
                 read_exact_at(file, at, &mut payload)?;
                 track.unpack.frame(&mut payload)?;
                 track.cues.push(MkvCue {
-                    // The cluster's timestamp plus the block's own signed offset,
-                    // checked: the pair is where a corrupt file's two numbers can
-                    // still overflow what an `i64` holds, one step before the
-                    // scale above would refuse the result.
-                    start_us: us(cluster_ts
-                        .checked_add(i64::from(block.rel))
-                        .ok_or("a Matroska subtitle block at no timestamp a clock can hold")?)?,
+                    // The cluster's timestamp plus the block's own signed
+                    // offset, checked by [`block_ticks`]: the pair is where a
+                    // corrupt file's two numbers can still overflow what an
+                    // `i64` holds, one step before the scale above would refuse
+                    // the result.
+                    start_us: us(block_ticks(cluster_ts, block.rel)?)?,
                     duration_us: duration.map(us).transpose()?,
                     payload,
                 });
@@ -4511,6 +4519,20 @@ fn mkv_subtitle_blocks(
         }
     }
     Ok(())
+}
+
+/// A block's absolute timestamp in ticks: the cluster's own, plus the block's
+/// signed offset from it -- refused where the sum leaves what an `i64` holds.
+///
+/// Both walks need it: the video block index a copy reads and the subtitle cues.
+/// Both get `cluster_ts` from an EBML uint the file writes with no bound this
+/// reader applies, so a crafted cluster near `i64::MAX` overflows the add one
+/// step *before* [`ticks_scaled`] could refuse the product -- and the block would
+/// be taken at a time that wrapped negative.
+fn block_ticks(cluster_ts: i64, rel: i16) -> crate::Result<i64> {
+    cluster_ts
+        .checked_add(i64::from(rel))
+        .ok_or_else(|| "a Matroska block at no timestamp a clock can hold".into())
 }
 
 /// A tick count scaled out of the file's own clock, or the refusal a corrupt one
@@ -4567,6 +4589,16 @@ mod tests {
             "the subtitle walk's product must not wrap into a negative cue time"
         );
         assert!(ticks_scaled(i64::MIN, 1_000_000_000, 1_000).is_err());
+        // ...and the add that comes before either scale: a cluster timestamp near
+        // the top of what an `i64` holds plus a block's own offset still has to
+        // fit before any product is computed at all.
+        assert_eq!(block_ticks(1_000, -5).unwrap(), 995);
+        assert_eq!(block_ticks(0, 32_767).unwrap(), 32_767);
+        assert!(
+            block_ticks(i64::MAX, 1).is_err(),
+            "the add must not wrap negative"
+        );
+        assert!(block_ticks(i64::MIN, -1).is_err());
     }
 
     fn asset(name: &str) -> std::path::PathBuf {
