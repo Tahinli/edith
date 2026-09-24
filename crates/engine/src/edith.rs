@@ -387,8 +387,24 @@ pub fn save(
     let result = std::fs::File::create(&part)
         .and_then(|mut f| {
             f.write_all(&emit(
-                &dir, sources, lanes, gains, subs, subtitles, eq, color, transform, resolution,
-                fps, tone, proxy, auto_proxy, encoder, limiter, sample_rate, playhead,
+                &dir,
+                sources,
+                lanes,
+                gains,
+                subs,
+                subtitles,
+                eq,
+                color,
+                transform,
+                resolution,
+                fps,
+                tone,
+                proxy,
+                auto_proxy,
+                encoder,
+                limiter,
+                sample_rate,
+                playhead,
             ))?;
             f.sync_all()
         })
@@ -810,10 +826,9 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
             }
             b"samplerate" if v17 => {
                 if doc.sample_rate.is_some() || !doc.sources.is_empty() {
-                    return Err(format!(
-                        "line {n}: samplerate belongs once, before the sources"
-                    )
-                    .into());
+                    return Err(
+                        format!("line {n}: samplerate belongs once, before the sources").into(),
+                    );
                 }
                 let f = fields(rest, 1, "samplerate", n)?;
                 let rate = number(f[0], n)?;
@@ -838,9 +853,7 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
             }
             b"proxy" if v12 => {
                 if !doc.sources.is_empty() {
-                    return Err(
-                        format!("line {n}: proxy belongs once, before the sources").into()
-                    );
+                    return Err(format!("line {n}: proxy belongs once, before the sources").into());
                 }
                 let f = fields(rest, 1, "proxy", n)?;
                 doc.proxy = match f[0] {
@@ -877,7 +890,7 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
             b"encoder" if v14 => {
                 if !doc.sources.is_empty() {
                     return Err(
-                        format!("line {n}: encoder belongs once, before the sources").into()
+                        format!("line {n}: encoder belongs once, before the sources").into(),
                     );
                 }
                 let f = fields(rest, 1, "encoder", n)?;
@@ -1215,7 +1228,7 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
                         fade_in: number(f.get(9).copied().unwrap_or(b"0"), n)?.min(frames),
                         fade_out: number(f.get(10).copied().unwrap_or(b"0"), n)?.min(frames),
                         transition_out: number(f.get(11).copied().unwrap_or(b"0"), n)?.min(frames),
-                        visualizer: number(f.get(13).copied().unwrap_or(b"0"), n)? as u8,
+                        visualizer: flags_byte(f.get(13).copied().unwrap_or(b"0"), n)?,
                         viz_paint: number64(f.get(14).copied().unwrap_or(b"0"), n)?,
                         start: number(f[0], n)?,
                         in_frame,
@@ -1472,6 +1485,15 @@ fn float(field: &[u8], line: usize) -> crate::Result<f32> {
     }
 }
 
+/// A clip's visualizer field: every bit of the byte is a flag
+/// ([`crate::decode::VIZ_STYLE_FILL`]'s low bits, the fast bit, the ink
+/// nibble), so a line naming one past what a byte holds is a look this
+/// program does not have rather than a 300 that quietly loads as a 44.
+fn flags_byte(field: &[u8], line: usize) -> crate::Result<u8> {
+    let n = number(field, line)?;
+    u8::try_from(n).map_err(|_| format!("line {line}: {n} is not a set of visualizer flags").into())
+}
+
 fn number(field: &[u8], line: usize) -> crate::Result<u32> {
     match std::str::from_utf8(field).ok().and_then(|s| s.parse().ok()) {
         Some(n) => Ok(n),
@@ -1695,7 +1717,11 @@ mod tests {
             (LaneKind::Audio, vec![clip(0, 0, 30, 0, Some(7))]),
             (LaneKind::Subtitle, Vec::new()),
         ];
-        let subs = vec![vec![], vec![], vec![caption(0, 30, Some(7)), caption(40, 10, None)]];
+        let subs = vec![
+            vec![],
+            vec![],
+            vec![caption(0, 30, Some(7)), caption(40, 10, None)],
+        ];
         let bytes = super::emit(
             &dir,
             &doc().1,
@@ -1917,7 +1943,10 @@ mod tests {
         for seat in [EncoderSeat::Hardware, EncoderSeat::Software] {
             let written = bytes(seat);
             let text = String::from_utf8_lossy(&written).to_string();
-            assert!(text.contains(&format!("encoder {}\n", seat.name())), "{text}");
+            assert!(
+                text.contains(&format!("encoder {}\n", seat.name())),
+                "{text}"
+            );
             assert_eq!(parse(&written, &dir).expect("v14 parses").encoder, seat);
         }
 
@@ -2622,7 +2651,10 @@ mod tests {
             "the fades are the clip line's last two fields"
         );
         let back = parse(&bytes, &dir).expect("parse");
-        assert_eq!(back.lanes, lanes, "the fades round trip as the very numbers");
+        assert_eq!(
+            back.lanes, lanes,
+            "the fades round trip as the very numbers"
+        );
     }
 
     /// The whole of the v19 bump, the fade test's twin: a clip's dissolve into
@@ -3248,13 +3280,11 @@ mod tests {
             assert!(err.starts_with("line 4: clip at "), "{err}");
         }
         // The lanes are independent, so a video line never crowds an audio one.
-        assert!(
-            parse(
-                b"edith 2\nsource a.mp4\nvideo 0 0 30 0 -\naudio 0 0 30 0 -\n",
-                &dir
-            )
-            .is_ok()
-        );
+        assert!(parse(
+            b"edith 2\nsource a.mp4\nvideo 0 0 30 0 -\naudio 0 0 30 0 -\n",
+            &dir
+        )
+        .is_ok());
         // ...and a lane may be empty as long as the other one is not.
         let only_audio = parse(b"edith 2\nsource a.mp4\naudio 0 0 30 0 -\n", &dir).expect("parse");
         assert!(only_audio.lanes[0].1.is_empty(), "V1 is there and empty");
@@ -3457,7 +3487,10 @@ mod tests {
             parse(b"edith 1\nsource a.mp4\n", &dir).expect("v1").lanes,
             two(Vec::new(), Vec::new())
         );
-        assert!(parse(b"edith 1\n", &dir).expect("a project of nothing").sources.is_empty());
+        assert!(parse(b"edith 1\n", &dir)
+            .expect("a project of nothing")
+            .sources
+            .is_empty());
     }
 
     /// Every truncation of a good file either parses or refuses; none panics.
@@ -3477,6 +3510,50 @@ mod tests {
                 .unwrap_err()
                 .to_string(),
             "line 2: truncated % escape in the path"
+        );
+    }
+
+    /// A clip's visualizer field is a whole byte of flags, and a line naming one
+    /// past it used to be truncated into a look nobody chose (`300` loaded as
+    /// `44`, with the fast bit and the ink nibble both wrong). It is refused by
+    /// name now, like the resolution's bound, the sample rate's range, the tone
+    /// map and the encoder seat beside it.
+    #[test]
+    fn a_visualizer_byte_past_a_byte_is_refused_and_the_legal_ones_still_load() {
+        // The door the parser reads that field through: the low bits are the
+        // style, bit 3 the fast flag and the high nibble the ink, so every value a
+        // byte holds is a look and 256 and up is not one.
+        assert_eq!(flags_byte(b"0", 1).expect("zero is the plain look"), 0);
+        assert_eq!(flags_byte(b"255", 1).expect("the whole byte is flags"), 255);
+        let refused = flags_byte(b"300", 9).expect_err("300 is not a byte of flags");
+        assert_eq!(
+            refused.to_string(),
+            "line 9: 300 is not a set of visualizer flags"
+        );
+    }
+
+    /// ...and the same field through the parser, on a document of the newest
+    /// dialect: the legal byte is what lands in the clip, the illegal one is the
+    /// refusal above rather than a truncation.
+    #[test]
+    fn a_clip_line_whose_visualizer_is_past_a_byte_loses_the_whole_load() {
+        let dir = PathBuf::from("/proj");
+        let line = |flags: &str| {
+            format!(
+                "edith 22\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
+             video 1 0 0 30 0 - - - fit 1000 0 0 0 - {flags} 0\n"
+            )
+        };
+        let doc = parse(line("12").as_bytes(), &dir).expect("12 is a look");
+        // The keyword is the saver's own for this dialect, so a mismatch here would
+        // be this test's line and not the field it is about.
+        assert_eq!(doc.lanes[0].1[0].visualizer, 12);
+        let refused = parse(line("300").as_bytes(), &dir).expect_err("300 is not a look");
+        assert!(
+            refused
+                .to_string()
+                .contains("is not a set of visualizer flags"),
+            "{refused}"
         );
     }
 }

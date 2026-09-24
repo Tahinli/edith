@@ -116,6 +116,11 @@ pub(crate) struct SweepParts(
     pub(crate) usize,
     pub(crate) Vec<(LaneKind, Vec<Clip>)>,
     pub(crate) Vec<Vec<SubClip>>,
+    /// The palette, which the history holds beside the lanes and an undo
+    /// therefore restores ([`Project::undo`]). Left out of this shape, a
+    /// round-trip check passed with the palette restore deleted outright.
+    pub(crate) Vec<SubtitleTrack>,
+    pub(crate) ProjectSettings,
 );
 
 impl Speed {
@@ -881,10 +886,74 @@ pub type Parts = (
 
 /// How many undo steps a project keeps. One gesture is one step, so 100 is past
 /// any chain a person walks back by hand, and the oldest step is dropped rather
-/// than the history growing without end: a snapshot is the whole lane list, so
-/// on a 1394-clip jumpcut timeline this is a bounded ~10 MB instead of a leak
-/// that grows for as long as the session lasts.
+/// than the history growing without end: a snapshot is the whole lane list plus
+/// the palette and the project's own settings, so on a 1394-clip jumpcut
+/// timeline this is a bounded ~10 MB instead of a leak that grows for as long
+/// as the session lasts.
 const HISTORY_CAP: usize = 100;
+
+/// The project's own settings, as one value: the header a `.edith` file carries
+/// beside the edit list, and what every undo step restores beside the lanes.
+/// None of it is the media's own -- the scaffolding file's picture and rate
+/// ([`PlaybackSession::native`]) stay on the session and are never rolled back.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ProjectSettings {
+    /// The canvas every clip is composed onto: the project resolution, which a
+    /// clip of another size is placed onto rather than refused for.
+    pub(crate) resolution: (u32, u32),
+    /// The rate the timeline is cut at, which every clip and source is
+    /// conformed to ([`Project::retime`]).
+    pub(crate) frame_rate: f64,
+    /// Which encoder an export of this project opens its picture on
+    /// ([`crate::export::EncoderSeat`]).
+    pub(crate) encoder_seat: crate::export::EncoderSeat,
+    /// The rate the mix was picked to run at, or `None` for the one the first
+    /// audio source derives.
+    pub(crate) sample_rate: Option<u32>,
+    /// Whether the picture is decoded from the stand-ins ([`crate::proxy`]).
+    pub(crate) proxies: bool,
+    /// Whether a source that wants a stand-in gets one made for it as it
+    /// arrives ([`crate::proxy::wanted`]).
+    pub(crate) auto_proxies: bool,
+    /// Which HDR-to-SDR rendition the picture is watched and exported in.
+    pub(crate) tone: crate::tonemap::Preset,
+    /// The master limiter every lane's sound is summed through.
+    pub(crate) limiter: Limiter,
+}
+
+impl ProjectSettings {
+    /// What a project built by hand carries before its constructor names the
+    /// canvas: the defaults every fresh open has -- nobody has picked stand-ins
+    /// (the films themselves are cut), an encoder or a mix rate, and the
+    /// rendition and limiter are the reference ones. Every door that builds a
+    /// session chains [`Project::with_canvas`] straight after, so the zero
+    /// canvas here is never a project anybody plays from.
+    fn placeholder() -> Self {
+        Self {
+            resolution: (0, 0),
+            frame_rate: 0.0,
+            encoder_seat: crate::export::EncoderSeat::default(),
+            sample_rate: None,
+            proxies: false,
+            auto_proxies: true,
+            tone: crate::tonemap::Preset::default(),
+            limiter: Limiter::default(),
+        }
+    }
+}
+
+/// One undo step: the lanes, the subtitle palette and the project's own
+/// settings exactly as they were before the edit that pushed it. Whole values
+/// rather than the lane list alone, so an undo (or a redo) restores all three
+/// together and no half of one edit can come back without the others -- which
+/// is what lets a subtitle removal reindex every placement and still undo: the
+/// restored palette names the very tracks the restored placements index.
+#[derive(Clone, Debug)]
+struct Snapshot {
+    lanes: Vec<LaneData>,
+    subtitles: Vec<SubtitleTrack>,
+    settings: ProjectSettings,
+}
 
 /// One gap a close-all sweep left open, with the frame it still starts on and
 /// the same refusal a single [`Project::gap_take_scope`] close would have said.
@@ -917,32 +986,31 @@ pub struct Project {
     /// The same, for [`Clip::transform`].
     transform: Vec<TransformParams>,
     /// Snapshots pushed *before* each successful edit; `undo` pops one. The
-    /// whole lane list, so adding a lane undoes as well. Bounded by
-    /// [`HISTORY_CAP`]: at the cap the oldest step goes.
-    history: Vec<Vec<LaneData>>,
-    /// Lane lists `undo` has stepped past; `redo` pops one. Cleared by
+    /// whole lane list, the subtitle palette and the project's own settings,
+    /// so adding a lane undoes as well and so does picking a resolution. Bounded
+    /// by [`HISTORY_CAP`]: at the cap the oldest step goes.
+    history: Vec<Snapshot>,
+    /// Snapshots `undo` has stepped past; `redo` pops one. Cleared by
     /// [`Project::snapshot`], since a fresh edit invalidates whatever branch
     /// the undone steps came from. Not saved to `.edith`, matching `history`.
-    redo: Vec<Vec<LaneData>>,
+    redo: Vec<Snapshot>,
     /// Never rolled back by an undo: an id retired by an undone split must not
     /// come back and group two clips that were never together.
     next_link: u32,
     /// The subtitle tracks this timeline shows, in the order they were added.
-    /// Not in the lane list and not in the history snapshots, for the reason
-    /// the limiter is not: which subtitles a project carries is a setting on
-    /// it, and it is saved as a *reference* to the file the cues came out of
-    /// ([`crate::subtitle`]).
+    /// Saved as a *reference* to the file the cues came out of
+    /// ([`crate::subtitle`]). In the history snapshots since the widened
+    /// [`Snapshot`]: a placement names a track by index into this list, so a
+    /// removal that reindexes the placements can only undo together with the
+    /// palette it removed the row from.
     subtitles: Vec<SubtitleTrack>,
-    /// The master limiter every lane's sound is summed *through*
-    /// ([`Project::limiter`]). Off by default, and not in the lane list, which
-    /// is what the history snapshots hold: it is a setting on the mix, like the
-    /// project's resolution is a setting on the picture, and neither is an undo
-    /// step.
-    limiter: Limiter,
-    /// Which HDR-to-SDR rendition every clip on an HDR curve is shown and
-    /// exported in ([`crate::tonemap::Preset`]). A setting on the picture, like
-    /// the resolution, and not in the lane snapshots for the same reason.
-    tone: crate::tonemap::Preset,
+    /// The project's own settings ([`ProjectSettings`]) -- the canvas, the
+    /// rate, the proxies switches, the encoder seat, the mix rate, the
+    /// rendition and the limiter. In every snapshot, so each of them undoes
+    /// like a lane edit: they are the header of the project's own `.edith`
+    /// file, not this machine's, and a pick a ctrl+z could not take back
+    /// would be the one setting with no way out.
+    settings: ProjectSettings,
 }
 
 impl Project {
@@ -980,8 +1048,7 @@ impl Project {
             redo: Vec::new(),
             next_link: 1,
             subtitles: Vec::new(),
-            limiter: Limiter::default(),
-            tone: crate::tonemap::Preset::default(),
+            settings: ProjectSettings::placeholder(),
         }
     }
 
@@ -1124,8 +1191,7 @@ impl Project {
             redo: Vec::new(),
             next_link,
             subtitles: Vec::new(),
-            limiter: Limiter::default(),
-            tone: crate::tonemap::Preset::default(),
+            settings: ProjectSettings::placeholder(),
         })
     }
 
@@ -1400,7 +1466,8 @@ impl Project {
     /// different file. [`PlaybackSession::remove_source`] hands back the index
     /// that went for exactly that.
     ///
-    /// corner-cut: this retires the undo stack. `history` holds lanes alone, so a
+    /// corner-cut: this retires the undo stack. `history` holds the lanes, the
+    /// subtitle palette and the project's own settings -- no source list -- so a
     /// snapshot older than the removal can name the very source being removed
     /// (delete a file's clips, then remove the file) and restoring it would
     /// point a clip at an entry that is gone. The upgrade path is snapshotting
@@ -1679,14 +1746,44 @@ impl Project {
                 data.gain_db = db.clamp(MIN_GAIN_DB, MAX_GAIN_DB);
             }
         }
-        self.limiter = limiter.with_ceiling(limiter.ceiling_db);
+        self.settings.limiter = limiter.with_ceiling(limiter.ceiling_db);
         self
     }
 
     /// The HDR rendition a *load* puts back -- the same door
     /// [`with_mix`](Project::with_mix) is, and no undo step for the same reason.
     pub fn with_tone(mut self, preset: crate::tonemap::Preset) -> Self {
-        self.tone = preset;
+        self.settings.tone = preset;
+        self
+    }
+
+    /// The canvas and rate a *load* or a fresh open names -- the project
+    /// resolution and the rate every clip is counted in. The same door
+    /// [`with_mix`](Project::with_mix) is, and no undo step for the same
+    /// reason: a project that arrives one undo away from a state it was never
+    /// in is a project whose first ctrl+z is a surprise.
+    pub fn with_canvas(mut self, width: u32, height: u32, frame_rate: f64) -> Self {
+        self.settings.resolution = (width, height);
+        self.settings.frame_rate = frame_rate;
+        self
+    }
+
+    /// The saved switches a *load* puts back: whether the picture is cut on
+    /// the stand-ins, whether new ones are made on arrival, which encoder an
+    /// export opens, and the rate the mix was picked to run at. The load half
+    /// of [`set_proxies`](Project::set_proxies) and its siblings, and no undo
+    /// step for [`with_mix`](Project::with_mix)'s reason.
+    pub fn with_switches(
+        mut self,
+        proxies: bool,
+        auto_proxies: bool,
+        encoder_seat: crate::export::EncoderSeat,
+        sample_rate: Option<u32>,
+    ) -> Self {
+        self.settings.proxies = proxies;
+        self.settings.auto_proxies = auto_proxies;
+        self.settings.encoder_seat = encoder_seat;
+        self.settings.sample_rate = sample_rate;
         self
     }
 
@@ -1694,21 +1791,18 @@ impl Project {
     /// project setting, not a clip's: one picture, one look
     /// ([`crate::tonemap::Preset`]).
     pub fn tone(&self) -> crate::tonemap::Preset {
-        self.tone
+        self.settings.tone
     }
 
     /// Sets it. `false` for the one already in force, which is what keeps a
-    /// re-pick of the current rendition from costing a reseek.
-    ///
-    /// corner-cut: not an undo step, for the reason the limiter and the project
-    /// resolution are not -- it is not in the lane list the history snapshots.
-    /// Upgrade path is the same one: a history entry holding the project's own
-    /// settings beside the lanes.
+    /// re-pick of the current rendition from costing a reseek. One undo step
+    /// like every other project-setting pick.
     pub fn set_tone(&mut self, preset: crate::tonemap::Preset) -> bool {
-        if self.tone == preset {
+        if self.settings.tone == preset {
             return false;
         }
-        self.tone = preset;
+        self.snapshot();
+        self.settings.tone = preset;
         true
     }
 
@@ -1763,16 +1857,14 @@ impl Project {
     /// [`remove_source`](Project::remove_source) refuses the same way for the
     /// same silent corruption.
     ///
-    /// corner-cut: not an undo step, for the reason the limiter is not -- the
-    /// history snapshots hold the lane list and subtitles are not on it
-    /// ([`Project::subtitles`]). The inverse is putting the file's tracks back
-    /// on -- [`crate::PlaybackSession::import_subtitles`], the panel's own
-    /// door, which reads the subtitles of a file and nothing else -- and not a
-    /// ctrl+z; the upgrade path is the same one the limiter has: a history
-    /// entry holding the project's own settings beside the lanes. The history
-    /// is *cleared* rather than kept, as a source removal clears it: the
-    /// snapshots hold the indexes as they were before the reindex, so an undo
-    /// into one would put every placement past `idx` on the wrong track.
+    /// One undo step, and the reindex with it: every placement names a track
+    /// by index into the palette ([`crate::subtitle`]), so a removal that
+    /// renumbers them can only come back together with the palette it took
+    /// the row from -- which is what the history entry holds, beside the
+    /// lanes it also carries ([`Snapshot`]). The inverse, for a caller that
+    /// wants the file's tracks back, is [`crate::PlaybackSession::import_subtitles`]
+    /// -- the panel's own door, which reads the subtitles of a file and
+    /// nothing else.
     pub fn remove_subtitles(&mut self, idx: usize) -> crate::Result<()> {
         if idx >= self.subtitles.len() {
             return Err(format!("there is no subtitle track {idx} to remove").into());
@@ -1796,13 +1888,13 @@ impl Project {
             )
             .into());
         }
+        self.snapshot();
         self.subtitles.remove(idx);
         for s in self.lanes.iter_mut().flat_map(|l| &mut l.subs) {
             if s.track > idx {
                 s.track -= 1;
             }
         }
-        self.history.clear();
         Ok(())
     }
 
@@ -2252,24 +2344,33 @@ impl Project {
     /// The master limiter the mix is summed through. A project setting, not a
     /// clip's and not a lane's: there is one mix.
     pub fn limiter(&self) -> Limiter {
-        self.limiter
+        self.settings.limiter
     }
 
     /// Sets it, with the ceiling clamped to what [`Limiter`] allows. `false`
-    /// for a setting already in force.
-    ///
-    /// corner-cut: not an undo step, for the reason the project resolution is not
-    /// one ([`crate::PlaybackSession::set_resolution`]) -- it is not in the
-    /// lane list the history snapshots. Upgrade path is a history entry that
-    /// holds the mix settings beside the lanes.
+    /// for a setting already in force. One undo step like every other
+    /// project-setting pick.
     pub fn set_limiter(&mut self, limiter: Limiter) -> bool {
         let limiter = limiter.with_ceiling(limiter.ceiling_db);
-        if self.limiter == limiter {
+        if self.settings.limiter == limiter {
             return false;
         }
-        self.limiter = limiter;
+        self.snapshot();
+        self.settings.limiter = limiter;
         true
     }
+
+
+
+
+
+
+
+
+
+
+
+
 
     /// What the clip at `idx` of `lane` plays through, or `None` for one that
     /// plays flat (and for an index that is not there) -- what a feeder and an
@@ -4948,6 +5049,36 @@ impl Project {
         self.redo.len()
     }
 
+    /// The project's own settings as they stand ([`ProjectSettings`]) -- what an
+    /// undo entry holds beside the lanes, and what the session reads back after
+    /// one is restored ([`crate::PlaybackSession::undo`]).
+    pub(crate) fn settings_now(&self) -> ProjectSettings {
+        self.settings.clone()
+    }
+
+    /// One undo step for a change to the project's own settings: `from` is the
+    /// state the change is from and `now` the one it leaves behind. The entry
+    /// pushed holds `from`, while the copy kept here is `now` -- so the next
+    /// lane edit's own entry carries the canvas and the rate really in force
+    /// rather than the ones before the pick. The lanes the entry holds are the
+    /// ones in place at the call: a settings door leaves them alone and may
+    /// take this step after its change, and one that moves them
+    /// ([`Project::retime`] on a rate change) takes it before, with `now` equal
+    /// to `from`, mirroring the new state afterwards
+    /// ([`Project::mirror_settings`]).
+    pub(crate) fn push_settings_step(&mut self, from: ProjectSettings, now: ProjectSettings) {
+        self.settings = from;
+        self.snapshot();
+        self.settings = now;
+    }
+
+    /// Keeps `now` as this project's copy of its own settings, without a step:
+    /// the second half of a settings door that had to take its step before the
+    /// change.
+    pub(crate) fn mirror_settings(&mut self, now: ProjectSettings) {
+        self.settings = now;
+    }
+
     /// Every part of the project that an edit can change, as comparable
     /// values: what the sweep's undo round-trip asks "byte identical?" of.
     #[cfg(test)]
@@ -4956,31 +5087,45 @@ impl Project {
             self.sources.len(),
             self.lanes.iter().map(|l| (l.kind, l.clips.clone())).collect(),
             self.lanes.iter().map(|l| l.subs.clone()).collect(),
+            self.subtitles.clone(),
+            self.settings.clone(),
         )
     }
 
-    /// Restore every lane from before the last successful edit -- the clips and
-    /// the lane list both. `false` when there is nothing left to undo. Pushes
-    /// the lanes just left onto the redo stack, so [`Project::redo`] can walk
-    /// forward again.
+    /// Restore everything from before the last successful edit -- the lanes,
+    /// the subtitle palette and the project's own settings. `false` when there
+    /// is nothing left to undo. Pushes what was just left onto the redo stack,
+    /// so [`Project::redo`] can walk forward again.
     pub fn undo(&mut self) -> bool {
         match self.history.pop() {
             Some(prev) => {
-                self.redo.push(std::mem::replace(&mut self.lanes, prev));
+                self.redo.push(Snapshot {
+                    lanes: std::mem::replace(&mut self.lanes, prev.lanes),
+                    subtitles: self.subtitles.clone(),
+                    settings: self.settings.clone(),
+                });
+                self.subtitles = prev.subtitles;
+                self.settings = prev.settings;
                 true
             }
             None => false,
         }
     }
 
-    /// Restore every lane from before the last [`Project::undo`] -- the
+    /// Restore everything from before the last [`Project::undo`] -- the
     /// mirror of `undo`, walking the redo stack it fills. `false` when there
     /// is nothing left to redo, which is also true after any fresh edit: a
     /// new [`Project::snapshot`] clears the branch `undo` left behind.
     pub fn redo(&mut self) -> bool {
         match self.redo.pop() {
             Some(next) => {
-                self.history.push(std::mem::replace(&mut self.lanes, next));
+                self.history.push(Snapshot {
+                    lanes: std::mem::replace(&mut self.lanes, next.lanes),
+                    subtitles: self.subtitles.clone(),
+                    settings: self.settings.clone(),
+                });
+                self.subtitles = next.subtitles;
+                self.settings = next.settings;
                 true
             }
             None => false,
@@ -5002,8 +5147,7 @@ impl Project {
             redo: Vec::new(),
             next_link: self.next_link,
             subtitles: self.subtitles.clone(),
-            limiter: self.limiter,
-            tone: self.tone,
+            settings: self.settings.clone(),
         }
     }
 
@@ -5216,7 +5360,11 @@ impl Project {
         if self.history.len() == HISTORY_CAP {
             self.history.remove(0);
         }
-        self.history.push(self.lanes.clone());
+        self.history.push(Snapshot {
+            lanes: self.lanes.clone(),
+            subtitles: self.subtitles.clone(),
+            settings: self.settings.clone(),
+        });
         self.redo.clear();
     }
 
@@ -10405,4 +10553,42 @@ mod tests {
         .expect("valid parts");
         assert_eq!(p.audio_segments_from(0, FPS), vec![vec![(None, 0.0, 1.0)]]);
     }
+
+/// D4: removing a subtitle column used to clear the whole undo history,
+/// because a placement names its track by index into the palette and the
+/// reindex left every later entry naming the wrong one. The entry holds the
+/// palette beside the lanes now, so the reindex undoes with it.
+#[test]
+fn removing_a_subtitle_column_undoes_with_its_reindex() {
+    let track = |label: &str| SubtitleTrack {
+        path: FILE.into(),
+        track: None,
+        language: "eng".into(),
+        name: String::new(),
+        label: label.into(),
+        cues: Vec::new(),
+        bitmap: false,
+        refused: None,
+    };
+    let mut p = Project::single(FILE, 300)
+        .with_subtitles(vec![track("one"), track("two"), track("three")]);
+    assert_eq!(p.subtitles().len(), 3);
+    let before = p.parts();
+    let palette = p.subtitles().to_vec();
+    // Column 0 goes, which renumbers the two behind it.
+    p.remove_subtitles(0).expect("a column with nothing on it");
+    assert_eq!(p.subtitles().len(), 2);
+    assert_eq!(p.subtitles()[0].label, "two");
+    assert!(p.undo(), "the removal is a step like any other cut");
+    // The palette itself, and not only what `parts` happens to compare: this
+    // is the assertion that cannot go vacuous if the restore below it ever
+    // leaves a field of it behind.
+    assert_eq!(p.subtitles(), palette.as_slice(), "the palette itself, back");
+    assert_eq!(p.parts(), before, "the palette and the lanes, both back");
+    assert!(p.redo(), "and forward again");
+    assert_eq!(p.subtitles().len(), 2, "the column goes again");
+    assert_eq!(p.subtitles()[0].label, "two");
+    assert_ne!(p.subtitles(), palette.as_slice(), "and it is not back");
+}
+
 }

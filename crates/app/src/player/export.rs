@@ -2,6 +2,7 @@
 //! two of them decide.
 
 use crate::*;
+use std::time::Instant;
 
 impl Player {
     /// What [`timeline_math::lane_refuses`] asks to decide a video lane's
@@ -231,7 +232,7 @@ impl Player {
             }
             starting.push(path);
         }
-        for key in unseen_sources(session.sources(), &self.waves) {
+        for key in unseen_sources(session.sources(), &self.waves, Instant::now()) {
             self.waves.insert(key.clone(), Wave::Loading);
             let decoded = cx.background_executor().spawn({
                 let (path, stream) = key.clone();
@@ -254,7 +255,11 @@ impl Player {
                             // A file whose sound we could not read is not a
                             // silent one, and a lane that drew it as silent is
                             // how a broken decode passes for a design choice.
-                            Err(_) => Wave::Failed,
+                            // Stamped, and not an answer: a repaint past
+                            // [`WAVE_RETRY`] asks again, so a failure whose
+                            // cause went away (a file still being copied when
+                            // it arrived) draws its envelope without a reopen.
+                            Err(_) => Wave::Failed(Instant::now()),
                         },
                     );
                     cx.notify();
