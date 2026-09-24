@@ -729,6 +729,11 @@ impl PlaybackSession {
             // the default description is what it is drawn in.
             color: ColorDescription::default(),
             rotation: Rotation::None,
+            // No container said anything about these: the canvas this engine drew
+            // itself is square pixels at the size it was drawn at.
+            coded_width: width,
+            coded_height: height,
+            pixel_aspect: crate::demux::PixelAspect::SQUARE,
         };
         let (audio, audio_disabled) = open_audio(path, stream);
         // Through `from_parts` rather than `Project::single`, which is the
@@ -827,6 +832,11 @@ impl PlaybackSession {
             codec: Codec::H264,
             color: ColorDescription::default(),
             rotation: Rotation::None,
+            // No container said anything about these: the picture this engine
+            // decoded itself is square pixels at the size it was decoded at.
+            coded_width: still.width,
+            coded_height: still.height,
+            pixel_aspect: crate::demux::PixelAspect::SQUARE,
         };
         let clip = Clip {
             fade_in: 0,
@@ -991,6 +1001,11 @@ impl PlaybackSession {
                     codec: Codec::H264,
                     color: ColorDescription::default(),
                     rotation: Rotation::None,
+            // No container said anything about these: the canvas this engine drew
+            // itself is square pixels at the size it was drawn at.
+            coded_width: width,
+            coded_height: height,
+            pixel_aspect: crate::demux::PixelAspect::SQUARE,
                 };
                 (meta, DecodeSession::open_black(width, height, 1))
             }
@@ -1009,6 +1024,11 @@ impl PlaybackSession {
                     codec: Codec::H264,
                     color: ColorDescription::default(),
                     rotation: Rotation::None,
+                    // No container said anything about these: the picture this
+                    // engine decoded itself is square pixels at its own size.
+                    coded_width: still.width,
+                    coded_height: still.height,
+                    pixel_aspect: crate::demux::PixelAspect::SQUARE,
                 };
                 let stream = DecodeSession::open_still(
                     &first.path,
@@ -1051,6 +1071,11 @@ impl PlaybackSession {
                         codec: Codec::H264,
                         color: ColorDescription::default(),
                         rotation: Rotation::None,
+            // No container said anything about these: the canvas this engine drew
+            // itself is square pixels at the size it was drawn at.
+            coded_width: width,
+            coded_height: height,
+            pixel_aspect: crate::demux::PixelAspect::SQUARE,
                     };
                     (meta, DecodeSession::open_black(width, height, 1))
                 }

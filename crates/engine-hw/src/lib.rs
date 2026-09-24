@@ -403,6 +403,10 @@ impl Session {
                 height: meta.height,
                 frame_rate: meta.frame_rate,
                 frame_count: meta.frame_count,
+                coded_width: meta.coded_width,
+                coded_height: meta.coded_height,
+                pixel_aspect_h: meta.pixel_aspect.h,
+                pixel_aspect_v: meta.pixel_aspect.v,
             },
             ready: VecDeque::new(),
             pending: Vec::new(),
@@ -935,6 +939,10 @@ impl VpxSession {
                 height: meta.height,
                 frame_rate: meta.frame_rate,
                 frame_count: meta.frame_count,
+                coded_width: meta.coded_width,
+                coded_height: meta.coded_height,
+                pixel_aspect_h: meta.pixel_aspect.h,
+                pixel_aspect_v: meta.pixel_aspect.v,
             },
             flushed: false,
             skip: 0,
@@ -1110,6 +1118,10 @@ pub unsafe extern "C" fn vh_meta(session: *mut c_void, out: *mut VhMeta) -> i32 
             (*out).height = meta.height;
             (*out).frame_rate = meta.frame_rate;
             (*out).frame_count = meta.frame_count;
+            (*out).coded_width = meta.coded_width;
+            (*out).coded_height = meta.coded_height;
+            (*out).pixel_aspect_h = meta.pixel_aspect_h;
+            (*out).pixel_aspect_v = meta.pixel_aspect_v;
         }
         0
     }))

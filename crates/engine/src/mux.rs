@@ -949,6 +949,17 @@ const DEFAULT_DURATION: u32 = 0x23E383;
 const VIDEO: u32 = 0xE0;
 const PIXEL_WIDTH: u32 = 0xB0;
 const PIXEL_HEIGHT: u32 = 0xBA;
+// How the copied picture is drawn: the same elements [`crate::demux`] reads
+// back. `DisplayUnit` 4 spells the pair as the sample aspect ratio itself and
+// 3 as a display aspect ratio; this writer says SAR (unit 4) because that is
+// the ratio it was handed ([`crate::demux::PixelAspect`]) and the one a
+// round-trip through this engine's own reader reproduces exactly. Square --
+// the default these elements are optional for -- writes none of them, which is
+// what keeps every existing copy's header byte-identical.
+const DISPLAY_WIDTH: u32 = 0x54B0;
+const DISPLAY_HEIGHT: u32 = 0x54BA;
+const DISPLAY_UNIT: u32 = 0x54B2;
+const DISPLAY_UNIT_SAR: u64 = 4;
 // `Colour` and the four children this writes, all inside `Video`. Byte-verified
 // against what `demux` reads back and what ffprobe reports: the spec tables that
 // list Range as 0x55B3 are describing ChromaSubsamplingHorz.
@@ -1044,6 +1055,12 @@ pub struct CopyParams<'a> {
     /// grading display. Upgrade path is a `Colour` element written from that
     /// same struct.
     pub colour: ColorDescription,
+    /// The ratio one of the copied samples' pixels is drawn at, written as the
+    /// track's `Display*` elements: the aspect is metadata about the samples,
+    /// which are the source's own, so it travels instead of being baked in --
+    /// ffmpeg's own copy behaviour. [`PixelAspect::SQUARE`] writes nothing,
+    /// which is every square-pixel file's header exactly as it was.
+    pub pixel_aspect: crate::demux::PixelAspect,
 }
 
 /// The soft subtitle track a file carries beside the picture: text, timed, still
@@ -1168,6 +1185,7 @@ impl MkvMuxer {
             b"V_AV1",
             &av1c,
             ColorDescription::output(video.height),
+            crate::demux::PixelAspect::SQUARE,
             audio,
             subs,
         )
@@ -1197,6 +1215,7 @@ impl MkvMuxer {
             b"V_MPEGH/ISO/HEVC",
             video.hvcc,
             ColorDescription::output(video.height),
+            crate::demux::PixelAspect::SQUARE,
             audio,
             subs,
         )
@@ -1229,6 +1248,7 @@ impl MkvMuxer {
             video.codec_id,
             video.codec_private,
             video.colour,
+            video.pixel_aspect,
             audio,
             subs,
         )
@@ -1243,6 +1263,7 @@ impl MkvMuxer {
         codec_id: &[u8],
         codec_private: &[u8],
         colour: ColorDescription,
+        pixel_aspect: crate::demux::PixelAspect,
         audio: Option<(&AudioParams, Vec<crate::AacPacket>)>,
         subs: Vec<SubParams>,
     ) -> crate::Result<Self> {
@@ -1308,6 +1329,15 @@ impl MkvMuxer {
         let mut dims = Vec::new();
         uint(&mut dims, PIXEL_WIDTH, u64::from(width));
         uint(&mut dims, PIXEL_HEIGHT, u64::from(height));
+        // The copied samples' aspect, where it is not square: the same three
+        // elements this engine's own reader asks a Matroska track for, as a
+        // sample aspect ratio (unit 4). A square copy writes none of them --
+        // exactly the header every square-pixel copy wrote before this.
+        if !pixel_aspect.is_square() {
+            uint(&mut dims, DISPLAY_WIDTH, u64::from(pixel_aspect.h));
+            uint(&mut dims, DISPLAY_HEIGHT, u64::from(pixel_aspect.v));
+            uint(&mut dims, DISPLAY_UNIT, DISPLAY_UNIT_SAR);
+        }
         // What the samples in those pixels mean. Written rather than left to a
         // reader's own 720-line guess -- the guess is right for an encoded file
         // (the export remaps every clip into exactly that space) but a remuxer

@@ -769,5 +769,36 @@ for ext in mp4 mkv; do
 done
 rm -f assets/.rotation_tall_src.mp4
 
+# The sample aspect ratio: `test_anamorphic.*` are one 1440x1080 source whose
+# pixels are drawn 4/3 wide -- the classic anamorphic 16:9 frame stored on a
+# 4:3 raster (`-vf setsar=4/3`), so the displayed picture is 1920x1080 and the
+# stored one never is. This is how a DVD rip and a Blu-ray remux say "widen
+# me": the pixels stay where the encoder put them and the container carries
+# the ratio.
+#
+# What each muxer actually writes, byte-verified by walking the output rather
+# than taken off a table: the Matroska muxer writes `DisplayWidth` 16,
+# `DisplayHeight` 9 and `DisplayUnit` 3 -- a *display aspect ratio* pair, not
+# a sample aspect ratio, and 4:3 SAR over 1440x1080 is exactly 16:9 DAR -- and
+# a square-pixel file gets no `Display*` element at all. The mp4 muxer writes
+# a `pasp` box (hSpacing 4, vSpacing 3) inside the `avc1` sample entry, and
+# 1/1 for a square one. `tests/anamorphic.rs` reads both spellings through the
+# engine and asserts the same displayed shape off either.
+ffmpeg -y -f lavfi -i "testsrc2=size=1440x1080:rate=30:duration=1" \
+    -vf "setsar=4/3" -c:v libx264 -profile:v baseline -pix_fmt yuv420p \
+    assets/test_anamorphic.mp4
+ffmpeg -y -f lavfi -i "testsrc2=size=1440x1080:rate=30:duration=1" \
+    -vf "setsar=4/3" -c:v libx264 -profile:v baseline -pix_fmt yuv420p \
+    assets/test_anamorphic.mkv
+
+# ...and the anamorphic HEVC Matroska twin, for the copy path: `tests/`'s
+# copy door only copies HEVC or AV1 Matroska (`tests/video_copy.rs`), so an
+# anamorphic *copy* needs an anamorphic source in a codec that door takes.
+# Same source as above through libx265; the SAR rides the stream.
+ffmpeg -y -f lavfi -i "testsrc2=size=1440x1080:rate=30:duration=2" \
+    -vf "setsar=4/3" -c:v libx265 -pix_fmt yuv420p \
+    -x265-params "log-level=error:keyint=30:min-keyint=30" \
+    assets/test_anamorphic_hevc.mkv
+
 
 echo "fixtures written to assets/"
