@@ -278,6 +278,11 @@ fn exports_at_the_project_resolution_with_the_watched_geometry() {
         codec: engine::Codec::H264,
         color: Default::default(),
         rotation: Rotation::None,
+        // Square pixels, coded where they are declared: a meta no container
+        // wrote, so nothing was read to disagree with it.
+        coded_width: 960,
+        coded_height: 720,
+        pixel_aspect: engine::demux::PixelAspect::SQUARE,
     };
     let out = out_path("mixed");
     let handle = engine::export::start(project, meta, &out, &ExportSettings::default(), None);

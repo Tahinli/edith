@@ -32,8 +32,8 @@
 //! cancel a file export has ([`Job`]).
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
 use crate::demux::{Codec, Demuxer, NoVideoTrack, VideoMeta};
@@ -127,7 +127,10 @@ pub fn path_for(source: &Path) -> Option<PathBuf> {
     let meta = std::fs::metadata(source).ok()?;
     let mtime = match meta.modified().ok()?.duration_since(UNIX_EPOCH) {
         Ok(d) => (d.as_secs() as i128, d.subsec_nanos()),
-        Err(e) => (-(e.duration().as_secs() as i128), e.duration().subsec_nanos()),
+        Err(e) => (
+            -(e.duration().as_secs() as i128),
+            e.duration().subsec_nanos(),
+        ),
     };
     let canonical = std::fs::canonicalize(source).unwrap_or_else(|_| source.to_path_buf());
     let mut bytes = canonical.as_os_str().as_encoded_bytes().to_vec();
@@ -542,7 +545,10 @@ fn started(
         // it: sweeping to the bare cap left the finished ones filling it and
         // then [`AT_ONCE`] encodes adding gigabytes on top, which is a cap that
         // is over by a whole film's worth by construction ([`reserve`]).
-        sweep(dir, CACHE_CAP.saturating_sub(reserve(width, height, meta.frame_count)));
+        sweep(
+            dir,
+            CACHE_CAP.saturating_sub(reserve(width, height, meta.frame_count)),
+        );
     }
     // What a killed editor left behind: the export worker deletes its own part
     // file when it is cancelled or fails, but nothing can delete it for a
@@ -579,8 +585,7 @@ fn started(
         Vec::new(),
         Vec::new(),
     )?;
-    let bitrate =
-        (f64::from(width) * f64::from(height) * meta.frame_rate * BITS_PER_PIXEL) as u64;
+    let bitrate = (f64::from(width) * f64::from(height) * meta.frame_rate * BITS_PER_PIXEL) as u64;
     let handle = crate::export::start(
         project,
         VideoMeta {
@@ -632,6 +637,11 @@ mod tests {
             codec,
             color: ColorDescription::default(),
             rotation: Rotation::None,
+            // Square pixels, coded where they are declared: a meta no
+            // container wrote, so nothing was read to disagree with it.
+            coded_width: width,
+            coded_height: height,
+            pixel_aspect: crate::demux::PixelAspect::SQUARE,
         }
     }
 
@@ -714,10 +724,17 @@ mod tests {
             // order of their own, and the order is what is under test. `atime`
             // is what `sweep` reads and `set_times` is the one door to it
             // without a dependency.
-            let file = std::fs::File::options().write(true).open(&path).expect("open");
+            let file = std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .expect("open");
             let when = std::time::SystemTime::now() - std::time::Duration::from_secs(ago);
-            file.set_times(std::fs::FileTimes::new().set_accessed(when).set_modified(when))
-                .expect("stamp");
+            file.set_times(
+                std::fs::FileTimes::new()
+                    .set_accessed(when)
+                    .set_modified(when),
+            )
+            .expect("stamp");
             path
         };
         let old = write("old.mp4", 400, 300);
@@ -732,7 +749,10 @@ mod tests {
         assert!(!old.exists(), "the oldest stand-in survived the sweep");
         assert!(!middle.exists(), "the next oldest survived it");
         assert!(fresh.exists(), "the freshest was taken");
-        assert!(part.exists(), "a half-written proxy was deleted under its writer");
+        assert!(
+            part.exists(),
+            "a half-written proxy was deleted under its writer"
+        );
         assert_eq!(left, 800, "what is left is the fresh one and the part file");
 
         // Under the cap, nothing is touched at all.
@@ -897,7 +917,10 @@ mod tests {
         // is a stand-in still on the disk, and it is answered as one.
         let answer = delete(&file);
         assert!(answer.is_err(), "a refused unlink reported as a delete");
-        assert!(proxy.is_dir(), "and what could not be deleted is still there");
+        assert!(
+            proxy.is_dir(),
+            "and what could not be deleted is still there"
+        );
         std::fs::remove_dir(&proxy).expect("clean up");
         // ...against the honest no-op, which *is* an off switch: nothing there.
         assert_eq!(delete(&file).ok(), Some(false), "nothing to take");
@@ -952,7 +975,9 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(true));
 
         let answer = generate_if_wanted(&file, &cancel);
-        let err = answer.err().expect("a pre-cancelled ask must not hand back a job");
+        let err = answer
+            .err()
+            .expect("a pre-cancelled ask must not hand back a job");
         assert!(
             crate::demux::is_cancelled(&err),
             "not the cancelled answer: {err}"

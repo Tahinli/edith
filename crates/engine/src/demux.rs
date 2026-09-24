@@ -357,13 +357,74 @@ impl UnsupportedRotation {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PixelAspect {
+    /// Horizontal sample size: the width a coded pixel is drawn at, relative to
+    /// [`PixelAspect::v`]. 1 and 1 together are square pixels, which is every
+    /// file that states no aspect anywhere in its container.
+    pub h: u32,
+    /// The vertical half of the same ratio; zero means the container said
+    /// nothing usable and the pixels are square.
+    pub v: u32,
+}
+
+impl PixelAspect {
+    /// The square pixels everything before anamorphic sources was.
+    pub const SQUARE: Self = Self { h: 1, v: 1 };
+
+    /// Whether the displayed picture is the coded one, drawn one to one.
+    pub fn is_square(self) -> bool {
+        // An unstated ratio (0) and a stated 1:1 are the same pixels, and a
+        // degenerate one a crafted header claimed is square rather than a
+        // division by zero.
+        self.v == 0 || self.h == self.v
+    }
+
+    /// How many coded columns one displayed column is worth: the factor the
+    /// width is stretched by, exactly as swscale takes it. 1 for square.
+    ///
+    /// Rounded to the even grid 4:2:0 composes on, so a ratio that is not a
+    /// whole number of columns still lands on a picture the chroma planes
+    /// cover -- the same rounding swscale applies, and the same one that keeps
+    /// the stretch a whole-sample operation rather than a smear.
+    pub fn width_factor(self, coded_width: u32) -> u32 {
+        if self.is_square() {
+            return coded_width;
+        }
+        // (coded * h / v), rounded up to even: 1440 at 4:3 gives 1920 exactly,
+        // and a ratio that does not divide evenly is widened to the nearest
+        // even column count rather than shown cropped or squeezed.
+        let wide = u64::from(coded_width) * u64::from(self.h);
+        (((wide + u64::from(self.v) - 1) / u64::from(self.v)) as u32 | 1) & !1
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct VideoMeta {
     /// The displayed width: the coded one, swapped where the file's display
-    /// matrix is a 90- or 270-degree turn (see [`Rotation`]).
+    /// matrix is a 90- or 270-degree turn (see [`Rotation`]) *and* stretched
+    /// where the file's pixel aspect is not square (see [`PixelAspect`]) -- the
+    /// size a player draws the picture at, which is what a timeline is cut in.
+    /// The picture as stored is [`VideoMeta::coded_width`] by
+    /// [`VideoMeta::coded_height`].
     pub width: u32,
-    /// The displayed height; see [`VideoMeta::width`].
+    /// The displayed height; see [`VideoMeta::width`]. The aspect never touches
+    /// it: a non-square pixel stretches the width, always -- 4:3 SAR over
+    /// 1440x1080 displays 1920x1080, and the height is the coded one either way.
     pub height: u32,
+    /// The size the samples are stored at, before the display-matrix turn and
+    /// the pixel stretch: what a decoder hands back, what a copy carries, and
+    /// the shape every container header of a *copied* file has to declare. The
+    /// displayed pair above is derived; this one is read.
+    pub coded_width: u32,
+    /// The stored height; see [`VideoMeta::coded_width`].
+    pub coded_height: u32,
+    /// The sample aspect ratio the container states, square where it states
+    /// none. Metadata about the pixels, like [`VideoMeta::rotation`] is about
+    /// their orientation: the decode keeps the coded pixels and everything
+    /// downstream is told the ratio, which is what applies it exactly once --
+    /// at the conversion to the square-pixel raster.
+    pub pixel_aspect: PixelAspect,
     pub frame_rate: f64,
     pub frame_count: u32,
     pub codec: Codec,
@@ -856,13 +917,23 @@ impl Mp4Demuxer {
             None => Rotation::None,
         };
         let (coded_w, coded_h) = (u32::from(track.width()), u32::from(track.height()));
+        // The ratio one coded pixel is drawn at, off the sample entry's `pasp`
+        // box: absent for the square-pixel file, which is the common case.
+        let pixel_aspect = pasp_of(path, track_id);
+        // The aspect widens the *coded* frame, then the turn swaps that
+        // stretched pair the way it swaps the coded one (`pixel_aspect_of`'s
+        // twin comment in the Matroska door carries the measured proof). The
+        // SAR only ever widens a width, never a height.
         let (width, height) = match rotation.swaps_axes() {
-            true => (coded_h, coded_w),
-            false => (coded_w, coded_h),
+            true => (coded_h, pixel_aspect.width_factor(coded_w)),
+            false => (pixel_aspect.width_factor(coded_w), coded_h),
         };
         let meta = VideoMeta {
             width,
             height,
+            coded_width: coded_w,
+            coded_height: coded_h,
+            pixel_aspect,
             frame_rate: frame_rate(track),
             frame_count: 0,
             codec,
@@ -1313,17 +1384,27 @@ impl MkvDemuxer {
                 }
             }
         };
-        // The coded size, swapped where the turn is a quarter one: a portrait
-        // `.mkv` stores a landscape picture plus the turn, so the displayed
-        // shape is the coded one turned -- the same two numbers the mp4 door
-        // swaps, off the same kind of turn.
+        // The displayed shape, in the order the two facts compose: the aspect
+        // widens the *coded* frame (180x320 at SAR 4/3 is drawn 240x320 --
+        // ffprobe's own `display_aspect_ratio` of such a file, measured), then
+        // the quarter turn swaps that stretched pair the way it swaps the
+        // coded one. The other order is a different picture: 320x180 then
+        // widened by 4/3 lands at 426x180, and a pixel's drawn shape turns
+        // with the picture it belongs to. The SAR only ever widens a width,
+        // never a height; the displayed height is the coded one without a
+        // turn and the stretched coded width with one. The coded pair stays
+        // what the decoder hands back, and carries on to
+        // [`VideoMeta::coded_width`]/[`VideoMeta::coded_height`].
         let (width, height) = match video.rotation.swaps_axes() {
-            true => (video.height, video.width),
-            false => (video.width, video.height),
+            true => (video.height, video.pixel_aspect.width_factor(video.width)),
+            false => (video.pixel_aspect.width_factor(video.width), video.height),
         };
         let meta = VideoMeta {
             width,
             height,
+            coded_width: video.width,
+            coded_height: video.height,
+            pixel_aspect: video.pixel_aspect,
             frame_rate,
             frame_count: mkv.frames as u32,
             codec: video.codec,
@@ -2014,6 +2095,10 @@ struct MkvVideo {
     number: u64,
     width: u32,
     height: u32,
+    /// The sample aspect ratio the track's `Display*` elements state, square
+    /// where they state none ([`PixelAspect::SQUARE`]) -- the same reading
+    /// every Matroska reader makes of their absence.
+    pixel_aspect: PixelAspect,
     /// The quarter turn the track's `Projection` asks for;
     /// [`Rotation::None`] where it states none.
     rotation: Rotation,
@@ -2164,6 +2249,14 @@ const DEFAULT_DURATION: u32 = 0x23E383;
 const VIDEO: u32 = 0xE0;
 const PIXEL_WIDTH: u32 = 0xB0;
 const PIXEL_HEIGHT: u32 = 0xBA;
+// How the picture is drawn: Matroska carries the aspect as a `Display*` pair
+// in *display units* (0x54B2) -- 0 pixels, 1 centimetres, 2 inches, 3 a display
+// aspect ratio, 4 the sample aspect ratio itself. Absent, the pixels are the
+// coded ones: every square-pixel file states none of these, which is what makes
+// their absence the square answer rather than an error.
+const DISPLAY_WIDTH: u32 = 0x54B0;
+const DISPLAY_HEIGHT: u32 = 0x54BA;
+const DISPLAY_UNIT: u32 = 0x54B2;
 // The track's projection: how the flat picture sits in space. A roll on the
 // rectangular projection (type 0) is how a Matroska muxer states what an mp4
 // states with its `tkhd` matrix -- mkvmerge has translated display matrices
@@ -2428,6 +2521,9 @@ fn mkv_track_entry(
 ) -> crate::Result<MkvEntry> {
     let (mut number, mut kind, mut codec, mut default_duration) = (0, 0, String::new(), None);
     let (mut width, mut height, mut config) = (0, 0, Vec::new());
+    // The `Display*` elements: unstated for the square-pixel file, which is
+    // most of them.
+    let (mut display_width, mut display_height, mut display_unit) = (0u64, 0u64, 0u64);
     let mut rotation = Rotation::None;
     let (mut language, mut name, mut bcp47) = (String::new(), String::new(), String::new());
     let mut tags = Tags::default();
@@ -2455,6 +2551,9 @@ fn mkv_track_entry(
                     match e.0 {
                         PIXEL_WIDTH => width = ebml_uint(file, e.1, e.2)? as u32,
                         PIXEL_HEIGHT => height = ebml_uint(file, e.1, e.2)? as u32,
+                        DISPLAY_WIDTH => display_width = ebml_uint(file, e.1, e.2)?,
+                        DISPLAY_HEIGHT => display_height = ebml_uint(file, e.1, e.2)?,
+                        DISPLAY_UNIT => display_unit = ebml_uint(file, e.1, e.2)?,
                         PROJECTION => {
                             let (mut kind, mut yaw, mut pitch, mut roll) =
                                 (0u64, 0.0f64, 0.0f64, 0.0f64);
@@ -2599,6 +2698,13 @@ fn mkv_track_entry(
         number,
         width,
         height,
+        pixel_aspect: pixel_aspect_of(
+            display_width,
+            display_height,
+            display_unit,
+            width,
+            height,
+        ),
         rotation,
         tags,
         light,
@@ -2795,6 +2901,53 @@ fn rotation_of_roll(degrees: f64) -> crate::Result<Rotation> {
 /// quarter turn here can make -- the same missing capability the mp4 door
 /// refuses a 45-degree matrix for, so it gets the same refusal rather than a
 /// sideways picture.
+
+/// The sample aspect ratio a Matroska `TrackEntry`'s `Video` element states,
+/// from its `DisplayWidth`/`DisplayHeight`/`DisplayUnit` children and the coded
+/// size beside them.
+///
+/// The units decide what the pair *is*: 3 spells a display aspect ratio (16 and
+/// 9 over 1440x1080 is what ffmpeg writes for a `setsar=4/3` source, measured),
+/// 4 spells the sample aspect ratio itself, and 0/absent spells pixels -- where
+/// a pair beside the coded one at all means a crop, not an aspect. 1 and 2
+/// (centimetres, inches) are physical sizes a picture this engine shows cannot
+/// mean anything by, and read as square rather than guessed. Every unstated or
+/// unusable shape is [`PixelAspect::SQUARE`], which is also the answer the spec's
+/// own default gives: DisplayWidth and DisplayHeight "SHOULD be set to the
+/// PixelWidth and PixelHeight" when they mean the same thing, so a file that
+/// means square most often says nothing at all.
+fn pixel_aspect_of(
+    display_width: u64,
+    display_height: u64,
+    display_unit: u64,
+    coded_width: u32,
+    coded_height: u32,
+) -> PixelAspect {
+    // A zero pair (unstated, or a header that lies about it) and a zero coded
+    // size are all square: there is nothing to divide by and nothing to stretch.
+    if display_width == 0 || display_height == 0 || coded_width == 0 || coded_height == 0 {
+        return PixelAspect::SQUARE;
+    }
+    match display_unit {
+        // 4: the pair *is* the sample aspect ratio.
+        4 => PixelAspect {
+            h: display_width.min(u32::MAX as u64) as u32,
+            v: display_height.min(u32::MAX as u64) as u32,
+        },
+        // 3: the pair is the display aspect ratio -- display_w / display_h --
+        // which the SAR is that against the coded one: sar = dar * h / w.
+        // 16/9 over 1440x1080 lands on 4/3.
+        3 => PixelAspect {
+            h: ((display_width * u64::from(coded_height))
+                .min(u32::MAX as u64 * u64::from(coded_width))) as u32,
+            v: ((display_height * u64::from(coded_width))
+                .min(u32::MAX as u64 * u64::from(coded_height))) as u32,
+        },
+        // Pixels (0) or a physical unit this engine cannot interpret: square.
+        _ => PixelAspect::SQUARE,
+    }
+}
+
 fn projection_rotation(kind: u64, yaw: f64, pitch: f64, roll: f64) -> crate::Result<Rotation> {
     if kind != 0 {
         return Ok(Rotation::None);
@@ -3991,6 +4144,33 @@ fn colr_tags(path: &Path, track_id: u32) -> Option<Tags> {
         _ => 0,
     };
     Some(Tags::from_codes(code(8)?, code(6)?, range))
+}
+
+/// The `pasp` box of `track_id`'s sample entry (ISO/IEC 14496-12 §6.2.3, the
+/// pixel aspect ratio box a visual sample entry may carry): two 32-bit
+/// big-endian integers, hSpacing then vSpacing, the ratio one coded pixel is
+/// drawn at. ffmpeg writes it for a `setsar=4/3` source and writes 1/1 for a
+/// square one (both measured); a box absent -- most mp4s there are -- is square
+/// pixels, the same answer Matroska's absent `Display*` elements give.
+///
+/// [`None`] rather than an error for a file with no such box, which is most of
+/// them -- an untagged mp4 is not a broken one.
+fn pasp_of(path: &Path, track_id: u32) -> PixelAspect {
+    let Ok((_, entry)) = sample_entry(path, track_id) else {
+        return PixelAspect::SQUARE;
+    };
+    // The same fixed 78-byte VisualSampleEntry header `colr` and `hvcC` sit
+    // behind; `pasp` is one of their siblings.
+    let Some(pasp) = child(entry.get(78..).unwrap_or_default(), b"pasp") else {
+        return PixelAspect::SQUARE;
+    };
+    let (Some(h), Some(v)) = (
+        pasp.get(..4).map(|b| u32::from_be_bytes(b.try_into().unwrap())),
+        pasp.get(4..8).map(|b| u32::from_be_bytes(b.try_into().unwrap())),
+    ) else {
+        return PixelAspect::SQUARE;
+    };
+    PixelAspect { h, v }
 }
 
 /// The `clli` and `mdcv` boxes of `track_id`'s sample entry: what an mp4 says

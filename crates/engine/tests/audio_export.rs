@@ -379,6 +379,11 @@ fn a_still_and_a_song_export_as_an_mp4_with_sound() {
         codec: engine::Codec::H264,
         color: Default::default(),
         rotation: Rotation::None,
+        // Square pixels, coded where they are declared: a meta no container
+        // wrote, so nothing was read to disagree with it.
+        coded_width: 640,
+        coded_height: 360,
+        pixel_aspect: engine::demux::PixelAspect::SQUARE,
     };
     let out = out_path("still_song", "mp4");
     let handle = engine::export::start(project, meta, &out, &ExportSettings::default(), None);
@@ -440,8 +445,8 @@ fn a_fader_is_one_tracks_own_and_the_limiter_holds_the_sum() {
             ],
             Vec::new(),
             Vec::new(),
-        Vec::new(),
-    )
+            Vec::new(),
+        )
         .expect("one second on four audio tracks")
     };
     let write = |project: Project, name: &str| {
@@ -454,8 +459,8 @@ fn a_fader_is_one_tracks_own_and_the_limiter_holds_the_sum() {
                 format: Format::Wav,
                 ..Default::default()
             },
-        None,
-    );
+            None,
+        );
         wait(&handle, Duration::from_secs(60)).unwrap_or_else(|e| panic!("{name}: {e}"));
         let (audio, samples) = decode(&out);
         let peak = samples.iter().fold(0.0f32, |m, s| m.max(s.abs()));
@@ -630,8 +635,8 @@ fn the_sound_is_written_at_the_rate_that_was_asked_for() {
                 audio_kbps: kbps,
                 ..Default::default()
             },
-        None,
-    );
+            None,
+        );
         wait(&handle, Duration::from_secs(120)).expect("mp3 export");
         let got = mp3_declared_kbps(&out);
         println!("mp3 asked {kbps:?}, header says {got} kbps");
@@ -706,6 +711,11 @@ fn the_sound_is_written_at_the_rate_that_was_asked_for() {
         codec: engine::Codec::H264,
         color: Default::default(),
         rotation: Rotation::None,
+        // Square pixels, coded where they are declared: a meta no container
+        // wrote, so nothing was read to disagree with it.
+        coded_width: 640,
+        coded_height: 360,
+        pixel_aspect: engine::demux::PixelAspect::SQUARE,
     };
     for want in [128u32, 320] {
         let out = out_path(&format!("mp4_aac_{want}"), "mp4");
@@ -717,8 +727,8 @@ fn the_sound_is_written_at_the_rate_that_was_asked_for() {
                 audio_kbps: Some(want),
                 ..Default::default()
             },
-        None,
-    );
+            None,
+        );
         wait(&handle, Duration::from_secs(300)).expect("an mp4 of a still under a song");
         let got = mp4_aac_kbps(&out, f64::from(RATE));
         println!("mp4 asked {want} kbps, the track measures {got:.1}");
@@ -859,7 +869,9 @@ fn a_51_ac3_source_round_trips_through_a_wav() {
         Vec::new(),
     )
     .expect("a one-source AC-3 project");
-    let video = engine::demux::Demuxer::open(&source).expect("open the fixture").0;
+    let video = engine::demux::Demuxer::open(&source)
+        .expect("open the fixture")
+        .0;
 
     let out = out_path("ac3", "wav");
     let handle = engine::export::start(
@@ -881,11 +893,20 @@ fn a_51_ac3_source_round_trips_through_a_wav() {
         "the §7.8 downmix is what reaches the file"
     );
     let secs = (samples.len() / 2) as f64 / 48_000.;
-    assert!((0.9..1.1).contains(&secs), "one second of clip, got {secs:.3}s");
-    let energy = (samples.iter().map(|s| f64::from(*s) * f64::from(*s)).sum::<f64>()
+    assert!(
+        (0.9..1.1).contains(&secs),
+        "one second of clip, got {secs:.3}s"
+    );
+    let energy = (samples
+        .iter()
+        .map(|s| f64::from(*s) * f64::from(*s))
+        .sum::<f64>()
         / samples.len() as f64)
         .sqrt();
-    assert!(energy > 0.005, "the exported AC-3 is silence: RMS {energy:.6}");
+    assert!(
+        energy > 0.005,
+        "the exported AC-3 is silence: RMS {energy:.6}"
+    );
     std::fs::remove_file(&out).unwrap();
 }
 
@@ -1004,6 +1025,11 @@ fn a_fade_in_reaches_the_exported_audio() {
         codec: engine::Codec::H264,
         color: Default::default(),
         rotation: Rotation::None,
+        // Square pixels, coded where they are declared: a meta no container
+        // wrote, so nothing was read to disagree with it.
+        coded_width: 640,
+        coded_height: 360,
+        pixel_aspect: engine::demux::PixelAspect::SQUARE,
     };
     let out = out_path("fadein", "wav");
     let handle = engine::export::start(
@@ -1034,7 +1060,10 @@ fn a_fade_in_reaches_the_exported_audio() {
         start < body * 0.1,
         "the very start is quiet: {start:.4} vs body {body:.4}"
     );
-    assert!(quarter < half, "the envelope rises: {quarter:.4} -> {half:.4}");
+    assert!(
+        quarter < half,
+        "the envelope rises: {quarter:.4} -> {half:.4}"
+    );
     assert!(
         half < near_end,
         "the envelope keeps rising into the ramp's end: {half:.4} -> {near_end:.4}"
@@ -1080,10 +1109,7 @@ fn a_split_and_crossfaded_clip_has_no_muted_interior() {
     // exactly what `Project::split` leaves behind.
     let mut project = Project::from_parts(
         vec![Source::new(src.to_path_buf(), 0)],
-        vec![(
-            LaneKind::Audio,
-            vec![clip(0, 0, 45), clip(45, 45, 90)],
-        )],
+        vec![(LaneKind::Audio, vec![clip(0, 0, 45), clip(45, 45, 90)])],
         Vec::new(),
         Vec::new(),
         Vec::new(),
@@ -1101,6 +1127,11 @@ fn a_split_and_crossfaded_clip_has_no_muted_interior() {
         codec: engine::Codec::H264,
         color: Default::default(),
         rotation: Rotation::None,
+        // Square pixels, coded where they are declared: a meta no container
+        // wrote, so nothing was read to disagree with it.
+        coded_width: 640,
+        coded_height: 360,
+        pixel_aspect: engine::demux::PixelAspect::SQUARE,
     };
     let out = out_path("crossfade", "wav");
     let handle = engine::export::start(
