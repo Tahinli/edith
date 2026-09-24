@@ -793,8 +793,8 @@ struct Player {
     /// The engine's own word on the sound device, as the last pump saw it: the
     /// cache [`Player::watch_audio`] compares each frame against so a reason is
     /// announced once when it *changes* and taken back when it clears. `None`
-    /// while the sound is up, and seeded by `Player::seed_audio_watch` at every
-    /// open, whose own line already carries the same fact.
+    /// while the sound is up; seeded by [`Player::session_swapped`], which every
+    /// door that installs or drops a session already calls.
     audio_reason: Option<String>,
     /// Which session generation (`session_gen`) the cached reason above describes:
     /// the watch is keyed to the session it is a statement about, so a preview
