@@ -179,7 +179,10 @@ fn a_block_holding_the_erase_after_the_picture_still_draws_the_picture() {
 
     let tracks = subtitle::of_matroska(&file).expect("the walk");
     let cue = &tracks[0].cues[0];
-    let image = cue.image.as_ref().expect("the packed block is still a picture");
+    let image = cue
+        .image
+        .as_ref()
+        .expect("the packed block is still a picture");
     assert_eq!((image.width, image.height), (8, 4));
     let rgba = image.rgba().expect("it decodes");
     assert_eq!(
@@ -378,7 +381,11 @@ fn a_subtitle_row_can_be_removed_and_the_survivors_round_trip() {
                 .into_owned()
         })
         .collect();
-    assert_eq!(names, vec!["a.srt", "c.srt"], "the survivors keep their order");
+    assert_eq!(
+        names,
+        vec!["a.srt", "c.srt"],
+        "the survivors keep their order"
+    );
     assert_eq!(session.subtitles()[0].cues, expected(), "and their cues");
 
     let project = dir.join("cut.edith");
@@ -397,7 +404,12 @@ fn a_subtitle_row_can_be_removed_and_the_survivors_round_trip() {
     assert_eq!(
         back.subtitles()
             .iter()
-            .map(|t| t.path.file_name().expect("a name").to_string_lossy().into_owned())
+            .map(|t| t
+                .path
+                .file_name()
+                .expect("a name")
+                .to_string_lossy()
+                .into_owned())
             .collect::<Vec<_>>(),
         vec!["a.srt", "c.srt"],
         "and a load is the same two, in the same order"
@@ -435,7 +447,9 @@ fn subtitles_come_off_another_file_without_it_joining_the_timeline() {
     // A different file entirely, carrying two subtitle tracks.
     let other = asset("test_subs.mkv");
     assert_eq!(
-        session.import_subtitles(&other).expect("its subtitles come"),
+        session
+            .import_subtitles(&other)
+            .expect("its subtitles come"),
         2
     );
     assert_eq!(session.subtitles().len(), 2);
@@ -445,13 +459,21 @@ fn subtitles_come_off_another_file_without_it_joining_the_timeline() {
     }
     // ...and the timeline is exactly the timeline it was.
     assert_eq!(
-        session.sources().iter().map(|s| s.path.clone()).collect::<Vec<_>>(),
+        session
+            .sources()
+            .iter()
+            .map(|s| s.path.clone())
+            .collect::<Vec<_>>(),
         sources,
         "the file whose subtitles these are did not join the library"
     );
     assert_eq!(session.lanes(), lanes, "no lane was added");
     assert_eq!(
-        session.lanes().iter().map(|&l| session.lane_clips(l).len()).collect::<Vec<_>>(),
+        session
+            .lanes()
+            .iter()
+            .map(|&l| session.lane_clips(l).len())
+            .collect::<Vec<_>>(),
         clips,
         "and nothing was cut, moved or dropped on one"
     );
@@ -590,12 +612,19 @@ fn a_project_naming_many_tracks_of_one_file_walks_it_once_and_keeps_its_order() 
     let opened = subtitle::open_all(&rows);
     let cost = read_bytes() - before;
     assert_eq!(
-        opened.iter().map(|t| (&t.path, t.track)).collect::<Vec<_>>(),
+        opened
+            .iter()
+            .map(|t| (&t.path, t.track))
+            .collect::<Vec<_>>(),
         rows.iter().map(|(p, n)| (p, *n)).collect::<Vec<_>>(),
         "every row comes back where it was saved"
     );
     assert_eq!(opened[1].label, "eng", "and it is that file's track 1");
-    assert_eq!(opened[2].cues, expected(), "the standalone row is untouched");
+    assert_eq!(
+        opened[2].cues,
+        expected(),
+        "the standalone row is untouched"
+    );
     assert!(
         opened[5]
             .refused
@@ -798,7 +827,10 @@ fn a_caption_is_placed_trimmed_moved_and_undone_on_its_lane() {
     project.move_sub(lane, 0, s2, 300).expect("it changes lane");
     assert!(project.sub_lane(lane).is_empty(), "off the first row");
     assert_eq!(project.sub_lane(s2).len(), 1, "and onto the second");
-    assert!(project.undo() && project.undo(), "the move and the added lane");
+    assert!(
+        project.undo() && project.undo(),
+        "the move and the added lane"
+    );
 
     // Every one of the four was one undo step, and the snapshots are the lane
     // list's own: subtitles joined the history without a history of their own.
@@ -843,10 +875,24 @@ fn a_caption_is_placed_trimmed_moved_and_undone_on_its_lane() {
 fn two_captions_may_not_cover_one_frame_and_the_refusal_says_which() {
     let (mut project, lane) = with_subtitle_lane();
     project
-        .place_sub(lane, 30, SubClip { frames: 60, ..whole(0) })
+        .place_sub(
+            lane,
+            30,
+            SubClip {
+                frames: 60,
+                ..whole(0)
+            },
+        )
         .expect("the first goes down");
     let err = project
-        .place_sub(lane, 60, SubClip { frames: 60, ..whole(0) })
+        .place_sub(
+            lane,
+            60,
+            SubClip {
+                frames: 60,
+                ..whole(0)
+            },
+        )
         .expect_err("the second lands inside it");
     assert!(
         err.to_string().contains("already covers [30, 90)"),
@@ -854,7 +900,14 @@ fn two_captions_may_not_cover_one_frame_and_the_refusal_says_which() {
     );
 
     project
-        .place_sub(lane, 200, SubClip { frames: 60, ..whole(0) })
+        .place_sub(
+            lane,
+            200,
+            SubClip {
+                frames: 60,
+                ..whole(0)
+            },
+        )
         .expect("clear of it, it goes down");
     let err = project
         .move_sub(lane, 0, lane, 150)
@@ -867,21 +920,50 @@ fn two_captions_may_not_cover_one_frame_and_the_refusal_says_which() {
     // Neither refusal moved anything, and neither cost a step: one undo takes
     // the *second placement* back, not a refusal.
     assert_eq!(
-        project.sub_lane(lane).iter().map(|s| s.start).collect::<Vec<_>>(),
+        project
+            .sub_lane(lane)
+            .iter()
+            .map(|s| s.start)
+            .collect::<Vec<_>>(),
         [30, 200]
     );
     assert!(project.undo());
     assert_eq!(
-        project.sub_lane(lane).iter().map(|s| s.start).collect::<Vec<_>>(),
+        project
+            .sub_lane(lane)
+            .iter()
+            .map(|s| s.start)
+            .collect::<Vec<_>>(),
         [30]
     );
 
     // The other refusals of the door, each in its own words.
     for (lane, at, sub, want) in [
         (Lane::V1, 0, whole(0), "not a subtitle track"),
-        (Lane::new(LaneKind::Subtitle, 4), 0, whole(0), "there is no S5"),
-        (Lane::S1, 0, SubClip { frames: 0, ..whole(0) }, "is empty"),
-        (Lane::S1, 0, SubClip { track: 7, ..whole(0) }, "subtitle track 7 of 1"),
+        (
+            Lane::new(LaneKind::Subtitle, 4),
+            0,
+            whole(0),
+            "there is no S5",
+        ),
+        (
+            Lane::S1,
+            0,
+            SubClip {
+                frames: 0,
+                ..whole(0)
+            },
+            "is empty",
+        ),
+        (
+            Lane::S1,
+            0,
+            SubClip {
+                track: 7,
+                ..whole(0)
+            },
+            "subtitle track 7 of 1",
+        ),
     ] {
         let err = project.place_sub(lane, at, sub).expect_err("refused");
         assert!(
@@ -941,7 +1023,11 @@ fn a_lane_maps_to_cues_clipped_to_the_window_and_shifted_onto_the_timeline() {
             .collect::<Vec<_>>(),
         [
             (0, 500_000, "first line".to_string()),
-            (1_000_000, 2_000_000, "second line\nwith a break".to_string()),
+            (
+                1_000_000,
+                2_000_000,
+                "second line\nwith a break".to_string()
+            ),
         ],
         "both cues clipped to the window and shifted to the placement"
     );
@@ -1003,25 +1089,60 @@ fn a_removed_palette_row_walks_the_placements_below_it_down() {
 
     // The row above it comes off -- nothing plays it -- and the placement is
     // walked down with the palette, so it still says the same words.
-    project.remove_subtitles(0).expect("an unplaced row comes off");
+    project
+        .remove_subtitles(0)
+        .expect("an unplaced row comes off");
     assert_eq!(
-        project.subtitles().iter().map(|t| &*t.label).collect::<Vec<_>>(),
+        project
+            .subtitles()
+            .iter()
+            .map(|t| &*t.label)
+            .collect::<Vec<_>>(),
         ["fra - Signs", "spa"],
         "the survivors keep their order"
     );
-    assert_eq!(project.sub_lane(lane)[0].track, 0, "the placement moved down");
+    assert_eq!(
+        project.sub_lane(lane)[0].track,
+        0,
+        "the placement moved down"
+    );
     assert_eq!(
         project.subtitles()[project.sub_lane(lane)[0].track].label,
         "fra - Signs",
         "and names the very track it named before"
     );
 
-    // The history went with it: its snapshots hold the indexes as they were
-    // before the reindex, so an undo into one would put the placement back on a
-    // track that is no longer there.
+    // The history went with it -- and it *can*, now that the entry carries the
+    // palette ([`Snapshot`]'s own `subtitles`, beside the lanes and the
+    // settings): the reindex is a step like any other, so an undo puts the row
+    // and the placement's own index back together and the same clip goes on
+    // naming the same words.
     assert!(
-        !project.undo(),
-        "no step survives a reindex the snapshots do not know about"
+        project.undo(),
+        "a reindex the entry carries is a step; the history was thrown away instead"
+    );
+    assert_eq!(
+        project
+            .subtitles()
+            .iter()
+            .map(|t| &*t.label)
+            .collect::<Vec<_>>(),
+        ["eng", "fra - Signs", "spa"],
+        "the undo did not put the removed row back"
+    );
+    assert_eq!(
+        project.subtitles()[project.sub_lane(lane)[0].track].label,
+        "fra - Signs",
+        "and the placement names the very track it named before the removal"
+    );
+    // ...and the step again, which is where the rest of this test starts: the
+    // row off and the placement walked down with it (`undo` left it on the
+    // redo stack).
+    assert!(project.redo(), "the step is a step both ways");
+    assert_eq!(
+        project.sub_lane(lane)[0].track,
+        0,
+        "the placement moved down again"
     );
 
     // ...and now that it *is* placed, the same row does not come off at all:
@@ -1045,7 +1166,14 @@ fn a_removed_palette_row_walks_the_placements_below_it_down() {
 fn a_drag_that_changes_nothing_is_ok_and_costs_no_step() {
     let (mut project, lane) = with_subtitle_lane();
     project
-        .place_sub(lane, 30, SubClip { frames: 60, ..whole(0) })
+        .place_sub(
+            lane,
+            30,
+            SubClip {
+                frames: 60,
+                ..whole(0)
+            },
+        )
         .expect("it goes down");
     let placed = project.sub_lane(lane)[0];
 
@@ -1095,7 +1223,10 @@ fn a_caption_is_cut_and_rippled_with_the_picture_under_it() {
         .expect("it goes down");
 
     // The razor: halves that add up to the whole, in frames and in microseconds.
-    assert!(project.split(30), "the cut lands on the picture and the words");
+    assert!(
+        project.split(30),
+        "the cut lands on the picture and the words"
+    );
     assert_eq!(
         project
             .sub_lane(lane)
@@ -1107,14 +1238,21 @@ fn a_caption_is_cut_and_rippled_with_the_picture_under_it() {
     // ...and its inverse puts the caption back exactly as it was.
     assert!(project.regroup(30), "the halves rejoin");
     assert_eq!(
-        project.sub_lane(lane).iter().map(|s| (s.start, s.frames, s.in_us, s.out_us)).collect::<Vec<_>>(),
+        project
+            .sub_lane(lane)
+            .iter()
+            .map(|s| (s.start, s.frames, s.in_us, s.out_us))
+            .collect::<Vec<_>>(),
         [(0, 60, 0, 2_000_000)]
     );
 
     // A rippling delete through the middle of it: the hole closes, what was
     // inside it is gone from the words as well as from the picture, and the two
     // halves keep exactly the seconds they kept frames for.
-    assert!(project.ripple_delete(20, 20), "the hole closes on every lane");
+    assert!(
+        project.ripple_delete(20, 20),
+        "the hole closes on every lane"
+    );
     assert_eq!(
         project
             .sub_lane(lane)
@@ -1234,7 +1372,10 @@ fn subtitle_lanes_and_their_captions_survive_a_save() {
 
     let mut session = engine::PlaybackSession::open(&media).expect("open the fixture");
     session.set_gain(0.0); // silent like the rest of the suites
-    assert_eq!(session.import_subtitles(&subs).expect("the .srt imports"), 1);
+    assert_eq!(
+        session.import_subtitles(&subs).expect("the .srt imports"),
+        1
+    );
 
     let s1 = session.add_lane(LaneKind::Subtitle);
     let s2 = session.add_lane(LaneKind::Subtitle);
@@ -1246,7 +1387,9 @@ fn subtitle_lanes_and_their_captions_survive_a_save() {
         out_us: 1_500_000,
         link: None,
     };
-    session.place_sub(s1, 10, caption).expect("a caption goes down");
+    session
+        .place_sub(s1, 10, caption)
+        .expect("a caption goes down");
 
     let project = dir.join("cut.edith");
     session.save_project(&project).expect("save");
@@ -1270,7 +1413,10 @@ fn subtitle_lanes_and_their_captions_survive_a_save() {
     );
     assert_eq!(
         back.sub_lane(s1),
-        [SubClip { start: 10, ..caption }],
+        [SubClip {
+            start: 10,
+            ..caption
+        }],
         "and the caption is the very placement it was"
     );
     assert!(back.sub_lane(s2).is_empty(), "the empty one is still empty");
@@ -1374,7 +1520,10 @@ fn a_caption_naming_a_track_the_palette_does_not_have_is_refused() {
     // ...and the load's own door says the same thing about the same file, by
     // the lane rather than by the line: `from_parts` for words.
     let (project, _lane) = with_subtitle_lane();
-    let beyond = SubClip { track: 3, ..whole(0) };
+    let beyond = SubClip {
+        track: 3,
+        ..whole(0)
+    };
     let refused = project
         .clone()
         .with_subs(vec![Vec::new(), Vec::new(), vec![beyond]])
