@@ -2784,6 +2784,9 @@ fn run(
     let mut audio_fed = false;
     let mut muxer = None;
     let mut done = 0u32;
+    // ...and how many of the edit's frames a file could not give, summed over
+    // the spans that ran out under their clip ([`Shared::truncated`]).
+    let mut skipped = 0u32;
     let black = Black::new(meta);
     // Spans, not clips: a gap in the video is part of the timeline and gets
     // encoded too, as black frames. The picture count is therefore
@@ -3013,16 +3016,20 @@ fn run(
                 }
             };
             let Some(frame) = picture else {
-                // The file ran out before its clip did, so the walk ends here
-                // and the rest of the edit never gets a picture. Counted, not
+                // The file ran out before its clip did: this span's tail never
+                // gets a picture -- and *only* this span's tail, because the
+                // span loop this break sits in carries on with the spans after
+                // it and writes every picture they have. Counted, not
                 // swallowed: the bar reaches its end whatever happens, so
                 // without this a truncated file reads as a whole one. The same
                 // sentence `planned_subtitles` gives cues that hang past the
-                // last picture -- and this one is said after the fact, because
-                // how many pictures a *file* holds is only known by opening it.
-                shared
-                    .truncated
-                    .fetch_max(total.saturating_sub(done), Ordering::Relaxed);
+                // last picture, said after the fact here because how many
+                // pictures a *file* holds is only known by opening it.
+                //
+                // `span.len > done_here` holds by the loop's own condition, and
+                // the sum over every break is exactly `total - done` at the end
+                // of the walk: the spans are disjoint and cover the whole edit.
+                skipped += span.len - done_here;
                 break; // source ran out early; the clip list outlives the file
             };
             // A picture still on the GPU has nothing waiting for it here: the
@@ -3123,6 +3130,12 @@ fn run(
             done_here += repeats;
         }
     }
+    // The whole walk is over, so what it could not write is known to the frame
+    // and is published once. `fetch_max` and not `fetch_add`, because a
+    // hardware seat that died has the *whole* walk run again from its first
+    // frame ([`start`]): the same project and the same picture counts, so a
+    // second run must not double a number that is already on the line.
+    shared.truncated.fetch_max(skipped, Ordering::Relaxed);
     while let Some((au, key)) = encoder.drain()? {
         write_video(
             &mut muxer,
