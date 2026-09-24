@@ -623,11 +623,15 @@ pub(crate) fn subtitle_rows(tracks: &[engine::subtitle::SubtitleTrack]) -> Vec<S
 /// last. Zero on an emptied list, which is the index the section is not drawn at
 /// all.
 ///
-/// Its own function because the pick is what the overlay draws: left where it
-/// was it would name a different track, and the plate over the picture would
-/// change language on its own the moment a row above it went. What an export
-/// writes is *not* this pick and cannot be desynced by a removal -- it is worked
-/// out from the cues on the timeline each time ([`Player::export_subs`]).
+/// Its own function because the pick is read as "which row" everywhere it is
+/// echoed -- the dock highlights the picked row by comparing it
+/// (`dock_stance`'s `track == player.sub_track`), and the section heading and
+/// its notices name it -- so left where it was it would highlight one track and
+/// name another the moment a row above it went. The plate over the picture is
+/// not on that list: it is drawn from the *placements* on the shown lane
+/// ([`Player::active_sub_lane`], and the session's own `sub_lane_cues`). What an export
+/// writes is not this pick either -- it is worked out from the cues on the
+/// timeline each time ([`Player::export_subs`]).
 pub(crate) fn sub_pick_after_removal(picked: usize, removed: usize, left: usize) -> usize {
     let picked = match removed < picked {
         true => picked - 1,
