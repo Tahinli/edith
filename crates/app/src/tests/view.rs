@@ -3,6 +3,63 @@
 
 use super::*;
 
+/// The preview's one cached cue picture is keyed by the *cue* and not only by
+/// where it happens to sit: a lane and a start microsecond are not an identity --
+/// lift a bitmap caption off a lane, drop another track's caption at the same
+/// frame, and a key of those two matched the cache, painting the picture of the
+/// cue that is gone over the one that is up. The picture's own allocation is the
+/// rest of the key, and an identical repeat still hits, which is the whole cache.
+#[test]
+fn a_cached_cue_picture_is_keyed_by_the_cue_not_only_its_moment() {
+    use crate::ui::preview::sub_image_key;
+    let (lane, other) = (Lane::S1, Lane::A1);
+    // Two cues that share the lane and the start, and nothing else: one lifted,
+    // one placed at the same frame.
+    let a = sub_image_key(lane, 1_000_000, 3_000_000, 0x1000);
+    let b = sub_image_key(lane, 1_000_000, 3_000_000, 0x2000);
+    assert_ne!(
+        a, b,
+        "two different cues at one moment on one lane are one cache key again, so \
+         the second paints the first's picture"
+    );
+    // The same cue repainted: still a hit.
+    assert_eq!(
+        a,
+        sub_image_key(lane, 1_000_000, 3_000_000, 0x1000),
+        "the cache misses on every repaint of the same cue, so it decodes an 8 MB \
+         display set per frame"
+    );
+    // The same picture recut over the same start is a different cue.
+    assert_ne!(
+        a,
+        sub_image_key(lane, 1_000_000, 2_500_000, 0x1000),
+        "a cue's own end is no part of the key, so a recut cue serves the old window"
+    );
+    // And the other half of the old key still holds: the four PGS tracks of a
+    // remux start at the same microsecond, so the lane separates them.
+    assert_ne!(
+        a,
+        sub_image_key(other, 1_000_000, 3_000_000, 0x1000),
+        "the lane is no longer part of the key, so a lane's eye shut leaves the \
+         other lane's caption on screen"
+    );
+    // And the door builds its key this way, out of the cue's own picture: the
+    // cache is only keyed by the cue while the lookup goes through this
+    // constructor, and a test of the constructor alone would pass with the door
+    // still keying on `(lane, start_us)`.
+    let preview_rs = src_text("ui/preview.rs");
+    assert!(
+        preview_rs.contains(
+            "let key = sub_image_key(lane, start_us, end_us, Arc::as_ptr(image) as usize);"
+        ),
+        "the cue picture is cached under a key that is not the cue's own"
+    );
+    assert!(
+        preview_rs.contains("*up == key"),
+        "the cache no longer compares the key it built"
+    );
+}
+
 /// What a drop reads: the frame under the pointer, through the same scale
 /// the boxes are drawn through. Zoomed in, the same pixel is a different
 /// frame -- which is the whole reason `Player::frame_under` goes through
