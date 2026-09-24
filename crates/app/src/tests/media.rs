@@ -16,12 +16,11 @@ use crate::ui::preview::{bgra_to_rgba, screenshot_path};
 /// them (`notices` is a private module re-exported for the window).
 use crate::notices::{audio_change_notice, audio_lost_line, audio_tail};
 
-/// A sound device that dies under a file that is already open says so, and stops
-/// saying so when the engine's own re-arm takes. The engine sets its
-/// `audio_disabled_reason` to its lost-device word on a death and clears it on a
-/// successful reopen, and nothing on this side ever looked at it: the two call
-/// sites were the *open* paths, so a mid-session death played on in silence with
-/// no message at all.
+/// A reason that changes under a session that is already open says so, and stops
+/// saying so when it clears. This side is the *reader*: the writer of a reason is
+/// the engine's own `audio_disabled_reason`, and the app's two call sites were
+/// the *open* paths -- so a reason that arrived mid-session reached no consumer
+/// at all and the window played on in silence with nothing said.
 ///
 /// Driven through the queue step itself -- [`audio_change_notice`] is the whole
 /// of what a reason change does to the strip -- because a test cannot make a
