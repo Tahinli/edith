@@ -2731,14 +2731,17 @@ fn a_refused_split_keeps_the_clip_in_hand() {
         .split_once("} else {")
         .expect("the split door no longer branches on what the cut answered")
         .0;
-    let cleared_twice = after.split("self.selected.clear()").count() > 1;
+    // One arm's worth of clear, counted with `matches`: `split(..).count()`
+    // counts the pieces *between* matches, so a single occurrence reads as two
+    // there and the guard fails on the fix it is guarding.
+    let extra_clear = after.matches("self.selected.clear()").count() > 1;
     assert!(
         !before.contains("self.selected.clear()"),
         "the split drops the selection before it knows the cut happened, so a \
          refused split leaves the user with nothing picked and nothing told"
     );
     assert!(
-        then.contains("self.selected.clear()") && !cleared_twice,
+        then.contains("self.selected.clear()") && !extra_clear,
         "the clear does not ride the split's own success branch: a split that \
          happened leaves the mark naming a different clip across the seam, and a \
          refused one must leave it naming the clip it named"
