@@ -29,12 +29,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use engine::PlaybackSession;
-use engine::colorspace::{ColorDescription, Matrix, Transfer, remap};
+use engine::colorspace::{remap, ColorDescription, Matrix, Transfer};
 use engine::demux::Demuxer;
 use engine::export::{ExportSettings, Format};
 use engine::scratch::Scratch;
 use engine::tonemap::{self, ToneMapper};
+use engine::PlaybackSession;
 
 fn asset(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -512,8 +512,14 @@ fn a_real_hdr_film_exports_as_a_picture() {
     // seconds and no leading black.
     assert!(session.cut_at(605.0), "the tail cut");
     assert!(session.cut_at(600.0), "the head cut");
-    assert!(session.delete_clip(engine::project::Lane::V1, 2), "the tail");
-    assert!(session.delete_clip(engine::project::Lane::V1, 0), "the head");
+    assert!(
+        session.delete_clip(engine::project::Lane::V1, 2),
+        "the tail"
+    );
+    assert!(
+        session.delete_clip(engine::project::Lane::V1, 0),
+        "the head"
+    );
     let out = out_path("hdr_film", "mp4");
     export(&session, &out, Format::Mp4);
 
@@ -611,7 +617,11 @@ fn a_graded_clip_exports_the_picture_the_preview_showed() {
 #[test]
 fn a_declared_peak_exports_the_picture_the_preview_showed() {
     let mut session = two_frames(&asset("test_hdr_bright.mkv"));
-    assert_eq!(session.meta().color.transfer, Transfer::Pq, "an HDR fixture");
+    assert_eq!(
+        session.meta().color.transfer,
+        Transfer::Pq,
+        "an HDR fixture"
+    );
     let preview = frame0_bgra(&mut session);
     let out = out_path("declared_peak", "mp4");
     export(&session, &out, Format::Mp4);
@@ -623,6 +633,64 @@ fn a_declared_peak_exports_the_picture_the_preview_showed() {
     assert!(
         diff <= 2.0,
         "the export is {diff:.2} codes from what the preview showed"
+    );
+    drop(reopened);
+    std::fs::remove_file(&out).unwrap();
+}
+
+/// The graded-clip invariant on the one placement the fused conversion cannot
+/// take: the clip is the project's own size (so the conversion would pass it
+/// through untouched) but a transform *moves* it, which makes it a placement
+/// again. The grade has to land before that placement -- the export side
+/// applies it unconditionally -- or the preview quietly drops the grade
+/// whenever a passthrough-sized clip is moved, scaled or turned.
+#[test]
+fn a_moved_passthrough_clip_keeps_its_grade_in_preview_and_export() {
+    let grade = Some(engine::color::ColorParams {
+        brightness: 0.0,
+        contrast: 1.0,
+        saturation: 0.0,
+        tint: 0.0,
+    });
+    let moved = engine::transform::TransformParams {
+        pos_x: 0.25,
+        ..Default::default()
+    };
+
+    // The half that must fail loudly on the canvas: the moved passthrough
+    // preview changes with the grade. These bars are spread ~250 per channel,
+    // so a grade that does not land leaves the two previews identical.
+    let mut session = two_frames(&asset("test_baseline.mp4"));
+    assert!(
+        session.set_transform(engine::project::Lane::V1, 0, Some(moved)),
+        "the move went on the clip"
+    );
+    assert!(
+        session.set_color(engine::project::Lane::V1, 0, grade),
+        "the grade went on the clip"
+    );
+    let graded = frame0_bgra(&mut session);
+    assert!(session.set_color(engine::project::Lane::V1, 0, None));
+    let ungraded = frame0_bgra(&mut session);
+    let parted = mean_abs_diff(&graded, &ungraded);
+    eprintln!("moved passthrough: graded vs ungraded preview {parted:.2} mean codes");
+    assert!(
+        parted > 3.0,
+        "the grade never reached the moved passthrough preview: {parted:.2}"
+    );
+
+    // The matching half, on the file: the export -- which has always applied
+    // the grade -- is still the picture the preview showed.
+    assert!(session.set_color(engine::project::Lane::V1, 0, grade));
+    let out = out_path("moved_grade", "mp4");
+    export(&session, &out, Format::Mp4);
+    let mut reopened = PlaybackSession::open(&*out).expect("reopen the export");
+    let exported = frame0_bgra(&mut reopened);
+    let diff = mean_abs_diff(&graded, &exported);
+    eprintln!("moved passthrough: preview vs export {diff:.2} mean codes");
+    assert!(
+        diff <= 2.0,
+        "the export is {diff:.2} codes from what the moved passthrough preview showed"
     );
     drop(reopened);
     std::fs::remove_file(&out).unwrap();
