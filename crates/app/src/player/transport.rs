@@ -36,8 +36,9 @@ impl Player {
     /// A file that *opens* silent says so in its own open line
     /// ([`audio_notice`], `library.rs`); what used to reach no consumer at all is
     /// a reason that changes *under* a session that is already up. This is the
-    /// reader of that state -- the writer of it is the engine's own
-    /// `PlaybackSession::audio_disabled_reason`, which this lane never spells.
+    /// reader of that state: the writer is the engine's (the wave branch's
+    /// `tick` dead branch sets the lost-device reason, `rearm_audio` clears it),
+    /// and this lane spells none of its words.
     ///
     /// Called from [`Player::pump`] because that is the one place every frame
     /// passes through, and written to cost an ordinary frame nothing: one read of

@@ -114,11 +114,12 @@ pub(crate) fn audio_step(
 /// the caching; this owns the queue, so a test can drive both directions without
 /// a window and without a device that dies on cue.
 ///
-/// The reason itself is the engine's to write
-/// ([`PlaybackSession::audio_disabled_reason`]): this side never spells its
-/// words, so a lost-device reason the engine lane teaches the death path to set
-/// needs nothing here -- and a death that sets nothing stays unsaid, which is
-/// what the engine side of this defect is.
+/// The reason is the engine's to write, and the engine's writer is the wave
+/// branch's: `tick`'s dead branch sets the lost-device reason and `rearm_audio`
+/// clears it (its own test observes both). This side is the reader and never
+/// spells the engine's words, so the end-to-end flip is asserted on the merged
+/// tree while this lane drives the same step through the seam below -- on this
+/// lane's base engine no path flips the reason at all.
 pub(crate) fn audio_change_notice(
     notices: &mut std::collections::VecDeque<SharedString>,
     was: Option<&str>,

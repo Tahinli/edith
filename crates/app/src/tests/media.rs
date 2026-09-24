@@ -20,7 +20,10 @@ use crate::notices::{audio_change_notice, audio_lost_line, audio_tail};
 /// saying so when it clears. This side is the *reader*: the writer of a reason is
 /// the engine's own `audio_disabled_reason`, and the app's two call sites were
 /// the *open* paths -- so a reason that arrived mid-session reached no consumer
-/// at all and the window played on in silence with nothing said.
+/// at all and the window played on in silence with nothing said. The engine's
+/// writer is the wave branch's, so the flip is driven through the seam here and
+/// asserted end to end on the merged tree; nothing below depends on when the
+/// engine's `tick` sets it.
 ///
 /// Driven through the queue step itself -- [`audio_change_notice`] is the whole
 /// of what a reason change does to the strip -- because a test cannot make a
