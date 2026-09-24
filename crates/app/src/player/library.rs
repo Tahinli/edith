@@ -1711,11 +1711,13 @@ impl Player {
     /// would name a *different* track -- and the pick is what an export writes
     /// into the file.
     ///
-    /// Not an undo step: subtitles are not on the history's snapshots, so the
-    /// way back is putting the file's subtitles on again -- which is a door of
-    /// its own ([`Player::pick_and_add_subtitles`]) and reads the subtitles
-    /// alone, never the media. The notice says that rather than promising a
-    /// ctrl+z that would do nothing.
+    /// One undo step, and the palette comes back with the reindex
+    /// ([`engine::Project::remove_subtitles`]), so `^z` is a way back that
+    /// works -- [`Player::step_history`] moves the pick back with it and drops
+    /// the plate the old index drew. The second way back, for a caller that
+    /// wants the *file's* tracks again, is putting them on
+    /// ([`Player::pick_and_add_subtitles`]): a door of its own that reads the
+    /// subtitles alone, never the media, which is what the notice names.
     pub(crate) fn remove_subtitle_track(&mut self, track: usize, cx: &mut Context<Self>) {
         // The one availability oracle, for the same reason the × on a row and
         // the stroke are one call: an empty list is not a failure, it is an
@@ -1749,8 +1751,12 @@ impl Player {
                     .as_ref()
                     .map_or(0, |session| session.subtitles().len());
                 self.sub_track = sub_pick_after_removal(self.sub_track, track, left);
-                // The drawn cue is keyed by that index ([`Player::sub_picture`])
-                // and the index now stands for another track.
+                // The cue over the picture goes with the pick: its tile is
+                // keyed by *where* the cue sits ([`Player::sub_picture`]'s
+                // `(lane, start_us)`) and never by the track it shows, so the
+                // index that moved here is not something that cache can be
+                // asked about. Conservative, and the same drop a history step
+                // makes for the same reason ([`Player::step_history`]).
                 //
                 // corner-cut: its atlas tile is not released -- `close_session`'s
                 // note, for its reason and with its upgrade path.

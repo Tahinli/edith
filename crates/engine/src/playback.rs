@@ -26,7 +26,7 @@ use crate::colorspace::{ColorDescription, ContentLight};
 use crate::decode::{Backend, BackendCell, DecodeSession, Frame, Worker};
 use crate::demux::{Codec, Demuxer, NoVideoTrack, Rotation, VideoMeta};
 use crate::eq::EqParams;
-use crate::project::{
+use crate::project::{ProjectSettings,
     Clip, Edge, GapSweep, Lane, LaneKind, Project, Rate, Source, Span, Speed, SubClip,
 };
 use crate::scale::{Composer, FitPolicy};
@@ -1188,7 +1188,18 @@ impl PlaybackSession {
             // it, and [`Project::with_subs`] refuses one naming a row that is
             // not there.
             .with_subtitles(subtitles)
-            .with_subs(doc.subs)?;
+            .with_subs(doc.subs)?
+            // The header a load puts back: the canvas and rate above, which a
+            // save's own `resolution`/`fps` lines may have moved off the
+            // scaffold's, and the switches the literal below carries -- handed
+            // in here because they are the project's own and a door that moved
+            // one after this would snapshot whatever copy it holds, which until
+            // this line is the placeholder's. No undo step for
+            // [`Project::with_mix`]'s reason: a project that arrived one `z`
+            // from a state it was never in is a project whose first undo is a
+            // surprise.
+            .with_canvas(meta.width, meta.height, meta.frame_rate)
+            .with_switches(doc.proxy, doc.auto_proxy, doc.encoder, doc.sample_rate);
         let span = project.composite_span_at(0);
         // Last, because it is the one thing here that cannot be taken back: the
         // feeder thread outlives the `Audio` value (it holds its own clones) and
@@ -1469,12 +1480,15 @@ impl PlaybackSession {
     /// unlike [`remove_source`](Self::remove_source) this does not reseek. Rows
     /// past `idx` move down by one: a caller holding a picked row (the export's
     /// subtitle pick) has to fix it up or drop it; the placements on the lanes
-    /// are walked down with it and need no fixing. Not an undo step, for the
-    /// reason [`Project::remove_subtitles`] gives -- the way back is
-    /// [`import_subtitles`](Self::import_subtitles), which reads a file's
-    /// subtitles and touches nothing else on the timeline -- and it *empties*
-    /// the undo history, because the steps in it name the tracks by the indexes
-    /// this call just changed.
+    /// are walked down with it and need no fixing.
+    ///
+    /// One undo step, and the reindex with it ([`Project::remove_subtitles`]'s
+    /// own entry): every step in the history names its tracks by index into the
+    /// palette, so an entry carries the palette it was taken beside its lanes --
+    /// which is what lets a `z` put this row back, and every placement that
+    /// moved down with it. What that entry cannot bring back is the *pick*: it
+    /// is the caller's, and a caller holding one fixes it up or drops it
+    /// ([`crate::subs::sub_pick_after_restore`]).
     pub fn remove_subtitles(&mut self, idx: usize) -> crate::Result<()> {
         self.project.remove_subtitles(idx)
     }
@@ -2820,11 +2834,17 @@ impl PlaybackSession {
     /// Says nothing about *which* films have one: a source with no stand-in
     /// keeps playing its own pictures either way, and one made while this is on
     /// is picked up at the next seek.
+    ///
+    /// One undo step ([`Project::push_settings_step`]), and the seek below is
+    /// what makes the undo of it land on the picture: it reopens the span
+    /// through [`picture_path`](Self::picture_path), which reads this switch.
     pub fn set_proxies(&mut self, on: bool) {
         if self.proxies == on {
             return;
         }
+        let from = self.settings_value();
         self.proxies = on;
+        self.step_settings(from);
         let now = self.now();
         self.seek(now);
     }
@@ -2839,9 +2859,15 @@ impl PlaybackSession {
     }
 
     /// Pick the seat. Nothing to reseek and nothing to re-probe here: this
-    /// decides what an *export* opens, never what plays.
+    /// decides what an *export* opens, never what plays. One undo step, like
+    /// every other pick on the project.
     pub fn set_encoder_seat(&mut self, seat: crate::export::EncoderSeat) {
+        if self.encoder_seat == seat {
+            return;
+        }
+        let from = self.settings_value();
         self.encoder_seat = seat;
+        self.step_settings(from);
     }
 
     /// The rate this project's mix was picked to run at
@@ -2853,9 +2879,15 @@ impl PlaybackSession {
 
     /// Pick the mix's own rate, overriding the derived one. Nothing to reseek
     /// here: it takes effect at the next audio rebuild (a seek, an edit, a
-    /// reopen), not on the device already playing.
+    /// reopen), not on the device already playing. One undo step, like every
+    /// other pick on the project.
     pub fn set_sample_rate(&mut self, rate: Option<u32>) {
+        if self.sample_rate == rate {
+            return;
+        }
+        let from = self.settings_value();
         self.sample_rate = rate;
+        self.step_settings(from);
     }
 
     /// Whether an imported film that wants a stand-in gets one made for it
@@ -2867,8 +2899,15 @@ impl PlaybackSession {
     /// Make the stand-ins on import, or make none until asked. Nothing to
     /// reseek: this decides what is *started*, never what is decoded -- a proxy
     /// already in the cache is still cut on while [`Self::proxies`] is on.
+    ///
+    /// One undo step, like every other switch on the project.
     pub fn set_auto_proxies(&mut self, on: bool) {
+        if self.auto_proxies == on {
+            return;
+        }
+        let from = self.settings_value();
         self.auto_proxies = on;
+        self.step_settings(from);
     }
 
     /// Which source `path` is, canonicalising only if it has to: a source's own
@@ -2999,10 +3038,9 @@ impl PlaybackSession {
     /// that is not a picture -- zero either way, or past 8K, which is where the
     /// per-frame buffers stop being a sane thing to allocate from a keystroke.
     ///
-    /// corner-cut: not an undo step. The project resolution is not in the lane
-    /// snapshots [`Project::undo`] restores, so cycling it back is one more
-    /// keypress rather than a `z`. Upgrade path is snapshotting it beside the
-    /// lanes, which every existing snapshot site would then have to carry.
+    /// One undo step: the resolution is the project's own, so it rides in the
+    /// entry beside the lanes and a `z` takes the canvas back to the size it
+    /// was ([`Project::push_settings_step`]).
     pub fn set_resolution(&mut self, width: u32, height: u32) -> bool {
         if !crate::is_resolution(width, height) {
             return false;
@@ -3010,8 +3048,10 @@ impl PlaybackSession {
         if (width, height) == (self.meta.width, self.meta.height) {
             return false;
         }
+        let from = self.settings_value();
         self.meta.width = width;
         self.meta.height = height;
+        self.step_settings(from);
         self.invalidate(Dirty::Picture);
         true
     }
@@ -3073,12 +3113,15 @@ impl PlaybackSession {
     /// ([`crate::mux::frame_timing`], the same wall a file of an unnameable rate
     /// is refused at).
     ///
-    /// corner-cut: not an undo step, exactly as the project resolution is not --
-    /// and this one *moves the frame numbers*, so the way back is picking the
-    /// old rate (or the media's, [`native_frame_rate`](Self::native_frame_rate))
-    /// rather than a `z`, and it lands within a frame of where it started rather
-    /// than on it (see [`Project::retime`]). Upgrade path is the same one: the
-    /// project's settings snapshotted beside the lanes.
+    /// One undo step, and the entry it takes is the whole of the change: the
+    /// lanes as they were in the *old* rate's numbering, with that rate beside
+    /// them, so a `z` restores the two together ([`Project::retime`]). The
+    /// step is taken before the retime rather than after, since this is the one
+    /// settings door that moves the lanes the step holds. Picking the old rate
+    /// back is still within a frame of where it started rather than on it: the
+    /// *lanes* come home exactly out of the entry, and the per-source lengths
+    /// are the half that goes through the map twice
+    /// ([`PlaybackSession::adopt_settings`]).
     pub fn set_frame_rate(&mut self, fps: f64) -> bool {
         if !fps.is_finite() || fps <= 0.0 || fps == self.meta.frame_rate {
             return false;
@@ -3090,6 +3133,8 @@ impl PlaybackSession {
         let Ok(k) = Rate::from_fps(self.meta.frame_rate, fps) else {
             return false;
         };
+        let from = self.settings_value();
+        self.project.push_settings_step(from.clone(), from);
         // Lengths first: the retime holds every clip inside its source's *new*
         // length, so a clip that played to the last frame of its file still
         // does rather than naming one past the end.
@@ -3103,6 +3148,9 @@ impl PlaybackSession {
         }
         self.meta.frame_rate = fps;
         self.meta.frame_count = k.timeline_at(self.meta.frame_count).max(1);
+        // The copy the project keeps, now that the change has landed: what the
+        // next lane edit's entry carries.
+        self.project.mirror_settings(self.settings_value());
         let now = self.now();
         self.seek(now);
         true
@@ -3511,15 +3559,19 @@ impl PlaybackSession {
         self.edit(Dirty::Both, |p| p.delete_in(lane, idx))
     }
 
-    /// Undoes the last successful edit, and reseeks like a delete.
+    /// Undoes the last successful edit, and reseeks like a delete. A step on
+    /// the project's own settings comes back the same way: the canvas, the
+    /// rate and the switches are put back on the session here
+    /// ([`Self::adopt_settings`]), so a `z` after a resolution pick, an
+    /// encoder pick or a proxy switch lands exactly as one after a cut does.
     pub fn undo(&mut self) -> bool {
-        self.edit(Dirty::Both, Project::undo)
+        self.restored_step(Project::undo)
     }
 
     /// Redoes the last edit [`undo`](Self::undo) took back, and reseeks like
-    /// a delete.
+    /// a delete -- settings included, exactly as `undo` takes them back.
     pub fn redo(&mut self) -> bool {
-        self.edit(Dirty::Both, Project::redo)
+        self.restored_step(Project::redo)
     }
 
     /// Takes `path` into the **library**: it becomes a source of this session,
@@ -3686,6 +3738,94 @@ impl PlaybackSession {
     /// policy rebuilds the picture where it stands, with the sound running
     /// through it untouched -- no flush, no re-open, no hole -- and an
     /// equalizer the other way round.
+    /// The project's own settings as this session has them now
+    /// ([`ProjectSettings`]): the canvas and the rate are `meta`'s, the
+    /// switches are this session's own fields, and the rendition and the
+    /// limiter are the project's -- two halves of one header, which is what
+    /// every history entry carries beside the lanes ([`Project::snapshot`]).
+    fn settings_value(&self) -> ProjectSettings {
+        ProjectSettings {
+            resolution: (self.meta.width, self.meta.height),
+            frame_rate: self.meta.frame_rate,
+            encoder_seat: self.encoder_seat,
+            sample_rate: self.sample_rate,
+            proxies: self.proxies,
+            auto_proxies: self.auto_proxies,
+            tone: self.project.tone(),
+            limiter: self.project.limiter(),
+        }
+    }
+
+    /// One undo step for a change to the project's own settings, taken after
+    /// the change: `from` is the state the door found, and what the project
+    /// does with the two values is [`Project::push_settings_step`]'s.
+    fn step_settings(&mut self, from: ProjectSettings) {
+        let now = self.settings_value();
+        self.project.push_settings_step(from, now);
+    }
+
+    /// Puts the project's settings back on this session -- what a step that
+    /// restored them leaves for the player to take up. The canvas, the rate and
+    /// the switches live here, and the rendition and the limiter are the
+    /// project's own, already back in place by the time this runs. Every lane
+    /// edit's entry comes through here too and moves nothing, which is the
+    /// common case; the *rate* is the one that needs more than the fields,
+    /// because every source's frame count is held against it and the conform
+    /// that scaled them is not in the entry.
+    fn adopt_settings(&mut self) {
+        let s = self.project.settings_now();
+        // A project nobody has handed a canvas to: a fresh [`Project`] carries
+        // the placeholder ([`ProjectSettings::placeholder`]) and no session is
+        // on one -- the entries pushed before the first settings door hold lane
+        // edits and that placeholder, and adopting it would zero the canvas.
+        if s.frame_rate <= 0.0 {
+            return;
+        }
+        let was = self.meta.frame_rate;
+        self.meta.width = s.resolution.0;
+        self.meta.height = s.resolution.1;
+        self.meta.frame_rate = s.frame_rate;
+        self.encoder_seat = s.encoder_seat;
+        self.sample_rate = s.sample_rate;
+        self.proxies = s.proxies;
+        self.auto_proxies = s.auto_proxies;
+        if s.frame_rate != was {
+            // Within a frame, like the way out ([`Self::set_frame_rate`]'s own
+            // caveat): the lane frame numbers came home exactly, out of the
+            // entry, and only the per-source lengths are re-derived through the
+            // map back.
+            let Ok(k) = Rate::from_fps(was, s.frame_rate) else {
+                return;
+            };
+            for count in &mut self.counts {
+                *count = k.timeline_at(*count).max(1);
+            }
+            for rate in &mut self.rates {
+                *rate = rate.then(k);
+            }
+            self.meta.frame_count = k.timeline_at(self.meta.frame_count).max(1);
+        }
+    }
+
+    /// [`Self::undo`] and [`Self::redo`] themselves: the project's own step,
+    /// and then whatever it restored for the session to take up
+    /// ([`Self::adopt_settings`]). Reseeks both halves, so a canvas that moved
+    /// is repainted and a proxy switch that flipped reopens the file.
+    fn restored_step(&mut self, f: impl FnOnce(&mut Project) -> bool) -> bool {
+        if !f(&mut self.project) {
+            return false;
+        }
+        // Adopted *before* the reseek below, never after it: everything the
+        // reseek reads is one of the settings the entry just put back --
+        // `landing` the rate and the frame count, `picture_path` the switches,
+        // the sound the sample rate -- so a landing computed from the values
+        // the step *undid* lands on the wrong frame of the right project (and
+        // reopens the file through the switch that just went back).
+        self.adopt_settings();
+        self.invalidate(Dirty::Both);
+        true
+    }
+
     fn edit(&mut self, dirty: Dirty, f: impl FnOnce(&mut Project) -> bool) -> bool {
         if !f(&mut self.project) {
             return false;
@@ -5177,6 +5317,53 @@ mod tests {
 
         assert_eq!(before, s.restarts(), "a live transform edit must reuse the worker");
         assert_eq!(next.index, first.index, "paused: same timeline position before and after");
+    }
+
+    /// A rate undo lands the picture where the playhead is, in the rate that
+    /// came *back*: the entry a pick takes carries the old numbering beside the
+    /// old rate, so an undo restores both and the reseek has to be computed
+    /// after the restore. Computed before it, the landing is the pre-undo
+    /// rate's reading of the post-undo project -- `now` clamps to the pre-undo
+    /// rate's idea of the timeline's end and the worker is handed the last
+    /// frame of a five-second timeline for a playhead at three seconds.
+    #[test]
+    fn a_rate_undo_reseeks_at_the_rate_it_restored() {
+        let mut s = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+        s.set_gain(0.0);
+        let poll = |s: &mut PlaybackSession| -> crate::decode::Frame {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            loop {
+                if let Some(f) = s.try_frame() {
+                    return f;
+                }
+                assert!(std::time::Instant::now() < deadline, "no frame within 20s");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        let native = s.native_frame_rate();
+        s.seek(3.0);
+        assert_eq!(s.now(), 3.0, "the fixture is five seconds long");
+        assert!(s.set_frame_rate(native * 2.0), "the rate pick");
+        assert!(s.undo(), "the pick is one step");
+        assert_eq!(s.meta().frame_rate, native, "the rate came back");
+        assert_eq!(
+            s.now(),
+            3.0,
+            "the playhead is the seconds it was, read at the rate that came back"
+        );
+        // The worker's own landing, which is the half the clock alone cannot
+        // show: a frame 149 of 150 is exactly the pre-undo rate's clamp.
+        assert_eq!(
+            s.span.expect("a span for the picture").start,
+            secs_to_frame(3.0, native),
+            "the picture was asked for the playhead's own frame"
+        );
+        let frame = poll(&mut s);
+        assert_eq!(
+            frame.index,
+            secs_to_frame(3.0, native),
+            "and that is the frame that arrived"
+        );
     }
 
     /// The session's live look samples leave its history exactly where the

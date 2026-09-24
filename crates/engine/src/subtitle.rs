@@ -140,7 +140,11 @@ fn segments(set: &[u8]) -> Option<Vec<(u8, &[u8])>> {
 }
 
 /// A subtitle track: where it came from and what it says.
-#[derive(Clone, Debug)]
+///
+/// `PartialEq` because it is one of the things an edit can change and therefore
+/// one of the things an undo has to bring back exactly
+/// ([`crate::Project::parts`], the sweep's round-trip).
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SubtitleTrack {
     /// The file it was read out of: a standalone subtitle file, or the media
     /// file whose track number is below.

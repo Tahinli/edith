@@ -684,7 +684,11 @@ fn export_section(player: &Player, cx: &mut Context<Player>) -> impl IntoElement
         .as_ref()
         .and_then(|session| format_refusal(session, format))
         .map(|why| (short_reason(&why).into(), INK4()));
-    let picture_ink = if refused_now.is_some() { INK4() } else { INK1() };
+    let picture_ink = if refused_now.is_some() {
+        INK4()
+    } else {
+        INK1()
+    };
     let (codec, rated) = sound_codec(format);
     let seat = player.encoder_seat();
     let av1_gpu = seat == EncoderSeat::Hardware && matches!(format, Format::Av1 | Format::Av1Mp4);
@@ -745,18 +749,25 @@ fn export_section(player: &Player, cx: &mut Context<Player>) -> impl IntoElement
             )
             .into_any_element()
         }))
-        .child(row_chord(
-            "settings-export-encoder",
-            "Encoder",
-            encoder_word(seat),
-            "which encoder writes the picture: the GPU where this machine has a seat, or the CPU",
-            "g",
-            av1_gpu.then(|| (AV1_GPU_NOTICE.into(), NOTICE_LOOK())),
-            player,
-            cx.listener(|this, _: &ClickEvent, _, cx| {
-                this.cycle_encoder(cx);
-            }),
-        ))
+        // The encoder writes the *picture*, and the engine opens no seat for a
+        // song: with WAV/FLAC/MP3/Ogg picked the row would be a button that
+        // does nothing when pressed. The export moment mounts no row there
+        // either (`Format::has_video`), so this is that same rule rather than a
+        // third treatment.
+        .children(format.has_video().then(|| {
+            row_chord(
+                "settings-export-encoder",
+                "Encoder",
+                encoder_word(seat),
+                "which encoder writes the picture: the GPU where this machine has a seat, or the CPU",
+                "g",
+                av1_gpu.then(|| (AV1_GPU_NOTICE.into(), NOTICE_LOOK())),
+                player,
+                cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.cycle_encoder(cx);
+                }),
+            )
+        }))
         // Read-only: the range is set on the timeline with the marks
         // themselves ([`keymap::ActionId::SetIn`]/`SetOut`), which is where a
         // person can see what they are marking.

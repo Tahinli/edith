@@ -685,20 +685,141 @@ impl Player {
     }
 
     pub(crate) fn undo(&mut self, cx: &mut Context<Self>) {
-        if self.session.as_mut().is_some_and(PlaybackSession::undo) {
-            self.reset_after_reseek();
-        }
+        self.step_history(PlaybackSession::undo);
         self.selected.clear();
         cx.notify();
     }
 
     pub(crate) fn redo(&mut self, cx: &mut Context<Self>) {
-        if self.session.as_mut().is_some_and(PlaybackSession::redo) {
-            self.reset_after_reseek();
-        }
+        self.step_history(PlaybackSession::redo);
         self.selected.clear();
         cx.notify();
     }
+
+    /// One step of the session's own history through the door both `^z` and
+    /// `^y` go through, and the window-side state it moves taken back up
+    /// afterwards ([`history_step`]).
+    ///
+    /// The plate the pick drew goes with the pick
+    /// ([`Player::remove_subtitle_track`]'s own drop, for its own reason) and
+    /// the frame owed to the screen is cleared
+    /// ([`Player::reset_after_reseek`]): an undo reseeks inside the engine, and
+    /// a picture left where it was is the frame before the step.
+    fn step_history(&mut self, step: fn(&mut PlaybackSession) -> bool) {
+        let mut caches = SessionCaches {
+            fps: self.fps,
+            proxies_on: self.proxies_on,
+            auto_proxies_on: self.auto_proxies_on,
+        };
+        let before = HistoryBefore::of(
+            self.session.as_ref().map_or(&[][..], |s| s.subtitles()),
+            self.sub_track,
+        );
+        let Some(outcome) = self
+            .session
+            .as_mut()
+            .and_then(|session| history_step(&before, &mut caches, session, step))
+        else {
+            return;
+        };
+        self.fps = caches.fps;
+        self.proxies_on = caches.proxies_on;
+        self.auto_proxies_on = caches.auto_proxies_on;
+        self.sub_track = outcome.sub_track;
+        if outcome.drop_sub_image {
+            // corner-cut: its atlas tile is not released -- `close_session`'s
+            // note, for its reason and with its upgrade path.
+            self.sub_image = None;
+        }
+        self.reset_after_reseek();
+    }
+}
+
+/// The three session settings a window keeps its own copy of, as a value so
+/// that [`history_step`] can re-read them in place: the rate every
+/// frame↔second conversion in the window counts in (`Player::timeline_at`,
+/// `Scale::snap_frames`) and the two switches a project carries and the
+/// Settings rows *show* (`settings_stance`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct SessionCaches {
+    pub(crate) fps: f64,
+    pub(crate) proxies_on: bool,
+    pub(crate) auto_proxies_on: bool,
+}
+
+/// The window-side state of the palette as a history step finds it: the pick,
+/// how many rows there are, and which row the pick names.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct HistoryBefore {
+    pub(crate) sub_track: usize,
+    pub(crate) sub_rows: usize,
+    pub(crate) sub_row: Option<SubPickKey>,
+}
+
+impl HistoryBefore {
+    /// `tracks` as they stand and the index picked there -- an empty palette
+    /// for a window with no session, which is the state a step cannot happen in
+    /// anyway.
+    pub(crate) fn of(tracks: &[engine::subtitle::SubtitleTrack], sub_track: usize) -> Self {
+        Self {
+            sub_track,
+            sub_rows: tracks.len(),
+            sub_row: SubPickKey::of(tracks, sub_track),
+        }
+    }
+}
+
+/// What a history step leaves this window to take up beside the session's own
+/// lanes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct HistoryOutcome {
+    pub(crate) sub_track: usize,
+    /// The plate over the picture (`Player::sub_image`) has to go. Its tile is
+    /// keyed by *where* a cue sits ([`Player::sub_picture`]'s `(lane,
+    /// start_us)`) and carries no track, so a step that moves captions, takes
+    /// one off, or renumbers the track a placement names
+    /// ([`engine::Project::remove_subtitles`] walks `SubClip::track` down)
+    /// cannot be asked of that cache -- the tile at a key can be served for a
+    /// cue it was not drawn from. Conservative on purpose: at most one plate is
+    /// redrawn by the next repaint.
+    pub(crate) drop_sub_image: bool,
+}
+
+/// One step of the session's own history ([`PlaybackSession::undo`],
+/// [`PlaybackSession::redo`]) with everything this window caches re-read after
+/// it. `None` when the step did not happen -- nothing to undo, nothing to redo
+/// -- and then nothing here moves either.
+///
+/// A free function over the session and the caches rather than a [`Player`]
+/// method: this test binary has no `TestAppContext` to build a `Player` in, so
+/// what `^z` does to the session *and* to the caches beside it is pinned here,
+/// and [`Player::step_history`] is this call plus the repaint.
+///
+/// The rate and the two switches are read off the *session*, exactly as the
+/// doors that own them do ([`Player::apply_frame_rate`], the `.edith` load): a
+/// history entry carries the project's settings beside its lanes
+/// (`Project::snapshot`), so a step puts them back -- and a window that kept
+/// its old copies counts a cut at the rate just undone, keeps reporting a
+/// switch the session no longer has, and pushes that switch at the next session
+/// it makes.
+pub(crate) fn history_step(
+    before: &HistoryBefore,
+    caches: &mut SessionCaches,
+    session: &mut PlaybackSession,
+    step: fn(&mut PlaybackSession) -> bool,
+) -> Option<HistoryOutcome> {
+    if !step(session) {
+        return None;
+    }
+    caches.fps = session.meta().frame_rate;
+    caches.proxies_on = session.proxies();
+    caches.auto_proxies_on = session.auto_proxies();
+    let tracks = session.subtitles();
+    let sub_track = sub_pick_after_restore(before.sub_track, before.sub_row.as_ref(), tracks);
+    Some(HistoryOutcome {
+        sub_track,
+        drop_sub_image: tracks.len() != before.sub_rows || sub_track != before.sub_track,
+    })
 }
 
 /// The half-open range a mark and a mark make, in either order: a person's two

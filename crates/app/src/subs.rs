@@ -333,9 +333,7 @@ pub(crate) fn subtitle_tail(session: &mut PlaybackSession, subs: Subs) -> Option
     match subs {
         Ok(tracks) => match session.add_subtitle_tracks(tracks) {
             0 => None,
-            n => Some(format!(
-                " · {n} subtitle track(s)"
-            )),
+            n => Some(format!(" · {n} subtitle track(s)")),
         },
         Err(e) => Some(format!(" — SUBTITLES UNREAD: {e}")),
     }
@@ -625,17 +623,80 @@ pub(crate) fn subtitle_rows(tracks: &[engine::subtitle::SubtitleTrack]) -> Vec<S
 /// last. Zero on an emptied list, which is the index the section is not drawn at
 /// all.
 ///
-/// Its own function because the pick is what the overlay draws: left where it
-/// was it would name a different track, and the plate over the picture would
-/// change language on its own the moment a row above it went. What an export
-/// writes is *not* this pick and cannot be desynced by a removal -- it is worked
-/// out from the cues on the timeline each time ([`Player::export_subs`]).
+/// Its own function because the pick is read as "which row" everywhere it is
+/// echoed -- the dock highlights the picked row by comparing it
+/// (`dock_stance`'s `track == player.sub_track`), and the section heading and
+/// its notices name it -- so left where it was it would highlight one track and
+/// name another the moment a row above it went. The plate over the picture is
+/// not on that list: it is drawn from the *placements* on the shown lane
+/// ([`Player::active_sub_lane`], and the session's own `sub_lane_cues`). What an export
+/// writes is not this pick either -- it is worked out from the cues on the
+/// timeline each time ([`Player::export_subs`]).
 pub(crate) fn sub_pick_after_removal(picked: usize, removed: usize, left: usize) -> usize {
     let picked = match removed < picked {
         true => picked - 1,
         false => picked,
     };
     picked.min(left.saturating_sub(1))
+}
+
+/// What a palette row *is*, apart from where it sits: the file it came out of,
+/// which track of it, and the two words a row shows. Cloned out of the palette
+/// once per history step -- a path and three short strings, against a palette
+/// whose cues are the whole film's subtitles. Not [`SubRow`], which is a row as
+/// the column *draws* it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SubPickKey {
+    path: PathBuf,
+    track: Option<u64>,
+    language: String,
+    label: String,
+}
+
+impl SubPickKey {
+    /// The row `track` of this palette names, `None` for an index no track
+    /// answers to -- the same silence [`sub_pick_name`] gives.
+    pub(crate) fn of(tracks: &[engine::subtitle::SubtitleTrack], track: usize) -> Option<Self> {
+        let track = tracks.get(track)?;
+        Some(Self {
+            path: track.path.clone(),
+            track: track.track,
+            language: track.language.clone(),
+            label: track.label.clone(),
+        })
+    }
+
+    /// Whether `track` is this row: the four fields a palette would have had to
+    /// change for a pick left where it was to name a different track.
+    fn is(&self, track: &engine::subtitle::SubtitleTrack) -> bool {
+        track.path == self.path
+            && track.track == self.track
+            && track.language == self.language
+            && track.label == self.label
+    }
+}
+
+/// Where the pick lands once a *restored* palette is back in place: the row
+/// that was picked, found by what it is rather than by where it sat.
+///
+/// A history step moves rows without saying which one moved -- an undo of a
+/// removal puts a column back above the pick as often as below it -- so an
+/// index left where it was names a different track, which is the desync
+/// [`sub_pick_after_removal`] prevents at the door where the row that moved is
+/// known. That door's arithmetic is this map's one-row-moved case.
+///
+/// A row the restored palette does not have (it went again, or the pick named
+/// nothing) falls back to the old index clamped into the new list -- that same
+/// door's own fallback, and the zero the section is not drawn at all for an
+/// emptied palette.
+pub(crate) fn sub_pick_after_restore(
+    picked: usize,
+    before: Option<&SubPickKey>,
+    after: &[engine::subtitle::SubtitleTrack],
+) -> usize {
+    before
+        .and_then(|was| after.iter().position(|track| was.is(track)))
+        .unwrap_or_else(|| picked.min(after.len().saturating_sub(1)))
 }
 
 pub(crate) fn sub_pick_name(
@@ -705,17 +766,33 @@ pub(crate) fn cues_at(cues: &[engine::subtitle::Cue], at: f64) -> Vec<&engine::s
         .collect()
 }
 
-/// The sources a repaint has not asked about yet. A key that is already there
-/// means "asked", whatever state it is in, which is what stops a decode already
-/// running from being started again by the next of sixty repaints a second.
+/// How long a failed waveform decode is left alone before the next repaint asks
+/// again: long enough that sixty repaints a second do not become sixty decodes,
+/// short enough that a file which arrived mid-copy has its envelope a moment
+/// after it lands. The engine memoizes no failure for the same reason
+/// ([`engine::waveform`]): the reason one failed may have gone away.
+pub(crate) const WAVE_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The sources a repaint has not asked about yet, as of `now`. A key that is
+/// already there means "asked", whatever state it is in -- which is what stops
+/// a decode already running from being started again by the next of sixty
+/// repaints a second -- with one exception: a [`Wave::Failed`] older than
+/// [`WAVE_RETRY`] is asked again, because a decode that failed once is not an
+/// answer about the file, only about the moment it was tried. A file with no
+/// audio (`Wave::Silent`) is an answer like any other and is never re-asked.
 pub(crate) fn unseen_sources(
     sources: &[Source],
     waves: &HashMap<(PathBuf, usize), Wave>,
+    now: std::time::Instant,
 ) -> Vec<(PathBuf, usize)> {
     sources
         .iter()
         .map(|s| (s.path.clone(), s.audio_stream))
-        .filter(|key| !waves.contains_key(key))
+        .filter(|key| match waves.get(key) {
+            None => true,
+            Some(Wave::Failed(at)) => now.duration_since(*at) >= WAVE_RETRY,
+            Some(_) => false,
+        })
         .collect()
 }
 
