@@ -1229,10 +1229,16 @@ struct Dissolve<'a> {
     /// B's own file's display-matrix turn, [`place_picture`]'s first stage;
     /// B is a different file and may be turned differently from A.
     rotation: Rotation,
+    /// B's own file's sample aspect, [`place_picture`]'s second stage, for
+    /// the same reason the turn is per file.
+    pixel_aspect: crate::demux::PixelAspect,
     canvas: Composer,
     /// The turn's, the grade's and the transform's scratch, exactly as A's
     /// span keeps them: refilled per picture, allocated once.
     rotated: (Vec<u8>, Vec<u8>, Vec<u8>),
+    /// The stretch's own scratch, [`place_picture`]'s second stage -- the
+    /// pixel aspect's, beside the turn's.
+    stretched: (Vec<u8>, Vec<u8>, Vec<u8>),
     graded: (Vec<u8>, Vec<u8>, Vec<u8>),
     transformed: (Vec<u8>, Vec<u8>, Vec<u8>),
 }
@@ -2721,7 +2727,13 @@ fn run(
     // samples *mean* ([`ColorDescription`]), which is what decides whether they
     // are remapped on the way in. Real time for a still, a song and a
     // single-rate project, where every conversion below is the identity.
-    let rates: Vec<(Rate, ColorDescription, Option<f32>, Rotation)> = sources
+    let rates: Vec<(
+        Rate,
+        ColorDescription,
+        Option<f32>,
+        Rotation,
+        crate::demux::PixelAspect,
+    )> = sources
         .iter()
         .map(|source| source_rate(&source.path, meta.frame_rate))
         .collect();
@@ -2740,7 +2752,7 @@ fn run(
     let preset = project.tone();
     let tone: Vec<Option<ToneMapper>> = rates
         .iter()
-        .map(|(_, color, peak, _)| match color.transfer {
+        .map(|(_, color, peak, _, _)| match color.transfer {
             // A preview file keeps the film's own curve and is tone-mapped when
             // it is *shown* ([`ExportSettings::keep_source_colour`]), which is
             // both cheaper and the only way the preset can still be changed
@@ -2806,12 +2818,14 @@ fn run(
         // A's pixels on the CPU, so a dissolving span never asks for a GPU
         // buffer, not even outside its own window.
         let dissolve = dissolve_window(project, &span);
-        let (mut pictures, rate, in_frame, color, mapper, rotation) = match span.from {
+        let (mut pictures, rate, in_frame, color, mapper, rotation, pixel_aspect) =
+            match span.from
+            {
             Some((source, in_frame)) => {
                 let entry = sources
                     .get(source)
                     .ok_or_else(|| format!("clip names source {source} of {}", sources.len()))?;
-                let (rate, color, _peak, rotation) = rates[source];
+                let (rate, color, _peak, rotation, pixel_aspect) = rates[source];
                 let mapper = tone[source].as_ref();
                 // Nothing on the way from this span's decoder to the encoder
                 // touches a sample: no tone map, no matrix remap, no grade --
@@ -2831,8 +2845,12 @@ fn run(
                     // A file whose display matrix asks for a turn is *not*
                     // untouched, whatever else the timeline says: its pictures
                     // have to be turned, which is a read-back no GPU buffer
-                    // survives.
+                    // survives. The sample aspect is the same refusal one
+                    // stage later: its pictures have to be stretched to the
+                    // square-pixel raster before an encoder sees them, which
+                    // is the same kind of touch.
                     && rotation.is_none()
+                    && pixel_aspect.is_square()
                     && dissolve.is_none();
                 let want = untouched.then(|| encoder.dma_want(meta)).flatten();
                 // Opened at the file's own frame, which is the only place the
@@ -2852,13 +2870,21 @@ fn run(
                 } else {
                     ClipDecoder::open(&entry.path, rate.source_at(in_frame), want)?
                 };
-                (Some(pictures), rate, in_frame, Some(color), mapper, rotation)
+                (Some(pictures), rate, in_frame, Some(color), mapper, rotation, pixel_aspect)
             }
             // A gap's black is 16/128/128, which is black in every matrix here
             // and on every curve: nothing to remap and nothing to tone-map,
             // which is what `None` says. A gap is no file either, so nothing
             // turns it.
-            None => (None, Rate::REAL_TIME, 0, None, None, Rotation::None),
+            None => (
+                None,
+                Rate::REAL_TIME,
+                0,
+                None,
+                None,
+                Rotation::None,
+                crate::demux::PixelAspect::SQUARE,
+            ),
         };
         // Mixed spaces on one timeline: a clip coded against another matrix than
         // the one this file declares is rewritten into it, *after* the grade --
@@ -2885,8 +2911,10 @@ fn run(
         let mut transformed = (Vec::new(), Vec::new(), Vec::new());
         // ...and one more for the file's own display-matrix turn, which happens
         // before all of those (see [`place_picture`]): empty for every source
-        // that states no turn.
+        // that states no turn. `stretched` is its twin for the pixel aspect,
+        // which happens right after it.
         let mut rotated = (Vec::new(), Vec::new(), Vec::new());
+        let mut stretched = (Vec::new(), Vec::new(), Vec::new());
         // ...and the canvas it is placed on, which is where a source of another
         // resolution becomes a picture at the project's. The same `Composer`
         // playback composes with, given the same policy, so an export is what
@@ -2905,7 +2933,7 @@ fn run(
                 let entry = sources.get(b_source).ok_or_else(|| {
                     format!("clip names source {b_source} of {}", sources.len())
                 })?;
-                let (b_rate, b_color, _peak, b_rotation) = rates[b_source];
+                let (b_rate, b_color, _peak, b_rotation, b_pixel_aspect) = rates[b_source];
                 let b_mapper = tone[b_source].as_ref();
                 let b_remap = remap_into(Some(b_color), b_mapper.is_some(), out_color.matrix);
                 Ok(Dissolve {
@@ -2935,12 +2963,14 @@ fn run(
                         .copied()
                         .unwrap_or_default(),
                     rotation: b_rotation,
+                    pixel_aspect: b_pixel_aspect,
                     canvas: Composer::new(
                         meta.width,
                         meta.height,
                         project.composite_fit_at(b_start),
                     ),
                     rotated: (Vec::new(), Vec::new(), Vec::new()),
+                    stretched: (Vec::new(), Vec::new(), Vec::new()),
                     graded: (Vec::new(), Vec::new(), Vec::new()),
                     transformed: (Vec::new(), Vec::new(), Vec::new()),
                 })
@@ -3045,11 +3075,13 @@ fn run(
                     width,
                     height,
                     rotation,
+                    pixel_aspect,
                     grade,
                     transform,
                     remap,
                     mapper,
                     &mut rotated,
+                    &mut stretched,
                     &mut graded,
                     &mut transformed,
                     &mut canvas,
@@ -3079,9 +3111,10 @@ fn run(
                             }
                             Some(Frame::Pixels(by, bu, bv, bw, bh)) => {
                                 let (by, bu, bv, _, _) = place_picture(
-                                    by, bu, bv, bw, bh, d.rotation, d.grade, d.transform,
-                                    d.remap, d.mapper, &mut d.rotated, &mut d.graded,
-                                    &mut d.transformed, &mut d.canvas,
+                                    by, bu, bv, bw, bh, d.rotation, d.pixel_aspect, d.grade,
+                                    d.transform, d.remap, d.mapper, &mut d.rotated,
+                                    &mut d.stretched, &mut d.graded, &mut d.transformed,
+                                    &mut d.canvas,
                                 );
                                 let idx_in_window = done_here + r - d.tail_start;
                                 let t = dissolve_weight(idx_in_window, d.window);
@@ -3236,11 +3269,13 @@ fn place_picture<'a>(
     width: u32,
     height: u32,
     rotation: Rotation,
+    pixel_aspect: crate::demux::PixelAspect,
     grade: Option<crate::color::ColorParams>,
     transform: TransformParams,
     remap: Option<(Matrix, Matrix)>,
     mapper: Option<&ToneMapper>,
     turned: &'a mut (Vec<u8>, Vec<u8>, Vec<u8>),
+    stretched: &'a mut (Vec<u8>, Vec<u8>, Vec<u8>),
     graded: &'a mut (Vec<u8>, Vec<u8>, Vec<u8>),
     transformed: &'a mut (Vec<u8>, Vec<u8>, Vec<u8>),
     canvas: &'a mut Composer,
@@ -3263,6 +3298,35 @@ fn place_picture<'a>(
             );
             (&turned.0[..], &turned.1[..], &turned.2[..], w, h)
         }
+    };
+    // The pixel aspect, applied exactly once -- the same single conversion to
+    // the square-pixel raster the decode funnel makes, in the same order
+    // (stretch after turn), so the encoder is fed the pixels the preview
+    // showed to the byte. A square-pixel file -- every file whose samples are
+    // one to one -- borrows the planes through.
+    let (y, u, v, width, height) = if pixel_aspect.is_square() {
+        (y, u, v, width, height)
+    } else {
+        let display_width = pixel_aspect.width_factor(width);
+        crate::scale::scale_i420(
+            y,
+            u,
+            v,
+            width as usize,
+            height as usize,
+            &mut stretched.0,
+            &mut stretched.1,
+            &mut stretched.2,
+            display_width as usize,
+            height as usize,
+        );
+        (
+            &stretched.0[..],
+            &stretched.1[..],
+            &stretched.2[..],
+            display_width,
+            height,
+        )
     };
     // The planes are borrowed from the decoder (and `Black::picture` hands the
     // same slice as both u and v), so a grade cannot be applied in place: it
@@ -3334,13 +3398,26 @@ fn remap_into(
 fn source_rate(
     path: &Path,
     timeline_fps: f64,
-) -> (Rate, ColorDescription, Option<f32>, Rotation) {
+) -> (
+    Rate,
+    ColorDescription,
+    Option<f32>,
+    Rotation,
+    crate::demux::PixelAspect,
+) {
     if crate::is_image(path) || crate::is_audio(path) {
         // A still is BT.601 by construction whatever it was authored as:
         // `decode::rgb_to_i420` is the one matrix that turns its pixels into
         // planes. A song has no picture and the answer is never read. Neither
-        // has a display matrix to be turned by.
-        return (Rate::REAL_TIME, ColorDescription::default(), None, Rotation::None);
+        // has a display matrix to be turned by, nor an aspect to be widened
+        // by: both are authored square.
+        return (
+            Rate::REAL_TIME,
+            ColorDescription::default(),
+            None,
+            Rotation::None,
+            crate::demux::PixelAspect::SQUARE,
+        );
     }
     match Demuxer::open(path) {
         // ...and one whose rate cannot be named against the timeline's, which
@@ -3357,10 +3434,19 @@ fn source_rate(
             // The file's own turn, so the encoder is fed the picture the
             // preview shows: the same header read, one more answer.
             meta.rotation,
+            // ...and its own sample aspect, for the same reason on the same
+            // read: the encoder is fed the shape the preview showed.
+            meta.pixel_aspect,
         ),
         // Unreadable here means unreadable below too, where the span dies with a
         // real message; the file's own space is the least of that.
-        Err(_) => (Rate::REAL_TIME, ColorDescription::default(), None, Rotation::None),
+        Err(_) => (
+            Rate::REAL_TIME,
+            ColorDescription::default(),
+            None,
+            Rotation::None,
+            crate::demux::PixelAspect::SQUARE,
+        ),
     }
 }
 
