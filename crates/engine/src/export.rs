@@ -5488,6 +5488,11 @@ mod tests {
             codec: crate::demux::Codec::H264,
             color: Default::default(),
             rotation: Rotation::None,
+            // Square pixels, coded where they are declared: a meta no container
+            // wrote, so nothing was read to disagree with it.
+            coded_width: width,
+            coded_height: height,
+            pixel_aspect: crate::demux::PixelAspect::SQUARE,
         };
         // 1280 * 720 * 30 * 0.1
         assert_eq!(bitrate_for(&meta(1280, 720, 30.0)), 2_764_800);
@@ -5540,6 +5545,11 @@ mod tests {
             codec: crate::demux::Codec::H264,
             color: Default::default(),
             rotation: Rotation::None,
+            // Square pixels, coded where they are declared: a meta no
+            // container wrote, so nothing was read to disagree with it.
+            coded_width: width,
+            coded_height: height,
+            pixel_aspect: crate::demux::PixelAspect::SQUARE,
         }
     }
 
