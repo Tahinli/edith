@@ -949,9 +949,12 @@ impl Keymap {
                 // Seeking without a pointer, on the keys every player already
                 // seeks with (gpui names them "left"/"right"/"home"/"end",
                 // platform.rs:872-877). The colour card reads the same arrows
-                // for its sliders, but a card answers the stroke and returns
-                // before the keymap is consulted at all -- so these move the
-                // playhead only while no card is open.
+                // for its sliders, and a card answers its own strokes before the
+                // keymap is consulted -- the arrows among them -- so these move
+                // the playhead only while no card is open. The document chords
+                // are the exception and are not these: `Undo`, `Redo`, `Save`,
+                // `Copy` and `Paste` reach the keymap whatever is up
+                // (`ui::stance::card_safe_action`).
                 b(ActionId::StepBack, "left", false),
                 b(ActionId::StepForward, "right", false),
                 b(ActionId::JumpBack, "left", true),
