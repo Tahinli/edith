@@ -813,7 +813,7 @@ impl Mp4Demuxer {
         // hev1 in that the parameter sets may not repeat in-band, which costs
         // nothing: they are re-injected out of `hvcC` ahead of every sync sample
         // either way, exactly as an AV1 sequence header is out of `av1C`.
-        let (track, codec, entry) = reader
+        let (track, codec) = reader
             .moov
             .traks
             .iter()
@@ -822,8 +822,8 @@ impl Mp4Demuxer {
                 matches!(t.track_type(), Ok(TrackType::Video))
                     .then(|| sample_entry(path, t.track_id()).ok())
                     .flatten()
-                    .and_then(|(kind, entry)| mp4_codec(&kind).map(|codec| (codec, entry)))
-                    .map(|(codec, entry)| (t, codec, entry))
+                    .and_then(|(kind, _)| mp4_codec(&kind))
+                    .map(|codec| (t, codec))
             })
             // Named, for the same reason the Matroska door names it: "no video
             // track" is a lie about a file that has one in a codec this does not
@@ -852,14 +852,9 @@ impl Mp4Demuxer {
             None => Rotation::None,
         };
         let (coded_w, coded_h) = (u32::from(track.width()), u32::from(track.height()));
-        // The picture's displayed shape, in the same two steps the Matroska door
-        // resolves its `Display*` elements in: the aspect the sample entry
-        // states, then the turn. A `pasp`-carrying file and the mkv remux of it
-        // report one size.
-        let shown = pasp_size(&entry, coded_w, coded_h).unwrap_or((coded_w, coded_h));
         let (width, height) = match rotation.swaps_axes() {
-            true => (shown.1, shown.0),
-            false => shown,
+            true => (coded_h, coded_w),
+            false => (coded_w, coded_h),
         };
         let meta = VideoMeta {
             width,
@@ -1314,18 +1309,13 @@ impl MkvDemuxer {
                 }
             }
         };
-        // The picture's *displayed* shape, resolved exactly as the mp4 door
-        // resolves it: the size the file states its pictures are shown at
-        // ([`display_size`] -- an anamorphic track's `DisplayWidth`, which is
-        // the shape the coded pixels are stretched to and the shape a player
-        // shows), then swapped where the turn is a quarter one. The file states
-        // that size in the *coded* orientation -- it is a property of the
-        // picture, not of the screen -- so the turn comes second, here and
-        // there.
-        let shown = video.display.unwrap_or((video.width, video.height));
+        // The coded size, swapped where the turn is a quarter one: a portrait
+        // `.mkv` stores a landscape picture plus the turn, so the displayed
+        // shape is the coded one turned -- the same two numbers the mp4 door
+        // swaps, off the same kind of turn.
         let (width, height) = match video.rotation.swaps_axes() {
-            true => (shown.1, shown.0),
-            false => shown,
+            true => (video.height, video.width),
+            false => (video.width, video.height),
         };
         let meta = VideoMeta {
             width,
@@ -1801,7 +1791,11 @@ impl MkvDemuxer {
         Ok(Some(CodedBlock {
             bytes: &self.scratch,
             key: block.key,
-            ts_ns: block.ts * self.timestamp_scale as i64,
+            // Widened and fallible, exactly as the subtitle walk's tick scale
+            // is ([`ticks_scaled`]): `block.ts` is whatever the file says, so the
+            // multiply overflows an `i64` on a crafted cluster and a copy would
+            // write a block time that wrapped negative.
+            ts_ns: ticks_scaled(block.ts, self.timestamp_scale, 1)?,
         }))
     }
 }
@@ -2011,10 +2005,6 @@ struct MkvVideo {
     number: u64,
     width: u32,
     height: u32,
-    /// The size the file displays its pictures at (`DisplayWidth`/
-    /// `DisplayHeight`, stated in the pixel unit), or `None` -- which is every
-    /// square-pixel file, and falls back to the pixel dims above.
-    display: Option<(u32, u32)>,
     /// The quarter turn the track's `Projection` asks for;
     /// [`Rotation::None`] where it states none.
     rotation: Rotation,
@@ -2165,16 +2155,6 @@ const DEFAULT_DURATION: u32 = 0x23E383;
 const VIDEO: u32 = 0xE0;
 const PIXEL_WIDTH: u32 = 0xB0;
 const PIXEL_HEIGHT: u32 = 0xBA;
-// ...and the size the track's pictures are *shown* at, which a square-pixel
-// file -- the common case -- states none of, so absence falls back to the pixel
-// dims above. IDs checked against RFC 9559 and byte-verified against an
-// ffmpeg-written fixture before the test that reads them was trusted.
-const DISPLAY_WIDTH: u32 = 0x54B0;
-const DISPLAY_HEIGHT: u32 = 0x54BA;
-/// The unit `DisplayWidth`/`DisplayHeight` are counted in: 0 pixels, then
-/// centimetres, inches, a bare aspect, unknown. Only the pixel unit resolves
-/// without a physical screen, so any other unit keeps the pixel dims.
-const DISPLAY_UNIT: u32 = 0x54B2;
 // The track's projection: how the flat picture sits in space. A roll on the
 // rectangular projection (type 0) is how a Matroska muxer states what an mp4
 // states with its `tkhd` matrix -- mkvmerge has translated display matrices
@@ -2182,7 +2162,8 @@ const DISPLAY_UNIT: u32 = 0x54B2;
 // rotated input -- so the same quarter turns are read off it. Anything else (a
 // spherical or mesh projection, a yaw/pitch pose) is not a turn this engine can
 // make, and is refused by name like the mp4 door refuses a matrix that is not a
-// quarter turn.
+// quarter turn; a spherical one's pose is the sphere's orientation rather than
+// the picture's and is left alone ([`projection_rotation`]).
 const PROJECTION: u32 = 0x7670;
 const PROJECTION_TYPE: u32 = 0x7671;
 const PROJECTION_POSE_YAW: u32 = 0x7673;
@@ -2438,7 +2419,6 @@ fn mkv_track_entry(
 ) -> crate::Result<MkvEntry> {
     let (mut number, mut kind, mut codec, mut default_duration) = (0, 0, String::new(), None);
     let (mut width, mut height, mut config) = (0, 0, Vec::new());
-    let mut display = None;
     let mut rotation = Rotation::None;
     let (mut language, mut name, mut bcp47) = (String::new(), String::new(), String::new());
     let mut tags = Tags::default();
@@ -2462,14 +2442,10 @@ fn mkv_track_entry(
             CODEC_PRIVATE => config = ebml_bytes(file, body, stop)?,
             VIDEO => {
                 let mut at = body;
-                let (mut display_width, mut display_height, mut display_unit) = (None, None, None);
                 while let Some(e) = ebml_element(file, at, stop)? {
                     match e.0 {
                         PIXEL_WIDTH => width = ebml_uint(file, e.1, e.2)? as u32,
                         PIXEL_HEIGHT => height = ebml_uint(file, e.1, e.2)? as u32,
-                        DISPLAY_WIDTH => display_width = Some(ebml_uint(file, e.1, e.2)?),
-                        DISPLAY_HEIGHT => display_height = Some(ebml_uint(file, e.1, e.2)?),
-                        DISPLAY_UNIT => display_unit = Some(ebml_uint(file, e.1, e.2)?),
                         PROJECTION => {
                             let (mut kind, mut yaw, mut pitch, mut roll) =
                                 (0u64, 0.0f64, 0.0f64, 0.0f64);
@@ -2542,11 +2518,6 @@ fn mkv_track_entry(
                     }
                     at = e.2;
                 }
-                // Resolved here rather than per element: `DisplayWidth` and
-                // `DisplayHeight` can come in either order and their unit is a
-                // *ratio*, so neither half means anything until the pixel dims
-                // and the unit are all in hand.
-                display = display_size(height, display_width, display_height, display_unit);
             }
             _ => {}
         }
@@ -2619,7 +2590,6 @@ fn mkv_track_entry(
         number,
         width,
         height,
-        display,
         rotation,
         tags,
         light,
@@ -2831,70 +2801,6 @@ fn projection_rotation(kind: u64, yaw: f64, pitch: f64, roll: f64) -> crate::Res
         false => rotation_of_roll(roll),
     }
 }
-
-/// The size a track's `Display*` elements say its pictures are shown at, or
-/// `None` for a file that states none -- or states one in a unit nothing here can
-/// resolve, which falls back to the pixel dims for the same reason.
-///
-/// The mkv spelling of what an mp4 keeps in its sample entry's `pasp` box, and
-/// resolved the same way round: the **coded height is kept** and the width is
-/// the one the file's own numbers make it. That is what anamorphic video is:
-/// HDV's 1440x1080 is 1920x1080 wide when shown, DVD's 720x576 is 1024x576 -- never
-/// 1440x810 or 720x405, which is the vertical resolution thrown away.
-///
-/// Only two of the five units can be resolved without a screen to show the
-/// picture on: **pixels** (0, the spec's default where the file states no unit)
-/// is the size itself, and the **display aspect ratio** (3) is the shape the
-/// size is derived from. Centimetres, inches and "unknown" are left to the pixel
-/// dims -- a physical size says nothing about how many pixels to show, and a DPI
-/// guessed here would be this engine's invention rather than the file's word.
-fn display_size(
-    pixel_height: u32,
-    display_width: Option<u64>,
-    display_height: Option<u64>,
-    display_unit: Option<u64>,
-) -> Option<(u32, u32)> {
-    let (across, down) = match (display_width, display_height) {
-        (Some(across), Some(down)) if across > 0 && down > 0 => (across, down),
-        _ => return None,
-    };
-    match display_unit.unwrap_or(0) {
-        0 => Some((u32::try_from(across).ok()?, u32::try_from(down).ok()?)),
-        3 => Some((
-            u32::try_from((u64::from(pixel_height) * across + down / 2) / down).ok()?,
-            pixel_height,
-        )),
-        _ => None,
-    }
-}
-
-/// The size a sample entry's `pasp` box says the pictures are shown at -- an
-/// mp4's spelling of [`display_size`], read the same way: the box is a *sample*
-/// aspect ratio, so the coded height is kept and the width is the one the ratio
-/// makes it (1440x1080 at `pasp` 4:3 is the 1920x1080 an HDV file is meant to be
-/// shown at).
-///
-/// The box is one of the sample entry's *children*, so the walk starts after the
-/// entry's own fixed fields rather than at its first byte: a `boxes` pass over a
-/// whole `avc1` payload reads a length out of its `data_reference_index` and
-/// finds nothing.
-fn pasp_size(entry: &[u8], coded_w: u32, coded_h: u32) -> Option<(u32, u32)> {
-    let payload = child(entry.get(VISUAL_SAMPLE_ENTRY..)?, b"pasp")?;
-    let across = u32::from_be_bytes(payload.get(..4)?.try_into().ok()?);
-    let down = u32::from_be_bytes(payload.get(4..8)?.try_into().ok()?);
-    if across == 0 || down == 0 {
-        return None;
-    }
-    let width = (u64::from(coded_w) * u64::from(across) + u64::from(down) / 2) / u64::from(down);
-    Some((u32::try_from(width).ok()?, coded_h))
-}
-
-/// What a `VisualSampleEntry` states before its child boxes: the reserved word
-/// and `data_reference_index` (8), the pre-defined and reserved words (16), the
-/// coded width and height (4), the two fixed-point resolutions (8), a reserved
-/// word (4), the frame count (2), the 32-byte compressor name, the depth (2) and
-/// one more reserved word (2).
-const VISUAL_SAMPLE_ENTRY: usize = 78;
 
 /// Why an mp4 came back with no picture, by the fourcc of the video track it
 /// does carry: `avc3` and `mp4v` are files with video in them, and telling their
@@ -4524,10 +4430,10 @@ fn mkv_subtitle_blocks(
     const BLOCK_DURATION: u32 = 0x9B;
     // Ticks to microseconds, the unit `MkvCue` keeps. `TimestampScale` is
     // nanoseconds per tick and is a millisecond in every file anything writes.
-    // [`ticks_to_us`] does the arithmetic: it is widened and fallible, and a
+    // [`ticks_scaled`] does the arithmetic: it is widened and fallible, and a
     // corrupt cluster timestamp is refused rather than wrapped into a negative
     // cue time -- see the test beside it.
-    let us = |ticks: i64| ticks_to_us(ticks, timestamp_scale);
+    let us = |ticks: i64| ticks_scaled(ticks, timestamp_scale, 1_000);
     let mut at = segment.0;
     while let Some((id, body, stop)) = ebml_element(file, at, segment.1)? {
         // The import's second walk, stopped by the same Cancel as its first.
@@ -4607,20 +4513,23 @@ fn mkv_subtitle_blocks(
     Ok(())
 }
 
-/// A tick count as the microseconds [`MkvCue`] keeps, or the refusal a corrupt
-/// one earns.
+/// A tick count scaled out of the file's own clock, or the refusal a corrupt one
+/// earns: `ticks * TimestampScale / per_tick`, which is microseconds for the
+/// subtitle walk (`per_tick` 1_000) and nanoseconds for the block walk a copy
+/// reads (`per_tick` 1).
 ///
 /// The multiply is widened to `i128` rather than done in `i64`, and a result that
 /// does not fit is refused rather than saturated: both numbers are the file's --
-/// a cluster timestamp is an EBML uint nothing bounds and `TimestampScale` is a
-/// scale it chooses -- so `ticks * timestamp_scale` overflows on a crafted file,
-/// which is a panic in debug and a *negative* cue time in release, silently.
-/// Widened, no product can overflow; a timestamp that then does not fit the
-/// answer is the same class of corrupt as the oversized block refused above, and
-/// gets the same loud refusal rather than a cue at a time no clock can hold.
-fn ticks_to_us(ticks: i64, timestamp_scale: u64) -> crate::Result<i64> {
-    i64::try_from(i128::from(ticks) * i128::from(timestamp_scale) / 1_000)
-        .map_err(|_| "a Matroska subtitle timestamp no clock can hold".into())
+/// a cluster or block timestamp is an EBML uint nothing bounds, and
+/// `TimestampScale` is a scale it chooses -- so `ticks * timestamp_scale`
+/// overflows on a crafted file, which is a panic in debug and a *negative*
+/// timestamp in release, silently. Widened no product can overflow; a timestamp
+/// that then does not fit its unit is the same class of corrupt as the oversized
+/// block refused above, and gets the same loud refusal rather than a time no
+/// clock can hold.
+fn ticks_scaled(ticks: i64, timestamp_scale: u64, per_tick: u64) -> crate::Result<i64> {
+    i64::try_from(i128::from(ticks) * i128::from(timestamp_scale) / i128::from(per_tick))
+        .map_err(|_| "a Matroska timestamp no clock can hold".into())
 }
 
 /// A string element, without the trailing NULs a `Name` may be padded with.
@@ -4635,23 +4544,29 @@ fn string_of(file: &mut File, body: u64, stop: u64) -> crate::Result<String> {
 mod tests {
     use super::*;
 
-    /// A corrupt cluster timestamp is refused, not wrapped: the product is where
-    /// an `i64` overflows, so this is the assertion that fails (as a panic in
-    /// debug, as a negative cue time in release) without the widening -- the
-    /// shape a hostile `.mkv` reaches through `mkv_subtitle_blocks`.
+    /// Both walks that scale a file's own clock: the subtitle one
+    /// (microseconds, `per_tick` 1_000) and the block one a copy reads
+    /// (nanoseconds, `per_tick` 1). The product is where an `i64` overflows, so
+    /// these are the assertions that fail -- a panic in debug, a negative
+    /// timestamp in release -- without the widening.
     #[test]
-    fn a_subtitle_timestamp_no_clock_can_hold_is_refused() {
+    fn a_timestamp_no_clock_can_hold_is_refused() {
         // A millisecond scale, which is every file anything writes: 1000 ticks
-        // is one second.
-        assert_eq!(ticks_to_us(1_000, 1_000_000).unwrap(), 1_000_000);
-        assert_eq!(ticks_to_us(0, 1_000_000).unwrap(), 0);
+        // is one second, in either unit.
+        assert_eq!(ticks_scaled(1_000, 1_000_000, 1_000).unwrap(), 1_000_000);
+        assert_eq!(ticks_scaled(0, 1_000_000, 1_000).unwrap(), 0);
+        assert_eq!(ticks_scaled(1_000, 1_000_000, 1).unwrap(), 1_000_000_000);
         // A nanosecond scale and the largest tick count an EBML uint can cast
-        // to: 600 million years of microseconds, which no `i64` holds.
+        // to: tens of thousands of years of nanoseconds, which no `i64` holds.
         assert!(
-            ticks_to_us(i64::MAX, 1_000_000_000).is_err(),
-            "the product must not wrap into a negative cue time"
+            ticks_scaled(i64::MAX, 1_000_000_000, 1).is_err(),
+            "the block walk's product must not wrap into a negative time"
         );
-        assert!(ticks_to_us(i64::MIN, 1_000_000_000).is_err());
+        assert!(
+            ticks_scaled(i64::MAX, 1_000_000_000, 1_000).is_err(),
+            "the subtitle walk's product must not wrap into a negative cue time"
+        );
+        assert!(ticks_scaled(i64::MIN, 1_000_000_000, 1_000).is_err());
     }
 
     fn asset(name: &str) -> std::path::PathBuf {
