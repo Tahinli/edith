@@ -384,12 +384,21 @@ impl VizWindows {
             0.0
         };
         let first = ((t_secs * per_sec) as usize / per_window) * per_window;
+        // The decode is asked for from the seek margin *below* the window's own
+        // first bucket, and the whole of what it returns is served: `from` is
+        // where the slice starts, absolutely, which is the one thing a caller
+        // cannot recover from the slice itself. The margin is what the frames at
+        // the window's own edges read -- the painter's window is two seconds
+        // wide and centred on the frame -- and it is a *seek* margin rather than
+        // a served one, because a decode's own first and last buckets can hold
+        // part of a bucket the neighbouring window covers too.
+        let from = first.saturating_sub(seek);
         if first >= total {
             // Past the end of the file -- which is where a source shorter than
             // the clip playing it leaves the last frames. Nothing to decode:
             // the painter measures "past the file" against `total` and draws
             // silence there, exactly as it did when it held the whole envelope.
-            return crate::decode::VizView::window(&[], first, total, self.summary.peak);
+            return crate::decode::VizView::window(&[], first, total, self.summary.peak, per_sec);
         }
         if self.current.as_ref().map(|(at, _)| *at) != Some(first) {
             // A window that will not open keeps the frame's own silence for the
@@ -403,18 +412,18 @@ impl VizWindows {
                 &self.key,
                 self.summary.sample_rate,
                 self.buckets_per_sec,
-                first,
+                from,
                 per_window + 2 * seek,
             )
             .unwrap_or_else(|_| SharedPeaks::new(Vec::new()));
             self.current = Some((first, window));
         }
         let (at, peaks) = self.current.as_ref().expect("just set");
-        // The slice starts where the decode did, a seek margin below the
-        // window's own first bucket -- the same arithmetic [`viz_window`] was
-        // asked with, so the absolute positions line up.
-        let slice_first = at.saturating_sub(seek);
-        crate::decode::VizView::window(peaks.as_slice(), slice_first, total, self.summary.peak)
+        debug_assert_eq!(
+            *at, first,
+            "the seat kept a window other than the one it asked for"
+        );
+        crate::decode::VizView::window(peaks.as_slice(), from, total, self.summary.peak, per_sec)
     }
 }
 
@@ -466,6 +475,20 @@ static VIZ_DECODES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUs
 #[cfg(test)]
 fn viz_decodes() -> usize {
     VIZ_DECODES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Test-only: how many frames of *sound* the summary pass folded
+/// ([`fold_summary`]); not the window decodes, so a delta across one ask is how
+/// many times over the file's own length that pass read. The windows partition
+/// the file, so a pass is one file's worth -- and a pass that also folded the
+/// ask's whole-file probe would be up to twice that.
+#[cfg(test)]
+static VIZ_FOLDED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// [`VIZ_FOLDED`], for a test that measures a delta across its own ask.
+#[cfg(test)]
+fn viz_folded() -> u64 {
+    VIZ_FOLDED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// The visualizer seat's own ask: the whole envelope when the memo holds it,
@@ -624,11 +647,20 @@ fn viz_summary(
         .collect::<Result<_, _>>()?;
     #[cfg(test)]
     VIZ_DECODES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    // Every window folds everything it is handed, the first one included: no
-    // stop sample, because a stop that dropped a window's own tail could drop
-    // the loudest sample in the file with it -- and the peak a visualizer frame
-    // is scaled by is the one thing here that has to be the envelope's own.
-    let (mut peak, mut samples) = fold_summary(rx, u64::MAX, channels);
+    // The first window stops at the joint the second one was told to start at,
+    // exactly as the envelope's own split stops it -- and the windows between
+    // them are the file, so a pass reads it once. Folding this receiver whole
+    // (it is the ask's probe, opened at the file's end) would have every later
+    // window decode the same sound again: measured at 1.5x the file on a
+    // two-window split and 1.875x at the eight-window ceiling, on the critical
+    // path of the first look edit. A window with no joint to stop at -- the only
+    // window there is -- folds everything it is handed, which is what the
+    // single-threaded envelope ask does with it.
+    let stop = match jobs {
+        1 => u64::MAX,
+        _ => (window * rate) as u64,
+    };
+    let (mut peak, mut samples) = fold_summary(rx, stop, channels);
     for handle in rest {
         let (part_peak, part_samples) = handle.join().map_err(|_| "waveform worker panicked")??;
         peak = peak.max(part_peak);
@@ -736,6 +768,11 @@ fn fold_summary(rx: Receiver<AudioChunk>, stop_sample: u64, channels: usize) -> 
         if chunk.start_sample >= stop_sample {
             break;
         }
+        #[cfg(test)]
+        VIZ_FOLDED.fetch_add(
+            (chunk.samples.len() / channels) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         samples = samples.max(chunk.start_sample + (chunk.samples.len() / channels) as u64);
         for &v in &chunk.samples {
             peak = peak.max(v.clamp(-1.0, 1.0).abs());
@@ -897,7 +934,7 @@ mod tests {
 
     use super::{
         memo_decodes, memoize, peak_of, peaks, peaks_over, peaks_shared_capped, viz_decodes,
-        viz_envelope, viz_envelope_capped, MemoEntry, PeaksKey, PeaksMemo, SharedPeaks,
+        viz_envelope, viz_envelope_capped, viz_folded, MemoEntry, PeaksKey, PeaksMemo, SharedPeaks,
         PEAKS_MEMO_BUCKETS,
     };
 
@@ -1287,6 +1324,142 @@ mod tests {
         assert_eq!(memo.len(), 1, "the replace added a second entry");
     }
 
+    /// A window is where it says it is: on a fixture whose envelope is *not*
+    /// periodic, so a slice labelled a margin below where it starts cannot hide.
+    /// A sine hides it -- a shift by a whole number of periods leaves every
+    /// bucket identical, which is exactly how a +3 s mislabel survived a 440 Hz
+    /// fixture at 8 kHz (3 s is 1320 whole periods) -- so this is noise, in
+    /// FLAC (a seek lands on the sample, so the buckets must be *equal*, not
+    /// merely close).
+    ///
+    /// Every place a window can go wrong: the file's head, its middle, both
+    /// sides of a 30 s grid line, and the last window it has. At each: every
+    /// bucket a two-second picture can reach is the envelope's, and the frame is
+    /// byte for byte the one the *export* path paints from the whole envelope
+    /// ([`crate::decode::visualizer_i420`]).
+    #[test]
+    fn a_window_of_a_non_periodic_file_is_where_it_says_it_is() {
+        let path =
+            std::env::temp_dir().join(format!("edith-peaks-noise-{}.flac", std::process::id()));
+        let generated = std::process::Command::new("ffmpeg")
+            .args(["-y", "-v", "error", "-f", "lavfi", "-i"])
+            .arg("anoisesrc=color=white:amplitude=0.5:sample_rate=8000:duration=120")
+            .args(["-c:a", "flac"])
+            .arg(&path)
+            .status()
+            .map(|status| status.success() && path.exists())
+            .unwrap_or(false);
+        if !generated {
+            eprintln!("no ffmpeg: a non-periodic fixture cannot be generated, skipping");
+            return;
+        }
+        let bps = crate::decode::VIZ_BUCKETS_PER_SEC;
+        let per_sec = f64::from(bps);
+        let plain = peaks(&path, 0, bps)
+            .expect("open")
+            .expect("the noise is audio");
+        assert!(
+            plain.len().abs_diff(120 * bps as usize) < 100,
+            "the envelope is {} buckets, not the 120 s it was generated for",
+            plain.len()
+        );
+        let peak = peak_of(&plain);
+        let mut scratch = crate::decode::VizScratch::default();
+        for secs in [0.0, 15.0, 29.5, 30.5, 60.0, 89.5, 119.0] {
+            // A ceiling of a thousand buckets, so the windowed route is the one
+            // walked (the route is what the real ceiling takes for a film).
+            let mut seat = viz_envelope_capped(&path, 0, bps, 1000).expect("open");
+            let view = seat.view_at(secs);
+            assert!(
+                !view.peaks.is_empty(),
+                "t={secs}: the window decoded nothing"
+            );
+            assert_eq!(
+                view.peak, peak,
+                "t={secs}: the window's peak is not the file's"
+            );
+            assert_eq!(
+                view.total,
+                plain.len(),
+                "t={secs}: the length is not the file's"
+            );
+            // The buckets the frame at `secs` can reach: a second either way,
+            // plus the bucket the interpolation reads past the end.
+            let from = ((secs - 1.0).max(0.0) * per_sec) as usize;
+            let to = (((secs + 1.0) * per_sec) as usize + 2).min(plain.len());
+            let (mut compared, mut wrong, mut out_of_reach) = (0, 0, 0);
+            for abs in from..to {
+                match (view.at(abs), plain.get(abs)) {
+                    (Some(window), Some(&whole)) => {
+                        compared += 1;
+                        if window != whole {
+                            wrong += 1;
+                        }
+                    }
+                    _ => out_of_reach += 1,
+                }
+            }
+            assert!(
+                compared > 1000,
+                "t={secs}: only {compared} buckets were comparable ({out_of_reach} out of reach)"
+            );
+            assert_eq!(
+                (wrong, out_of_reach),
+                (0, 0),
+                "t={secs}: {wrong} of {compared} windowed buckets are not the envelope's, \
+                 {out_of_reach} out of reach"
+            );
+            let whole = crate::decode::visualizer_i420(&mut scratch, &plain, secs, 320, 180, 0, 5);
+            let window =
+                crate::decode::visualizer_window_i420(&mut scratch, &view, secs, 320, 180, 0, 5);
+            assert_eq!(
+                whole, window,
+                "t={secs}: the window painted a frame the whole envelope does not"
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The summary pass reads the file *once*. Its windows partition it -- the
+    /// first one stops at the joint the next was told to start at -- so the
+    /// frames it folds are the file's own, and folding the ask's whole-file
+    /// probe on top of them (which is what it used to do) is up to twice a file
+    /// for nothing, on the critical path of the first look edit.
+    #[test]
+    fn a_summary_pass_folds_the_file_once() {
+        let path =
+            std::env::temp_dir().join(format!("edith-peaks-once-{}.flac", std::process::id()));
+        let generated = std::process::Command::new("ffmpeg")
+            .args(["-y", "-v", "error", "-f", "lavfi", "-i"])
+            .arg("anoisesrc=color=white:amplitude=0.5:sample_rate=8000:duration=120")
+            .args(["-c:a", "flac"])
+            .arg(&path)
+            .status()
+            .map(|status| status.success() && path.exists())
+            .unwrap_or(false);
+        if !generated {
+            eprintln!("no ffmpeg: a film-length fixture cannot be generated, skipping");
+            return;
+        }
+        let bps = crate::decode::VIZ_BUCKETS_PER_SEC;
+        let frames = 120 * 8000;
+        let before = viz_folded();
+        let mut seat = viz_envelope_capped(&path, 0, bps, 1000).expect("open");
+        let view = seat.view_at(60.0);
+        assert!(!view.peaks.is_empty(), "the window decoded nothing");
+        let folded = viz_folded() - before;
+        assert!(
+            folded >= frames - frames / 10,
+            "the summary pass folded {folded} frames of a {frames}-frame file: it lost a window"
+        );
+        assert!(
+            folded <= frames + frames / 20,
+            "the summary pass folded {folded} frames of a {frames}-frame file, {:.2}x over",
+            folded as f64 / frames as f64
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// A container that states no sample rate (or a zero one) must not make the
     /// samples-per-bucket arithmetic zero: `sample / 0.0` is infinite, `as
     /// usize` saturates, and the fold's own `resize(bucket + 1)` is then a
@@ -1390,8 +1563,13 @@ mod tests {
                 // interpolation reads past it.
                 let from = ((secs - 1.0).max(0.0) * per_sec) as usize;
                 let to = (((secs + 1.0) * per_sec) as usize + 2).min(whole.len());
-                let view =
-                    crate::decode::VizView::window(&whole[from..to], from, whole.len(), peak);
+                let view = crate::decode::VizView::window(
+                    &whole[from..to],
+                    from,
+                    whole.len(),
+                    peak,
+                    per_sec,
+                );
                 let window_frame = crate::decode::visualizer_window_i420(
                     &mut scratch,
                     &view,

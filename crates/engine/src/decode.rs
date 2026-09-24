@@ -650,7 +650,16 @@ impl DecodeSession {
         // Painted at the canvas's own size, so the composite places nothing:
         // the picture *is* the canvas, and whatever transform the clip
         // carries still reaches it through the render below.
-        let (width, height) = canvas.dims();
+        //
+        // Masked to even dimensions first, and floored at two: that is what the
+        // painter does to the planes it hands back, so a canvas it cannot divide
+        // evenly (an odd `resolution 1921 1081` line, or a one-pixel-high one)
+        // used to be *declared* at a size the picture never had -- and the
+        // conversion below then indexes a chroma plane that is not there
+        // (`index out of bounds` on a zero-length slice, in this worker, where
+        // no frame ever arrives and nothing catches it).
+        let (canvas_w, canvas_h) = canvas.dims();
+        let (width, height) = ((canvas_w & !1).max(2), (canvas_h & !1).max(2));
         let worker_cancel = Arc::clone(&cancel);
         let path = path.to_path_buf();
         let handle = thread::Builder::new()
@@ -2137,11 +2146,18 @@ pub(crate) fn visualizer_i420(
 /// measured it against itself would draw the file's end wherever the window
 /// ended -- and `peak` is the file's loudest bucket, which every column is
 /// scaled by: no window can derive that from itself.
+///
+/// `per_sec` is the rate *this* envelope was drawn at, in buckets per second,
+/// and it is carried rather than assumed: the slice is indexed at it, so an
+/// envelope drawn at another rate under a painter that hard-coded the
+/// visualizer's own would read a tenth of a second of sound as a second. The
+/// whole-file constructor is the one place the visualizer's rate is named.
 pub(crate) struct VizView<'a> {
     pub(crate) peaks: &'a [(f32, f32)],
     pub(crate) first: usize,
     pub(crate) total: usize,
     pub(crate) peak: f32,
+    pub(crate) per_sec: f64,
 }
 
 impl<'a> VizView<'a> {
@@ -2152,22 +2168,26 @@ impl<'a> VizView<'a> {
             first: 0,
             total: peaks.len(),
             peak: crate::waveform::peak_of(peaks),
+            per_sec: f64::from(VIZ_BUCKETS_PER_SEC),
         }
     }
 
     /// One window of an envelope: `peaks` starts at absolute bucket `first`,
-    /// `total` and `peak` are the whole file's.
+    /// `total` and `peak` are the whole file's, and `per_sec` is the rate the
+    /// file's envelope was drawn at.
     pub(crate) fn window(
         peaks: &'a [(f32, f32)],
         first: usize,
         total: usize,
         peak: f32,
+        per_sec: f64,
     ) -> Self {
         Self {
             peaks,
             first,
             total,
             peak,
+            per_sec,
         }
     }
 
@@ -2223,8 +2243,8 @@ pub(crate) fn visualizer_window_i420(
     scratch.sig.clear();
     scratch.sig.resize(w, 0.0);
     if !view.is_empty() && view.total != 0 {
-        let duration = view.total as f64 / f64::from(VIZ_BUCKETS_PER_SEC);
-        let per_sec = f64::from(VIZ_BUCKETS_PER_SEC);
+        let duration = view.total as f64 / view.per_sec;
+        let per_sec = view.per_sec;
         let window = if flags & VIZ_FAST != 0 {
             VIZ_FAST_SECS
         } else {
