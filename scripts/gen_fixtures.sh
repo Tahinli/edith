@@ -730,6 +730,44 @@ for deg in 90 180 270 45; do
     ffmpeg -y -display_rotation "$deg" -i assets/.rotation_src.mp4 \
         -c copy "assets/test_rotation$deg.mp4"
 done
+# ...and the very same turn asked for inside a Matroska, from the very same
+# source: one set of expected layouts then covers both containers
+# (`tests/rotation.rs`), which is the point -- a roll read the wrong way round is
+# a file that plays on its side in exactly one of the two.
+#
+# What the muxer actually writes, byte-verified by walking the header rather than
+# taken off a table: a `Projection` master (`0x7670`) holding one
+# `ProjectionPoseRoll` (`0x7675`), an 8-byte big-endian float -- `+90.0`, `+180.0`
+# and *`-90.0`* for `-display_rotation 90/180/270` -- and no `ProjectionType`
+# element at all, which is the spec's default of 0 (rectangular). `ffprobe`
+# reports the same display matrix as the mp4 twin, which is what makes the
+# layouts above ffmpeg's own autorotation of either file. The roll counts
+# counter-clockwise where the matrix counts clockwise turns, which is why the
+# engine negates it.
+for deg in 90 180 270 45; do
+    ffmpeg -y -display_rotation "$deg" -i assets/.rotation_src.mp4 \
+        -c copy "assets/test_rotation$deg.mkv"
+done
 rm -f assets/.rotation_src.mp4
+
+# The one fixture where the coded and the displayed height disagree about what the
+# material is: `test_rotation90tall` is 1280x640 as stored and 640x1280 as shown,
+# and neither container tags its colour (the mkv's `Colour` element carries only
+# chroma siting, the mp4 has no `colr` box), so the 720-line rule an untagged
+# stream's matrix is guessed from reads a different side of itself depending on
+# which height a door feeds it.
+ffmpeg -y -f lavfi -i "color=c=red:s=640x320:d=1:r=30,format=yuv420p" \
+    -f lavfi -i "color=c=green:s=640x320:d=1:r=30,format=yuv420p" \
+    -f lavfi -i "color=c=blue:s=640x320:d=1:r=30,format=yuv420p" \
+    -f lavfi -i "color=c=yellow:s=640x320:d=1:r=30,format=yuv420p" \
+    -filter_complex "[0:v][1:v]hstack[top];[2:v][3:v]hstack[bot];[top][bot]vstack[v]" \
+    -map "[v]" -frames:v 30 -c:v libx264 -profile:v baseline -pix_fmt yuv420p \
+    assets/.rotation_tall_src.mp4
+for ext in mp4 mkv; do
+    ffmpeg -y -display_rotation 90 -i assets/.rotation_tall_src.mp4 \
+        -c copy "assets/test_rotation90tall.$ext"
+done
+rm -f assets/.rotation_tall_src.mp4
+
 
 echo "fixtures written to assets/"

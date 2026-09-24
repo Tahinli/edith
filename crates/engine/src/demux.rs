@@ -371,13 +371,17 @@ pub struct VideoMeta {
     /// which range -- resolved off the container's tags, the bitstream's, and
     /// the resolution, in that order. See [`crate::colorspace`].
     pub color: ColorDescription,
-    /// How far the picture must be turned to be seen right, off the
-    /// container's display matrix. [`Rotation::None`] for everything whose
-    /// container states no turn, and for a Matroska file: only the mp4 half is
-    /// read today, because Matroska's own spelling (a `ProjectionPoseYaw`
-    /// element) is written by nobody in practice while the `tkhd` matrix is how
-    /// every phone records it. That is a known gap and not a silent one:
-    /// [`MkvDemuxer::open`] says where a reader for it would go.
+    /// How far the picture must be turned to be seen right, off the container's
+    /// display matrix: an mp4 `tkhd` matrix, or a Matroska `Projection` roll on
+    /// a rectangular projection -- the same quarter turns read off either.
+    /// [`Rotation::None`] for everything whose container states no turn, and for
+    /// a projection that is not rectangular: on a spherical or cubemap one those
+    /// same pose elements describe how the *sphere* is oriented, which is no turn
+    /// of the picture, so the pose is deliberately not applied and the file
+    /// paints as a flat frame -- what every player does with a 360 clip, and
+    /// cheaper than a refusal that would cost a file that plays. A turn that is
+    /// not a quarter turn -- a mirror, a shear, an angle in between -- is refused
+    /// at the door ([`UnsupportedRotation`]) rather than shown wrong.
     pub rotation: Rotation,
 }
 
@@ -1309,25 +1313,37 @@ impl MkvDemuxer {
                 }
             }
         };
+        // The coded size, swapped where the turn is a quarter one: a portrait
+        // `.mkv` stores a landscape picture plus the turn, so the displayed
+        // shape is the coded one turned -- the same two numbers the mp4 door
+        // swaps, off the same kind of turn.
+        let (width, height) = match video.rotation.swaps_axes() {
+            true => (video.height, video.width),
+            false => (video.width, video.height),
+        };
         let meta = VideoMeta {
-            width: video.width,
-            height: video.height,
+            width,
+            height,
             frame_rate,
             frame_count: mkv.frames as u32,
             codec: video.codec,
             // `config` is the parameter sets by now -- Annex-B for H.264 and
             // HEVC, the sequence header OBU for AV1 -- which is what the
             // bitstream tier reads.
+            // The height the picture is *shown* at, which is what the mp4 door
+            // feeds here and the whole reason both doors resolve their size the
+            // same way: the 720-line rule below is a guess about the material, and
+            // the material is the picture as displayed -- a device-held `.mkv` is
+            // 640 coded but 1280 shown, and the two sides of that rule disagree.
             color: ColorDescription::resolve(
                 video.tags,
                 bitstream_tags(video.codec, &mkv.config),
-                video.height,
+                height,
             ),
-            // FLAG: Matroska's turn is not read yet -- see [`VideoMeta::rotation`].
-            // Nothing in this tree writes a `ProjectionPoseYaw`, and the mkv
-            // tracks a phone or a camera app produces are mp4s; a `.mkv` that
-            // does carry one would play sideways until this is written.
-            rotation: Rotation::None,
+            // The turn off the track's `Projection` element ([`projection_rotation`]),
+            // which is where a Matroska muxer states what an mp4 states with its
+            // `tkhd` matrix.
+            rotation: video.rotation,
         };
         Ok((meta, mkv))
     }
@@ -1784,7 +1800,11 @@ impl MkvDemuxer {
         Ok(Some(CodedBlock {
             bytes: &self.scratch,
             key: block.key,
-            ts_ns: block.ts * self.timestamp_scale as i64,
+            // Widened and fallible, exactly as the subtitle walk's tick scale
+            // is ([`ticks_scaled`]): `block.ts` is whatever the file says, so the
+            // multiply overflows an `i64` on a crafted cluster and a copy would
+            // write a block time that wrapped negative.
+            ts_ns: ticks_scaled(block.ts, self.timestamp_scale, 1)?,
         }))
     }
 }
@@ -1994,6 +2014,9 @@ struct MkvVideo {
     number: u64,
     width: u32,
     height: u32,
+    /// The quarter turn the track's `Projection` asks for;
+    /// [`Rotation::None`] where it states none.
+    rotation: Rotation,
     /// What the track's `Colour` element declared, empty when it has none.
     tags: Tags,
     /// What that same element said about brightness (MaxCLL and the mastering
@@ -2141,6 +2164,20 @@ const DEFAULT_DURATION: u32 = 0x23E383;
 const VIDEO: u32 = 0xE0;
 const PIXEL_WIDTH: u32 = 0xB0;
 const PIXEL_HEIGHT: u32 = 0xBA;
+// The track's projection: how the flat picture sits in space. A roll on the
+// rectangular projection (type 0) is how a Matroska muxer states what an mp4
+// states with its `tkhd` matrix -- mkvmerge has translated display matrices
+// into roll since v95, and ffmpeg's Matroska muxer writes a `Projection` for
+// rotated input -- so the same quarter turns are read off it. Anything else (a
+// spherical or mesh projection, a yaw/pitch pose) is not a turn this engine can
+// make, and is refused by name like the mp4 door refuses a matrix that is not a
+// quarter turn; a spherical one's pose is the sphere's orientation rather than
+// the picture's and is left alone ([`projection_rotation`]).
+const PROJECTION: u32 = 0x7670;
+const PROJECTION_TYPE: u32 = 0x7671;
+const PROJECTION_POSE_YAW: u32 = 0x7673;
+const PROJECTION_POSE_PITCH: u32 = 0x7674;
+const PROJECTION_POSE_ROLL: u32 = 0x7675;
 // The `Colour` element and the three of its children this reads. Byte-verified
 // against real files rather than taken off a spec table: published tables that
 // list Range as 0x55B3 are describing ChromaSubsamplingHorz.
@@ -2391,6 +2428,7 @@ fn mkv_track_entry(
 ) -> crate::Result<MkvEntry> {
     let (mut number, mut kind, mut codec, mut default_duration) = (0, 0, String::new(), None);
     let (mut width, mut height, mut config) = (0, 0, Vec::new());
+    let mut rotation = Rotation::None;
     let (mut language, mut name, mut bcp47) = (String::new(), String::new(), String::new());
     let mut tags = Tags::default();
     let mut light = ContentLight::default();
@@ -2417,6 +2455,26 @@ fn mkv_track_entry(
                     match e.0 {
                         PIXEL_WIDTH => width = ebml_uint(file, e.1, e.2)? as u32,
                         PIXEL_HEIGHT => height = ebml_uint(file, e.1, e.2)? as u32,
+                        PROJECTION => {
+                            let (mut kind, mut yaw, mut pitch, mut roll) =
+                                (0u64, 0.0f64, 0.0f64, 0.0f64);
+                            let mut at = e.1;
+                            while let Some(c) = ebml_element(file, at, e.2)? {
+                                match c.0 {
+                                    PROJECTION_TYPE => kind = ebml_uint(file, c.1, c.2)?,
+                                    PROJECTION_POSE_YAW => yaw = ebml_float(file, c.1, c.2)?,
+                                    PROJECTION_POSE_PITCH => pitch = ebml_float(file, c.1, c.2)?,
+                                    PROJECTION_POSE_ROLL => roll = ebml_float(file, c.1, c.2)?,
+                                    // ProjectionPrivate: the spherical/mesh
+                                    // payload, which only matters where the
+                                    // type is one of those -- and those refuse
+                                    // below before it could be read.
+                                    _ => {}
+                                }
+                                at = c.2;
+                            }
+                            rotation = projection_rotation(kind, yaw, pitch, roll)?;
+                        }
                         // `Colour`: what the file says its picture's numbers
                         // mean, in the same H.273 code points the bitstream
                         // uses. An element the file leaves out stays 0, which
@@ -2541,6 +2599,7 @@ fn mkv_track_entry(
         number,
         width,
         height,
+        rotation,
         tags,
         light,
         default_duration,
@@ -2682,6 +2741,74 @@ fn rotation_of_matrix(a: i32, b: i32, c: i32, d: i32) -> crate::Result<Rotation>
         2 => Rotation::Cw180,
         _ => Rotation::Cw270,
     })
+}
+
+/// The quarter turn a Matroska `ProjectionPoseRoll` asks for -- the mkv door's
+/// half of [`rotation_of_matrix`], with the same half-degree tolerance and the
+/// same refusal by name.
+///
+/// **Measured against ffmpeg's own autorotate**, the same arbiter
+/// [`rotation_of_matrix`] was measured against: `test_rotation{90,180,270}.mkv`
+/// (`scripts/gen_fixtures.sh`) are the very quadrant source their `.mp4` twins
+/// are, remuxed with `-display_rotation` asked for, and ffmpeg 8.1.2's matroska
+/// muxer writes this element for it -- `+90.0`, `+180.0` and **`-90.0`**, an
+/// 8-byte big-endian float, with no `ProjectionType` element at all (RFC 9559's
+/// default of 0, rectangular). Its demuxer reads each of those back as the very
+/// same `tkhd` matrix the mp4 twin carries, so both files autorotate to the same
+/// four quadrants -- which is what `tests/rotation.rs` asserts, corner by corner.
+///
+/// Hence the negation below: the element counts **counter-clockwise** degrees
+/// about the viewing axis (RFC 9559 says so, and the measured layouts confirm
+/// it), while the matrix this engine counts its quarter turns off is the
+/// clockwise one `-display_rotation 90` writes -- so a roll of +90 is
+/// [`Rotation::Cw270`] here, exactly as `a=0, b=-65536, c=65536, d=0` is.
+fn rotation_of_roll(degrees: f64) -> crate::Result<Rotation> {
+    let steps = -(degrees / 90.0).round();
+    if !degrees.is_finite() || (degrees + steps * 90.0).abs() > 0.5 {
+        return Err(UnsupportedRotation {
+            degrees: degrees.is_finite().then_some(degrees),
+        }
+        .into());
+    }
+    Ok(match steps.rem_euclid(4.0) as u8 {
+        0 => Rotation::None,
+        1 => Rotation::Cw90,
+        2 => Rotation::Cw180,
+        _ => Rotation::Cw270,
+    })
+}
+
+/// The turn a track's `Projection` asks for, or [`Rotation::None`] where it does
+/// not ask for a turn of the picture at all.
+///
+/// Only a **rectangular** projection has a pose that turns the *picture*, and
+/// rectangular (0) is what an absent `ProjectionType` means. On an
+/// equirectangular or cubemap one those same three elements state how the sphere
+/// is oriented, which is not a turn of anything 2D: the pose is left alone, as a
+/// flat player shows a 360° file, rather than refused -- refusing would cost a
+/// file that plays right now and would not show it any righter.
+///
+/// A rectangular projection whose **yaw or pitch** is off zero is refused by
+/// name, though, and that is mkvmerge's spelling to watch for: since v95 it
+/// translates an mp4 display matrix into roll *and* yaw, using yaw for a mirror.
+/// A picture mirrored, or turned out of its own plane, is the one thing no
+/// quarter turn here can make -- the same missing capability the mp4 door
+/// refuses a 45-degree matrix for, so it gets the same refusal rather than a
+/// sideways picture.
+fn projection_rotation(kind: u64, yaw: f64, pitch: f64, roll: f64) -> crate::Result<Rotation> {
+    if kind != 0 {
+        return Ok(Rotation::None);
+    }
+    let off_plane = [yaw, pitch]
+        .into_iter()
+        .any(|degrees| !degrees.is_finite() || degrees.abs() > 0.5);
+    match off_plane {
+        // No angle to name: a pose out of the picture's own plane -- a mirror
+        // through it, or a tilt of it -- is not a rotation in that plane whatever
+        // number it states, which is what the sentence without one says.
+        true => Err(UnsupportedRotation { degrees: None }.into()),
+        false => rotation_of_roll(roll),
+    }
 }
 
 /// Why an mp4 came back with no picture, by the fourcc of the video track it
@@ -3105,7 +3232,7 @@ fn mkv_cluster(
         if block.number != number {
             continue;
         }
-        let ts = cluster_ts + i64::from(block.rel);
+        let ts = block_ticks(cluster_ts, block.rel)?;
         if block.flags & 0x06 == 0 {
             blocks.push(Block {
                 at: block.at,
@@ -4312,7 +4439,10 @@ fn mkv_subtitle_blocks(
     const BLOCK_DURATION: u32 = 0x9B;
     // Ticks to microseconds, the unit `MkvCue` keeps. `TimestampScale` is
     // nanoseconds per tick and is a millisecond in every file anything writes.
-    let us = |ticks: i64| ticks * timestamp_scale as i64 / 1_000;
+    // [`ticks_scaled`] does the arithmetic: it is widened and fallible, and a
+    // corrupt cluster timestamp is refused rather than wrapped into a negative
+    // cue time -- see the test beside it.
+    let us = |ticks: i64| ticks_scaled(ticks, timestamp_scale, 1_000);
     let mut at = segment.0;
     while let Some((id, body, stop)) = ebml_element(file, at, segment.1)? {
         // The import's second walk, stopped by the same Cancel as its first.
@@ -4376,14 +4506,52 @@ fn mkv_subtitle_blocks(
                 read_exact_at(file, at, &mut payload)?;
                 track.unpack.frame(&mut payload)?;
                 track.cues.push(MkvCue {
-                    start_us: us(cluster_ts + i64::from(block.rel)),
-                    duration_us: duration.map(us),
+                    // The cluster's timestamp plus the block's own signed
+                    // offset, checked by [`block_ticks`]: the pair is where a
+                    // corrupt file's two numbers can still overflow what an
+                    // `i64` holds, one step before the scale above would refuse
+                    // the result.
+                    start_us: us(block_ticks(cluster_ts, block.rel)?)?,
+                    duration_us: duration.map(us).transpose()?,
                     payload,
                 });
             }
         }
     }
     Ok(())
+}
+
+/// A block's absolute timestamp in ticks: the cluster's own, plus the block's
+/// signed offset from it -- refused where the sum leaves what an `i64` holds.
+///
+/// Both walks need it: the video block index a copy reads and the subtitle cues.
+/// Both get `cluster_ts` from an EBML uint the file writes with no bound this
+/// reader applies, so a crafted cluster near `i64::MAX` overflows the add one
+/// step *before* [`ticks_scaled`] could refuse the product -- and the block would
+/// be taken at a time that wrapped negative.
+fn block_ticks(cluster_ts: i64, rel: i16) -> crate::Result<i64> {
+    cluster_ts
+        .checked_add(i64::from(rel))
+        .ok_or_else(|| "a Matroska block at no timestamp a clock can hold".into())
+}
+
+/// A tick count scaled out of the file's own clock, or the refusal a corrupt one
+/// earns: `ticks * TimestampScale / per_tick`, which is microseconds for the
+/// subtitle walk (`per_tick` 1_000) and nanoseconds for the block walk a copy
+/// reads (`per_tick` 1).
+///
+/// The multiply is widened to `i128` rather than done in `i64`, and a result that
+/// does not fit is refused rather than saturated: both numbers are the file's --
+/// a cluster or block timestamp is an EBML uint nothing bounds, and
+/// `TimestampScale` is a scale it chooses -- so `ticks * timestamp_scale`
+/// overflows on a crafted file, which is a panic in debug and a *negative*
+/// timestamp in release, silently. Widened no product can overflow; a timestamp
+/// that then does not fit its unit is the same class of corrupt as the oversized
+/// block refused above, and gets the same loud refusal rather than a time no
+/// clock can hold.
+fn ticks_scaled(ticks: i64, timestamp_scale: u64, per_tick: u64) -> crate::Result<i64> {
+    i64::try_from(i128::from(ticks) * i128::from(timestamp_scale) / i128::from(per_tick))
+        .map_err(|_| "a Matroska timestamp no clock can hold".into())
 }
 
 /// A string element, without the trailing NULs a `Name` may be padded with.
@@ -4397,6 +4565,41 @@ fn string_of(file: &mut File, body: u64, stop: u64) -> crate::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Both walks that scale a file's own clock: the subtitle one
+    /// (microseconds, `per_tick` 1_000) and the block one a copy reads
+    /// (nanoseconds, `per_tick` 1). The product is where an `i64` overflows, so
+    /// these are the assertions that fail -- a panic in debug, a negative
+    /// timestamp in release -- without the widening.
+    #[test]
+    fn a_timestamp_no_clock_can_hold_is_refused() {
+        // A millisecond scale, which is every file anything writes: 1000 ticks
+        // is one second, in either unit.
+        assert_eq!(ticks_scaled(1_000, 1_000_000, 1_000).unwrap(), 1_000_000);
+        assert_eq!(ticks_scaled(0, 1_000_000, 1_000).unwrap(), 0);
+        assert_eq!(ticks_scaled(1_000, 1_000_000, 1).unwrap(), 1_000_000_000);
+        // A nanosecond scale and the largest tick count an EBML uint can cast
+        // to: tens of thousands of years of nanoseconds, which no `i64` holds.
+        assert!(
+            ticks_scaled(i64::MAX, 1_000_000_000, 1).is_err(),
+            "the block walk's product must not wrap into a negative time"
+        );
+        assert!(
+            ticks_scaled(i64::MAX, 1_000_000_000, 1_000).is_err(),
+            "the subtitle walk's product must not wrap into a negative cue time"
+        );
+        assert!(ticks_scaled(i64::MIN, 1_000_000_000, 1_000).is_err());
+        // ...and the add that comes before either scale: a cluster timestamp near
+        // the top of what an `i64` holds plus a block's own offset still has to
+        // fit before any product is computed at all.
+        assert_eq!(block_ticks(1_000, -5).unwrap(), 995);
+        assert_eq!(block_ticks(0, 32_767).unwrap(), 32_767);
+        assert!(
+            block_ticks(i64::MAX, 1).is_err(),
+            "the add must not wrap negative"
+        );
+        assert!(block_ticks(i64::MIN, -1).is_err());
+    }
 
     fn asset(name: &str) -> std::path::PathBuf {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
