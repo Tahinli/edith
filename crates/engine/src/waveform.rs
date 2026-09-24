@@ -392,10 +392,13 @@ impl VizWindows {
             return crate::decode::VizView::window(&[], first, total, self.summary.peak);
         }
         if self.current.as_ref().map(|(at, _)| *at) != Some(first) {
-            // A window that will not open keeps the frame's own silence and is
-            // *not* remembered as the window: the next frame asks again, and a
-            // source that comes back (a share remounting, a file finishing its
-            // write) paints again.
+            // A window that will not open keeps the frame's own silence for the
+            // rest of it: the seat is what remembers that, and only while it is
+            // painting in this window -- the memo keeps successes only, so the
+            // next seek (and the next window) asks the file again, and a source
+            // that comes back (a share remounting, a file finishing its write)
+            // paints again. Re-asking every frame instead would hammer a file
+            // that is not there thirty times a second.
             let window = viz_window(
                 &self.key,
                 self.summary.sample_rate,
