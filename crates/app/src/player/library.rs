@@ -668,11 +668,16 @@ impl Player {
         match PlaybackSession::open_with_audio_stream(path, stream) {
             Ok(mut session) => {
                 session.drop_late_pictures(true);
-                session.set_gain(self.volume.gain());
                 // The button says "plays it" -- a preview that opens paused
                 // reads as a frozen picture, not as a player awaiting a click.
                 session.play();
                 self.preview_session = Some(session);
+                // The one place the window's level reaches a session
+                // ([`Player::apply_volume`]) -- and it goes at the timeline
+                // under the preview too, which is what makes closing the
+                // preview hand back a session already at the shown level
+                // rather than the one it had before the preview opened.
+                self.apply_volume();
                 self.session_swapped();
                 self.notify_user(
                     format!(
@@ -711,6 +716,13 @@ impl Player {
                 cx.notify();
             }
         }
+        // The session on screen is the timeline's again, and it is told the
+        // window's level here rather than being trusted to have kept it: a
+        // level changed while the preview was up reaches every session
+        // ([`Player::apply_volume`]), and this is the belt to that pair of
+        // braces -- the session that takes the picture is the one that must be
+        // heard at the level the control shows.
+        self.apply_volume();
         // The picture swaps back to the timeline's, so everything keyed to a
         // session hears it (`Player::session_swapped`) -- the sound watch among
         // them, or the timeline's own unchanged reason would read as a device

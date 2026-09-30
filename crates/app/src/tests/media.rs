@@ -6,8 +6,8 @@ use crate::player::library::{
     auto_proxies_pref_path, load_auto_proxies_pref, save_auto_proxies_pref,
 };
 use crate::subs::{
-    audio_import_tail, load_subtitle_style, save_subtitle_style, sub_line_h_for,
-    subtitle_style_path, SUB_SIZE_RANGE,
+    SUB_SIZE_RANGE, audio_import_tail, load_subtitle_style, save_subtitle_style, sub_line_h_for,
+    subtitle_style_path,
 };
 use crate::ui::preview::{bgra_to_rgba, screenshot_path};
 
@@ -106,7 +106,7 @@ fn a_device_that_dies_under_an_open_file_says_so_and_unsays_it() {
 /// speaks.
 #[test]
 fn a_preview_flip_is_not_a_device_that_came_back() {
-    use crate::notices::{audio_step, AudioStep};
+    use crate::notices::{AudioStep, audio_step};
     // A swap, every way round: seeded, never announced.
     assert_eq!(audio_step(7, 8, None, Some("AUDIO_LOST")), AudioStep::Seed);
     assert_eq!(audio_step(7, 8, Some("AUDIO_LOST"), None), AudioStep::Seed);
@@ -152,8 +152,8 @@ fn an_audio_import_names_its_rate_channels_and_length() {
 /// stuck read and never as a frozen window.
 #[test]
 fn an_import_line_says_a_stage_has_stopped_moving_and_only_then() {
-    use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
     let stage = Arc::new(AtomicU8::new(ImportStage::Header as u8));
     let started = Instant::now() - Duration::from_secs(9);
     let mut import = Import {
@@ -364,8 +364,8 @@ fn the_wheel_draws_the_sample_a_drag_is_holding() {
 #[test]
 fn the_strand_slot_starts_at_the_complement_and_the_write_chooses_it() {
     use engine::decode::{
-        viz_hue_ui, viz_sat_ui, viz_strand_hue_ui, viz_strand_sat_ui, viz_strand_set,
-        with_viz_paint_hue, with_viz_paint_strands, VIZ_PAINT_AZURE,
+        VIZ_PAINT_AZURE, viz_hue_ui, viz_sat_ui, viz_strand_hue_ui, viz_strand_sat_ui,
+        viz_strand_set, with_viz_paint_hue, with_viz_paint_strands,
     };
 
     let paint = with_viz_paint_strands(VIZ_PAINT_AZURE, 2);
@@ -407,8 +407,8 @@ fn the_strand_slot_starts_at_the_complement_and_the_write_chooses_it() {
 #[test]
 fn a_strand_slot_on_a_single_strand_clip_is_the_clip_s_own_colour() {
     use engine::decode::{
-        viz_hue_ui, viz_sat_ui, viz_strand_set, viz_strands_of, with_viz_paint_hue,
-        with_viz_paint_sat, with_viz_paint_strands, VIZ_PAINT_AZURE,
+        VIZ_PAINT_AZURE, viz_hue_ui, viz_sat_ui, viz_strand_set, viz_strands_of,
+        with_viz_paint_hue, with_viz_paint_sat, with_viz_paint_strands,
     };
 
     let one = with_viz_paint_strands(
@@ -449,8 +449,8 @@ fn a_seek_says_so_only_once_it_has_stood() {
 /// fifty-one seconds on a 25 GB film.
 #[test]
 fn a_silence_card_is_up_while_its_scan_runs_and_says_where_it_has_got_to() {
-    use std::sync::atomic::Ordering::Relaxed;
     use std::sync::Arc;
+    use std::sync::atomic::Ordering::Relaxed;
     let progress = Arc::new(engine::silence::Progress::default());
     // Two hours and eight minutes, as the header claims it.
     progress.total.store(7680, Relaxed);
@@ -880,9 +880,11 @@ fn every_codec_row_is_offered_or_says_why_not() {
         detail.contains("ec-vorbis"),
         "the row names the encoder like every other live one: {detail}"
     );
-    assert!(FORMATS
-        .into_iter()
-        .any(|(row, _, _, detail)| row.contains(&Format::Hevc) && detail.contains("intra")));
+    assert!(
+        FORMATS
+            .into_iter()
+            .any(|(row, _, _, detail)| row.contains(&Format::Hevc) && detail.contains("intra"))
+    );
     // The destination follows the format and keeps the stem, mp4 included.
     assert_eq!(
         retarget(std::path::Path::new("/a/take.export.mp4"), Format::Wav),
@@ -1457,6 +1459,94 @@ fn ticking_the_preview_session_never_moves_the_timeline() {
         before,
         "ticking the preview moved the timeline's clock"
     );
+}
+
+/// The monitoring level is the *window's*, and a preview closing must not hand
+/// the timeline back the level it had before the preview opened: muting during
+/// a preview and pressing `esc` used to leave the timeline playing at full
+/// volume with the control still reading "muted" -- the shown level and the
+/// heard level disagreed and nothing said so.
+///
+/// What is driven is the real push, [`push_gain`] -- the function
+/// [`apply_volume`](crate::player::transport::Player::apply_volume) is nothing
+/// but a call to, over the same two session slots a `Player` holds -- and the
+/// answer is read back out of the *device* ([`PlaybackSession::gain`]), not
+/// out of the window. `Player` itself cannot be built here (it takes a gpui
+/// `Context` this binary has no `TestAppContext` to build; the sibling preview
+/// tests say the same), so the door that calls the push is pinned by the scan
+/// below rather than executed.
+#[test]
+fn a_preview_close_leaves_the_timeline_at_the_level_the_window_shows() {
+    let timeline = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+    // The control: an untouched session is at full volume, so a level read back
+    // as 1.0 is a real answer and not a default this test could pass on.
+    assert_eq!(
+        timeline.gain(),
+        Some(1.0),
+        "a fresh session is not at full volume"
+    );
+
+    // Stands in for `open_preview`: a second session arrives, and the window is
+    // muted while it is the one on screen.
+    let preview = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+    let muted = 0.0;
+    push_gain(muted, [Some(&timeline), Some(&preview)]);
+
+    // The preview goes away -- `close_preview` takes it and pushes at what is
+    // left. The session that takes the picture must be the session heard at
+    // the level the control shows.
+    drop(preview);
+    push_gain(muted, [Some(&timeline), None]);
+    assert_eq!(
+        timeline.gain(),
+        Some(muted),
+        "closing a preview handed the timeline back a level the window is not showing"
+    );
+
+    // The other half of the regression, and the half a single-session test can
+    // never see: a push that reached only the *active* session (the preview)
+    // left the timeline exactly where it was, which is the reported bug. The
+    // pre-fix shape is therefore the control that makes the assertion above
+    // mean something.
+    let control = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+    let other = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+    push_gain(muted, [Some(&other), None]);
+    assert_eq!(
+        control.gain(),
+        Some(1.0),
+        "a session outside the push followed it, so the read above proves nothing"
+    );
+    assert_eq!(
+        other.gain(),
+        Some(muted),
+        "the pushed session ignored the level"
+    );
+}
+
+/// The wiring the round trip above cannot build a `Player` for: the level
+/// reaches *both* session slots, and both doors that install or drop a session
+/// push it. A push at the active session alone is the regression, and it is
+/// invisible to any test that only ever holds one session.
+#[test]
+fn the_window_level_is_pushed_at_every_session_and_on_every_swap() {
+    let apply = fn_body("apply_volume");
+    assert!(
+        apply.contains("self.session.as_ref()") && apply.contains("self.preview_session.as_ref()"),
+        "the level is pushed at one session only, so a preview closing hands the \
+         timeline back the level from before the preview opened"
+    );
+    assert!(
+        !apply.contains("self.active_session()"),
+        "the push still goes through the active session, which is the one-session \
+         rule this replaced"
+    );
+    for door in ["open_preview", "close_preview"] {
+        assert!(
+            fn_body(door).contains("self.apply_volume();"),
+            "{door} swaps the session on screen without telling the new one what \
+             level the window is showing"
+        );
+    }
 }
 
 /// [`bgra_to_rgba`] and [`save_screenshot`]'s own PNG write, round-tripped: a

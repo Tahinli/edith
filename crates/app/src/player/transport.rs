@@ -396,15 +396,28 @@ impl Player {
 
     /// The play binding and the transport button share it: once the timeline is finished
     /// the only sensible "play" is from the top.
-    /// Pushes the current volume at the session, which is the only place it is
-    /// ever pushed: after a change here, and after a session arrives. A session
-    /// starts at full volume, so a file opened while muted has to be told --
-    /// that is the whole reason this is not just called from the key handler.
-    /// Silent no-op with no timeline, or with a run that has no audio device.
+    /// Pushes the current volume at every session that is up, which is the only
+    /// place it is ever pushed: after a change here, and after a session
+    /// arrives. A session starts at full volume, so a file opened while muted
+    /// has to be told -- that is the whole reason this is not just called from
+    /// the key handler.
+    ///
+    /// *Every* session, not [`active_session`](Player::active_session): a
+    /// preview and the timeline under it are both live output, and pushing only
+    /// the active one left the level the window showed belonging to whichever
+    /// session happened to be on screen. Muting during a preview and closing it
+    /// then handed the timeline back the level from before the preview, at full
+    /// volume, with the control still reading "muted". The engine holds the
+    /// level per session and restores it when a device is replaced underneath
+    /// it ([`PlaybackSession::set_gain`]), so the app's one copy of the level is
+    /// the owner and every session is a follower of it.
+    ///
+    /// Silent no-op with no session at all, or on one with no audio device.
     pub(crate) fn apply_volume(&self) {
-        if let Some(session) = self.active_session() {
-            session.set_gain(self.volume.gain());
-        }
+        push_gain(
+            self.volume.gain(),
+            [self.session.as_ref(), self.preview_session.as_ref()],
+        );
     }
 
     /// The mute key and the two volume keys, and the click on the button. The
@@ -486,6 +499,22 @@ pub(crate) fn resync_due(late: f64, last: Option<Instant>, priming: bool) -> boo
 /// keeps this checkable on its own instead of only through a live session.
 pub(crate) fn crosses_into_loop(was: Transport, now: Transport, loop_on: bool) -> bool {
     now == Transport::Ended && was != Transport::Ended && loop_on
+}
+
+/// The window's monitoring level, pushed at *every* session handed in -- the
+/// timeline and a preview over it are both live output, and pushing only the
+/// one on screen left the level belonging to whichever session happened to be
+/// active: muting during a preview and closing it handed the timeline back the
+/// level from before the preview opened, at full volume, with the control still
+/// reading "muted".
+///
+/// A free function over the sessions rather than a `&self` method so the round
+/// trip can be driven without a `Player` -- which takes a gpui `Context` this
+/// test binary has no `TestAppContext` to build.
+pub(crate) fn push_gain<const N: usize>(gain: f32, sessions: [Option<&PlaybackSession>; N]) {
+    for session in sessions.into_iter().flatten() {
+        session.set_gain(gain);
+    }
 }
 
 #[cfg(test)]

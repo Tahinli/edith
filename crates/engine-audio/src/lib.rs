@@ -626,6 +626,27 @@ pub unsafe extern "C" fn ao_set_volume(session: *mut c_void, gain: f32) -> i32 {
     .unwrap_or(-1)
 }
 
+/// Reads back the gain [`ao_set_volume`] last set: what the stream is actually
+/// multiplying by, which is not the same question as what a caller last asked
+/// for once the device has been replaced (a re-armed stream comes up at 1.0).
+/// -1.0 for a session that cannot answer -- never a real gain, which is 0.0 to
+/// 1.0.
+///
+/// # Safety
+/// `session` must come from [`ao_open`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ao_gain(session: *mut c_void) -> f32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if session.is_null() {
+            return -1.0;
+        }
+        // SAFETY: caller-guaranteed live session.
+        let session = unsafe { &*(session as *const Session) };
+        f32::from_bits(session.shared.gain.load(Ordering::Relaxed))
+    }))
+    .unwrap_or(-1.0)
+}
+
 /// Drops every queued sample, so playback resumes from whatever is written
 /// next: what a seek needs. Takes effect on the next process callback (or the
 /// first one after a resume), and leaves the played position alone -- the
@@ -751,7 +772,10 @@ mod tests {
         flush.store(true, Ordering::Release);
         let mut out = [0u8; 16];
         assert_eq!(consume(&flush, &ring, &mut out, 2), 0, "the flush landed");
-        assert!(!primed.load(Ordering::Acquire), "the restart counts as late");
+        assert!(
+            !primed.load(Ordering::Acquire),
+            "the restart counts as late"
+        );
 
         // ...until its own first sample lands, from where it counts again --
         // which is also what makes the tail work: `ao_stream_ended` unprimes

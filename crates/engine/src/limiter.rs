@@ -140,14 +140,24 @@ impl LimiterState {
     }
 
     /// One switched in **while the mix is already running**: the same limiter,
-    /// except that it swallows nothing to fill its delay line -- what comes out
-    /// first is the line's own [`LOOKAHEAD_MS`] of silence and the mix behind
-    /// it, where a fresh state would have eaten that much of the mix instead.
+    /// except that it swallows nothing to fill its delay line -- the line is
+    /// zeroed and emitting from the first frame, where [`new`] would have eaten
+    /// that much of the mix at the front instead.
     ///
     /// Which matters because the count *is* the clock: a mixer that emitted
     /// fewer samples than the timeline asked for would slide the picture off
-    /// the sound by the lookahead, once per switch-on. A hair of silence at the
-    /// moment somebody engages a limiter is the honest price.
+    /// the sound by the lookahead, once per switch-on.
+    ///
+    /// The price, stated as it measures rather than as it was hoped: not a
+    /// momentary hair of silence the stream grows back from, but a **permanent**
+    /// shift of [`LOOKAHEAD_MS`] for the rest of the stream -- the output is
+    /// the input delayed by the whole line, every block, because nothing ever
+    /// re-aligns it. That is at most 2 ms, which is under the perceptual
+    /// threshold, and it is paid once per stream rather than growing; it is
+    /// pinned by
+    /// `tests::an_engaged_limiter_shifts_the_stream_by_the_lookahead_for_good`.
+    /// Changing it is a design call about the export's A/V alignment, not a
+    /// bug fix.
     pub fn engaged(params: &Limiter, sample_rate: u32, channels: usize) -> Self {
         Self {
             warm: 0,
@@ -314,7 +324,10 @@ mod tests {
         state.process(&mut buf);
         assert_eq!(buf.len(), block.len(), "a retune ate samples");
         let quiet = buf.iter().fold(0.0f32, |m, s| m.max(s.abs()));
-        assert!(quiet <= db_to_linear(-12.0) + 1e-6, "peak {quiet} passed -12 dB");
+        assert!(
+            quiet <= db_to_linear(-12.0) + 1e-6,
+            "peak {quiet} passed -12 dB"
+        );
         assert!(quiet < hot, "the ceiling did not move: {hot} -> {quiet}");
 
         // Switched out: the line still delays, so the count still holds, and
@@ -328,6 +341,85 @@ mod tests {
         assert_eq!(buf.len(), block.len(), "a bypass ate samples");
         let raw = buf.iter().fold(0.0f32, |m, s| m.max(s.abs()));
         assert!(raw > 1.0, "bypassed, the mix is untouched: peak {raw}");
+    }
+
+    /// What engaging a limiter mid-stream actually costs, measured rather than
+    /// described: not a momentary hair of silence that the stream then grows
+    /// back from, but a **permanent** shift. `engaged` starts its delay line
+    /// empty and swallows nothing, so from the first block onward the output is
+    /// the input delayed by the whole lookahead -- for the rest of the stream.
+    /// `new` is head-aligned instead: it swallows the lookahead once, at the
+    /// front, and is a block shorter for it.
+    ///
+    /// The two are measured against each other because the difference is the
+    /// whole claim: same tone, same settings, one index offset and one block
+    /// length apart. A permanent offset of at most [`LOOKAHEAD_MS`] is below
+    /// the perceptual threshold, so this pins the *measured* behaviour the doc
+    /// comment on [`LimiterState::engaged`] describes rather than ruling on
+    /// whether it should be changed -- that is a design call, not a bug fix.
+    #[test]
+    fn an_engaged_limiter_shifts_the_stream_by_the_lookahead_for_good() {
+        let rate = 48_000;
+        let params = Limiter {
+            ceiling_db: -3.0,
+            on: true,
+        };
+        let lookahead = ((LOOKAHEAD_MS / 1000.0 * rate as f32) as usize).max(1);
+        // Under the knee throughout, so what comes out is the input and the
+        // only thing being measured is *when* each frame appears.
+        let tone: Vec<f32> = (0..4_000)
+            .flat_map(|i| {
+                let s = 0.1 * (i as f32 / rate as f32 * 440.0 * std::f32::consts::TAU).sin();
+                [s, s]
+            })
+            .collect();
+
+        // `new`: head-aligned, and a block shorter by exactly the lookahead.
+        let mut fresh = LimiterState::new(&params, rate, 2);
+        let mut head = tone.clone();
+        fresh.process(&mut head);
+        assert_eq!(
+            head.len(),
+            tone.len() - lookahead * 2,
+            "a fresh limiter is not head-aligned by exactly the lookahead"
+        );
+
+        // `engaged`: the same count, the same samples -- one lookahead later.
+        let mut live = LimiterState::engaged(&params, rate, 2);
+        let mut shifted = tone.clone();
+        live.process(&mut shifted);
+        assert_eq!(
+            shifted.len(),
+            tone.len(),
+            "an engaged limiter ate samples, which is the thing it exists not to do"
+        );
+        assert_eq!(
+            &shifted[lookahead * 2..],
+            &head[..],
+            "an engaged limiter is not the fresh one delayed by exactly the \
+             lookahead, so what it costs mid-stream is not what the doc claims"
+        );
+        // And the shift is the *stream's*, not one block's. A second block of a
+        // marker the first did not contain comes out *still* delayed by the
+        // lookahead: the head of it is still the tail of the tone, and the
+        // marker itself only appears from the lookahead on. Nothing re-aligns
+        // the line, which is what makes the cost permanent rather than a one-off
+        // at the moment of engaging.
+        let marker = vec![0.5; tone.len()];
+        let mut next = marker.clone();
+        live.process(&mut next);
+        assert!(
+            next[..lookahead * 2].iter().any(|s| *s != 0.5),
+            "the second block is aligned where the first was not, so the cost is \
+             a one-off rather than a permanent shift"
+        );
+        assert!(
+            next[lookahead * 2..]
+                .iter()
+                .all(|s| (*s - 0.5).abs() < 1e-6),
+            "the marker is not behind by exactly the lookahead: the stream is not \
+             delayed by a fixed amount from here on"
+        );
     }
 
     /// Flat settings are a passthrough, which is what the export invariant

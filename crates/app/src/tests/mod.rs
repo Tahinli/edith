@@ -77,6 +77,8 @@ fn config_env_lock() -> MutexGuard<'static, ()> {
         .expect("config environment lock poisoned")
 }
 
+use crate::player::transport::push_gain;
+
 /// Tests never open PipeWire. The output seam also refuses a cargo-test
 /// binary under `target/*/deps/`; this pin is the documented door and the
 /// source-scan guard below.
