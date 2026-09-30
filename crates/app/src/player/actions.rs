@@ -73,8 +73,16 @@ impl Player {
                 // [`Player::dissolve_selected`]) and the clip-menu row reaches
                 // `dissolve_selected` directly, never through this table, so a
                 // list entry armed the key path and left the menu path armed by
-                // nothing. `remove_lane` is out of the same list for the same
-                // reason -- it arms on its own `Ok(())`.
+                // nothing.
+                //
+                // The three `Remove*Lane` entries ARE still here and are still
+                // wrong in the same way -- `remove_lane` refuses a track that
+                // holds clips and the last of its kind, and it now carries its
+                // own arm ([`Player::remove_lane`]) -- but taking them off is
+                // a wider pass over this list than this change makes, so they
+                // stay until it does. Until then each of those removals arms
+                // twice over, which is the lesser fault beside arming once for
+                // a removal that did not happen.
                 | ActionId::Visualizer
         ) {
             self.mark_dirty();
