@@ -97,32 +97,46 @@ pub const MAX_GAIN_DB: f32 = 12.0;
 ///
 /// A window is a stretch of *source media*, not of the timeline, so its width
 /// is the length of the recording a caption was cut from -- and that is not
-/// bounded by anything a day. A two-day conference stream, a lecture
-/// archive, a long interview session: all of them produce a palette row whose
-/// `out_us` is measured in tens of hours, and a ceiling that refuses those is
-/// refusing the user's own media back at them. So the ceiling is set where no
-/// real recording reaches and a typed number does not survive.
+/// bounded by anything a day. A two-day conference stream, a lecture archive, a
+/// long interview session: all produce a palette row whose `out_us` is tens of
+/// hours, and a ceiling that refuses those refuses the user's own media back at
+/// them. The value is therefore "past any recording", and nothing more
+/// sophisticated: 30 days is a round number four orders of magnitude above the
+/// longest thing anybody captions and three orders below the point where a
+/// typed number becomes plausible as a duration at all.
 ///
-/// What it has to clear, concretely:
+/// What it has to clear, concretely, and the honest arithmetic for each:
 ///
-/// - [`SubClip::window_at`]'s proportion cut. It saturates rather than
-///   wrapping, so this is about *precision*, not safety: `f64` holds an
-///   integer exactly to 2^53, and 30 days is 2.6e12 -- nine orders of magnitude
-///   inside that, so the cut is exact rather than merely finite.
-/// - The `i64` multiply underneath it, which `saturating_mul` already makes
-///   total. 30 days is 3.5e6x below `i64::MAX`, so it never saturates in
-///   practice either.
-/// - `sub_lane_cues`'s f64 mapping of cues onto the timeline, likewise exact.
+/// - **The i64 multiply in [`SubClip::window_at`].** `window_us() * into`,
+///   where `into` is a `u32` frame offset, so at most 4.29e9. It is a
+///   `saturating_mul`, so this is not about safety -- saturation is total --
+///   but about the result still *meaning* something: 30 days x 4.29e9 is
+///   1.1e22, which does NOT fit an i64. So the multiply saturates for any
+///   window above `i64::MAX / u32::MAX` = 2.1e9 us (~35 minutes), and 30 days
+///   is 1200x past that. The value is then finite but the proportion is not
+///   exact, and `set_window`'s clamp on the answer keeps the result inside the
+///   window rather than trusting it. That is the real precision cost, and it
+///   is why this is not "unlimited": past 35 minutes the cut degrades, past
+///   this it has degraded to "the far end of the window".
+/// - **`sub_lane_cues`'s f64 mapping.** `(t - in_us) as f64 * per`, where `per`
+///   is `frames / fps * 1e6 / window_us`. Here f64 exactness genuinely does
+///   apply: an i64 is exact in f64 to 2^53 = 9.0e15, and 30 days is 2.6e12 --
+///   about 3.5 orders of magnitude inside it, so the cue mapping is exact and
+///   not merely close.
+/// - **Nothing else.** There is no allocation, no index and no length derived
+///   from a window, so a wider value costs no memory. The ceiling is a claim
+///   about meaning, not about resource.
 ///
 /// Past it, the value is not a caption any project holds -- a `.edith` a hand
-/// edited (or a hostile actor wrote) reaches this with a line the
-/// never-empty check at the parser cannot see past, because `out_us > in_us`
-/// says the window is *open* and never how wide it is. That line is refused by
-/// name, next to every other range check a `.edith` line has to pass. The
-/// bounds that *grow* a window rather than read one -- [`Project::trim_sub`]
-/// and the group-follow twin it calls -- clamp to this rather than refuse,
-/// because a trim that ran out of window should stop at the window's end, not
-/// fail: see [`MAX_WINDOW_US`'s growth law](MAX_WINDOW_US).
+/// edited (or a hostile actor wrote) reaches this with a line the never-empty
+/// check at the parser cannot see past, because `out_us > in_us` says the
+/// window is *open* and never how wide it is. Every door -- the parse,
+/// [`Project::with_subs`], [`Project::place_sub`] -- refuses such a line by
+/// name, next to every other range check a `.edith` line has to pass. Every
+/// *composer* instead clamps to it through [`set_window`], which is the only
+/// function that writes a window; a trim that ran out of window stops at the
+/// window's end rather than failing, exactly like the frame walls it already
+/// has.
 pub const MAX_WINDOW_US: i64 = 30 * 24 * 60 * 60 * 1_000_000;
 
 /// How fast a clip plays, in **thousandths of real time**: 1000 is the speed it
@@ -2260,32 +2274,30 @@ impl Project {
             // The words that stay are the words that were there, so the window
             // moves with the head -- a trim, not a slip.
             Edge::Start => {
-                // Clamped to a window that is still a window: the walls above
-                // are frames and the rounding between the two clocks is not
-                // exact, and neither is a caller's hand-built placement. The
-                // add saturates for the reason [`SubClip::window_at`]'s does --
-                // this is one of the two places a caption's clock is composed,
-                // and a `SubClip` that did not come through a door is the one
-                // whose `in_us` may already be at the top of `i64`.
-                s.in_us = s
-                    .in_us
-                    .saturating_add(us_of(i64::from(to) - i64::from(s.start), fps))
-                    .clamp(0, s.out_us - 1);
+                // The head moves and the words that stay are the words that
+                // were there, so `in_us` follows it -- a trim, not a slip.
+                // Falling `in_us` makes the window *wider* (the ceiling bounds
+                // a difference), which is the half of this nothing here can
+                // see: `set_window` is what puts the width back inside.
+                set_window(
+                    s,
+                    s.in_us
+                        .saturating_add(us_of(i64::from(to) - i64::from(s.start), fps)),
+                    s.out_us,
+                );
                 s.frames = s.end() - to;
                 s.start = to;
             }
             Edge::End => {
-                // ...and `grow_window`, because this arm is where a caption's
-                // clock grows and the doors only ever *read* one. Without it a
-                // trim out to the end of a long track produced a window past
-                // [`MAX_WINDOW_US`], `save_project` wrote it, and the loader
-                // then refused the file the editor had just written -- a user's
-                // saved work that stops opening, with no in-app way back. The
-                // trim stops at the ceiling instead, which is the same answer
-                // the frame walls above already give for running out of room.
-                s.out_us = grow_window(
+                // ...and the tail, for [`set_window`]'s reason: the End room
+                // is walled at the ceiling, but `set_window` is what holds it
+                // for every other composer too, including this one when a
+                // caller hands `trim_sub` a `to` past its own room.
+                set_window(
+                    s,
                     s.in_us,
-                    s.out_us.saturating_add(us_of(i64::from(to) - i64::from(s.end()), fps)),
+                    s.out_us
+                        .saturating_add(us_of(i64::from(to) - i64::from(s.end()), fps)),
                 );
                 s.frames = to - s.start;
             }
@@ -3468,7 +3480,15 @@ impl Project {
         for (data, sub) in self.lanes.iter_mut().zip(join_subs) {
             if let Some(idx) = sub {
                 data.subs[idx].frames += data.subs[idx + 1].frames;
-                data.subs[idx].out_us = data.subs[idx + 1].out_us;
+                // The left half's `in_us`, the right half's `out_us` -- which
+                // is the SUM of two legal widths, because `sub_joinable` has
+                // just established that the two halves are consecutive in the
+                // *source* (`next.in_us == subs[idx].out_us`). Neither half
+                // broke the ceiling and the whole does, so this is a composer
+                // a per-arm check on one writer could never have found:
+                // `set_window` is what makes the closed set closed.
+                let (in_us, out_us) = (data.subs[idx].in_us, data.subs[idx + 1].out_us);
+                set_window(&mut data.subs[idx], in_us, out_us);
                 data.subs.remove(idx + 1);
                 debug_assert!(subs_sorted_disjoint(&data.subs));
             }
@@ -5677,29 +5697,54 @@ fn us_of(frames: i64, fps: f64) -> i64 {
     }
 }
 
-/// The growth law, and the one function here that may write `out_us` past what
-/// a caller asked for: the ceiling a caption's window may reach, given the
-/// `in_us` it starts from.
+/// **The one function in this file that writes a caption's window.** Every
+/// composer -- a trim, a split, a ripple, a group follow, a rejoin -- routes
+/// through it, and the invariant it holds is total:
 ///
-/// Every *door* -- the parser, [`Project::with_subs`], [`Project::place_sub`]
-/// -- refuses a window wider than [`MAX_WINDOW_US`] by name. A door only sees
-/// a value on the way IN, so on its own it is not enough: [`Project::trim_sub`]
-/// and the group-follow [`write_sub_edge`] both *grow* `out_us`, and a project
-/// could be trimmed past the ceiling after loading legally. That produced a
-/// file `save_project` wrote and `open_project` then refused -- the user's own
-/// saved work, stopping, with no way back in the app.
+/// ```text
+/// 0 <= in_us  and  in_us < out_us  and  out_us - in_us <= MAX_WINDOW_US
+/// ```
 ///
-/// So growth clamps and entry refuses, and that asymmetry is the point: a trim
-/// is a continuous gesture whose every intermediate frame the user sees, so
-/// clamping it to the end of the window is a drag that stops -- exactly like
-/// the frame walls `trim_sub` already applies. A value *arriving* from a file
-/// or a foreign caller is a different thing, where nobody was mid-gesture, so
-/// it is named and refused rather than quietly changed.
+/// which is the never-empty invariant plus the width ceiling, restated as one
+/// shape both ends of it come from. Note that the ceiling bounds a
+/// **difference**, which is why a per-arm check is not enough and this is:
 ///
-/// The `+ 1` is the never-empty invariant: the window is open, always, so a
-/// growth that would otherwise clamp it shut lands on one microsecond instead.
-fn grow_window(in_us: i64, out_us: i64) -> i64 {
-    out_us.clamp(in_us + 1, in_us.saturating_add(MAX_WINDOW_US))
+/// - Growing `out_us` (a tail trim) makes the width larger, so the *upper*
+///   wall bites.
+/// - Falling `in_us` (a head trim) makes the width larger too, from the other
+///   side -- so bounding `in_us` alone, which is what a head trim's own clamp
+///   (`in_us <= out_us - 1`) does, says nothing at all about the ceiling.
+/// - A rejoin takes the left half's `in_us` and the right half's `out_us`, and
+///   the two halves are consecutive in the *source* (that is what
+///   [`sub_joinable`] requires), so the joined width is the **sum** of two
+///   legal widths. Each half passes its own door; the whole does not.
+///
+/// Three rounds of review each found one more composer this way, so the
+/// function is the fix rather than any single call site: clamping a new
+/// caller into shape is a two-line change, and forgetting one is silent.
+/// `every_window_write_goes_through_set_window` (in the tests below) is the
+/// other half of that promise -- it scans the file and fails if a write
+/// appears anywhere else.
+///
+/// **Why it clamps where the doors refuse.** The doors -- the parser,
+/// [`Project::with_subs`], [`Project::place_sub`] -- see a value on the way
+/// IN, from a file or a foreign caller, where nobody was mid-gesture, so a
+/// value that wide is named and refused rather than quietly changed. Every
+/// composer below is an edit a person is watching happen, so the same value is
+/// clamped to the end of the window: a drag that stops, exactly like the frame
+/// walls these trims already apply.
+fn set_window(s: &mut SubClip, in_us: i64, out_us: i64) {
+    let in_us = in_us.max(0);
+    // The `+ 1` is the never-empty invariant: the window is open, always, so a
+    // composer that would otherwise clamp it shut lands on one microsecond.
+    let out_us = out_us.clamp(in_us + 1, in_us.saturating_add(MAX_WINDOW_US));
+    s.in_us = in_us;
+    s.out_us = out_us;
+    debug_assert!(
+        s.in_us >= 0 && s.out_us > s.in_us && s.out_us - s.in_us <= MAX_WINDOW_US,
+        "set_window left an illegal window: {:?}",
+        (s.in_us, s.out_us)
+    );
 }
 
 /// [`clear`] for a subtitle lane: removes the timeline frames `[start, end)`,
@@ -5714,24 +5759,31 @@ fn sub_clear(subs: &mut Vec<SubClip>, start: u32, end: u32) {
             continue;
         }
         if s.start < start {
-            out.push(SubClip {
+            let cut = s.window_at(start);
+            let mut head = SubClip {
                 frames: start - s.start,
-                out_us: s.window_at(start),
                 // Both pieces lose the group id, for [`clear`]'s reason: one
                 // id on two boxes of one lane is the one thing it may never
                 // mean.
                 link: None,
                 ..s
-            });
+            };
+            // `window_at` already answers inside the window, and `set_window`
+            // is the shape that says so once, for every composer, rather than
+            // leaving each of them to re-derive it.
+            set_window(&mut head, s.in_us, cut);
+            out.push(head);
         }
         if s.end() > end {
-            out.push(SubClip {
+            let cut = s.window_at(end);
+            let mut tail = SubClip {
                 start: end,
                 frames: s.end() - end,
-                in_us: s.window_at(end),
                 link: None,
                 ..s
-            });
+            };
+            set_window(&mut tail, cut, s.out_us);
+            out.push(tail);
         }
     }
     *subs = out;
@@ -5745,22 +5797,21 @@ fn sub_open_room(subs: &mut Vec<SubClip>, at: u32, len: u32) {
     if let Some(idx) = subs.iter().position(|s| s.start < at && at < s.end()) {
         let s = subs[idx];
         let cut = s.window_at(at);
-        subs[idx] = SubClip {
+        let mut head = SubClip {
             frames: at - s.start,
-            out_us: cut,
             link: None,
             ..s
         };
-        subs.insert(
-            idx + 1,
-            SubClip {
-                start: at,
-                frames: s.end() - at,
-                in_us: cut,
-                link: None,
-                ..s
-            },
-        );
+        set_window(&mut head, s.in_us, cut);
+        subs[idx] = head;
+        let mut tail = SubClip {
+            start: at,
+            frames: s.end() - at,
+            link: None,
+            ..s
+        };
+        set_window(&mut tail, cut, s.out_us);
+        subs.insert(idx + 1, tail);
     }
     for s in subs.iter_mut().filter(|s| s.start >= at) {
         s.start += len;
@@ -5801,25 +5852,21 @@ fn sub_edge_room(subs: &[SubClip], idx: usize, edge: Edge) -> (u32, u32) {
 /// the window it already shows over the frames it already takes.
 fn write_sub_edge(s: &mut SubClip, edge: Edge, to: u32) {
     let per_frame = s.window_us() / i64::from(s.frames.max(1));
-    // The `saturating_add` beside the `saturating_mul` is the same claim
-    // [`SubClip::window_at`]'s arithmetic makes, in the other direction: this
-    // one *grows* a caption's clock, and a `SubClip` that reached here without
-    // a door behind it may already be at the top of `i64`, where a plain add
-    // wrapped the window negative and the two halves a trim hands back no
-    // longer met.
+    // The `saturating_mul` keeps a `SubClip` that reached here without a door
+    // behind it from wrapping the window negative; `set_window` is what keeps
+    // the result legal rather than merely finite. This is the group-follow twin
+    // of [`Project::trim_sub`], and it reaches the same field from both edges --
+    // so a fix that only walled the primary trim's End arm left the head (and
+    // the whole group path) open.
     let by = |from: u32, to: u32| per_frame.saturating_mul(i64::from(to) - i64::from(from));
     match edge {
         Edge::Start => {
-            s.in_us = s.in_us.saturating_add(by(s.start, to)).clamp(0, s.out_us - 1);
+            set_window(s, s.in_us.saturating_add(by(s.start, to)), s.out_us);
             s.frames = s.end() - to;
             s.start = to;
         }
         Edge::End => {
-            // `grow_window`, for [`Project::trim_sub`]'s reason: this is the
-            // group-follow twin and it reaches the same field, so a group trim
-            // would otherwise be a way round the ceiling the primary trim
-            // respects.
-            s.out_us = grow_window(s.in_us, s.out_us.saturating_add(by(s.end(), to)));
+            set_window(s, s.in_us, s.out_us.saturating_add(by(s.end(), to)));
             s.frames = to - s.start;
         }
     }
@@ -10719,5 +10766,81 @@ fn removing_a_subtitle_column_undoes_with_its_reindex() {
     assert_eq!(p.subtitles()[0].label, "two");
     assert_ne!(p.subtitles(), palette.as_slice(), "and it is not back");
 }
+
+    /// The closed set, proved by reading the files rather than by exercising
+    /// every path: a caption's `in_us`/`out_us` is written in exactly two
+    /// places, and this fails if a third appears.
+    ///
+    /// Three rounds of review each found one more composer a per-arm check had
+    /// missed -- a tail trim, a head trim, a rejoin that SUMS two legal widths
+    /// -- and each produced the same failure: the editor wrote a `.edith` its
+    /// own loader then refused, with no in-app way back. Reasoning about arms
+    /// does not scale to an unknown number of them, so the invariant is stated
+    /// structurally instead: a new composer routed through `set_window` is two
+    /// lines and needs no new argument, and one that is not fails here.
+    ///
+    /// The two allowed writers are `set_window` (every composer) and the
+    /// parser's own door, which builds the `SubClip` a `sub` line describes and
+    /// range-checks it on the next lines -- a door, not a composer, because a
+    /// file is not an edit anybody is watching happen.
+    #[test]
+    fn every_window_write_goes_through_set_window() {
+        // `CARGO_MANIFEST_DIR`, not `file!()`: a test runs with the WORKSPACE
+        // root as its working directory, so `file!()`'s crate-relative path
+        // does not resolve from where the binary actually starts.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        // Every line in the two files that names a clock and is not a write:
+        // the struct's own fields, the one function that may write, and the
+        // parser's two door lines. A new entry here is a claim someone has to
+        // defend in review, which is the point of writing the list out.
+        let allowed = [
+            ("project.rs", "pub in_us: i64,"),
+            ("project.rs", "pub out_us: i64,"),
+            ("project.rs", "fn set_window(s: &mut SubClip, in_us: i64, out_us: i64) {"),
+            ("project.rs", "s.in_us = in_us;"),
+            ("project.rs", "s.out_us = out_us;"),
+            ("edith.rs", "in_us: micros(f[3], n)?,"),
+            ("edith.rs", "out_us: micros(f[4], n)?,"),
+        ];
+        let mut found: Vec<String> = Vec::new();
+        let mut scanned = 0usize;
+        for name in ["project.rs", "edith.rs"] {
+            let text = std::fs::read_to_string(dir.join(name)).expect("read the file");
+            // The test MODULE, not any `cfg(test)`: this file carries several
+            // `cfg(test)` attributes on single test-only helpers, and two wrong
+            // boundaries were tried before this one -- the FIRST (line 160)
+            // scanned 160 lines of a 10,800-line file, and the LAST landed
+            // inside this very test, dragging the test module's own
+            // hand-built `SubClip`s into scope. A guard that reads nothing,
+            // and one that reads the wrong thing, are both worse than no
+            // guard because they read as one. The line count asserted below is
+            // what keeps this third boundary honest.
+            let at = text
+                .find("#[cfg(test)]\nmod tests {")
+                .expect("this file's test module is still spelled that way");
+            let code = &text[..at];
+            for line in code.lines() {
+                scanned += 1;
+                let line = line.trim();
+                let writes = line.contains(".in_us = ")
+                    || line.contains(".out_us = ")
+                    || line.contains("in_us:")
+                    || line.contains("out_us:");
+                if writes && !allowed.contains(&(name, line)) {
+                    found.push(format!("{name}: {line}"));
+                }
+            }
+        }
+        assert!(
+            scanned > 3_000,
+            "the scan only read {scanned} lines -- the cfg(test) boundary is wrong, \
+             and a guard that reads nothing is worse than no guard"
+        );
+        assert!(
+            found.is_empty(),
+            "a caption window is written outside set_window:\n  {}",
+            found.join("\n  ")
+        );
+    }
 
 }

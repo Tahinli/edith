@@ -1301,3 +1301,133 @@ fn a_group_trim_carries_its_sibling_no_further_than_the_ceiling() {
     session.save_project(&saved).expect("save");
     PlaybackSession::open_project(&saved).expect("and the file the editor wrote reopens");
 }
+
+/// The composer that no per-arm check finds: a **rejoin** takes the left
+/// half's `in_us` and the right half's `out_us`, and `sub_joinable` has just
+/// established that the two halves are consecutive in the *source* -- so the
+/// joined width is the SUM of two widths that each passed their own door.
+///
+/// Neither half is illegal and the whole is. Two 20-day windows, one ordinary
+/// undo-a-split keystroke, a 40-day window, and a file the editor writes and
+/// cannot reopen.
+#[test]
+fn a_rejoin_of_two_legal_windows_stays_inside_the_ceiling() {
+    use engine::project::{MAX_WINDOW_US, SubClip};
+
+    let dir = scratch("caption_rejoin");
+    let media = copy_in(&dir, "test_av.mp4");
+    let subs = long_srt(&dir, 960);
+    let twenty_days = 20 * 24 * 60 * 60 * 1_000_000i64;
+
+    let mut session = PlaybackSession::open(&media).expect("open the fixture");
+    session.import_subtitles(&subs).expect("a 40-day track imports");
+    let s1 = session.add_lane(engine::project::LaneKind::Subtitle);
+    // Two adjacent halves, each a legal 20-day window, the second starting
+    // exactly where the first's window ends -- which is what `sub_joinable`
+    // requires, and what makes the join a sum.
+    for (at, frames, in_us) in [(0u32, 10_000u32, 0i64), (10_000, 10_000, twenty_days)] {
+        session
+            .place_sub(
+                s1,
+                at,
+                SubClip {
+                    start: 0,
+                    frames,
+                    track: 0,
+                    in_us,
+                    out_us: in_us + twenty_days,
+                    link: None,
+                },
+            )
+            .unwrap_or_else(|e| panic!("a 20-day half at {at} places: {e}"));
+    }
+    let halves: Vec<i64> = session
+        .sub_lane(s1)
+        .iter()
+        .map(|s| s.out_us - s.in_us)
+        .collect();
+    assert!(
+        halves.iter().all(|&w| w <= MAX_WINDOW_US),
+        "both halves must be legal for this to be about the join: {halves:?}"
+    );
+
+    // `regroup_at` is in seconds, like every other front-end door; the
+    // boundary is the frame the second half starts on.
+    let at_secs = 10_000.0 / f64::from(session.meta().frame_rate);
+    assert!(
+        session.regroup_at(at_secs),
+        "the two halves rejoin -- the inverse of the split that made them"
+    );
+    let joined = &session.sub_lane(s1)[0];
+    assert!(
+        (joined.out_us - joined.in_us) <= MAX_WINDOW_US,
+        "the rejoin summed two {}us windows into {}us, past the {}us ceiling",
+        MAX_WINDOW_US / 2,
+        joined.out_us - joined.in_us,
+        MAX_WINDOW_US
+    );
+
+    let saved = dir.join("rejoined.edith");
+    session.save_project(&saved).expect("save");
+    PlaybackSession::open_project(&saved).expect("and the file the editor wrote reopens");
+}
+
+/// The other half of the ceiling: it bounds a **difference**, so a head trim
+/// grows the width as surely as a tail trim does, and from the other side.
+///
+/// A caption placed a year into its source with a 30-second window is legal.
+/// One head drag pulling its start back by 200 days of frames makes the
+/// window 200 days wide while `out_us` never moves -- so bounding `in_us`
+/// from above, which is all the head arm's own clamp does, says nothing at all
+/// about the ceiling.
+#[test]
+fn a_head_drag_no_further_than_the_ceiling() {
+    use engine::project::{Edge, MAX_WINDOW_US, SubClip};
+
+    let dir = scratch("caption_head_drag");
+    let media = copy_in(&dir, "test_av.mp4");
+    let subs = long_srt(&dir, 960);
+    let day = 24 * 60 * 60 * 1_000_000i64;
+
+    let mut session = PlaybackSession::open(&media).expect("open the fixture");
+    session.import_subtitles(&subs).expect("a 40-day track imports");
+    let s1 = session.add_lane(engine::project::LaneKind::Subtitle);
+    // A year into the source, 30 seconds of window: legal, and the only kind
+    // of caption a head drag can make enormous.
+    session
+        .place_sub(
+            s1,
+            90_000_000,
+            SubClip {
+                start: 0,
+                frames: 900,
+                track: 0,
+                in_us: 365 * day,
+                out_us: 365 * day + 30_000_000,
+                link: None,
+            },
+        )
+        .expect("a year-deep caption places");
+
+    // The head room the engine offers, then the drag to its far end: 200 days
+    // of source at 30 fps, which the Start arm's own `in_us <= out_us - 1`
+    // clamp is perfectly happy with.
+    let (lo, _) = session
+        .trim_sub_room(s1, 0, Edge::Start)
+        .expect("a head room");
+    session
+        .trim_sub(s1, 0, Edge::Start, lo)
+        .expect("the head drag commits");
+
+    let dragged = session.sub_lane(s1)[0];
+    assert!(
+        (dragged.out_us - dragged.in_us) <= MAX_WINDOW_US,
+        "a head drag onto a year-deep caption gave a {}us window, past the {}us ceiling",
+        dragged.out_us - dragged.in_us,
+        MAX_WINDOW_US
+    );
+
+    let saved = dir.join("head.edith");
+    session.save_project(&saved).expect("save");
+    PlaybackSession::open_project(&saved).expect("and the file the editor wrote reopens");
+}
