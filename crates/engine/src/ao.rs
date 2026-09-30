@@ -12,7 +12,7 @@
 
 use std::ffi::c_void;
 use std::path::Path;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{LazyLock, OnceLock};
 use std::time::Instant;
 
@@ -54,6 +54,11 @@ struct Plugin {
     /// did and only counts the tail of a played-out stream as lateness, which
     /// is a worse diagnostic rather than a worse session.
     stream_ended: Option<unsafe extern "C" fn(*mut c_void) -> i32>,
+    /// Optional, unlike its neighbours: without it a session plays and is
+    /// silenced exactly as before, it just cannot be *asked* what gain it is
+    /// running -- and asking is the only way to see that a device replaced
+    /// under it came back at the wrong level.
+    gain: Option<unsafe extern "C" fn(*mut c_void) -> f32>,
     close: unsafe extern "C" fn(*mut c_void),
     // Never dropped (lives in a static), so the fn pointers above stay valid.
     _lib: Library,
@@ -102,6 +107,7 @@ fn load() -> Option<Plugin> {
                     // reads zero underruns is worse than a run that says the
                     // plugin is the wrong one.
                     underruns: *lib.get(b"ao_underruns\0").ok()?,
+                    gain: lib.get(b"ao_gain\0").ok().map(|f| *f),
                     stream_ended: lib.get(b"ao_stream_ended\0").ok().map(|f| *f),
                     close: *lib.get(b"ao_close\0").ok()?,
                     _lib: lib,
@@ -137,6 +143,11 @@ struct Silent {
     base: AtomicI64,
     /// 0 = paused; otherwise milliseconds from [`epoch`] at the last resume.
     origin_ms: AtomicU64,
+    /// The gain last pushed, so the silent sink answers the same question the
+    /// plugin does: what is this stream actually multiplying by. Without it
+    /// every gain read back as a shrug, and a device that had been re-armed at
+    /// full volume looked exactly like one that had kept its level.
+    gain: AtomicU32,
 }
 
 fn epoch() -> Instant {
@@ -154,7 +165,16 @@ impl Silent {
             rate: f64::from(sample_rate),
             base: AtomicI64::new(-1),
             origin_ms: AtomicU64::new(0),
+            gain: AtomicU32::new(1.0f32.to_bits()),
         }
+    }
+
+    fn gain(&self) -> f32 {
+        f32::from_bits(self.gain.load(Ordering::Relaxed))
+    }
+
+    fn set_gain(&self, gain: f32) {
+        self.gain.store(gain.to_bits(), Ordering::Relaxed);
     }
 
     fn extra(&self) -> i64 {
@@ -308,10 +328,32 @@ impl AoSession {
             return false;
         }
         match &self.backend {
-            Backend::Silent(_) => true,
+            Backend::Silent(s) => {
+                s.set_gain(gain);
+                true
+            }
             Backend::Plugin { plugin, handle } => {
                 // SAFETY: `handle` came from `ao_open` and is still open.
                 unsafe { (plugin.set_volume)(*handle, gain) == 0 }
+            }
+        }
+    }
+
+    /// The gain this stream is actually running at, read back from the device
+    /// rather than remembered by the caller: the two come apart the moment the
+    /// device object is replaced (a fresh stream comes up at 1.0), and a
+    /// remembered answer would report the level that was asked for rather than
+    /// the one in force. `None` with no device, or a plugin too old to answer.
+    pub fn gain(&self) -> Option<f32> {
+        match &self.backend {
+            Backend::Silent(s) => Some(s.gain()),
+            Backend::Plugin { plugin, handle } => {
+                let read = plugin.gain?;
+                // SAFETY: `handle` came from `ao_open` and is still open.
+                match unsafe { read(*handle) } {
+                    gain if gain < 0.0 => None,
+                    gain => Some(gain),
+                }
             }
         }
     }
