@@ -11158,7 +11158,8 @@ mod tests {
     ///    are cut. A test cannot produce a file a user loses, so the line is
     ///    drawn there deliberately, not by omission.
     /// 4. **A file the walk does not reach**: a path outside `crates/`, or one
-    ///    under a directory named `target`, `.git` or `vendor`.
+    ///    under a directory named `target`, `.git`, `vendor`, or any
+    ///    dot-directory (`.delta/` holds scratch clones of other checkouts).
     ///
     /// What the matcher DOES now cover, after four rounds of it not doing so:
     /// every assignment operator; struct-literal fields and the shorthand form,
@@ -11370,9 +11371,25 @@ mod tests {
                 let path = entry.path();
                 if path.is_dir() {
                     // `target` is not source and `vendor` is not ours to rule on.
-                    let skip = path
-                        .file_name()
-                        .is_some_and(|n| n == "target" || n == ".git" || n == "vendor");
+                    //
+                    // Every DOT-directory, for the same reason and one more: a
+                    // dot-dir is by convention not part of the tree we are
+                    // making claims about. This workspace root holds `.delta/`,
+                    // a scratch area of clones and worktrees left by delta/A-B
+                    // tooling, and the walk used to descend into it and report
+                    // the ten window writes inside a checkout that is not this
+                    // one -- so the guard was RED here for a file nobody edits,
+                    // and, worse, VACUOUS about its own tree: the same stale
+                    // clone that produced the noise could have hidden a real
+                    // offender behind it, and the floor below was being met in
+                    // part by lines this guard has no business reading. Skipping
+                    // the whole class rather than naming `.delta` is the point:
+                    // the next scratch dir a tool drops here is skipped too.
+                    let name = path.file_name().unwrap_or_default().to_string_lossy();
+                    let skip = name == "target"
+                        || name == ".git"
+                        || name == "vendor"
+                        || name.starts_with('.');
                     if !skip {
                         stack.push(path);
                     }
