@@ -1083,3 +1083,221 @@ fn a_caption_window_no_project_can_hold_is_refused_by_name() {
         session.sub_lane(s1)
     );
 }
+
+/// A subtitle track whose last cue ends `hours` in, written into `dir`.
+///
+/// A caption's window is a window into SOURCE media, so its width is however
+/// long the recording was. Nothing in the format bounds that, and a lecture
+/// archive or a conference stream is tens of hours -- which is what a ceiling
+/// under a day refuses back at the user. The hour field is parsed as a plain
+/// `u32` with no digit limit, so 960 is a legal 40 days.
+fn long_srt(dir: &Path, hours: u32) -> PathBuf {
+    let path = dir.join(format!("subs_{hours}h.srt"));
+    std::fs::write(
+        &path,
+        format!(
+            "1\n00:00:00,500 --> 00:00:01,500\nfirst line\n\n\
+             2\n00:00:01,600 --> {hours}:00:00,000\nlast line of a long recording\n"
+        ),
+    )
+    .expect("write a long subtitle track");
+    path
+}
+
+/// The round trip a trim has to survive: grow a caption's window to the room
+/// the engine itself offers, save, and open the file that was just written.
+///
+/// This is the hole a ceiling on its own leaves. Every door -- the parse,
+/// `with_subs`, `place_sub` -- only ever sees a window on the way *in*, so a
+/// project could load legally and then be trimmed past the ceiling: `save`
+/// wrote the line and the loader refused it again, which is the user's own
+/// saved work stopping, with no in-app way back (the trim is committed and the
+/// undo does not survive a restart). So growth clamps (`grow_window`) and the
+/// room the front-end drags against is walled by the same number, and the two
+/// agree by construction rather than by luck.
+#[test]
+fn a_trim_grown_to_the_offered_room_saves_and_reopens() {
+    use engine::project::{Edge, MAX_WINDOW_US, SubClip};
+
+    let dir = scratch("caption_growth");
+    let media = copy_in(&dir, "test_av.mp4");
+    // 40 days of track, comfortably past the 30-day ceiling: only the growth
+    // clamp can keep this inside it, never the ceiling itself.
+    let subs = long_srt(&dir, 960);
+
+    let mut session = PlaybackSession::open(&media).expect("open the fixture");
+    session
+        .import_subtitles(&subs)
+        .expect("a 40-day subtitle track imports");
+    let s1 = session.add_lane(engine::project::LaneKind::Subtitle);
+    session
+        .place_sub(
+            s1,
+            60,
+            SubClip {
+                start: 0,
+                frames: 90,
+                track: 0,
+                in_us: 0,
+                out_us: 30_000_000,
+                link: None,
+            },
+        )
+        .expect("a 30s window places");
+
+    // The room the drag is drawn against. It must itself stop at the ceiling:
+    // an engine that offers a trim its own `trim_sub` would clamp is a drag
+    // that snaps back at the end of the gesture.
+    let (_, last) = session
+        .trim_sub_room(s1, 0, Edge::End)
+        .expect("a room for a caption that is there");
+    session
+        .trim_sub(s1, 0, Edge::End, last)
+        .expect("the trim to its own offered room");
+
+    let grown = session.sub_lane(s1)[0];
+    assert!(
+        (grown.out_us - grown.in_us) <= MAX_WINDOW_US,
+        "trimming to the offered room gave a {}us window, past the {}us ceiling",
+        grown.out_us - grown.in_us,
+        MAX_WINDOW_US
+    );
+
+    let saved = dir.join("grown.edith");
+    session.save_project(&saved).expect("save");
+    let reopened = PlaybackSession::open_project(&saved)
+        .expect("a project the editor wrote must open again -- that is the whole claim");
+    let back = reopened.sub_lane(s1)[0];
+    assert_eq!(
+        (back.in_us, back.out_us),
+        (grown.in_us, grown.out_us),
+        "and the window came back as it was saved"
+    );
+}
+
+/// The ceiling itself, against the case it was measured on: a 25-hour
+/// recording. `place_sub` is the door a palette row's drag comes through
+/// (`sub_of_track` builds the placement from the track's own last cue), so a
+/// ceiling under the length of real media refuses the user's own file back at
+/// them, with nothing placed.
+#[test]
+fn a_caption_over_a_day_of_track_places_and_round_trips() {
+    use engine::project::MAX_WINDOW_US;
+
+    let dir = scratch("caption_long_track");
+    let media = copy_in(&dir, "test_av.mp4");
+    let subs = long_srt(&dir, 25);
+    let whole_track_us = 25i64 * 60 * 60 * 1_000_000;
+    assert!(
+        whole_track_us > 86_400_000_000,
+        "the fixture must really be over a day, or this test proves nothing"
+    );
+    assert!(
+        whole_track_us < MAX_WINDOW_US,
+        "and comfortably under the ceiling, or the test is not about the ceiling"
+    );
+
+    let mut session = PlaybackSession::open(&media).expect("open the fixture");
+    assert_eq!(
+        session.import_subtitles(&subs).expect("a 25-hour track imports"),
+        1,
+        "one track"
+    );
+    let s1 = session.add_lane(engine::project::LaneKind::Subtitle);
+    // Exactly what `Player::sub_of_track` hands `place_sub` for palette row 0.
+    let fps = f64::from(session.meta().frame_rate);
+    session
+        .place_sub(
+            s1,
+            0,
+            engine::project::SubClip {
+                start: 0,
+                frames: ((whole_track_us as f64) * fps / 1e6).round() as u32,
+                track: 0,
+                in_us: 0,
+                out_us: whole_track_us,
+                link: None,
+            },
+        )
+        .expect("a caption over a 25-hour recording places -- that is the claim");
+
+    let saved = dir.join("long.edith");
+    session.save_project(&saved).expect("save");
+    let reopened = PlaybackSession::open_project(&saved).expect("and reopens");
+    assert_eq!(
+        reopened.sub_lane(s1)[0].out_us, whole_track_us,
+        "the whole window survived the round trip"
+    );
+}
+
+/// The second writer, which is the one a primary-trim-only fix would miss.
+///
+/// [`write_sub_edge`] carries a *sibling* in a group by the same delta as the
+/// member that was dragged, and reaches the same `out_us`. `follow_group`
+/// skips the dragged member, so the route here is a second caption in the
+/// group on another lane: it is not the one whose `trim_sub` arm is fixed, so
+/// nothing about the dragged caption's own clamp bounds it.
+///
+/// The sibling starts deep into the track -- 20 days in -- so the same delta
+/// that stops the dragged caption exactly at the ceiling carries the sibling
+/// past it. Without the clamp on this writer the sibling is 20 days wider than
+/// the ceiling when `save_project` runs, and the file it writes will not open.
+#[test]
+fn a_group_trim_carries_its_sibling_no_further_than_the_ceiling() {
+    use engine::project::{Edge, LaneKind, MAX_WINDOW_US, SubClip};
+
+    let dir = scratch("caption_group_growth");
+    let media = copy_in(&dir, "test_av.mp4");
+    let subs = long_srt(&dir, 960);
+    let day = 24 * 60 * 60 * 1_000_000i64;
+
+    let mut session = PlaybackSession::open(&media).expect("open the fixture");
+    session.import_subtitles(&subs).expect("a 40-day track imports");
+    let s1 = session.add_lane(LaneKind::Subtitle);
+    let s2 = session.add_lane(LaneKind::Subtitle);
+    let caption = |in_us| SubClip {
+        start: 0,
+        frames: 90,
+        track: 0,
+        in_us,
+        out_us: in_us + 30_000_000,
+        link: None,
+    };
+    session
+        .place_sub(s1, 60, caption(0))
+        .expect("the dragged caption places");
+    session
+        .place_sub(s2, 60, caption(20 * day))
+        .expect("its sibling, 20 days into the track");
+    session
+        .group_all(&[(s1, 0), (s2, 0)])
+        .expect("the two captions into one group");
+
+    // Drag the first caption's tail out to the room the engine offers it, which
+    // is a 40-day track so the room is the ceiling, not the track.
+    let (_, last) = session
+        .trim_sub_room(s1, 0, Edge::End)
+        .expect("a room for the dragged caption");
+    session
+        .trim_sub(s1, 0, Edge::End, last)
+        .expect("the drag commits");
+
+    let dragged = session.sub_lane(s1)[0];
+    assert_eq!(
+        dragged.out_us - dragged.in_us,
+        MAX_WINDOW_US,
+        "the dragged caption stops exactly at the ceiling, which is the room it was offered"
+    );
+    let sibling = session.sub_lane(s2)[0];
+    assert!(
+        (sibling.out_us - sibling.in_us) <= MAX_WINDOW_US,
+        "the group carried the sibling to a {}us window, past the {}us ceiling -- \
+         the dragged caption's own clamp does not reach here",
+        sibling.out_us - sibling.in_us,
+        MAX_WINDOW_US
+    );
+
+    let saved = dir.join("group.edith");
+    session.save_project(&saved).expect("save");
+    PlaybackSession::open_project(&saved).expect("and the file the editor wrote reopens");
+}

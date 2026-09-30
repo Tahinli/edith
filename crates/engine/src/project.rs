@@ -93,19 +93,37 @@ pub const MIN_GAIN_DB: f32 = -60.0;
 pub const MAX_GAIN_DB: f32 = 12.0;
 
 /// The longest `[in_us, out_us)` window a [`SubClip`] may show, in
-/// microseconds: a day of track, and past it the number is not a caption any
-/// project holds -- a `.edith` a hand edited (or a hostile actor wrote) reaches
-/// this with a line the never-empty check at the parser cannot see past,
-/// because `out_us > in_us` says the window is *open* and never how wide it is.
+/// microseconds: **30 days** of track.
 ///
-/// A ceiling rather than a clamp for the reason [`crate::is_resolution`] is
-/// one: a window this wide is a number nobody meant, and quietly turning it
-/// into a day-long caption would put words on screen for a day. The loader
-/// refuses it by name instead, next to every other range check a `.edith` line
-/// has to pass -- and the arithmetic that cuts a window ([`SubClip::window_at`])
-/// saturates besides, so no caller can reintroduce the wrap this door is here
-/// to stop.
-pub const MAX_WINDOW_US: i64 = 86_400_000_000;
+/// A window is a stretch of *source media*, not of the timeline, so its width
+/// is the length of the recording a caption was cut from -- and that is not
+/// bounded by anything a day. A two-day conference stream, a lecture
+/// archive, a long interview session: all of them produce a palette row whose
+/// `out_us` is measured in tens of hours, and a ceiling that refuses those is
+/// refusing the user's own media back at them. So the ceiling is set where no
+/// real recording reaches and a typed number does not survive.
+///
+/// What it has to clear, concretely:
+///
+/// - [`SubClip::window_at`]'s proportion cut. It saturates rather than
+///   wrapping, so this is about *precision*, not safety: `f64` holds an
+///   integer exactly to 2^53, and 30 days is 2.6e12 -- nine orders of magnitude
+///   inside that, so the cut is exact rather than merely finite.
+/// - The `i64` multiply underneath it, which `saturating_mul` already makes
+///   total. 30 days is 3.5e6x below `i64::MAX`, so it never saturates in
+///   practice either.
+/// - `sub_lane_cues`'s f64 mapping of cues onto the timeline, likewise exact.
+///
+/// Past it, the value is not a caption any project holds -- a `.edith` a hand
+/// edited (or a hostile actor wrote) reaches this with a line the
+/// never-empty check at the parser cannot see past, because `out_us > in_us`
+/// says the window is *open* and never how wide it is. That line is refused by
+/// name, next to every other range check a `.edith` line has to pass. The
+/// bounds that *grow* a window rather than read one -- [`Project::trim_sub`]
+/// and the group-follow twin it calls -- clamp to this rather than refuse,
+/// because a trim that ran out of window should stop at the window's end, not
+/// fail: see [`MAX_WINDOW_US`'s growth law](MAX_WINDOW_US).
+pub const MAX_WINDOW_US: i64 = 30 * 24 * 60 * 60 * 1_000_000;
 
 /// How fast a clip plays, in **thousandths of real time**: 1000 is the speed it
 /// was shot at, 2000 twice that, 500 half. An integer and not an `f32` for
@@ -2257,10 +2275,18 @@ impl Project {
                 s.start = to;
             }
             Edge::End => {
-                s.out_us = s
-                    .out_us
-                    .saturating_add(us_of(i64::from(to) - i64::from(s.end()), fps))
-                    .max(s.in_us + 1);
+                // ...and `grow_window`, because this arm is where a caption's
+                // clock grows and the doors only ever *read* one. Without it a
+                // trim out to the end of a long track produced a window past
+                // [`MAX_WINDOW_US`], `save_project` wrote it, and the loader
+                // then refused the file the editor had just written -- a user's
+                // saved work that stops opening, with no in-app way back. The
+                // trim stops at the ceiling instead, which is the same answer
+                // the frame walls above already give for running out of room.
+                s.out_us = grow_window(
+                    s.in_us,
+                    s.out_us.saturating_add(us_of(i64::from(to) - i64::from(s.end()), fps)),
+                );
                 s.frames = to - s.start;
             }
         }
@@ -2311,10 +2337,17 @@ impl Project {
                     .get(s.track)
                     .and_then(|t| t.cues.iter().map(|c| c.end_us).max())
                     .unwrap_or(s.out_us);
+                // ...and never past [`grow_window`]'s ceiling, which is the
+                // wall that matters here: a front-end asks this to draw the
+                // drag, then trims to whatever it is told. An engine that
+                // offers room its own trim would refuse is a drag that snaps
+                // back at the end of the gesture -- so the room stops where
+                // the window stops, and the two agree by construction.
+                let wall_us = track_end.min(s.in_us.saturating_add(MAX_WINDOW_US));
                 (
                     s.start + 1,
                     s.start
-                        .saturating_add(frames_of(track_end - s.in_us).max(1))
+                        .saturating_add(frames_of((wall_us - s.in_us).max(1)))
                         .min(subs.get(idx + 1).map_or(u32::MAX, |n| n.start)),
                 )
             }
@@ -5644,6 +5677,31 @@ fn us_of(frames: i64, fps: f64) -> i64 {
     }
 }
 
+/// The growth law, and the one function here that may write `out_us` past what
+/// a caller asked for: the ceiling a caption's window may reach, given the
+/// `in_us` it starts from.
+///
+/// Every *door* -- the parser, [`Project::with_subs`], [`Project::place_sub`]
+/// -- refuses a window wider than [`MAX_WINDOW_US`] by name. A door only sees
+/// a value on the way IN, so on its own it is not enough: [`Project::trim_sub`]
+/// and the group-follow [`write_sub_edge`] both *grow* `out_us`, and a project
+/// could be trimmed past the ceiling after loading legally. That produced a
+/// file `save_project` wrote and `open_project` then refused -- the user's own
+/// saved work, stopping, with no way back in the app.
+///
+/// So growth clamps and entry refuses, and that asymmetry is the point: a trim
+/// is a continuous gesture whose every intermediate frame the user sees, so
+/// clamping it to the end of the window is a drag that stops -- exactly like
+/// the frame walls `trim_sub` already applies. A value *arriving* from a file
+/// or a foreign caller is a different thing, where nobody was mid-gesture, so
+/// it is named and refused rather than quietly changed.
+///
+/// The `+ 1` is the never-empty invariant: the window is open, always, so a
+/// growth that would otherwise clamp it shut lands on one microsecond instead.
+fn grow_window(in_us: i64, out_us: i64) -> i64 {
+    out_us.clamp(in_us + 1, in_us.saturating_add(MAX_WINDOW_US))
+}
+
 /// [`clear`] for a subtitle lane: removes the timeline frames `[start, end)`,
 /// dropping what is inside the hole, splitting what straddles it and trimming
 /// what overlaps an edge. The windows follow the cut by proportion
@@ -5757,7 +5815,11 @@ fn write_sub_edge(s: &mut SubClip, edge: Edge, to: u32) {
             s.start = to;
         }
         Edge::End => {
-            s.out_us = s.out_us.saturating_add(by(s.end(), to)).max(s.in_us + 1);
+            // `grow_window`, for [`Project::trim_sub`]'s reason: this is the
+            // group-follow twin and it reaches the same field, so a group trim
+            // would otherwise be a way round the ceiling the primary trim
+            // respects.
+            s.out_us = grow_window(s.in_us, s.out_us.saturating_add(by(s.end(), to)));
             s.frames = to - s.start;
         }
     }
