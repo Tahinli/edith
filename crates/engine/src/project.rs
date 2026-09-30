@@ -10790,6 +10790,11 @@ fn removing_a_subtitle_column_undoes_with_its_reindex() {
                 continue;
             }
             let is_binding = line.starts_with("let ");
+            // `let (a, b) = ..` is a tuple pattern, not a struct literal: the
+            // commas there bind names. `let half = SubClip { frames: n, in_us,
+            // out_us, ..s };` is the opposite -- the same commas are shorthand
+            // fields -- and what separates them is the paren, not the `let`.
+            let tuple_pattern = line.starts_with("let (");
             for field in FIELDS {
                 let access = format!(".{field}");
                 if let Some(at) = line.find(&access) {
@@ -10802,12 +10807,18 @@ fn removing_a_subtitle_column_undoes_with_its_reindex() {
                         continue;
                     }
                 }
-                // A bare name: a literal field, a shorthand, or a binding.
-                // Skipped when a `.` or an identifier character precedes it --
-                // that is a read, not a field being set.
-                if is_binding {
-                    continue;
-                }
+                // A bare name: a literal field, a shorthand, or a local
+                // binding. Skipped when a `.` or an identifier character
+                // precedes it -- that is a read, not a field being set.
+                //
+                // The `let` exclusion is per-occurrence and keyed on what
+                // FOLLOWS, not on the line. `let out_us = s.out_us;` names a
+                // local, so the `=` form is skipped; but `let tail = SubClip {
+                // in_us: cut, out_us: s.out_us, ..s };` is a struct literal
+                // behind a `let`, and an earlier version of this matcher
+                // skipped the whole line for being a `let` -- so that shape,
+                // which is exactly what a plausible composer looks like, went
+                // through green. Keyed on the follower, a `let` hides nothing.
                 for (at, _) in line.match_indices(field) {
                     let preceded_by_name = line[..at]
                         .chars()
@@ -10817,7 +10828,10 @@ fn removing_a_subtitle_column_undoes_with_its_reindex() {
                         continue;
                     }
                     let after = line[at + field.len()..].trim_start();
-                    if after.starts_with(':') || after.starts_with(',') || after.starts_with('=') {
+                    let sets_a_field = after.starts_with(':')
+                        || (after.starts_with(',') && !tuple_pattern);
+                    let names_a_local = after.starts_with('=') && !after[1..].starts_with('=');
+                    if sets_a_field || (names_a_local && !is_binding) {
                         found.push((n + 1, line.to_owned()));
                         break;
                     }
@@ -10848,12 +10862,33 @@ fn removing_a_subtitle_column_undoes_with_its_reindex() {
     /// door's public shape rather than a bound, and the wrong size for this
     /// lane -- so the guard stands here with its limits written down instead.
     ///
-    /// Residual risk, concretely: a write through a helper taking
-    /// `&mut SubClip` that assigns by a form the matcher cannot see; a
-    /// macro-mediated write; a `.rs` under `crates/` the walk does not reach;
-    /// and -- the sharpest one -- renaming the fields themselves, since the
-    /// matcher keys on the literal strings `in_us`/`out_us` and would then
-    /// match nothing at all while still passing.
+    /// **Residual risk, by class, most likely first.** These are not all
+    /// equally hypothetical; the first is the one a real composer would reach
+    /// for, and it is the one this matcher cannot see at all:
+    ///
+    /// 1. **Field-less writes.** `*a = *b;`, `*a = other;`,
+    ///    `std::mem::swap(a, b)`, `a.clone_from(b)`, and any macro that
+    ///    expands to a field write (`bump!(s.out_us, by)`). None of these ever
+    ///    spell `in_us` or `out_us` on the line, so `window_writes` returns
+    ///    nothing for all of them. A *helper* that writes the field directly IS
+    ///    caught; it is specifically the whole-struct and macro forms that go
+    ///    through. This is the class most likely to be used, and it is
+    ///    unmatched by construction rather than by oversight.
+    /// 2. **A rename.** The matcher keys on the literal strings `in_us` and
+    ///    `out_us`. Renaming the fields silences it entirely while it stays
+    ///    green -- the sharpest failure here, because the guard is supposed to
+    ///    be the thing that notices a rule drifting.
+    /// 3. **A writer inside a test.** `/tests/` paths and `mod tests` blocks
+    ///    are cut. A test cannot produce a file a user loses, so the line is
+    ///    drawn there deliberately, not by omission.
+    /// 4. **A file the walk does not reach**: a path outside `crates/`, or one
+    ///    under a directory named `target`, `.git` or `vendor`.
+    ///
+    /// What the matcher DOES now cover, after four rounds of it not doing so:
+    /// every assignment operator; struct-literal fields and the shorthand form,
+    /// including behind a `let`; writes through an indirect `&mut`; and every
+    /// `.rs` under `crates/` with no filter on what the file contains, so a
+    /// glob import or a type alias can no longer hide a module.
     #[test]
     fn every_window_write_outside_set_window_is_named() {
         // `CARGO_MANIFEST_DIR`, not `file!()`: a test runs with the WORKSPACE
@@ -10928,18 +10963,29 @@ fn removing_a_subtitle_column_undoes_with_its_reindex() {
                 }
             }
         }
-        // A floor, not a census: the walk filters to files that can NAME
-        // `SubClip`, which today is 20 of them and ~39,000 lines. The point is
-        // only to catch a walk rooted in the wrong place, which reads a file
-        // or two. The `seen_app` half is the one that matters: the two-file
-        // version of this guard read `project.rs` and `edith.rs` and was
-        // silently certifying a claim about the app it had never opened.
+        // A floor, not a census: the walk now opens EVERY `.rs` under
+        // `crates/` that is not test code -- 86 files and ~77,600 lines today,
+        // which is 141 files and ~116,000 before `/tests/` and `mod tests` are
+        // cut. The point is only to catch a walk rooted in the wrong place,
+        // which reads a file or two.
+        // The `seen_app` half is the one that matters: the two-file version of
+        // this guard read `project.rs` and `edith.rs` and was silently
+        // certifying a claim about the app it had never opened, and the
+        // `contains("SubClip")` filter that came next
+        // was the same mistake wearing a derived hat -- a file that reached
+        // the type by glob import or alias was never opened either.
         assert!(
-            lines > 20_000 && files >= 10 && seen_app,
+            lines > 70_000 && files >= 80 && seen_app,
             "the walk read {lines} lines in {files} files (app reached: \
              {seen_app}) -- it is not covering the workspace, and a guard that \
              reads nothing is worse than no guard because it reads as one"
         );
+        // The assertion this whole test exists for. It was DELETED by a clumsy
+        // edit while the coverage floor above was being retuned, and for a
+        // moment the test reported green while `found` held a real offender --
+        // the fourth version of this guard failing in the one way that looks
+        // exactly like success. If you retune anything here, check this line
+        // still exists.
         assert!(
             found.is_empty(),
             "a caption window is written outside set_window:\n  {}",
@@ -10947,12 +10993,17 @@ fn removing_a_subtitle_column_undoes_with_its_reindex() {
         );
     }
 
-    /// The blind spot, pinned as a case. Every one of these is a write, and
-    /// the guard exists because its first two versions caught none of them --
+    /// The blind spot, pinned as cases. Every one of these is a write, and the
+    /// guard exists because each of its earlier versions caught none of them --
     /// `s.out_us += by(...)` being a one-token edit that made it green while a
     /// grouped caption really did grow past the ceiling. A matcher that has
     /// quietly stopped matching is the failure mode that looks most like a
     /// pass, so it gets its own test rather than a comment.
+    ///
+    /// The last group is the opposite: the field-less forms that are a write
+    /// and that this matcher CANNOT see. They are asserted to be missed, on
+    /// purpose, so that the day someone can match them the test says so --
+    /// and so nobody reads this file as claiming more than it does.
     #[test]
     fn the_window_write_matcher_catches_the_ways_a_composer_hides() {
         for (what, code) in [
@@ -10971,6 +11022,15 @@ fn removing_a_subtitle_column_undoes_with_its_reindex() {
                 "        out.push(SubClip { in_us: 0, out_us: 1, ..s });",
             ),
             ("the shorthand form", "        SubClip { in_us, out_us, ..s }"),
+            (
+                "a struct literal behind a `let`, which the old line-wide `let` \
+                 exclusion skipped whole",
+                "        let tail = SubClip { in_us: cut, out_us: s.out_us, ..s };",
+            ),
+            (
+                "a struct literal behind a `let` using the shorthand too",
+                "        let half = SubClip { frames: n, in_us, out_us, ..s };",
+            ),
         ] {
             assert!(
                 !window_writes(code).is_empty(),
@@ -10988,6 +11048,26 @@ fn removing_a_subtitle_column_undoes_with_its_reindex() {
             assert!(
                 window_writes(quiet).is_empty(),
                 "the matcher flags a read as a write: {quiet:?}"
+            );
+        }
+        // The class this matcher CANNOT see, asserted as missed. Each of these
+        // really does write a caption's window and none of them spell the field
+        // name, so a field matcher returns nothing -- that is a property of the
+        // approach, not a bug to be fixed here, and the test exists so the
+        // doc comment's residual-risk list cannot quietly grow a claim this
+        // matcher has not earned. If one of these ever starts matching, this
+        // test fails and asks which side of the line moved.
+        for unmatchable in [
+            "        *a = *b;",
+            "        *a = other;",
+            "        std::mem::swap(a, b);",
+            "        a.clone_from(b);",
+            "        bump!(s.out_us, by);",
+        ] {
+            assert!(
+                window_writes(unmatchable).is_empty(),
+                "the matcher now matches a field-less form it documented as \
+                 unmatched -- update the residual-risk list too: {unmatchable:?}"
             );
         }
     }
@@ -11014,9 +11094,16 @@ fn removing_a_subtitle_column_undoes_with_its_reindex() {
                     if !skip {
                         stack.push(path);
                     }
+                // EVERY `.rs`, with no filter on what it contains. The filter
+                // that was here (`text.contains("SubClip")`) was a name-based
+                // guess about which files can reach the type, and a glob import
+                // or a type alias defeats it exactly as it defeats a
+                // hardcoded file list: a new module holding the struct behind
+                // `use engine::project::*;` was never opened, and stayed green.
+                // The scan is text-only and the tree is small, so the honest
+                // thing costs nothing here.
                 } else if path.extension().is_some_and(|e| e == "rs")
                     && let Ok(text) = std::fs::read_to_string(&path)
-                    && text.contains("SubClip")
                 {
                     out.push((path, text));
                 }
