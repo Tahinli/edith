@@ -351,7 +351,7 @@ fn a_lane_row_is_a_fixed_header_and_a_bed_that_can_be_hit() {
 /// strip's row at the zoom boundary without the strip to show for it.
 #[test]
 fn the_scroll_strip_row_comes_and_goes_with_the_zoom() {
-    use crate::{lanes_h, split_size, timeline_fixed_h, timeline_h, Split, SCROLL_HIT};
+    use crate::{SCROLL_HIT, Split, lanes_h, split_size, timeline_fixed_h, timeline_h};
     use gpui::{px, size};
 
     // The strip's row, and only the strip's row, is what the two faces differ
@@ -398,8 +398,8 @@ fn the_scroll_strip_row_comes_and_goes_with_the_zoom() {
 /// on the track, the time axis's own thumb turned through a right angle.
 #[test]
 fn the_lane_thumb_is_the_visible_share_of_the_stack() {
-    use crate::lanes_thumb;
     use crate::SCROLL_THUMB_MIN;
+    use crate::lanes_thumb;
 
     // Whole stack on screen: the track fills and there is nothing to scroll.
     assert_eq!(lanes_thumb(200., 104., 200., 0.), (0., 200.));
@@ -1301,7 +1301,7 @@ fn the_darkroom_subtitle_palette_drags_tracks_to_subtitle_lanes() {
 /// arrival order, at the end.
 #[test]
 fn a_file_subtitle_group_follows_its_own_row() {
-    use crate::ui::dock_stance::{source_list_order, Slot};
+    use crate::ui::dock_stance::{Slot, source_list_order};
     let film = PathBuf::from("/films/a.mkv");
     let other = PathBuf::from("/rec/b.mp4");
     let loose = PathBuf::from("/subs/late.srt");
@@ -1798,8 +1798,8 @@ fn darkroom_lane_header_verbs_are_targeted_and_visible() {
 fn a_dragged_divider_stops_before_either_panel_disappears() {
     use crate::ui::theme::INSPECTOR_MIN_W;
     use crate::{
-        inspector_w, library_w, split_drag_size, split_size, timeline_fixed_h, timeline_h, Split,
-        SIDE_MAX_FRAC, SPLIT_W, TIMELINE_MAX_SHARE, TOOLBAR_H,
+        SIDE_MAX_FRAC, SPLIT_W, Split, TIMELINE_MAX_SHARE, TOOLBAR_H, inspector_w, library_w,
+        split_drag_size, split_size, timeline_fixed_h, timeline_h,
     };
     use gpui::{point, px, size};
 
@@ -1919,7 +1919,7 @@ fn a_dragged_divider_stops_before_either_panel_disappears() {
 fn the_darkroom_seams_stop_before_either_side_disappears() {
     use crate::ui::theme::INSPECTOR_MIN_W;
     use crate::{
-        split_bounds, split_drag_size, split_size, Split, BENCH_MIN_H, SIDE_MAX_FRAC, SPLIT_W,
+        BENCH_MIN_H, SIDE_MAX_FRAC, SPLIT_W, Split, split_bounds, split_drag_size, split_size,
     };
     use gpui::{point, px, size};
 
@@ -1978,9 +1978,9 @@ fn the_darkroom_seams_stop_before_either_side_disappears() {
 /// ~2px at the old `BENCH_MIN_H = 80.`).
 #[test]
 fn both_default_lanes_fit_the_bench_at_its_floor() {
-    use crate::ui::bench_stance::{row_h, LANE_MIN_H, ROW_GAP, RULER_H};
-    use crate::ui::stance::BENCH_CHROME_H;
     use crate::BENCH_MIN_H;
+    use crate::ui::bench_stance::{LANE_MIN_H, ROW_GAP, RULER_H, row_h};
+    use crate::ui::stance::BENCH_CHROME_H;
 
     let box_h = BENCH_MIN_H - BENCH_CHROME_H;
     let avail = box_h - RULER_H - ROW_GAP;
@@ -2020,9 +2020,9 @@ fn both_default_lanes_fit_the_bench_at_its_floor() {
 /// painted bounds back, so it stays geometry-only, same as its neighbours.
 #[test]
 fn the_whole_bench_stack_fits_its_own_floor_with_the_ledger_seam_clear() {
+    use crate::BENCH_MIN_H;
     use crate::ui::bench_stance::{LANE_MIN_H, ROW_GAP, RULER_H};
     use crate::ui::stance::BENCH_CHROME_H;
-    use crate::BENCH_MIN_H;
 
     const BENCH_BORDER_T: f32 = 1.;
     const BENCH_PY_TOP: f32 = 4.;
@@ -2092,9 +2092,9 @@ fn a_lane_row_fits_what_its_own_head_draws() {
 #[test]
 fn a_saved_seam_survives_a_reload() {
     use crate::{
-        load_stance_splits_from, save_stance_splits_to, Split, Splits, BENCH_MIN_H, SIDE_MAX_FRAC,
+        BENCH_MIN_H, SIDE_MAX_FRAC, Split, Splits, load_stance_splits_from, save_stance_splits_to,
     };
-    use gpui::{px, size, Pixels, Size};
+    use gpui::{Pixels, Size, px, size};
 
     let dir = engine::scratch::Scratch::dir("edith-stance-splits");
     let path = dir.join("stance-splits");
@@ -2137,7 +2137,7 @@ fn a_saved_seam_survives_a_reload() {
 /// drag that never started (`None`) owes nothing.
 #[test]
 fn only_the_persisted_seams_owe_a_save_when_a_drag_loses_the_window() {
-    use crate::{player::timeline_edit::split_drag_owes_save, Split};
+    use crate::{Split, player::timeline_edit::split_drag_owes_save};
 
     assert!(split_drag_owes_save(Some(Split::Dock)));
     assert!(split_drag_owes_save(Some(Split::Bench)));
@@ -2151,8 +2151,8 @@ fn only_the_persisted_seams_owe_a_save_when_a_drag_loses_the_window() {
 /// `load_stance_splits`'s doc comment promises.
 #[test]
 fn a_missing_stance_splits_file_leaves_every_region_at_its_default() {
-    use crate::{load_stance_splits_from, Split};
-    use gpui::{px, size, Pixels, Size};
+    use crate::{Split, load_stance_splits_from};
+    use gpui::{Pixels, Size, px, size};
 
     let dir = engine::scratch::Scratch::dir("edith-stance-splits-missing");
     let window: Size<Pixels> = size(px(1280.), px(720.));
@@ -2993,7 +2993,7 @@ fn the_bench_answers_a_wheel_notch_anywhere_over_it() {
 /// kept beside the first ([`Splits::clear`]).
 #[test]
 fn a_double_pressed_divider_forgets_the_size_it_was_dragged_to() {
-    use crate::layout::{split_size, Split, Splits};
+    use crate::layout::{Split, Splits, split_size};
     use gpui::{px, size};
 
     let window = size(px(1280.), px(720.));
@@ -3083,7 +3083,7 @@ fn the_bench_seam_reaches_no_further_than_every_other_seam() {
 /// `bench=105` at the floor, `bench=1164` at the ceiling.
 #[test]
 fn the_bench_seam_stops_at_its_floor_and_its_ceiling() {
-    use crate::{split_bounds, split_size, Split, BENCH_MIN_H};
+    use crate::{BENCH_MIN_H, Split, split_bounds, split_size};
     use gpui::{px, size};
 
     let window = size(px(2560.), px(1440.));
@@ -3194,6 +3194,41 @@ fn a_source_row_shows_its_name_before_anything_else() {
     assert!(
         dock.contains(r#".child("none"),"#),
         "the empty dock says something other than the one noun"
+    );
+}
+
+/// The dock's metadata line drops the decoder *seat* and nothing else. A file
+/// the decoder refused has no seat to drop: its detail is the refusal, and it
+/// is the only thing the line has to say.
+#[test]
+fn the_dock_keeps_a_refusal_where_it_drops_a_seat() {
+    use crate::ui::dock_stance::without_seats;
+    use engine::decode::Backend;
+
+    let seats = [
+        Backend::Opening,
+        Backend::Hardware,
+        Backend::Software,
+        Backend::Still,
+        Backend::Gap,
+    ]
+    .map(Backend::label);
+    assert_eq!(
+        without_seats("h264 · HW", &seats),
+        "h264",
+        "the seat is how this machine reads it, and the row says what the file is"
+    );
+    let refusal = "no Segment element: not a Matroska file";
+    assert_eq!(
+        without_seats(refusal, &seats),
+        refusal,
+        "a refusal is not a seat, and reaches the row whole"
+    );
+    // The halves keep their separator either way: a stream detail beside a
+    // refusal is still two things said in order.
+    assert_eq!(
+        without_seats(&format!("{refusal} · stereo · 48 kHz"), &seats),
+        format!("{refusal} · stereo · 48 kHz")
     );
 }
 
@@ -3400,8 +3435,8 @@ fn the_ledger_carries_the_rooms_four_verbs_and_no_rail_remains() {
 /// deletion.
 #[test]
 fn select_all_left_the_ruler_for_the_rulers_own_menu() {
-    use crate::menus::BENCH_ITEMS;
     use crate::ActionId;
+    use crate::menus::BENCH_ITEMS;
     let bench = src_text("ui/bench_stance.rs");
     for gone in ["bench-select-all", "select_all_band", "SELECT_ALL_PAD"] {
         assert!(!bench.contains(gone), "the ruler still carries {gone}");
@@ -3873,7 +3908,7 @@ fn the_export_section_is_four_rows_and_no_fifth() {
 /// cannot write, because [`Player::set_format`] would only refuse it back.
 #[test]
 fn the_picture_row_cycles_codec_and_container_together_and_skips_a_refusal() {
-    use crate::ui::settings_stance::{next_picture, picture_label, PICTURE_CYCLE};
+    use crate::ui::settings_stance::{PICTURE_CYCLE, next_picture, picture_label};
     assert_eq!(
         PICTURE_CYCLE,
         [

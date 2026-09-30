@@ -185,7 +185,11 @@ fn dock_tab(
             }
             cx.notify();
         }))
-        .tooltip(crate::ui::widgets::tip_hover(&format!("Show {}", label_text.to_lowercase()), "", None))
+        .tooltip(crate::ui::widgets::tip_hover(
+            &format!("Show {}", label_text.to_lowercase()),
+            "",
+            None,
+        ))
         .children(hitmap::control(id, label_text, true))
         .child(
             div()
@@ -230,6 +234,25 @@ fn usage_line(player: &Player, source_idx: usize, placed: usize) -> String {
             .collect()
     });
     lanes.join(" ")
+}
+
+/// A row's detail line with the decoder seats taken out of it, which is what
+/// the dock draws: the seat is how this machine happens to read the file and
+/// the transport line and the Properties side both still say it, so the row
+/// says what the file *is* instead.
+///
+/// Only a whole part is dropped, and a part is a seat only when it is exactly
+/// a seat's word. That is what keeps a refusal: the row's detail for a file
+/// the decoder would not take is the refusal itself
+/// ([`crate::Decoder::Refused`]), and no seat is ever named by a sentence --
+/// so the one line that has to say why the file will not play reaches the
+/// dock whole.
+pub(crate) fn without_seats(detail: &str, seats: &[&str]) -> String {
+    detail
+        .split(" · ")
+        .filter(|part| !seats.contains(part))
+        .collect::<Vec<_>>()
+        .join(" · ")
 }
 
 /// The file's name without its extension -- what the editor calls the film,
@@ -281,12 +304,7 @@ fn source_row(
         Backend::Gap,
     ]
     .map(Backend::label);
-    let detail = row
-        .detail
-        .split(" · ")
-        .filter(|part| !seats.contains(part))
-        .collect::<Vec<_>>()
-        .join(" · ");
+    let detail = without_seats(&row.detail, &seats);
     let under: String = match &row.unusable {
         Some(why) => why.clone(),
         None => join_detail(
@@ -690,15 +708,15 @@ fn subtitle_tab_rows(
                                 .on_drag(SubPick(track), {
                                     let me = cx.entity();
                                     move |_, _, _, cx| {
-                    // A fresh gesture inherits nothing: `Player::drag_lane`
-                    // and `Player::drag_x` are the *last live sample* of the
-                    // drag being made, and a drag whose first sample lands
-                    // outside every row would otherwise be let go onto the
-                    // lane the previous one ended over.
-                    me.update(cx, |this, _| {
-                        this.drag_lane = None;
-                        this.drag_x = None;
-                    });
+                                        // A fresh gesture inherits nothing: `Player::drag_lane`
+                                        // and `Player::drag_x` are the *last live sample* of the
+                                        // drag being made, and a drag whose first sample lands
+                                        // outside every row would otherwise be let go onto the
+                                        // lane the previous one ended over.
+                                        me.update(cx, |this, _| {
+                                            this.drag_lane = None;
+                                            this.drag_x = None;
+                                        });
                                         cx.new(|_| Tip(ghost.clone()))
                                     }
                                 })
@@ -707,7 +725,11 @@ fn subtitle_tab_rows(
                                     cx.notify();
                                 }))
                         })
-                        .tooltip(crate::ui::widgets::tip_hover("Subtitle track", "drag to a lane", None))
+                        .tooltip(crate::ui::widgets::tip_hover(
+                            "Subtitle track",
+                            "drag to a lane",
+                            None,
+                        ))
                         .children(hitmap::dynamic(
                             move || {
                                 (
@@ -777,7 +799,11 @@ fn subtitle_tab_rows(
                                     cx.stop_propagation();
                                     this.remove_subtitle_track(track, cx);
                                 }))
-                                .tooltip(crate::ui::widgets::tip_hover("Remove subtitle track", "", None))
+                                .tooltip(crate::ui::widgets::tip_hover(
+                                    "Remove subtitle track",
+                                    "",
+                                    None,
+                                ))
                                 .children(hitmap::dynamic(
                                     move || {
                                         (
@@ -794,78 +820,79 @@ fn subtitle_tab_rows(
             let has_header = !nested || track_count > 3;
             let folded = has_header && (nested != player.sub_folded.contains(&group_path));
             let header = div()
-                        .id(("dock-subtitle-group", group_ord))
+                .id(("dock-subtitle-group", group_ord))
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .px(px(8.))
+                // Stepped in under its parent when it has one, the
+                // same outline the track rows below it read as.
+                .when(nested, |d| d.pl(px(22.)))
+                .py(px(4.))
+                .rounded(px(3.))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(DARK_RAISED())))
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    if !this.sub_folded.remove(&fold_path) {
+                        this.sub_folded.insert(fold_path.clone());
+                    }
+                    cx.notify();
+                }))
+                .tooltip(crate::ui::widgets::tip_hover(
+                    "Fold this source",
+                    "click",
+                    None,
+                ))
+                .children(hitmap::dynamic(
+                    move || {
+                        (
+                            format!("subtitle-group.{group_ord}.fold"),
+                            "Toggle subtitle group".into(),
+                        )
+                    },
+                    true,
+                ))
+                // Bare, the glyph inherited the panel's dim ink and
+                // vanished ("the little arrow on left side is hard
+                // to see", user 2026-08-27) -- it reads at the same
+                // ink as the name it folds.
+                .child(
+                    div()
                         .flex_none()
-                        .flex()
-                        .items_center()
-                        .gap(px(6.))
-                        .px(px(8.))
-                        // Stepped in under its parent when it has one, the
-                        // same outline the track rows below it read as.
-                        .when(nested, |d| d.pl(px(22.)))
-                        .py(px(4.))
-                        .rounded(px(3.))
-                        .cursor_pointer()
-                        .hover(|s| s.bg(rgb(DARK_RAISED())))
-                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                            if !this.sub_folded.remove(&fold_path) {
-                                this.sub_folded.insert(fold_path.clone());
-                            }
-                            cx.notify();
-                        }))
-                        .tooltip(crate::ui::widgets::tip_hover("Fold this source", "click", None))
-                        .children(hitmap::dynamic(
-                            move || {
-                                (
-                                    format!("subtitle-group.{group_ord}.fold"),
-                                    "Toggle subtitle group".into(),
-                                )
-                            },
-                            true,
-                        ))
-                        // Bare, the glyph inherited the panel's dim ink and
-                        // vanished ("the little arrow on left side is hard
-                        // to see", user 2026-08-27) -- it reads at the same
-                        // ink as the name it folds.
-                        .child(
-                            div()
-                                .flex_none()
-                                .w(px(10.))
-                                .text_color(rgb(INK1()))
-                                .child(if folded { "▸" } else { "▾" }),
-                        )
-                        .when_some(tint, |d, tint| {
-                            d.child(
-                                div()
-                                    .flex_none()
-                                    .w(px(8.))
-                                    .h(px(8.))
-                                    .rounded(px(4.))
-                                    .bg(rgb(tint)),
-                            )
-                        })
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w(px(0.))
-                                .truncate()
-                                .type_style(mono(type_scale::LABEL_ROW_PX, FontWeight::MEDIUM))
-                                .text_color(rgb(INK1()))
-                                .child(group.name),
-                        )
-                        .child(
-                            div()
-                                .flex_none()
-                                .type_style(mono(
-                                    type_scale::CHORD_METADATA_MIN_PX,
-                                    FontWeight::MEDIUM,
-                                ))
-                                .text_color(rgb(INK3()))
-                                .child(format!(
-                                    "{track_count} track{}",
-                                    if track_count == 1 { "" } else { "s" }
-                                )),
-                        );
+                        .w(px(10.))
+                        .text_color(rgb(INK1()))
+                        .child(if folded { "▸" } else { "▾" }),
+                )
+                .when_some(tint, |d, tint| {
+                    d.child(
+                        div()
+                            .flex_none()
+                            .w(px(8.))
+                            .h(px(8.))
+                            .rounded(px(4.))
+                            .bg(rgb(tint)),
+                    )
+                })
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .truncate()
+                        .type_style(mono(type_scale::LABEL_ROW_PX, FontWeight::MEDIUM))
+                        .text_color(rgb(INK1()))
+                        .child(group.name),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .type_style(mono(type_scale::CHORD_METADATA_MIN_PX, FontWeight::MEDIUM))
+                        .text_color(rgb(INK3()))
+                        .child(format!(
+                            "{track_count} track{}",
+                            if track_count == 1 { "" } else { "s" }
+                        )),
+                );
             (
                 group_path,
                 track_count,
@@ -1033,7 +1060,11 @@ fn sources_tab(
                     this.dock_filter_edit = true;
                     cx.notify();
                 }))
-                .tooltip(crate::ui::widgets::tip_hover("Filter sources", "type to narrow", None))
+                .tooltip(crate::ui::widgets::tip_hover(
+                    "Filter sources",
+                    "type to narrow",
+                    None,
+                ))
                 .children(hitmap::control("dock.filter", "Filter sources", true))
                 // The glass alone at rest: the word "filter" beside it was
                 // the box telling the editor what a filter box is (DESIGN §8).
@@ -1160,7 +1191,11 @@ fn transition_row(player: &Player, cx: &mut Context<Player>) -> Option<impl Into
                     .text_size(label_style.size)
                     .text_color(rgb(INK2()))
                     .cursor_pointer()
-                    .tooltip(crate::ui::widgets::tip_hover("Transition duration", "click to type", None))
+                    .tooltip(crate::ui::widgets::tip_hover(
+                        "Transition duration",
+                        "click to type",
+                        None,
+                    ))
                     .children(hitmap::control(
                         "transition-duration-field",
                         "Transition duration, type-in",
@@ -1371,7 +1406,12 @@ fn viz_slot_chips(player: &Player, paint: u64, cx: &mut Context<Player>) -> impl
         .flex()
         .items_center()
         .child(chip("dock-viz-colour", "Colour", VizSlot::Main, true))
-        .child(chip("dock-viz-strand", "Strand", VizSlot::Strand, strand_live))
+        .child(chip(
+            "dock-viz-strand",
+            "Strand",
+            VizSlot::Strand,
+            strand_live,
+        ))
 }
 
 /// The picked slot's colour as text, and the way in: a click opens the type-in
@@ -1395,7 +1435,11 @@ fn viz_hex_row(player: &Player, paint: u64, cx: &mut Context<Player>) -> impl In
         .text_size(row.size)
         .text_color(rgb(INK2()))
         .cursor_pointer()
-        .tooltip(crate::ui::widgets::tip_hover("Colour", "click to type", None))
+        .tooltip(crate::ui::widgets::tip_hover(
+            "Colour",
+            "click to type",
+            None,
+        ))
         .children(hitmap::control(
             "dock-viz-hex-field",
             "Colour hex, type-in",
@@ -1424,7 +1468,11 @@ fn viz_color_wheel(player: &Player, paint: u64, cx: &mut Context<Player>) -> imp
         .h(px(112.))
         .relative()
         .cursor_pointer()
-        .tooltip(crate::ui::widgets::tip_hover("Colour wheel", "drag to pick", None))
+        .tooltip(crate::ui::widgets::tip_hover(
+            "Colour wheel",
+            "drag to pick",
+            None,
+        ))
         .children(hitmap::control("dock-viz-hs", "Colour wheel", true))
         .child(bounds_probe(player.viz_wheel.clone()))
         .child(
@@ -1448,10 +1496,22 @@ fn viz_color_wheel(player: &Player, paint: u64, cx: &mut Context<Player>) -> imp
                             let hue = i as f32 / wedges as f32 * 360.;
                             let (r, g, b) = engine::decode::viz_hsv_rgb(hue, sat, 0.84);
                             let color = (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b);
-                            let p00 = point(px(cx + radius * s0 * a0.sin()), px(cy - radius * s0 * a0.cos()));
-                            let p01 = point(px(cx + radius * s0 * a1.sin()), px(cy - radius * s0 * a1.cos()));
-                            let p11 = point(px(cx + radius * s1 * a1.sin()), px(cy - radius * s1 * a1.cos()));
-                            let p10 = point(px(cx + radius * s1 * a0.sin()), px(cy - radius * s1 * a0.cos()));
+                            let p00 = point(
+                                px(cx + radius * s0 * a0.sin()),
+                                px(cy - radius * s0 * a0.cos()),
+                            );
+                            let p01 = point(
+                                px(cx + radius * s0 * a1.sin()),
+                                px(cy - radius * s0 * a1.cos()),
+                            );
+                            let p11 = point(
+                                px(cx + radius * s1 * a1.sin()),
+                                px(cy - radius * s1 * a1.cos()),
+                            );
+                            let p10 = point(
+                                px(cx + radius * s1 * a0.sin()),
+                                px(cy - radius * s1 * a0.cos()),
+                            );
                             let mut path = PathBuilder::fill();
                             path.add_polygon(&[p00, p01, p11, p10], false);
                             if let Ok(path) = path.build() {
@@ -1523,9 +1583,20 @@ fn viz_paint_knobs(player: &Player, paint: u64, cx: &mut Context<Player>) -> imp
                         .text_color(rgb(INK2()))
                         .child("Strands"),
                 )
-                .child(viz_step("dock-viz-strands-minus", "Fewer strands", "−", cx, |this, cx| {
-                    this.set_viz_strands(engine::decode::viz_strands_of(this.viz_paint()).saturating_sub(1).max(1), cx);
-                }))
+                .child(viz_step(
+                    "dock-viz-strands-minus",
+                    "Fewer strands",
+                    "−",
+                    cx,
+                    |this, cx| {
+                        this.set_viz_strands(
+                            engine::decode::viz_strands_of(this.viz_paint())
+                                .saturating_sub(1)
+                                .max(1),
+                            cx,
+                        );
+                    },
+                ))
                 .child(
                     div()
                         .font(style.font.clone())
@@ -1533,9 +1604,20 @@ fn viz_paint_knobs(player: &Player, paint: u64, cx: &mut Context<Player>) -> imp
                         .text_color(rgb(INK1()))
                         .child(format!("{strands}")),
                 )
-                .child(viz_step("dock-viz-strands-plus", "More strands", "+", cx, |this, cx| {
-                    this.set_viz_strands(engine::decode::viz_strands_of(this.viz_paint()).saturating_add(1).min(32), cx);
-                })),
+                .child(viz_step(
+                    "dock-viz-strands-plus",
+                    "More strands",
+                    "+",
+                    cx,
+                    |this, cx| {
+                        this.set_viz_strands(
+                            engine::decode::viz_strands_of(this.viz_paint())
+                                .saturating_add(1)
+                                .min(32),
+                            cx,
+                        );
+                    },
+                )),
         )
         .child(
             div()
@@ -1550,9 +1632,18 @@ fn viz_paint_knobs(player: &Player, paint: u64, cx: &mut Context<Player>) -> imp
                         .text_color(rgb(INK2()))
                         .child("Glow"),
                 )
-                .child(viz_step("dock-viz-glow-minus", "Less glow", "−", cx, |this, cx| {
-                    this.set_viz_glow(engine::decode::viz_glow_of(this.viz_paint()).saturating_sub(1), cx);
-                }))
+                .child(viz_step(
+                    "dock-viz-glow-minus",
+                    "Less glow",
+                    "−",
+                    cx,
+                    |this, cx| {
+                        this.set_viz_glow(
+                            engine::decode::viz_glow_of(this.viz_paint()).saturating_sub(1),
+                            cx,
+                        );
+                    },
+                ))
                 .child(
                     div()
                         .font(style.font.clone())
@@ -1560,9 +1651,20 @@ fn viz_paint_knobs(player: &Player, paint: u64, cx: &mut Context<Player>) -> imp
                         .text_color(rgb(INK1()))
                         .child(format!("{glow}")),
                 )
-                .child(viz_step("dock-viz-glow-plus", "More glow", "+", cx, |this, cx| {
-                    this.set_viz_glow(engine::decode::viz_glow_of(this.viz_paint()).saturating_add(1).min(16), cx);
-                })),
+                .child(viz_step(
+                    "dock-viz-glow-plus",
+                    "More glow",
+                    "+",
+                    cx,
+                    |this, cx| {
+                        this.set_viz_glow(
+                            engine::decode::viz_glow_of(this.viz_paint())
+                                .saturating_add(1)
+                                .min(16),
+                            cx,
+                        );
+                    },
+                )),
         )
 }
 
@@ -1806,36 +1908,44 @@ fn keys_tab(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
                 .font(style.font.clone())
                 .text_size(style.size)
                 .text_color(rgb(INK1()))
-                .tooltip(crate::ui::widgets::tip_hover("Filter keys", "click to type", None))
+                .tooltip(crate::ui::widgets::tip_hover(
+                    "Filter keys",
+                    "click to type",
+                    None,
+                ))
                 .children(hitmap::control("dock.keys-filter", "Filter keys", true))
                 .child(match player.keys_filter.is_empty() {
                     true => "⌕".to_string(),
                     false => format!("⌕ {filter_text}"),
                 })
         })
-        .children(keys_rows_matching(&player.keys_filter, &player.keymap).into_iter().map(|row| match row {
-            KeyRow::Head(category) => div()
-                .flex_none()
-                .pt(px(4.))
-                .child(section_head(category.label().to_uppercase()))
-                .into_any_element(),
-            // The full-truth surface: every chord the action answers to
-            // (`display`), not the badge's primary-only compact form.
-            KeyRow::Act(action) => pair(
-                action.label().to_string(),
-                player.keymap.display(action),
-                match player.enable(action, None) {
-                    Enable::Yes => INK2(),
-                    _ => INK4(),
-                },
-            ),
-            // A fixed stroke is the window's, not an action the room can
-            // refuse, so it never greys.
-            KeyRow::Fixed(i) => {
-                let f = &keymap::FIXED[i];
-                pair(f.label.to_string(), f.chord.to_string(), INK2())
-            }
-        }))
+        .children(
+            keys_rows_matching(&player.keys_filter, &player.keymap)
+                .into_iter()
+                .map(|row| match row {
+                    KeyRow::Head(category) => div()
+                        .flex_none()
+                        .pt(px(4.))
+                        .child(section_head(category.label().to_uppercase()))
+                        .into_any_element(),
+                    // The full-truth surface: every chord the action answers to
+                    // (`display`), not the badge's primary-only compact form.
+                    KeyRow::Act(action) => pair(
+                        action.label().to_string(),
+                        player.keymap.display(action),
+                        match player.enable(action, None) {
+                            Enable::Yes => INK2(),
+                            _ => INK4(),
+                        },
+                    ),
+                    // A fixed stroke is the window's, not an action the room can
+                    // refuse, so it never greys.
+                    KeyRow::Fixed(i) => {
+                        let f = &keymap::FIXED[i];
+                        pair(f.label.to_string(), f.chord.to_string(), INK2())
+                    }
+                }),
+        )
 }
 
 /// The dock's content, under `stance.rs::dock()`'s tab-bar-and-body frame:
