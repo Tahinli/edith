@@ -68,11 +68,11 @@ use engine::transform::TransformParams;
 use engine::{Clip, Codec, ExportHandle, Frame, MediaBitrate, PlaybackSession};
 use gpui::{
     AnyElement, App, Application, Bounds, ClickEvent, Context, Corners, CursorStyle, Div,
-    DragMoveEvent, FocusHandle, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseExitEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point, RenderImage,
-    ScrollDelta, ScrollHandle, ScrollWheelEvent, SharedString, Size, Stateful, TextAlign,
-    TitlebarOptions, Window, WindowBounds, WindowOptions, canvas, div, point, prelude::*, px,
-    relative, rgb, rgba, size,
+    DragMoveEvent, FocusHandle, KeyDownEvent, MouseButton, MouseDownEvent, MouseExitEvent,
+    MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point, RenderImage, ScrollDelta,
+    ScrollHandle, ScrollWheelEvent, SharedString, Size, Stateful, TextAlign, TitlebarOptions,
+    Window, WindowBounds, WindowOptions, canvas, div, point, prelude::*, px, relative, rgb, rgba,
+    size,
 };
 
 struct Player {
@@ -278,13 +278,14 @@ struct Player {
     /// must stay in the map or every repaint would ask again.
     syncs: HashMap<PathBuf, Vec<u32>>,
     /// Which decoder each source will run on, probed once at import and kept:
-    /// the codec (`None` for a still) and the seat the engine picked for it.
+    /// the codec (`None` for a still) and the seat the engine picked for it --
+    /// or, where the decoder refused the file, the refusal in its own words.
     /// What a library row says *before* anything plays; the running answer is
     /// the session's own (`PlaybackSession::decode_backend`), which follows a
     /// fallback this cannot. Filled like `sizes`: presence means "asked", and
-    /// `None` is a source with no decoder to name -- a song, or one the probe
-    /// refused -- which must stay in the map or every repaint would ask again.
-    decoders: HashMap<PathBuf, Option<(Option<Codec>, Backend)>>,
+    /// `Decoder::Pending` is that asked-but-unanswered window -- which must
+    /// stay in the map or every repaint would ask again.
+    decoders: HashMap<PathBuf, Decoder>,
     /// What an export of the picked settings would open -- the picture's seat
     /// or the copy that means it opens none, and the sound's -- and what it was
     /// asked about: the settings, the canvas and the *cuts*, since where they
