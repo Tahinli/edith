@@ -92,6 +92,21 @@ pub const MIN_GAIN_DB: f32 = -60.0;
 /// a mix bus can take before the limiter is doing all the work.
 pub const MAX_GAIN_DB: f32 = 12.0;
 
+/// The longest `[in_us, out_us)` window a [`SubClip`] may show, in
+/// microseconds: a day of track, and past it the number is not a caption any
+/// project holds -- a `.edith` a hand edited (or a hostile actor wrote) reaches
+/// this with a line the never-empty check at the parser cannot see past,
+/// because `out_us > in_us` says the window is *open* and never how wide it is.
+///
+/// A ceiling rather than a clamp for the reason [`crate::is_resolution`] is
+/// one: a window this wide is a number nobody meant, and quietly turning it
+/// into a day-long caption would put words on screen for a day. The loader
+/// refuses it by name instead, next to every other range check a `.edith` line
+/// has to pass -- and the arithmetic that cuts a window ([`SubClip::window_at`])
+/// saturates besides, so no caller can reintroduce the wrap this door is here
+/// to stop.
+pub const MAX_WINDOW_US: i64 = 86_400_000_000;
+
 /// How fast a clip plays, in **thousandths of real time**: 1000 is the speed it
 /// was shot at, 2000 twice that, 500 half. An integer and not an `f32` for
 /// [`Clip`]'s sake -- a clip is `Copy` *and* `Eq`, a float is neither exactly
@@ -636,9 +651,10 @@ impl SubClip {
     }
 
     /// How much of its track it shows, in microseconds; `>= 1` by the
-    /// never-empty invariant.
+    /// never-empty invariant, and never more than [`MAX_WINDOW_US`] for one
+    /// that came through a door.
     pub fn window_us(&self) -> i64 {
-        self.out_us - self.in_us
+        self.out_us.saturating_sub(self.in_us)
     }
 
     /// Where in its window the timeline frame `frame` falls, in microseconds --
@@ -649,9 +665,19 @@ impl SubClip {
     /// before `frame` is the fraction of the microseconds before it. That is
     /// what lets a subtitle be cut by [`clear`]'s and [`open_room`]'s twins
     /// without either of them learning an fps.
+    ///
+    /// Total arithmetic, and clamped to the window it is cutting: the
+    /// `saturating_mul` is what a `SubClip` built by a caller rather than a
+    /// door gets (a hand-built one, a unit test, a future door that forgot the
+    /// bound) -- a wrapped window would put a caption's clock *before* its own
+    /// start, and the split that produced it would then hand back two halves
+    /// whose windows do not meet. The clamp is the never-empty invariant
+    /// restated: the answer is a point inside `[in_us, out_us]` or nothing.
     fn window_at(&self, frame: u32) -> i64 {
         let into = i64::from(frame.saturating_sub(self.start));
-        self.in_us + self.window_us() * into / i64::from(self.frames.max(1))
+        let window = self.window_us().max(0);
+        let at = window.saturating_mul(into) / i64::from(self.frames.max(1));
+        self.in_us.saturating_add(at.min(window))
     }
 }
 
@@ -1699,6 +1725,20 @@ impl Project {
                     )
                     .into());
                 }
+                // The width of that window, which the check above cannot see:
+                // [`edith`](crate::edith) asks the same question at the parse
+                // and this repeats it, because `with_subs` is the door a
+                // hand-built `Project` comes through and a caller is not more
+                // trustworthy than a file.
+                if s.out_us - s.in_us > MAX_WINDOW_US {
+                    return Err(format!(
+                        "{name} caption at {} is a {}us window, past the {}us a caption can hold",
+                        s.start,
+                        s.out_us - s.in_us,
+                        MAX_WINDOW_US
+                    )
+                    .into());
+                }
                 if s.track >= palette {
                     return Err(format!(
                         "{name} caption at {} names subtitle track {} of {palette}",
@@ -1965,6 +2005,19 @@ impl Project {
             )
             .into());
         }
+        // The width of that window, which the check above cannot see: the same
+        // bound the two file doors hold a placement to
+        // ([`edith`](crate::edith)'s parse and [`with_subs`]), asked here
+        // because this is the door a *dragged* caption comes through and the
+        // hand that dragged it builds the `SubClip` itself.
+        if sub.out_us - sub.in_us > MAX_WINDOW_US {
+            return Err(format!(
+                "that placement is a {}us window, past the {}us a caption can hold",
+                sub.out_us - sub.in_us,
+                MAX_WINDOW_US
+            )
+            .into());
+        }
         if sub.track >= self.subtitles.len() {
             return Err(format!(
                 "it names subtitle track {} of {}",
@@ -2191,15 +2244,23 @@ impl Project {
             Edge::Start => {
                 // Clamped to a window that is still a window: the walls above
                 // are frames and the rounding between the two clocks is not
-                // exact, and neither is a caller's hand-built placement.
-                s.in_us = (s.in_us + us_of(i64::from(to) - i64::from(s.start), fps))
+                // exact, and neither is a caller's hand-built placement. The
+                // add saturates for the reason [`SubClip::window_at`]'s does --
+                // this is one of the two places a caption's clock is composed,
+                // and a `SubClip` that did not come through a door is the one
+                // whose `in_us` may already be at the top of `i64`.
+                s.in_us = s
+                    .in_us
+                    .saturating_add(us_of(i64::from(to) - i64::from(s.start), fps))
                     .clamp(0, s.out_us - 1);
                 s.frames = s.end() - to;
                 s.start = to;
             }
             Edge::End => {
-                s.out_us =
-                    (s.out_us + us_of(i64::from(to) - i64::from(s.end()), fps)).max(s.in_us + 1);
+                s.out_us = s
+                    .out_us
+                    .saturating_add(us_of(i64::from(to) - i64::from(s.end()), fps))
+                    .max(s.in_us + 1);
                 s.frames = to - s.start;
             }
         }
@@ -5682,15 +5743,21 @@ fn sub_edge_room(subs: &[SubClip], idx: usize, edge: Edge) -> (u32, u32) {
 /// the window it already shows over the frames it already takes.
 fn write_sub_edge(s: &mut SubClip, edge: Edge, to: u32) {
     let per_frame = s.window_us() / i64::from(s.frames.max(1));
+    // The `saturating_add` beside the `saturating_mul` is the same claim
+    // [`SubClip::window_at`]'s arithmetic makes, in the other direction: this
+    // one *grows* a caption's clock, and a `SubClip` that reached here without
+    // a door behind it may already be at the top of `i64`, where a plain add
+    // wrapped the window negative and the two halves a trim hands back no
+    // longer met.
     let by = |from: u32, to: u32| per_frame.saturating_mul(i64::from(to) - i64::from(from));
     match edge {
         Edge::Start => {
-            s.in_us = (s.in_us + by(s.start, to)).clamp(0, s.out_us - 1);
+            s.in_us = s.in_us.saturating_add(by(s.start, to)).clamp(0, s.out_us - 1);
             s.frames = s.end() - to;
             s.start = to;
         }
         Edge::End => {
-            s.out_us = (s.out_us + by(s.end(), to)).max(s.in_us + 1);
+            s.out_us = s.out_us.saturating_add(by(s.end(), to)).max(s.in_us + 1);
             s.frames = to - s.start;
         }
     }

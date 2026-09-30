@@ -1151,6 +1151,28 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
                     )
                     .into());
                 }
+                // The width of that window, which the check above cannot see:
+                // it asks whether the window is *open*, never how wide it is,
+                // and a `sub` line is the one number in this format a hand (or
+                // a hostile actor) can set to `i64::MAX` and have accepted.
+                // Every cut, split, ripple and group trim re-derives the two
+                // halves of the window by proportion
+                // ([`crate::project::SubClip::window_at`]), a multiply that
+                // overflowed on the first frame inside the caption -- a panic
+                // on the UI thread the first time a hand ripple-deleted across
+                // it, and in a release build a silently wrapped clock. The
+                // same bound [`crate::is_resolution`] holds a `resolution`
+                // line to, and for the same reason: refused by name at the
+                // door rather than clamped into something nobody wrote.
+                if sub.out_us - sub.in_us > crate::project::MAX_WINDOW_US {
+                    return Err(format!(
+                        "line {n}: caption at {} is a {}us window, past the {}us a caption can hold",
+                        sub.start,
+                        sub.out_us - sub.in_us,
+                        crate::project::MAX_WINDOW_US
+                    )
+                    .into());
+                }
                 // The palette bound, which is a clip's source bound for words:
                 // the `subtitle` lines are written before these and a caption
                 // names one of them by position.

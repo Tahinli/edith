@@ -959,3 +959,127 @@ fn a_song_only_project_comes_back_at_the_rate_it_names() {
     let loaded = PlaybackSession::open_project(&old).expect("a v8 song project opens");
     assert_eq!(loaded.meta().frame_rate, 30.0, "the canvas rate, as before");
 }
+
+/// A hand-edited `.edith` whose caption names a microsecond window no project
+/// can hold: the whole load, the same edit a 30-second window survives, and the
+/// refusal the loader owes for it.
+///
+/// A caption's window is the one unbounded number this format takes. The
+/// never-empty check at `edith.rs` asks whether `out_us > in_us` and never how
+/// large either is, so `out_us = i64::MAX` was a legal line -- and every split,
+/// ripple and group trim since cuts the window *by proportion*
+/// (`SubClip::window_at`), a plain `window_us() * into` that overflows on the
+/// first frame inside the caption. That is a panic on the UI thread the first
+/// time a hand ripple-deletes across the caption, and in a release build the
+/// same line wraps the caption's clock to a negative number instead. So the
+/// window is bounded at the door, by name, and the arithmetic behind the cut
+/// is made total as well.
+#[test]
+fn a_caption_window_no_project_can_hold_is_refused_by_name() {
+    let dir = scratch("caption_window");
+    let media = copy_in(&dir, "test_av.mp4");
+    let subs = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/data/test_subs.srt")
+        .canonicalize()
+        .expect("the subtitle fixture");
+
+    // The control first: a 30-second window over 30 frames, the shape every
+    // save writes, and the shape this file's whole edit path is proved on.
+    let ok = dir.join("window_ok.edith");
+    std::fs::write(
+        &ok,
+        format!(
+            "edith 23\nplayhead 0\nresolution 1280 720\nsource 0 {}\nsubtitle - {}\n\
+             video 1 0 0 30 0 - - - fit 1000 0 0 0 - 0 0\n\
+             sub 1 0 30 0 0 30000000\n",
+            media.display(),
+            subs.display(),
+        ),
+    )
+    .expect("write");
+    let mut control = PlaybackSession::open_project(&ok).expect("a 30s caption window opens");
+    assert_eq!(control.sub_lane(Lane::S1)[0].out_us, 30_000_000);
+    // The edits the unbounded window used to survive: a split inside the
+    // caption and a ripple across it. Both cut the window by proportion.
+    assert!(control.cut_at(0.5), "the playhead splits the caption under it");
+    assert_eq!(
+        control.sub_lane(Lane::S1).len(),
+        2,
+        "the split cut the caption in two"
+    );
+    control.undo();
+    control
+        .cut_regions(&[(0, 10)], &[Lane::S1])
+        .expect("a ripple across the caption, scoped to its own lane");
+    let after = control.sub_lane(Lane::S1);
+    assert_eq!(after.len(), 1, "the caption's tail is still there");
+    assert_eq!(
+        (after[0].start, after[0].frames),
+        (0, 20),
+        "and it closed the hole the cut left"
+    );
+
+    // The same file, the same lane, the same edit -- with a window no project
+    // can hold. This is the line that used to load and then panic.
+    let huge = dir.join("window_huge.edith");
+    std::fs::write(
+        &huge,
+        format!(
+            "edith 23\nplayhead 0\nresolution 1280 720\nsource 0 {}\nsubtitle - {}\n\
+             video 1 0 0 30 0 - - - fit 1000 0 0 0 - 0 0\n\
+             sub 1 0 30 0 0 9223372036854775807\n",
+            media.display(),
+            subs.display(),
+        ),
+    )
+    .expect("write");
+    let err = PlaybackSession::open_project(&huge)
+        .err()
+        .unwrap_or_else(|| {
+            panic!(
+                "a caption window of {}us loaded, and the first split across it \
+                 panics in SubClip::window_at",
+                i64::MAX
+            )
+        })
+        .to_string();
+    assert!(
+        err.contains("window") && err.contains("9223372036854775807"),
+        "the refusal names the window it is refusing, and the value: {err}"
+    );
+    assert!(err.starts_with("line 7"), "and which line said it: {err}");
+
+    // The same bound at the other two doors a caption comes through, because a
+    // caller is not more trustworthy than a file: the placement a hand drags
+    // out of the palette is a `SubClip` somebody built, and it goes through
+    // `place_sub` rather than the parse.
+    let mut session = PlaybackSession::open(&media).expect("open the fixture");
+    session
+        .import_subtitles(&subs)
+        .expect("the fixture's one track");
+    let s1 = session.add_lane(engine::project::LaneKind::Subtitle);
+    let err = session
+        .place_sub(
+            s1,
+            0,
+            engine::project::SubClip {
+                start: 0,
+                frames: 30,
+                track: 0,
+                in_us: 0,
+                out_us: i64::MAX,
+                link: None,
+            },
+        )
+        .expect_err("a window no project can hold is refused by name, not clamped")
+        .to_string();
+    assert!(
+        err.contains("window") && err.contains(&i64::MAX.to_string()),
+        "the placement refusal names the window and the value: {err}"
+    );
+    assert!(
+        session.sub_lane(s1).is_empty(),
+        "and a refusal places nothing: {:?}",
+        session.sub_lane(s1)
+    );
+}
