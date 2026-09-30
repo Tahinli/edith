@@ -461,6 +461,24 @@ impl PixelAspect {
     /// What needs bounding is the raster, and [`Self::width_factor`] bounds
     /// that with [`Self::MAX_DISPLAY_WIDTH`] on every path. So this has only
     /// to refuse the degenerate claims: a zero half.
+    ///
+    /// # A named design gap, not an oversight
+    ///
+    /// The stated display *height* is read, checked, and then dropped. That is
+    /// correct against this engine's model today -- `VideoMeta::height` is the
+    /// coded height for every file, every door builds the display pair as
+    /// `width_factor(coded_width)` against the coded height, and every consumer
+    /// (`decode.rs`, `export.rs`, `hw.rs`'s `pixel_aspect_h`/`_v` beside
+    /// `coded_width`/`coded_height`) reads the aspect as width-only.
+    ///
+    /// It becomes a real defect the moment any path starts honouring a stated
+    /// display height: a 1920x803 pair would then have to drive
+    /// `VideoMeta::height`, and this function would be silently feeding it
+    /// `coded.0` instead. So the drop is recorded here rather than left as a
+    /// line that looks like an oversight, and whoever makes that change should
+    /// start by reading this paragraph -- the height half is being discarded
+    /// deliberately, and the reason it was safe to discard is exactly the thing
+    /// that change would remove.
     pub fn stated_size(display_width: u64, display_height: u64, coded: (u32, u32)) -> Option<Self> {
         // The height is checked for the degenerate claim and then goes unused:
         // a zero-height pair is a header that lies, and one this engine reads
