@@ -10767,80 +10767,262 @@ fn removing_a_subtitle_column_undoes_with_its_reindex() {
     assert_ne!(p.subtitles(), palette.as_slice(), "and it is not back");
 }
 
-    /// The closed set, proved by reading the files rather than by exercising
-    /// every path: a caption's `in_us`/`out_us` is written in exactly two
-    /// places, and this fails if a third appears.
+    /// Finds every line that **writes** a caption's clock, in three forms: an
+    /// assignment through any operator (`.out_us = `, `.out_us += `,
+    /// `.out_us <<= `), a struct-literal field (`out_us: ...`) and the
+    /// shorthand form (`out_us,`). A `let` binding is skipped for the literal
+    /// forms only, so `let x: &mut SubClip = ..; (*x).in_us = 5;` is still
+    /// caught while `let out_us = s.out_us;` is not.
     ///
-    /// Three rounds of review each found one more composer a per-arm check had
-    /// missed -- a tail trim, a head trim, a rejoin that SUMS two legal widths
-    /// -- and each produced the same failure: the editor wrote a `.edith` its
-    /// own loader then refused, with no in-app way back. Reasoning about arms
-    /// does not scale to an unknown number of them, so the invariant is stated
-    /// structurally instead: a new composer routed through `set_window` is two
-    /// lines and needs no new argument, and one that is not fails here.
-    ///
-    /// The two allowed writers are `set_window` (every composer) and the
-    /// parser's own door, which builds the `SubClip` a `sub` line describes and
-    /// range-checks it on the next lines -- a door, not a composer, because a
-    /// file is not an edit anybody is watching happen.
-    #[test]
-    fn every_window_write_goes_through_set_window() {
-        // `CARGO_MANIFEST_DIR`, not `file!()`: a test runs with the WORKSPACE
-        // root as its working directory, so `file!()`'s crate-relative path
-        // does not resolve from where the binary actually starts.
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        // Every line in the two files that names a clock and is not a write:
-        // the struct's own fields, the one function that may write, and the
-        // parser's two door lines. A new entry here is a claim someone has to
-        // defend in review, which is the point of writing the list out.
-        let allowed = [
-            ("project.rs", "pub in_us: i64,"),
-            ("project.rs", "pub out_us: i64,"),
-            ("project.rs", "fn set_window(s: &mut SubClip, in_us: i64, out_us: i64) {"),
-            ("project.rs", "s.in_us = in_us;"),
-            ("project.rs", "s.out_us = out_us;"),
-            ("edith.rs", "in_us: micros(f[3], n)?,"),
-            ("edith.rs", "out_us: micros(f[4], n)?,"),
+    /// The operator list is `=` plus one assignment operator each, and
+    /// deliberately excludes `<=`: the first version of this matcher counted
+    /// `s.out_us <= s.in_us` as a write, which would have flagged every
+    /// never-empty check in the file.
+    fn window_writes(text: &str) -> Vec<(usize, String)> {
+        const FIELDS: [&str; 2] = ["in_us", "out_us"];
+        const OPS: [&str; 11] = [
+            "=", "+=", "-=", "*=", "/=", "%=", "^=", "&=", "|=", "<<=", ">>=",
         ];
-        let mut found: Vec<String> = Vec::new();
-        let mut scanned = 0usize;
-        for name in ["project.rs", "edith.rs"] {
-            let text = std::fs::read_to_string(dir.join(name)).expect("read the file");
-            // The test MODULE, not any `cfg(test)`: this file carries several
-            // `cfg(test)` attributes on single test-only helpers, and two wrong
-            // boundaries were tried before this one -- the FIRST (line 160)
-            // scanned 160 lines of a 10,800-line file, and the LAST landed
-            // inside this very test, dragging the test module's own
-            // hand-built `SubClip`s into scope. A guard that reads nothing,
-            // and one that reads the wrong thing, are both worse than no
-            // guard because they read as one. The line count asserted below is
-            // what keeps this third boundary honest.
-            let at = text
-                .find("#[cfg(test)]\nmod tests {")
-                .expect("this file's test module is still spelled that way");
-            let code = &text[..at];
-            for line in code.lines() {
-                scanned += 1;
-                let line = line.trim();
-                let writes = line.contains(".in_us = ")
-                    || line.contains(".out_us = ")
-                    || line.contains("in_us:")
-                    || line.contains("out_us:");
-                if writes && !allowed.contains(&(name, line)) {
-                    found.push(format!("{name}: {line}"));
+        let mut found = Vec::new();
+        for (n, raw) in text.lines().enumerate() {
+            let line = raw.trim();
+            if line.starts_with("//") {
+                continue;
+            }
+            let is_binding = line.starts_with("let ");
+            for field in FIELDS {
+                let access = format!(".{field}");
+                if let Some(at) = line.find(&access) {
+                    let after = &line[at + access.len()..];
+                    let after = after.trim_start();
+                    if OPS.iter().any(|op| {
+                        after.starts_with(op) && !after[op.len()..].starts_with('=')
+                    }) {
+                        found.push((n + 1, line.to_owned()));
+                        continue;
+                    }
+                }
+                // A bare name: a literal field, a shorthand, or a binding.
+                // Skipped when a `.` or an identifier character precedes it --
+                // that is a read, not a field being set.
+                if is_binding {
+                    continue;
+                }
+                for (at, _) in line.match_indices(field) {
+                    let preceded_by_name = line[..at]
+                        .chars()
+                        .next_back()
+                        .is_some_and(|c| c == '.' || c.is_alphanumeric() || c == '_');
+                    if preceded_by_name {
+                        continue;
+                    }
+                    let after = line[at + field.len()..].trim_start();
+                    if after.starts_with(':') || after.starts_with(',') || after.starts_with('=') {
+                        found.push((n + 1, line.to_owned()));
+                        break;
+                    }
                 }
             }
         }
+        found
+    }
+
+    /// A **heuristic guard**, not a proof. The honest reading of a green here
+    /// is the residual risk in this comment, not the green itself.
+    ///
+    /// Three rounds of review each found one more composer a per-arm check had
+    /// missed -- a tail trim, a head trim, a rejoin that SUMS two legal
+    /// widths -- and each produced the same failure: the editor wrote a
+    /// `.edith` its own loader then refused, with no in-app way back. The
+    /// invariant is now structural in the code (every composer calls
+    /// [`set_window`]); this is what keeps that structure from quietly losing
+    /// a caller.
+    ///
+    /// **Why this is a scan and not the compiler**, which is the better answer
+    /// and was priced rather than skipped: making `in_us`/`out_us` private to
+    /// this module turns every outside write into a compile error, which no
+    /// one-token edit can defeat. It costs 74 `SubClip` construction sites
+    /// (31 of them in this crate's own integration tests) plus a public
+    /// constructor, and it reaches `crates/app`'s `timeline_edit.rs` and
+    /// `timeline_math.rs`, which other lanes own. That is a refactor of a
+    /// door's public shape rather than a bound, and the wrong size for this
+    /// lane -- so the guard stands here with its limits written down instead.
+    ///
+    /// Residual risk, concretely: a write through a helper taking
+    /// `&mut SubClip` that assigns by a form the matcher cannot see; a
+    /// macro-mediated write; a `.rs` under `crates/` the walk does not reach;
+    /// and -- the sharpest one -- renaming the fields themselves, since the
+    /// matcher keys on the literal strings `in_us`/`out_us` and would then
+    /// match nothing at all while still passing.
+    #[test]
+    fn every_window_write_outside_set_window_is_named() {
+        // `CARGO_MANIFEST_DIR`, not `file!()`: a test runs with the WORKSPACE
+        // root as its working directory, so `file!()`'s crate-relative path
+        // does not resolve from where the binary actually starts.
+        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("crates/engine sits two levels under the workspace root")
+            .to_path_buf();
+        // Every line in the workspace that names a clock and is not a
+        // composer, each with its reason. A new entry is a claim someone has
+        // to defend in review, which is the point of writing the list out.
+        let allowed = [
+            ("pub in_us: i64,", "the field declaration"),
+            ("pub out_us: i64,", "the field declaration"),
+            (
+                "fn set_window(s: &mut SubClip, in_us: i64, out_us: i64) {",
+                "set_window's own signature",
+            ),
+            ("s.in_us = in_us;", "set_window"),
+            ("s.out_us = out_us;", "set_window"),
+            (
+                "set_window(&mut data.subs[idx], in_us, out_us);",
+                "regroup naming the two values it is about to set",
+            ),
+            ("in_us: micros(f[3], n)?,", "edith.rs: the parse door"),
+            ("out_us: micros(f[4], n)?,", "edith.rs: the parse door"),
+            // Non-test helpers that build a value to hand `place_sub`, which is
+            // a door. Not composers: nobody was mid-gesture, which is exactly
+            // why a door refuses where a composer clamps.
+            (
+                "in_us: 0,",
+                "sweep.rs caption helper, and timeline_edit.rs's palette row, -> place_sub",
+            ),
+            (
+                "out_us: i64::from(frames) * 1_000_000,",
+                "sweep.rs caption helper -> place_sub",
+            ),
+            (
+                "frames: frames_of_us(out_us, self.fps),",
+                "timeline_edit.rs's palette row -> place_sub",
+            ),
+            ("out_us,", "timeline_edit.rs's palette row shorthand -> place_sub"),
+        ];
+
+        let mut found: Vec<String> = Vec::new();
+        let (mut files, mut lines) = (0usize, 0usize);
+        let mut seen_app = false;
+        for (file, text) in read_workspace_rust(&workspace) {
+            // Test code, by path or by module: a test builds `SubClip`s by hand
+            // and its value is not one the loader ever reads, so the 31 sites in
+            // `crates/engine/tests/` and three in `crates/app/src/tests/` are
+            // not composers. A real limit rather than a technicality -- the
+            // guard does not cover a writer hidden inside a test -- but a test
+            // cannot produce a file a user loses, so it is where the line goes.
+            let path = file.to_string_lossy().replace('\\', "/");
+            if path.contains("/tests/") {
+                continue;
+            }
+            let code = match text.find("\n#[cfg(test)]\nmod tests {") {
+                Some(at) => &text[..at],
+                None => text.as_str(),
+            };
+            lines += code.lines().count();
+            files += 1;
+            seen_app |= path.contains("crates/app/");
+            for (n, line) in window_writes(code) {
+                if !allowed.iter().any(|(text, _)| *text == line) {
+                    let at = file.strip_prefix(&workspace).unwrap_or(&file);
+                    found.push(format!("{}:{n}: {line}", at.display()));
+                }
+            }
+        }
+        // A floor, not a census: the walk filters to files that can NAME
+        // `SubClip`, which today is 20 of them and ~39,000 lines. The point is
+        // only to catch a walk rooted in the wrong place, which reads a file
+        // or two. The `seen_app` half is the one that matters: the two-file
+        // version of this guard read `project.rs` and `edith.rs` and was
+        // silently certifying a claim about the app it had never opened.
         assert!(
-            scanned > 3_000,
-            "the scan only read {scanned} lines -- the cfg(test) boundary is wrong, \
-             and a guard that reads nothing is worse than no guard"
+            lines > 20_000 && files >= 10 && seen_app,
+            "the walk read {lines} lines in {files} files (app reached: \
+             {seen_app}) -- it is not covering the workspace, and a guard that \
+             reads nothing is worse than no guard because it reads as one"
         );
         assert!(
             found.is_empty(),
             "a caption window is written outside set_window:\n  {}",
             found.join("\n  ")
         );
+    }
+
+    /// The blind spot, pinned as a case. Every one of these is a write, and
+    /// the guard exists because its first two versions caught none of them --
+    /// `s.out_us += by(...)` being a one-token edit that made it green while a
+    /// grouped caption really did grow past the ceiling. A matcher that has
+    /// quietly stopped matching is the failure mode that looks most like a
+    /// pass, so it gets its own test rather than a comment.
+    #[test]
+    fn the_window_write_matcher_catches_the_ways_a_composer_hides() {
+        for (what, code) in [
+            (
+                "the one-token compound assignment",
+                "            s.out_us += by(s.end(), to);",
+            ),
+            ("a plain compound assignment", "            s.in_us -= 1;"),
+            ("a shift-assign", "            s.out_us <<= 1;"),
+            (
+                "a write through a &mut the matcher cannot see past",
+                "        let x: &mut SubClip = q; (*x).in_us = 5;",
+            ),
+            (
+                "a struct literal",
+                "        out.push(SubClip { in_us: 0, out_us: 1, ..s });",
+            ),
+            ("the shorthand form", "        SubClip { in_us, out_us, ..s }"),
+        ] {
+            assert!(
+                !window_writes(code).is_empty(),
+                "the matcher misses {what}: {code:?}"
+            );
+        }
+        // ...and the other side, so the allowlist is not padded with reads.
+        for quiet in [
+            "    if sub.frames == 0 || sub.out_us <= sub.in_us || sub.in_us < 0 {",
+            "    debug_assert!(s.frames >= 1 && s.out_us > s.in_us && s.in_us >= 0);",
+            "    let out_us = s.out_us;",
+            "    (next.start == frame && next.in_us == subs[idx].out_us)",
+            "    let total = s.out_us - s.in_us;",
+        ] {
+            assert!(
+                window_writes(quiet).is_empty(),
+                "the matcher flags a read as a write: {quiet:?}"
+            );
+        }
+    }
+
+    /// Every `.rs` under the workspace, paired with its text. Recursive
+    /// because the set of files that can name `SubClip` is a fact about the
+    /// tree, and a hardcoded pair of names goes stale the moment a lane adds a
+    /// module -- which is how the two-file version of this guard came to
+    /// certify a claim about `crates/app` it had never read.
+    fn read_workspace_rust(root: &std::path::Path) -> Vec<(std::path::PathBuf, String)> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    // `target` is not source and `vendor` is not ours to rule on.
+                    let skip = path
+                        .file_name()
+                        .is_some_and(|n| n == "target" || n == ".git" || n == "vendor");
+                    if !skip {
+                        stack.push(path);
+                    }
+                } else if path.extension().is_some_and(|e| e == "rs")
+                    && let Ok(text) = std::fs::read_to_string(&path)
+                    && text.contains("SubClip")
+                {
+                    out.push((path, text));
+                }
+            }
+        }
+        out
     }
 
 }
