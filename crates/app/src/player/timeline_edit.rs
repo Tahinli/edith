@@ -1869,17 +1869,44 @@ impl Player {
         if self.exporting().is_some() {
             return;
         }
-        let Some(session) = &mut self.session else {
+        if self.session.is_none() {
             return;
+        }
+        // The engine's bool answers "the two clips are adjacent" -- both
+        // setters snapshot and clamp, and a `frames` already in force (a step
+        // past the cap, a number retyped in the field) writes the value the
+        // clip already carried and still says true. The arm therefore rides
+        // the join's own edges read back, the same before/after comparison
+        // `move_sub` and `commit_fade` make.
+        let before = self.transition_edges(lane, idx);
+        let ok = match &mut self.session {
+            Some(session) => match lane.kind {
+                LaneKind::Video => session.set_transition_out(lane, idx, frames),
+                LaneKind::Audio => session.crossfade(lane, idx, frames),
+                _ => false,
+            },
+            None => false,
         };
-        let ok = match lane.kind {
-            LaneKind::Video => session.set_transition_out(lane, idx, frames),
-            LaneKind::Audio => session.crossfade(lane, idx, frames),
-            _ => false,
-        };
-        if ok {
+        if ok && self.transition_edges(lane, idx) != before {
             self.mark_dirty();
-            cx.notify();
+        }
+        cx.notify();
+    }
+
+    /// What the join at `idx` of `lane` carries on both sides, for the doors
+    /// that only the *pair* can answer for: a crossfade writes `idx`'s
+    /// `fade_out` and its neighbour's `fade_in`, so a comparison of the
+    /// anchor's own field alone would miss a neighbour-side no-op. `None`
+    /// for a lane with no such pair, which is a value no write can equal.
+    fn transition_edges(&self, lane: Lane, idx: usize) -> Option<(u32, u32)> {
+        let session = self.session.as_ref()?;
+        match lane.kind {
+            LaneKind::Video => Some((session.transition_out_of(lane, idx), 0)),
+            LaneKind::Audio => {
+                let clips = session.lane_clips(lane);
+                Some((clips.get(idx)?.fade_out, clips.get(idx + 1)?.fade_in))
+            }
+            _ => None,
         }
     }
 
