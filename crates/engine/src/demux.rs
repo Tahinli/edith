@@ -1008,6 +1008,15 @@ impl Mp4Demuxer {
             None => Rotation::None,
         };
         let (coded_w, coded_h) = (u32::from(track.width()), u32::from(track.height()));
+        // The same bound the Matroska door applies, on the same values: the
+        // mp4 crate types a track's dimensions as `u16`, which is a smaller
+        // claim than Matroska's but still eight times past the 8K ceiling --
+        // 65535x65535 is a legal `tkhd`, and it sizes the same buffers.
+        for stated in [coded_w, coded_h] {
+            if stated > crate::MAX_RESOLUTION {
+                return Err(unsupported_display_size(u64::from(stated)));
+            }
+        }
         // The ratio one coded pixel is drawn at, off the sample entry's `pasp`
         // box: absent for the square-pixel file, which is the common case.
         let pixel_aspect = pasp_of(path, track_id);

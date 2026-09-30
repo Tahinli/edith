@@ -161,3 +161,47 @@ fn a_hostile_pasp_decodes_the_coded_picture_instead_of_aborting() {
         "the coded picture, drawn square: a wrapped claim resizes nothing"
     );
 }
+/// The same bound, on the other door. An mp4 states its picture in a visual
+/// sample entry's two `u16` fields -- a smaller claim than Matroska's EBML
+/// integer, but still eight times past the 8K ceiling, and it reaches the same
+/// `decode.rs` allocation.
+#[test]
+fn a_mp4_may_not_state_a_picture_past_the_resolution_bound() {
+    let scratch = Scratch::new("mp4dims");
+    let into = scratch.path("mp4_huge_dims.mp4");
+    patch_sample_entry_size(&asset("test_baseline.mp4"), &into, 65535, 65535);
+
+    let Err(why) = Demuxer::open(&into) else {
+        panic!("a 65535x65535 mp4 is refused by name, never opened");
+    };
+    let said = why.to_string();
+    assert!(
+        said.contains("65535") && said.contains(&engine::MAX_RESOLUTION.to_string()),
+        "the refusal names the size claimed and the maximum: {said}"
+    );
+    assert!(
+        engine::demux::UnsupportedDisplaySize::is_it(&why),
+        "and it is the named refusal a caller can match on, not a string"
+    );
+}
+
+/// A copy of `source` with the width and height of its first visual sample
+/// entry set to `w`/`h` (ISO/IEC 14496-12 §12.1.3: two 16-bit fields, 24
+/// bytes into the entry, after the 6 reserved bytes, the 2-byte data
+/// reference index and the 16 bytes of pre-defined and reserved fields).
+fn patch_sample_entry_size(source: &Path, into: &Path, w: u16, h: u16) {
+    let mut bytes = std::fs::read(source).expect("read the source fixture");
+    let stsd = find(&bytes, b"stsd").expect("the fixture has a sample description");
+    // 'stsd' + version/flags + entry_count, then the first entry.
+    let entry = stsd + 12;
+    assert_eq!(&bytes[entry + 4..entry + 8], b"avc1", "the first entry is the video one");
+    bytes[entry + 32..entry + 34].copy_from_slice(&w.to_be_bytes());
+    bytes[entry + 34..entry + 36].copy_from_slice(&h.to_be_bytes());
+    std::fs::write(into, bytes).expect("write the patched fixture");
+}
+
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
