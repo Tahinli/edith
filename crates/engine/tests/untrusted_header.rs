@@ -1,0 +1,247 @@
+//! What a container header claims is untrusted input, and the numbers it
+//! claims them with reach every raster this engine sizes.
+//!
+//! An mp4 `pasp` box is eight bytes: two 32-bit big-endian integers, the ratio
+//! one coded pixel is drawn at. Nothing in the file makes them sane. Four
+//! chosen bytes are enough to make the probe report a zero width, or a width
+//! that wrapped a `u32` on its way down from the multiply -- and both of those
+//! go straight into the `resize` that sizes the decode worker's stretched
+//! planes, before a single pixel is drawn.
+//!
+//! This test byte-patches a copy of the baseline fixture and opens it through
+//! the ordinary door: the patched files live in a temp directory and are made
+//! here, so no hostile bytes are committed to the repository.
+//!
+//! ```text
+//! cargo test -p engine --test untrusted_header -- --test-threads=1
+//! ```
+
+use std::path::{Path, PathBuf};
+
+use engine::demux::Demuxer;
+
+fn asset(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../assets")
+        .join(name)
+}
+
+/// A temp directory that cleans itself up, so a failing test does not leave a
+/// hostile mp4 lying around for the next one to trip over.
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new(tag: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("edith-untrusted-header-{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a temp directory for the patched fixture");
+        Self(dir)
+    }
+
+    fn path(&self, name: &str) -> PathBuf {
+        self.0.join(name)
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A copy of `source` with the eight bytes of its `pasp` payload replaced.
+///
+/// Returns the byte offset the payload was written at, so the test can name
+/// the exact bytes it changed rather than asserting about a file whose
+/// provenance is a fixture somebody might regenerate.
+fn patch_pasp(source: &Path, into: &Path, h: u32, v: u32) -> usize {
+    let bytes = std::fs::read(source).expect("read the source fixture");
+    let at = bytes
+        .windows(4)
+        .position(|window| window == b"pasp")
+        .expect("the fixture carries a pasp box")
+        + 4; // the type is four bytes; the payload follows it
+    let mut patched = bytes.clone();
+    patched[at..at + 4].copy_from_slice(&h.to_be_bytes());
+    patched[at + 4..at + 8].copy_from_slice(&v.to_be_bytes());
+    std::fs::write(into, patched).expect("write the patched fixture");
+    at
+}
+
+/// The claims an mp4 can make about its pixels that are not a picture: a zero
+/// half, which divides to nothing, and a huge half, whose multiply wraps a
+/// `u32` on the way down.
+#[test]
+fn a_pasp_box_cannot_declare_a_zero_or_wrapped_display_width() {
+    // Read the untouched fixture first: the patches below are asserted
+    // against *its* numbers, so a regenerated fixture that stops carrying a
+    // `pasp` box fails here loudly instead of silently passing.
+    let (baseline, _) = Demuxer::open(&asset("test_baseline.mp4")).expect("open the baseline");
+    let coded = (baseline.coded_width, baseline.coded_height);
+    assert_eq!(
+        (baseline.width, baseline.height),
+        coded,
+        "the baseline fixture is square, so its display pair is its coded pair -- which is \
+         what the patched files are asserted against"
+    );
+    assert!(
+        baseline.pixel_aspect.is_square(),
+        "the baseline fixture states 1:1, which is square"
+    );
+
+    let scratch = Scratch::new("pasp");
+    for (tag, h, v) in [
+        ("zero_h", 0u32, 1u32),
+        ("zero_v", 1, 0),
+        ("both_zero", 0, 0),
+        // 1920 * 0x00FF_FFFF = 32_212_252_800, which narrowed to a u32 is
+        // 2_147_481_728: a width that looks plausible in a log and cannot be
+        // allocated on any machine this runs on.
+        ("wrap_h", 0x00FF_FFFF, 1),
+        // 1:0x00FF_FFFF is the other end: a two-column strip of a picture.
+        ("wrap_v", 1, 0x00FF_FFFF),
+    ] {
+        let name = format!("pasp_{tag}.mp4");
+        let into = scratch.path(&name);
+        let at = patch_pasp(&asset("test_baseline.mp4"), &into, h, v);
+        assert_eq!(
+            std::fs::read(&into).unwrap()[at..at + 8],
+            [h.to_be_bytes(), v.to_be_bytes()].concat(),
+            "{tag}: the patch landed where it was aimed"
+        );
+
+        // The ordinary door: open the file the way a library open does.
+        let (meta, _) = Demuxer::open(&into)
+            .unwrap_or_else(|why| panic!("{tag} (pasp {h}:{v} at byte {at}): open failed: {why}"));
+
+        // A header that claims an unusable ratio is read as the picture it
+        // really is: the coded one, square, drawn one to one.
+        assert_eq!(
+            (meta.width, meta.height),
+            (baseline.width, baseline.height),
+            "{tag} (pasp {h}:{v}): an unusable ratio must read as square, not as a \
+             zero-column or wrapped raster"
+        );
+        assert!(
+            meta.pixel_aspect.is_square(),
+            "{tag} (pasp {h}:{v}): the reported aspect must be one this engine can draw"
+        );
+        assert!(
+            meta.width > 0 && meta.height > 0,
+            "{tag} (pasp {h}:{v}): a zero dimension here is what sizes an allocation to nothing"
+        );
+    }
+}
+
+/// The half that matters is not the probe: it is the worker that sizes its
+/// stretched planes from the same number. A decode that used to abort on a
+/// capacity overflow here now returns the coded picture.
+#[test]
+fn a_hostile_pasp_decodes_the_coded_picture_instead_of_aborting() {
+    let scratch = Scratch::new("decode");
+    let into = scratch.path("pasp_wrap.mp4");
+    patch_pasp(&asset("test_baseline.mp4"), &into, 0x00FF_FFFF, 1);
+
+    let (baseline, _) = Demuxer::open(&asset("test_baseline.mp4")).expect("open the baseline");
+    let coded = (baseline.width, baseline.height);
+    let (meta, _) = Demuxer::open(&into).expect("a hostile header is still an openable file");
+    let (_, frames, _) =
+        engine::DecodeSession::open_at(&into, 0).expect("a hostile header does not stop the decoder");
+    let frame = frames
+        .recv()
+        .expect("the first frame arrives rather than the worker aborting on its allocation");
+    assert_eq!(
+        frame.width,
+        meta.width,
+        "the decoded frame is drawn at the width the probe reported"
+    );
+    assert_eq!(
+        (frame.width, frame.height),
+        coded,
+        "the coded picture, drawn square: a wrapped claim resizes nothing"
+    );
+}
+/// The same bound, on the other door. An mp4 states its picture in a visual
+/// sample entry's two `u16` fields -- a smaller claim than Matroska's EBML
+/// integer, but still eight times past the 8K ceiling, and it reaches the same
+/// `decode.rs` allocation.
+#[test]
+fn a_mp4_may_not_state_a_picture_past_the_resolution_bound() {
+    let scratch = Scratch::new("mp4dims");
+    let into = scratch.path("mp4_huge_dims.mp4");
+    patch_sample_entry_size(&asset("test_baseline.mp4"), &into, 65535, 65535);
+
+    let Err(why) = Demuxer::open(&into) else {
+        panic!("a 65535x65535 mp4 is refused by name, never opened");
+    };
+    let said = why.to_string();
+    assert!(
+        said.contains("65535") && said.contains(&engine::MAX_RESOLUTION.to_string()),
+        "the refusal names the size claimed and the maximum: {said}"
+    );
+    assert!(
+        engine::demux::UnsupportedDisplaySize::is_it(&why),
+        "and it is the named refusal a caller can match on, not a string"
+    );
+}
+
+/// A copy of `source` with the width and height of its first visual sample
+/// entry set to `w`/`h` (ISO/IEC 14496-12 §12.1.3: two 16-bit fields, 24
+/// bytes into the entry, after the 6 reserved bytes, the 2-byte data
+/// reference index and the 16 bytes of pre-defined and reserved fields).
+fn patch_sample_entry_size(source: &Path, into: &Path, w: u16, h: u16) {
+    let mut bytes = std::fs::read(source).expect("read the source fixture");
+    let stsd = find(&bytes, b"stsd").expect("the fixture has a sample description");
+    // 'stsd' + version/flags + entry_count, then the first entry.
+    let entry = stsd + 12;
+    assert_eq!(&bytes[entry + 4..entry + 8], b"avc1", "the first entry is the video one");
+    bytes[entry + 32..entry + 34].copy_from_slice(&w.to_be_bytes());
+    bytes[entry + 34..entry + 36].copy_from_slice(&h.to_be_bytes());
+    std::fs::write(into, bytes).expect("write the patched fixture");
+}
+
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+/// The boundary of the bound, stated as a test rather than left as a surprise:
+/// 7680 -- 8K UHD -- opens, and 8192 -- 8K DCI, a real ProRes 4444 XQ master
+/// width -- is refused by name.
+///
+/// The refusal of a DCI-width master is a behaviour change this lane
+/// introduced: before it, the bound was asked only of a keystroke and a
+/// `.edith` line, never of a file's own header, so a container could state any
+/// size at all. `MAX_RESOLUTION` stays 7680 rather than being raised to 8192,
+/// because it gates those two doors at 7680 too and widening the ceiling on
+/// every path to accommodate a container is a wider decision than a header fix
+/// should make.
+#[test]
+fn the_resolution_bound_admits_uhd_and_refuses_dci_width_by_name() {
+    let scratch = Scratch::new("dci");
+    let coded_height = 720u16;
+
+    let uhd = scratch.path("uhd_7680.mp4");
+    patch_sample_entry_size(&asset("test_baseline.mp4"), &uhd, 7680, coded_height);
+    let (meta, _) = Demuxer::open(&uhd).expect("8K UHD is inside the bound and opens");
+    assert_eq!(
+        (meta.coded_width, meta.coded_height),
+        (7680, u32::from(coded_height)),
+        "an 8K UHD header is read as stated"
+    );
+
+    let dci = scratch.path("dci_8192.mp4");
+    patch_sample_entry_size(&asset("test_baseline.mp4"), &dci, 8192, coded_height);
+    let Err(why) = Demuxer::open(&dci) else {
+        panic!("an 8192-wide DCI master is refused by name, never opened");
+    };
+    assert!(
+        engine::demux::UnsupportedDisplaySize::is_it(&why),
+        "the refusal is the named one a caller can match: {why}"
+    );
+    assert!(
+        why.to_string().contains("8192"),
+        "and it names the width claimed: {why}"
+    );
+}

@@ -94,8 +94,18 @@ pub fn is_image(path: &std::path::Path) -> bool {
     })
 }
 
-/// The largest picture this engine composes onto, either way: 8K, which is where
-/// a per-frame buffer stops being a sane thing to allocate.
+/// The largest picture this engine composes onto, either way: 7680, which is
+/// where a per-frame buffer stops being a sane thing to allocate.
+///
+/// That is 8K **UHD** (7680x4320), not 8K DCI (8192x4320). A DCI-width master
+/// -- a ProRes 4444 XQ feature, for instance -- is 8192 wide and is refused
+/// here by name, which it was not before the container doors asked this bound
+/// of a file's own header rather than only of a keystroke and a `.edith` line.
+/// The bound is deliberately not raised to 8192 to admit it: `is_resolution`
+/// gates those two doors at 7680 too, and widening the ceiling on every path
+/// to accommodate a container is a wider decision than a header fix should
+/// make. A caller that needs DCI width needs the ceiling raised deliberately,
+/// on all four doors at once.
 pub const MAX_RESOLUTION: u32 = 7680;
 
 /// Whether a project resolution is a picture at all: not zero either way, and
