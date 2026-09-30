@@ -390,10 +390,21 @@ pub fn transformed_dst_rect(
     let cap_h = i64::from(canvas_h.max(1)) * 1024;
     let new_w = ((f64::from(dst.w) * scale).round() as i64).clamp(1, cap_w);
     let new_h = ((f64::from(dst.h) * scale).round() as i64).clamp(1, cap_h);
+    // ...and the position, to the same ceiling, for the same reason. A
+    // `transform` line takes any finite `f32` for `pos_x`/`pos_y` (there is
+    // no per-field clamp at the parse, unlike `scale`'s use of the value), and
+    // `f64 as i64` *saturates* -- so a hostile 3e38 arrived here as `i64::MAX`
+    // and the additions below, not the cast, are what overflowed: a panic on
+    // the compositing thread in a debug build and a silently wrapped position
+    // in a release one. A cap in canvas fractions is the same 1024 the scale
+    // gets, and a box pushed that far off the canvas is long gone either way:
+    // it comes back as the two empty rects the function already answers with.
     let pos_x = if t.pos_x.is_finite() { f64::from(t.pos_x) } else { 0.0 };
     let pos_y = if t.pos_y.is_finite() { f64::from(t.pos_y) } else { 0.0 };
-    let cx = i64::from(dst.x) + i64::from(dst.w) / 2 + (f64::from(canvas_w) * pos_x).round() as i64;
-    let cy = i64::from(dst.y) + i64::from(dst.h) / 2 + (f64::from(canvas_h) * pos_y).round() as i64;
+    let cx = (i64::from(dst.x) + i64::from(dst.w) / 2)
+        .saturating_add((f64::from(canvas_w) * pos_x.clamp(-1024.0, 1024.0)).round() as i64);
+    let cy = (i64::from(dst.y) + i64::from(dst.h) / 2)
+        .saturating_add((f64::from(canvas_h) * pos_y.clamp(-1024.0, 1024.0)).round() as i64);
     // The full box the transform describes, unclamped -- it may start
     // negative or run past either edge, which is exactly what "moved off the
     // canvas" means.
@@ -1542,6 +1553,41 @@ mod tests {
         let gone = TransformParams { pos_x: 2.0, ..Default::default() };
         let (d, s) = transformed_dst_rect(dst, src, 100, 100, &gone, 100, 100);
         assert!(d.is_empty() && s.is_empty(), "wholly off-canvas has nothing to draw");
+    }
+
+    /// `pos_x`/`pos_y` are canvas fractions and a `transform` line takes any
+    /// finite `f32`, so they are the one transform field with no bound on the
+    /// way in -- `float()` (edith.rs) refuses only inf/NaN, and unlike
+    /// `scale`, which this function caps at a thousand canvas widths precisely
+    /// so its own arithmetic cannot overflow, the position was multiplied by
+    /// the canvas and added to `dst.x` unchecked. Rust's `as i64` saturates, so
+    /// a hostile 3e38 became `i64::MAX` and the *add* is what overflowed:
+    /// a panic on the compositing thread in a debug build, a silently wrapped
+    /// position in a release one. A placement pushed off the canvas is already
+    /// a legal answer (the two empty rects above); a position past the point
+    /// where the picture is long gone must give that same answer.
+    #[test]
+    fn a_transform_position_a_file_can_name_does_not_overflow_the_centre() {
+        let dst = Rect { x: 10, y: 20, w: 100, h: 100 };
+        let src = Rect { x: 0, y: 0, w: 100, h: 100 };
+        for (pos_x, pos_y) in [
+            (3.0e38f32, 0.0),
+            (-3.0e38, 0.0),
+            (0.0, 3.0e38),
+            (0.0, -3.0e38),
+            (3.0e38, 3.0e38),
+            (f32::MAX, f32::MIN),
+        ] {
+            let t = TransformParams { pos_x, pos_y, ..Default::default() };
+            let (d, s) = transformed_dst_rect(dst, src, 100, 100, &t, 200, 200);
+            // The answer is "nothing to draw" -- the box is a thousand canvas
+            // widths off screen -- not an overflow and not a wrapped position
+            // that lands back on the canvas.
+            assert!(
+                d.is_empty() && s.is_empty(),
+                "pos ({pos_x}, {pos_y}) gave {d:?} / {s:?} rather than an empty rect pair"
+            );
+        }
     }
 
     /// [`nearest_90_steps`] rounds to the closest quarter turn and folds a
