@@ -404,6 +404,73 @@ fn a_touched_timeline_is_still_encoded() {
     assert!(!line.starts_with("copy"), "an mp4 was copied: {line}");
 }
 
+/// The canvas gate, which is the gate that is missing: a project resized to a
+/// size its source is not comes out at the **project's** size, not at the
+/// source's frame size wearing a "copy" label.
+///
+/// The seat line is the symptom -- a user reads "copy · …" and hands over a
+/// file at the wrong resolution -- so this checks both halves: the file was
+/// encoded rather than copied, and it is the canvas that is in it.
+#[test]
+fn a_canvas_the_source_is_not_is_encoded_at_the_canvas() {
+    let source = asset("test_hevc.mkv");
+    let (source_meta, _) = Demuxer::open(&source).expect("open the fixture");
+    let (canvas, portrait) = ((960, 540), (720, 1280));
+    assert_ne!(
+        (canvas.0, canvas.1),
+        (source_meta.coded_width, source_meta.coded_height),
+        "the fixture is already this size: the gate is not exercised"
+    );
+
+    for (label, (w, h)) in [("a smaller canvas", canvas), ("a taller canvas", portrait)] {
+        let mut session = PlaybackSession::open(&source).expect("open");
+        assert!(session.set_resolution(w, h), "resize the project");
+        let out = Scratch::file("ve_copy_canvas", "mkv");
+        let line = export(&session, &out, Format::Hevc);
+        assert!(
+            !line.starts_with("copy"),
+            "{label} ({w}x{h}) was copied: {line}"
+        );
+        let (written, _) = Demuxer::open(&out).expect("reopen the export");
+        assert_eq!(
+            (written.coded_width, written.coded_height),
+            (w, h),
+            "{label} ({w}x{h}) came out at the source's size"
+        );
+    }
+}
+
+/// ...and the fit policy is read against the *canvas*, not on its own: a clip
+/// on a canvas the size of its own coded picture is the identity under every
+/// policy, `Fill` included, so `Fill` there is still the source's own blocks.
+/// A gate that refused every non-default policy would pass the test above and
+/// break this one.
+#[test]
+fn a_fit_policy_on_a_matching_canvas_is_still_the_identity() {
+    let source = asset("test_hevc.mkv");
+    for (label, fit) in [
+        ("fill", engine::scale::FitPolicy::Fill),
+        ("stretch", engine::scale::FitPolicy::Stretch),
+        ("centre", engine::scale::FitPolicy::Center),
+    ] {
+        let mut session = PlaybackSession::open(&source).expect("open");
+        assert!(session.set_fit(Lane::V1, 0, fit), "{label}: set the fit");
+        let out = Scratch::file("ve_copy_fit", "mkv");
+        let line = export(&session, &out, Format::Hevc);
+        assert!(
+            line.starts_with("copy · "),
+            "{label} on the source's own canvas was not copied: {line}"
+        );
+        let before = blocks(&source);
+        let after = blocks(&out);
+        assert_eq!(before.len(), after.len(), "{label}: block count");
+        assert!(
+            before.iter().zip(&after).all(|(a, b)| a.bytes == b.bytes),
+            "{label}: the blocks are not the source's own"
+        );
+    }
+}
+
 /// A cut that lands between two sync points is the case this path refuses: the
 /// head of the second region would need pictures that are not in the file, so
 /// the whole export goes back through the encoder rather than writing a file

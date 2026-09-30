@@ -1837,7 +1837,8 @@ pub fn exact_refusal(project: &Project, meta: &VideoMeta, settings: &ExportSetti
             settings.format.name()
         ),
         true => "the edit does not let this file copy the source exactly — a cut off a sync \
-                 point, a grade, a speed or a transform forces a re-encode"
+                 point, a grade, a speed, a transform or a canvas the source is not forces a \
+                 re-encode"
             .to_string(),
     })
 }
@@ -1854,6 +1855,16 @@ impl CopyPlan {
         };
         let entries = project.sources();
         let mut sources: Vec<Option<MkvDemuxer>> = (0..entries.len()).map(|_| None).collect();
+        // The DRAWN pair each source is displayed at, kept beside its demuxer:
+        // the fit gate below asks what a clip's policy does with this source's
+        // picture on this canvas, and the picture the encoder places is the
+        // drawn one ([`VideoMeta::width`]/`height`] -- the coded one with the
+        // file's turn and its pixel aspect already applied), not the pair the
+        // samples are stored at. A non-square source at its own displayed size
+        // is therefore the identity again, which is what a copy of one is: the
+        // aspect travels beside the track in the `Display*` elements rather
+        // than being resampled into it.
+        let mut drawn: Vec<Option<(u32, u32)>> = (0..entries.len()).map(|_| None).collect();
         let mut declared: Option<(Vec<u8>, ColorDescription, crate::demux::PixelAspect)> = None;
         let mut regions: Vec<CopyRegion> = Vec::new();
         let r_start = settings.range.map_or(0, |(s, _)| s);
@@ -1952,8 +1963,56 @@ impl CopyPlan {
                     return None;
                 }
                 sources[source] = Some(demuxer);
+                drawn[source] = Some((source_meta.width, source_meta.height));
             }
             let demuxer = sources.get_mut(source)?.as_mut()?;
+            // **The canvas gate** -- the condition this path was missing, and
+            // the one that decides whether a copy can state the project's size.
+            //
+            // A copied packet is the source's own coded picture; the file this
+            // export writes has to be the size the *project* is, and those are
+            // two different pairs held in two different fields:
+            //
+            //   * `meta.coded_width`/`coded_height` is the pair a *copied* track
+            //     declares -- what the samples are stored at, and what the check
+            //     above compares every source against. Only a *source* ever moves
+            //     it.
+            //   * `meta.width`/`meta.height` is the canvas -- what a person chose
+            //     with [`crate::playback::PlaybackSession::set_resolution`],
+            //     which writes those two and leaves the coded pair exactly where
+            //     it was. The encode door sizes everything from it
+            //     ([`Composer`]), so this is the size the file must have.
+            //
+            // ...and the two meet in the *drawn* pair: what this span is
+            // composed from is the source's picture as a decoder delivers it,
+            // turn and pixel aspect already applied
+            // ([`VideoMeta::width`]/`height`]), which is what the check below is
+            // asked about.
+            //
+            // A canvas that differs from the source's drawn pair means every
+            // span is a picture the export has to *place onto* that canvas, and
+            // there is no resampler on this path at all -- so a copy would ship
+            // the source's frame size under the project's name, with the seat
+            // line reading "copy · …" all the way out. That is the defect: not
+            // a wrong rate or a wrong codec but the wrong geometry, silently,
+            // on the one door that is supposed to be exact.
+            //
+            // Asked as a *placement* rather than as two separate conditions --
+            // is this clip's policy the identity for this source on this canvas
+            // -- because that is the one thing a condition has to mean here:
+            // [`fit_is_identity`] computes it from [`scale::fit_rect`] itself,
+            // so it holds for `Fill` on a canvas the size of the picture the
+            // source draws at (there is nothing to crop there) and refuses a
+            // canvas of another size under *every* policy, and a
+            // [`crate::scale::FitPolicy`] added later is judged by what it
+            // places rather than by being absent from a list here.
+            if !fit_is_identity(
+                drawn.get(source).copied().flatten()?,
+                (meta.width, meta.height),
+                project.composite_fit_at(span.start),
+            ) {
+                return None;
+            }
             // The window this span reads, in the blocks the whole engine counts
             // a source's frames in. It has to *be* whole groups of pictures: a
             // copy that began between two sync points would hand a decoder
@@ -2065,6 +2124,59 @@ impl CopyPlan {
         shared.progress.store(PROGRESS_SCALE, Ordering::Relaxed);
         Ok(())
     }
+}
+
+/// Whether `policy` places the picture `source` is DRAWN at onto this `canvas`
+/// without touching a sample: the whole picture, at the whole canvas, 1:1.
+///
+/// The 1:1 is the half the rects cannot state: a source scaled onto a canvas
+/// of another aspect is placed whole and cropped nowhere, which is a resize
+/// and not an identity -- so the pairs themselves are compared first.
+///
+/// The pair asked about is the **drawn** one ([`VideoMeta::width`]/`height`]),
+/// never the coded one: what the fit is composed against is what a decoder
+/// hands the canvas after the file's turn and its pixel aspect have been
+/// applied, so a 1440x1080 file with a 4:3 sample aspect is a 1920x1080
+/// picture, and a project at 1920x1080 is copying it exactly. The coded pair
+/// has its own question -- what a copied track *declares* -- and the coded-to-
+/// coded check in [`CopyPlan::of`] already asks that one; asking it twice, in
+/// the geometry's stead, refuses a copy main performs byte for byte.
+///
+/// Asked from [`scale::fit_rect`] -- the one function that *is* a fit policy's
+/// meaning -- rather than from the policy itself, which is what makes this
+/// canvas-aware twice over: `Fill` on a canvas the size of the source's own
+/// samples is the identity (nothing is cropped, because there is nothing to
+/// crop), while `Fit` on a canvas of another aspect is not (it bars or crops).
+/// A policy added to [`FitPolicy`] later is judged by what it places, not by
+/// being absent from a list here.
+fn fit_is_identity(
+    source: (u32, u32),
+    canvas: (u32, u32),
+    policy: crate::scale::FitPolicy,
+) -> bool {
+    // The pairs themselves: a picture is the canvas only when it *is* the
+    // canvas, and the rects below cannot say so -- a source scaled onto a
+    // canvas of another aspect is still placed whole and still cropped
+    // nowhere, which is a resize, and a resize is exactly what a copied packet
+    // cannot be.
+    if source != canvas {
+        return false;
+    }
+    let (placed, cropped) = crate::scale::fit_rect(source.0, source.1, canvas.0, canvas.1, policy);
+    placed
+        == crate::scale::Rect {
+            x: 0,
+            y: 0,
+            w: canvas.0,
+            h: canvas.1,
+        }
+        && cropped
+            == crate::scale::Rect {
+                x: 0,
+                y: 0,
+                w: source.0,
+                h: source.1,
+            }
 }
 
 /// The same lane, *decoded*: what a packet copy cannot carry comes out here as
