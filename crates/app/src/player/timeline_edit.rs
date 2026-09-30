@@ -1783,12 +1783,25 @@ impl Player {
             return;
         };
         let frames = self.fps.round().max(1.) as u32;
-        if let Some(session) = &mut self.session {
-            if !session.crossfade(lane, idx, frames) {
-                self.notify_user("NOTHING TO CROSSFADE — no neighbour end to end".into());
-            }
+        if self.session.is_none() {
+            return;
         }
-        cx.notify();
+        // The arm rides the write, and rides the join's own edges as well as
+        // the door's answer: `Project::crossfade` answers true for any two
+        // adjacent clips, so a crossfade already at the room the two clips
+        // offer writes the value the join already carried and still says yes.
+        // This door carries its own arm rather than leaning on the action
+        // table's list, which fires before any door is asked.
+        let before = self.transition_edges(lane, idx);
+        let took = match &mut self.session {
+            Some(session) => session.crossfade(lane, idx, frames),
+            None => false,
+        };
+        if took && self.transition_edges(lane, idx) != before {
+            self.mark_dirty();
+        } else if !took {
+            self.notify_user("NOTHING TO CROSSFADE — no neighbour end to end".into());
+        }
     }
 
     /// Dissolves the join the selection names, into or back out of it: two
@@ -1809,22 +1822,46 @@ impl Player {
             cx.notify();
             return;
         };
-        let Some(session) = &mut self.session else {
+        if self.session.is_none() {
             cx.notify();
             return;
-        };
-        let removing = session.transition_out_of(lane, idx) > 0;
+        }
+        let removing = self.transition_out_of_selected(lane, idx);
         let frames = if removing {
             0
         } else {
             self.fps.round().max(1.) as u32
         };
-        if !session.set_transition_out(lane, idx, frames) {
+        // The arm rides the write, and the join's own edges as well as the
+        // door's answer -- `set_transition_out`'s own rule
+        // ([`Player::crossfade_selected`]'s). This door carries its own arm
+        // rather than leaning on the action table's list, which fires before
+        // any door is asked: the clip-menu row
+        // ([`crate::ui::bench_stance`]) reaches this door directly, never
+        // through the table at all, and was armed by nothing.
+        let before = self.transition_edges(lane, idx);
+        let took = match &mut self.session {
+            Some(session) => session.set_transition_out(lane, idx, frames),
+            None => false,
+        };
+        if took && self.transition_edges(lane, idx) != before {
+            self.mark_dirty();
+            if removing {
+                self.notify_user("DISSOLVE REMOVED — the clips cut again".into());
+            }
+        } else if !took {
             self.notify_user("NOTHING TO DISSOLVE — no neighbour end to end".into());
-        } else if removing {
-            self.notify_user("DISSOLVE REMOVED — the clips cut again".into());
         }
         cx.notify();
+    }
+
+    /// The dissolve the join at `idx` of `lane` already carries, read before
+    /// the session is borrowed mutably: `0` for a lane, index or join that has
+    /// none, and `false` if there is no session to ask.
+    fn transition_out_of_selected(&self, lane: Lane, idx: usize) -> bool {
+        self.session
+            .as_ref()
+            .is_some_and(|session| session.transition_out_of(lane, idx) > 0)
     }
 
     /// Widens or narrows the transition the anchor already carries, one

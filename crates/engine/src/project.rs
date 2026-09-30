@@ -77,11 +77,11 @@ use crate::map::TimelineMap;
 use std::path::{Path, PathBuf};
 
 use crate::color::ColorParams;
-use crate::transform::TransformParams;
 use crate::eq::EqParams;
 use crate::limiter::{Limiter, db_to_linear};
 use crate::scale::FitPolicy;
 use crate::subtitle::{Cue as SubtitleCue, SubtitleTrack};
+use crate::transform::TransformParams;
 
 /// How far down a lane's own volume goes ([`Project::set_lane_gain_db`]).
 /// -60 dB is a thousandth of the amplitude -- a track that is out of the mix
@@ -1083,7 +1083,9 @@ impl Project {
             return Err(format!("color {bad} holds a value that is not a finite number").into());
         }
         if let Some(bad) = transform.iter().position(|p| !transform_finite(p)) {
-            return Err(format!("transform {bad} holds a value that is not a finite number").into());
+            return Err(
+                format!("transform {bad} holds a value that is not a finite number").into(),
+            );
         }
         if lanes.is_empty() {
             return Err("no lanes at all: that is not a project".into());
@@ -1148,7 +1150,9 @@ impl Project {
                     )
                     .into());
                 }
-                if c.transform.is_some_and(|i| usize::from(i) >= transform.len()) {
+                if c.transform
+                    .is_some_and(|i| usize::from(i) >= transform.len())
+                {
                     return Err(format!(
                         "{name} clip at {} names transform {} of {}",
                         c.start,
@@ -1483,13 +1487,13 @@ impl Project {
         let used: Vec<String> = handles(&self.lanes)
             .into_iter()
             .zip(&self.lanes)
-            .filter_map(
-                |(lane, data)| match data.clips.iter().filter(|c| c.source == idx).count() {
+            .filter_map(|(lane, data)| {
+                match data.clips.iter().filter(|c| c.source == idx).count() {
                     0 => None,
                     1 => Some(format!("{} (1 clip)", lane.label())),
                     n => Some(format!("{} ({n} clips)", lane.label())),
-                },
-            )
+                }
+            })
             .collect();
         if !used.is_empty() {
             return Err(format!("{name} still plays on {}", used.join(", ")).into());
@@ -1982,7 +1986,9 @@ impl Project {
             ..sub
         };
         if at.checked_add(sub.frames).is_none() {
-            return Err(format!("a placement at frame {at} runs past the last frame there is").into());
+            return Err(
+                format!("a placement at frame {at} runs past the last frame there is").into(),
+            );
         }
         if let Some(other) = self.lanes[i]
             .subs
@@ -2093,10 +2099,12 @@ impl Project {
             let at = subs.partition_point(|o| o.start < moved.start);
             subs.insert(at, moved);
             debug_assert!(subs_sorted_disjoint(subs));
-            debug_assert!(members
-                .clips
-                .iter()
-                .all(|&(l, _)| sorted_disjoint(&self.lanes[l].clips)));
+            debug_assert!(
+                members
+                    .clips
+                    .iter()
+                    .all(|&(l, _)| sorted_disjoint(&self.lanes[l].clips))
+            );
             return Ok(());
         }
         let moved = SubClip { start, ..sub };
@@ -2209,7 +2217,13 @@ impl Project {
         // clip's trim does: one delta, each member clamped to its own room.
         // No source table to grow by, which only tightens how far a member may
         // follow -- never whether it may.
-        self.follow_group(&members, &(i, idx), edge, i64::from(to) - i64::from(at), &[]);
+        self.follow_group(
+            &members,
+            &(i, idx),
+            edge,
+            i64::from(to) - i64::from(at),
+            &[],
+        );
         Ok(())
     }
 
@@ -2230,7 +2244,10 @@ impl Project {
         // what turns its two walls -- its own start, and its last cue -- into
         // frames. A rate that is not a rate leaves the window where it is.
         let frames_of = |us: i64| match fps.is_finite() && fps > 0.0 {
-            true => ((us as f64) * fps / 1e6).round().max(0.0).min(f64::from(u32::MAX)) as u32,
+            true => ((us as f64) * fps / 1e6)
+                .round()
+                .max(0.0)
+                .min(f64::from(u32::MAX)) as u32,
             false => 0,
         };
         Some(match edge {
@@ -2360,18 +2377,6 @@ impl Project {
         true
     }
 
-
-
-
-
-
-
-
-
-
-
-
-
     /// What the clip at `idx` of `lane` plays through, or `None` for one that
     /// plays flat (and for an index that is not there) -- what a feeder and an
     /// export ask before they build an [`crate::eq::EqState`].
@@ -2489,7 +2494,12 @@ impl Project {
     /// [`set_color`](Self::set_color)'s twin for [`Clip::transform`]: one undo
     /// step, `false` (and no history) for an index that is not there or a
     /// value that is not finite, and equal settings share a table entry.
-    pub fn set_transform(&mut self, lane: Lane, idx: usize, params: Option<TransformParams>) -> bool {
+    pub fn set_transform(
+        &mut self,
+        lane: Lane,
+        idx: usize,
+        params: Option<TransformParams>,
+    ) -> bool {
         self.write_transform(lane, idx, params, true)
     }
 
@@ -2608,7 +2618,11 @@ impl Project {
             let map = TimelineMap::piece((s.start, s.end()), (scale(s.start), scale(s.end())));
             let start = map.apply(s.start);
             let end = map.apply(s.end()).max(start.saturating_add(1));
-            SubClip { start, frames: end - start, ..s }
+            SubClip {
+                start,
+                frames: end - start,
+                ..s
+            }
         };
         for &(l, i) in &members.clips {
             let clips = &self.lanes[l].clips;
@@ -2686,8 +2700,7 @@ impl Project {
         let held = self.lane(lane).get(idx).copied()?;
         let (held_old, new) = (held.speed.as_f64(), speed.as_f64());
         for &(l, i) in members.clips.iter().chain(&members.subs) {
-            let (span, map) = match self
-                .lanes[l]
+            let (span, map) = match self.lanes[l]
                 .clips
                 .get(i)
                 .filter(|_| members.clips.contains(&(l, i)))
@@ -2700,10 +2713,7 @@ impl Project {
                     (c.start, c.start + c.frames()),
                     TimelineMap::piece(
                         (c.start, c.start + c.frames()),
-                        (
-                            c.start,
-                            c.start + (c.len() as f64 / new).round() as u32,
-                        ),
+                        (c.start, c.start + (c.len() as f64 / new).round() as u32),
                     ),
                 ),
                 // The caption's span, scaled about the held clip's head by
@@ -3235,7 +3245,10 @@ impl Project {
             .iter()
             .enumerate()
             .map(|(i, l)| {
-                on.contains(&i) && l.subs.iter().any(|s| s.start < timeline_frame && timeline_frame < s.end())
+                on.contains(&i)
+                    && l.subs
+                        .iter()
+                        .any(|s| s.start < timeline_frame && timeline_frame < s.end())
             })
             .collect();
         // The links the captions carry, read before the room is opened below
@@ -3288,8 +3301,10 @@ impl Project {
             }
         }
         let fresh: Vec<u32> = (0..distinct.len()).map(|_| self.new_link()).collect();
-        let right_of =
-            |link: Option<u32>| link.and_then(|id| distinct.iter().position(|&d| d == id)).map(|at| fresh[at]);
+        let right_of = |link: Option<u32>| {
+            link.and_then(|id| distinct.iter().position(|&d| d == id))
+                .map(|at| fresh[at])
+        };
         for (l, data) in self.lanes.iter_mut().enumerate() {
             if !cut_subs[l] {
                 continue;
@@ -3299,7 +3314,11 @@ impl Project {
                 .subs
                 .iter()
                 .position(|s| s.end() == timeline_frame)
-                .filter(|&idx| data.subs.get(idx + 1).is_some_and(|n| n.start == timeline_frame))
+                .filter(|&idx| {
+                    data.subs
+                        .get(idx + 1)
+                        .is_some_and(|n| n.start == timeline_frame)
+                })
             {
                 data.subs[idx].link = sub_orig[l];
                 data.subs[idx + 1].link = right_of(sub_orig[l]);
@@ -3308,7 +3327,9 @@ impl Project {
         for (data_i, data) in self.lanes.iter_mut().enumerate() {
             // The lanes this call was not scoped to are not cut, whatever their
             // own clips would allow.
-            let Some(idx) = splittable(&data.clips, timeline_frame).filter(|_| cut[data_i].is_some()) else {
+            let Some(idx) =
+                splittable(&data.clips, timeline_frame).filter(|_| cut[data_i].is_some())
+            else {
                 continue;
             };
             let mut tail = data.clips[idx];
@@ -3547,9 +3568,7 @@ impl Project {
                 } else {
                     "clip"
                 };
-                return Err(
-                    format!("there is no {what} {idx} on {}", lane.label()).into()
-                );
+                return Err(format!("there is no {what} {idx} on {}", lane.label()).into());
             }
         }
         let links: Vec<Option<u32>> = picks
@@ -3573,8 +3592,16 @@ impl Project {
         let labels = handles(&self.lanes);
         let mut per_lane: std::collections::HashMap<usize, u32> = std::collections::HashMap::new();
         for (li, data) in self.lanes.iter().enumerate() {
-            let n = data.clips.iter().filter(|c| c.link.is_some() && links.contains(&c.link)).count()
-                + data.subs.iter().filter(|s| s.link.is_some() && links.contains(&s.link)).count();
+            let n = data
+                .clips
+                .iter()
+                .filter(|c| c.link.is_some() && links.contains(&c.link))
+                .count()
+                + data
+                    .subs
+                    .iter()
+                    .filter(|s| s.link.is_some() && links.contains(&s.link))
+                    .count();
             if n > 0 {
                 per_lane.insert(li, n as u32);
             }
@@ -3866,13 +3893,9 @@ impl Project {
             clips.insert(at, clip);
         }
         debug_assert!(sorted_disjoint(&self.lanes[dest].clips));
-        debug_assert!(members
-            .clips
-            .iter()
-            .chain(&members.subs)
-            .all(|&(l, _)| {
-                sorted_disjoint(&self.lanes[l].clips) && subs_sorted_disjoint(&self.lanes[l].subs)
-            }));
+        debug_assert!(members.clips.iter().chain(&members.subs).all(|&(l, _)| {
+            sorted_disjoint(&self.lanes[l].clips) && subs_sorted_disjoint(&self.lanes[l].subs)
+        }));
         true
     }
 
@@ -4048,7 +4071,13 @@ impl Project {
             Edge::End => c.out_frame = c.in_frame + keep,
         }
         debug_assert!(sorted_disjoint(&self.lanes[held].clips));
-        self.follow_group(&members, &(held, idx), edge, i64::from(to) - i64::from(at), source_frames);
+        self.follow_group(
+            &members,
+            &(held, idx),
+            edge,
+            i64::from(to) - i64::from(at),
+            source_frames,
+        );
         true
     }
 
@@ -4144,13 +4173,7 @@ impl Project {
     /// [`trim_room`](Project::trim_room) for a clip the caller already holds by
     /// its lane's storage index: the one wall computation, asked for the clip
     /// itself and for each member a group trim carries.
-    fn clip_room(
-        &self,
-        l: usize,
-        i: usize,
-        edge: Edge,
-        source_frames: &[u32],
-    ) -> (u32, u32) {
+    fn clip_room(&self, l: usize, i: usize, edge: Edge, source_frames: &[u32]) -> (u32, u32) {
         let clips = &self.lanes[l].clips;
         let c = clips[i];
         let (lo, hi) = match edge {
@@ -4606,13 +4629,11 @@ impl Project {
         let mut report = GapSweep::default();
         let mut snapshot = false;
         for (start, frames) in gaps(self.lane(lane)).into_iter().rev() {
-            match self
-                .gap_take_scope(lane, start, frames)
-                .and_then(|scope| {
-                    let on = self.scoped(&scope)?;
-                    self.scope_holds_takes_whole(&on, start)?;
-                    Ok(on)
-                }) {
+            match self.gap_take_scope(lane, start, frames).and_then(|scope| {
+                let on = self.scoped(&scope)?;
+                self.scope_holds_takes_whole(&on, start)?;
+                Ok(on)
+            }) {
                 Ok(on) => {
                     if !snapshot {
                         self.snapshot();
@@ -5085,7 +5106,10 @@ impl Project {
     pub(crate) fn parts(&self) -> SweepParts {
         SweepParts(
             self.sources.len(),
-            self.lanes.iter().map(|l| (l.kind, l.clips.clone())).collect(),
+            self.lanes
+                .iter()
+                .map(|l| (l.kind, l.clips.clone()))
+                .collect(),
             self.lanes.iter().map(|l| l.subs.clone()).collect(),
             self.subtitles.clone(),
             self.settings.clone(),
@@ -5373,7 +5397,6 @@ impl Project {
         self.next_link = self.next_link.saturating_add(1);
         id
     }
-
 }
 
 /// The handle of every lane, in storage order -- the one definition of what
@@ -5451,7 +5474,9 @@ impl GapPlacement for SubClip {
 /// Index of the placement covering `frame`, or `None` for a gap or past the
 /// end. Binary search: the sorted-disjoint invariant is what makes it legal.
 fn at<T: GapPlacement>(items: &[T], frame: u32) -> Option<usize> {
-    let idx = items.partition_point(|item| item.start_frame() <= frame).checked_sub(1)?;
+    let idx = items
+        .partition_point(|item| item.start_frame() <= frame)
+        .checked_sub(1)?;
     (frame < items[idx].end_frame()).then_some(idx)
 }
 
@@ -5667,10 +5692,7 @@ fn sub_joinable(subs: &[SubClip], frame: u32) -> Option<usize> {
 fn sub_edge_room(subs: &[SubClip], idx: usize, edge: Edge) -> (u32, u32) {
     let s = &subs[idx];
     match edge {
-        Edge::Start => (
-            idx.checked_sub(1).map_or(0, |p| subs[p].end()),
-            s.end() - 1,
-        ),
+        Edge::Start => (idx.checked_sub(1).map_or(0, |p| subs[p].end()), s.end() - 1),
         Edge::End => (s.start + 1, subs.get(idx + 1).map_or(u32::MAX, |n| n.start)),
     }
 }
@@ -5737,11 +5759,9 @@ fn links_are_consistent(lanes: &[LaneData]) -> crate::Result<()> {
         for (i, s) in data.subs.iter().enumerate() {
             let Some(id) = s.link else { continue };
             if data.subs[..i].iter().any(|prev| prev.link == Some(id)) {
-                return Err(format!(
-                    "link {id} names two captions in the {} lane",
-                    lane.label()
-                )
-                .into());
+                return Err(
+                    format!("link {id} names two captions in the {} lane", lane.label()).into(),
+                );
             }
         }
     }
@@ -6090,7 +6110,11 @@ mod tests {
             (f.gain_at(5) - midpoint.sin()).abs() < 1e-6,
             "equal-power midpoint is sin(pi/4)"
         );
-        assert_eq!(f.gain_at(20), 1.0, "unchanged in the body, past either ramp");
+        assert_eq!(
+            f.gain_at(20),
+            1.0,
+            "unchanged in the body, past either ramp"
+        );
         // The fade-out is the same curve, mirrored, counting down from the
         // clip's end: unity at the frame the ramp starts, the same
         // equal-power midpoint, and -- since `total` itself is one past the
@@ -6114,14 +6138,8 @@ mod tests {
     fn crossfade_only_joins_adjacent_audio_clips() {
         let mut p = Project::single(FILE, 20);
         assert!(p.split(10));
-        assert!(
-            !p.crossfade(Lane::V1, 0, 5),
-            "video is not an audio lane"
-        );
-        assert!(
-            !p.crossfade(Lane::A1, 1, 5),
-            "there is no clip after idx 1"
-        );
+        assert!(!p.crossfade(Lane::V1, 0, 5), "video is not an audio lane");
+        assert!(!p.crossfade(Lane::A1, 1, 5), "there is no clip after idx 1");
         assert!(p.crossfade(Lane::A1, 0, 5), "the two halves are adjacent");
         let a = p.lane(Lane::A1);
         assert_eq!(a[0].fade_out, 5);
@@ -6148,10 +6166,16 @@ mod tests {
         assert!(p.set_fade_out(Lane::V1, 0, 15));
         assert!(p.split(5));
         let v = p.lane(Lane::V1);
-        assert_eq!(v[0].fade_in, 5, "the left half's kept fade-in, clamped to 5 frames");
+        assert_eq!(
+            v[0].fade_in, 5,
+            "the left half's kept fade-in, clamped to 5 frames"
+        );
         assert_eq!(v[0].fade_out, 0, "the cut edge it made starts flat");
         assert_eq!(v[1].fade_in, 0, "the cut edge it made starts flat");
-        assert_eq!(v[1].fade_out, 15, "the right half's kept fade-out, unclamped: 15 frames fit in 15");
+        assert_eq!(
+            v[1].fade_out, 15,
+            "the right half's kept fade-out, unclamped: 15 frames fit in 15"
+        );
     }
 
     /// [`Project::set_transition_out`] refuses a non-video lane, a clip with
@@ -6187,6 +6211,55 @@ mod tests {
         assert!(!p2.set_transition_out(v2, 0, 5), "a gap is not adjacent");
     }
 
+    /// The two transition doors' bool is the WEAK shape, stated here as
+    /// behaviour rather than left as something a front-end has to know: both
+    /// answer "these two clips are adjacent", and both snapshot and clamp --
+    /// so a write that lands the value the join already carries is still
+    /// reported as a write, and still spends an undo step. This is the fact
+    /// `Player::transition_edges`'s before/after comparison exists to cover,
+    /// and the fact a UI test can only reach through a source scan: driving
+    /// the front-end needs a window this crate has no harness for, so the
+    /// door's own answer is pinned here, where it can be run.
+    #[test]
+    fn a_transition_door_says_yes_to_a_write_that_moved_nothing() {
+        let mut p = Project::single(FILE, 20);
+        assert!(p.split(10), "two halves to join");
+        assert!(p.set_transition_out(Lane::V1, 0, 5), "the dissolve lands");
+        assert!(p.crossfade(Lane::A1, 0, 5), "the crossfade lands");
+        let history = p.history.len();
+
+        // The very same numbers again: nothing moved, and both doors report a
+        // write anyway.
+        assert!(
+            p.set_transition_out(Lane::V1, 0, 5),
+            "set_transition_out answers 'the clips are adjacent', not 'the \
+             dissolve moved', so a no-op reads as a write"
+        );
+        assert!(
+            p.crossfade(Lane::A1, 0, 5),
+            "crossfade answers the same way for the same reason"
+        );
+        assert_eq!(
+            p.history.len(),
+            history + 2,
+            "and each spent an undo step saying so, which is why the \
+             front-end compares the join's own edges before it arms"
+        );
+
+        // What did not move -- the comparison the front-end makes: both edges
+        // a crossfade writes, and the dissolve itself.
+        let a = p.lane(Lane::A1);
+        assert_eq!((a[0].fade_out, a[1].fade_in), (5, 5), "unchanged");
+        assert_eq!(p.transition_out_of(Lane::V1, 0), 5, "unchanged");
+
+        // And a refusal still answers no, so the arm is not simply always on:
+        // the last clip has no successor to dissolve into.
+        assert!(
+            !p.set_transition_out(Lane::V1, 1, 5),
+            "no neighbour end to end"
+        );
+    }
+
     /// The rule [`Project::write_split`] follows for [`Clip::transition_out`],
     /// same shape as [`a_split_clamps_the_kept_fade_and_zeroes_the_cut_edge`]:
     /// only the half that kept the clip's original *end* keeps the dissolve,
@@ -6203,7 +6276,10 @@ mod tests {
         p.lane_mut(Lane::V1).unwrap()[0].transition_out = 15;
         assert!(p.split(5));
         let v = p.lane(Lane::V1);
-        assert_eq!(v[0].transition_out, 0, "the cut edge it made has no successor");
+        assert_eq!(
+            v[0].transition_out, 0,
+            "the cut edge it made has no successor"
+        );
         assert_eq!(
             v[1].transition_out, 15,
             "the tail's kept dissolve, unclamped: 15 frames fit in 15"
@@ -6451,11 +6527,7 @@ mod tests {
         p.group_all(&[(Lane::V1, 0), (v2, 0)])
             .expect("the clips group");
         let minted = p.lane(Lane::V1)[0].link.expect("grouped");
-        assert_ne!(
-            minted,
-            1,
-            "the caption's id is not re-issued to clips"
-        );
+        assert_ne!(minted, 1, "the caption's id is not re-issued to clips");
         assert_eq!(
             p.sub_lane(Lane::new(LaneKind::Subtitle, 0))[0].link,
             Some(1),
@@ -6501,8 +6573,16 @@ mod tests {
             .expect("room for it");
         assert_eq!(p.lane(Lane::V1)[0].frames(), 45);
         let s = p.sub_lane(s1)[0];
-        assert_eq!((s.start, s.frames), (0, 45), "same words, half the timeline");
-        assert_eq!((s.in_us, s.out_us), (0, 90_000_000), "the window is untouched");
+        assert_eq!(
+            (s.start, s.frames),
+            (0, 45),
+            "same words, half the timeline"
+        );
+        assert_eq!(
+            (s.in_us, s.out_us),
+            (0, 90_000_000),
+            "the window is untouched"
+        );
         assert!(links_are_consistent(&p.lanes).is_ok());
         assert!(p.undo());
         assert_eq!(p.sub_lane(s1)[0].frames, 90, "one undo puts it back");
@@ -6518,8 +6598,16 @@ mod tests {
             .expect("room for it");
         assert_eq!(p.lane(Lane::V1)[0].frames(), 180);
         let s = p.sub_lane(s1)[0];
-        assert_eq!((s.start, s.frames), (60, 120), "the offset doubles with the clip");
-        assert_eq!(s.end(), p.lane(Lane::V1)[0].end(), "still ends with the clip");
+        assert_eq!(
+            (s.start, s.frames),
+            (60, 120),
+            "the offset doubles with the clip"
+        );
+        assert_eq!(
+            s.end(),
+            p.lane(Lane::V1)[0].end(),
+            "still ends with the clip"
+        );
 
         // A stretch that runs the caption into its neighbour is refused, by
         // lane and frame, and costs no undo step.
@@ -6534,7 +6622,9 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("the S1 caption at frame 0 would run to frame 180 and the next starts at 95"),
+            err.contains(
+                "the S1 caption at frame 0 would run to frame 180 and the next starts at 95"
+            ),
             "{err}"
         );
         assert_eq!(p.history.len(), history, "a refusal costs no undo step");
@@ -6669,7 +6759,8 @@ mod tests {
                 // An odd-length caption straddling the clip's tail edge: its
                 // own last frame lands past the held clip.
                 let c_start = len.saturating_sub(3);
-                p.place_sub(s1, c_start, caption(c_start, 7)).expect("placed");
+                p.place_sub(s1, c_start, caption(c_start, 7))
+                    .expect("placed");
                 p.group_all(&[(Lane::V1, 0), (s1, 0)]).expect("grouped");
                 let speed = Speed::from_permille(permille);
                 let last = c_start + 7 - 1;
@@ -6804,8 +6895,7 @@ mod tests {
             refused: None,
         };
         // A timeline of words alone: 60 frames of caption, no media clips.
-        let mut p = Project::single(FILE, 60)
-            .with_subtitles(vec![track()]);
+        let mut p = Project::single(FILE, 60).with_subtitles(vec![track()]);
         for l in [Lane::V1, Lane::A1] {
             while !p.lane(l).is_empty() {
                 p.lift(l, 0);
@@ -6871,16 +6961,31 @@ mod tests {
             .expect("the region speeds up");
         // Adjacent one-frame cues: both map to frame 5, and are forced apart.
         let spans = |p: &Project, lane: Lane| -> Vec<(u32, u32)> {
-            p.sub_lane(lane).iter().map(|s| (s.start, s.frames)).collect()
+            p.sub_lane(lane)
+                .iter()
+                .map(|s| (s.start, s.frames))
+                .collect()
         };
-        assert_eq!(spans(&p, lanes[0]), [(5, 1), (6, 1)], "one frame each, in order");
+        assert_eq!(
+            spans(&p, lanes[0]),
+            [(5, 1), (6, 1)],
+            "one frame each, in order"
+        );
         // The three-frame pair: [5, 8) and [8, 11) map to [3, 5) and [4, 6),
         // and the walk pushes the second to where the first ends.
-        assert_eq!(spans(&p, lanes[1]), [(3, 1), (4, 2)], "forced apart, kept in order");
+        assert_eq!(
+            spans(&p, lanes[1]),
+            [(3, 1), (4, 2)],
+            "forced apart, kept in order"
+        );
         // The last cue of the region ends exactly where the region now does
         // (frame 15), and the caption behind it lands on that same frame:
         // touching, never overlapping.
-        assert_eq!(spans(&p, lanes[2]), [(14, 1), (15, 15)], "the cue ends with the region");
+        assert_eq!(
+            spans(&p, lanes[2]),
+            [(14, 1), (15, 15)],
+            "the cue ends with the region"
+        );
         for &lane in &lanes {
             assert!(subs_sorted_disjoint(&p.lanes[p.index(lane).unwrap()].subs));
         }
@@ -6968,17 +7073,24 @@ mod tests {
         // Too few, one lane twice, and an index that is not there: words, no
         // snapshot.
         let history = p.history.len();
-        assert!(p.group_all(&[]).unwrap_err().to_string().contains("two placements or more"));
-        assert!(p
-            .group_all(&[(Lane::V1, 0), (Lane::V1, 0)])
-            .unwrap_err()
-            .to_string()
-            .contains("V1 is picked twice"));
-        assert!(p
-            .group_all(&[(Lane::V1, 0), (s1, 9)])
-            .unwrap_err()
-            .to_string()
-            .contains("no subtitle 9"));
+        assert!(
+            p.group_all(&[])
+                .unwrap_err()
+                .to_string()
+                .contains("two placements or more")
+        );
+        assert!(
+            p.group_all(&[(Lane::V1, 0), (Lane::V1, 0)])
+                .unwrap_err()
+                .to_string()
+                .contains("V1 is picked twice")
+        );
+        assert!(
+            p.group_all(&[(Lane::V1, 0), (s1, 9)])
+                .unwrap_err()
+                .to_string()
+                .contains("no subtitle 9")
+        );
         assert_eq!(p.history.len(), history, "refusals cost no undo step");
 
         // The group: the picture, the layer, and the caption -- and the sound
@@ -6987,7 +7099,12 @@ mod tests {
             .expect("three picks, three lanes");
         let id = p.lane(Lane::V1)[0].link.expect("grouped");
         for lane in [Lane::V1, Lane::A1, v2] {
-            assert_eq!(p.lane(lane)[0].link, Some(id), "{} rides along", lane.label());
+            assert_eq!(
+                p.lane(lane)[0].link,
+                Some(id),
+                "{} rides along",
+                lane.label()
+            );
         }
         assert_eq!(p.sub_lane(s1)[0].link, Some(id), "the caption is a member");
         assert_eq!(p.sub_lane(s1)[0].frames, 6, "its own span, kept");
@@ -7053,7 +7170,11 @@ mod tests {
             .to_string();
         assert!(err.contains("one placement per lane"), "{err}");
         assert_eq!(p.history.len(), history, "the refusal costs no undo step");
-        assert_eq!(p.lane(Lane::V1)[0].link, v1_link, "the first group untouched");
+        assert_eq!(
+            p.lane(Lane::V1)[0].link,
+            v1_link,
+            "the first group untouched"
+        );
         assert_eq!(p.lane(v2)[0].link, v2_link, "the second group untouched");
         assert!(links_are_consistent(&p.lanes).is_ok());
     }
@@ -7138,8 +7259,15 @@ mod tests {
         // By the picture or by the caption, the same whole-group delete.
         assert!(p.delete_sub_in(s1, 0));
         assert!(p.lane(Lane::V1).is_empty(), "the take's span left V1");
-        assert!(p.sub_lane(s1).is_empty(), "the caption's span left its lane");
-        assert_eq!(p.lane(v2)[0].start, 10, "a lane the group does not touch stays");
+        assert!(
+            p.sub_lane(s1).is_empty(),
+            "the caption's span left its lane"
+        );
+        assert_eq!(
+            p.lane(v2)[0].start,
+            10,
+            "a lane the group does not touch stays"
+        );
         assert!(links_are_consistent(&p.lanes).is_ok());
         assert!(p.undo(), "one step puts the group back");
         assert_eq!(p.sub_lane(s1)[0].start, 2, "offsets and all");
@@ -7175,8 +7303,10 @@ mod tests {
         let group = || {
             let mut p = Project::single(FILE, 90).with_subtitles(vec![track()]);
             let s1 = p.add_lane(LaneKind::Subtitle);
-            p.place_sub(s1, 30, caption(30, 30)).expect("the group's caption");
-            p.place_sub(s1, 90, caption(90, 30)).expect("the caption behind");
+            p.place_sub(s1, 30, caption(30, 30))
+                .expect("the group's caption");
+            p.place_sub(s1, 90, caption(90, 30))
+                .expect("the caption behind");
             p.group_all(&[(Lane::V1, 0), (s1, 0)]).expect("grouped");
             (p, s1)
         };
@@ -7192,7 +7322,11 @@ mod tests {
             "the caption's lane closed by its own span: the follower slid up"
         );
         assert!(p.undo(), "one step");
-        assert_eq!(p.sub_lane(s1).len(), 2, "both captions back, offsets and all");
+        assert_eq!(
+            p.sub_lane(s1).len(),
+            2,
+            "both captions back, offsets and all"
+        );
 
         // By the sound: the same whole-group delete.
         let (mut p, s1) = group();
@@ -7204,7 +7338,11 @@ mod tests {
         let (mut p, s1) = group();
         assert!(p.delete_sub_in(s1, 0));
         assert!(p.lane(Lane::V1).is_empty() && p.lane(Lane::A1).is_empty());
-        assert_eq!(p.sub_lane(s1)[0].start, 60, "closed from the caption's own door");
+        assert_eq!(
+            p.sub_lane(s1)[0].start,
+            60,
+            "closed from the caption's own door"
+        );
         assert!(links_are_consistent(&p.lanes).is_ok());
 
         // A caption lifted ALONE still leaves its gap: the ungrouped law,
@@ -7213,7 +7351,8 @@ mod tests {
         assert!(p.ungroup(s1, 0), "the caption stands alone");
         assert!(p.lift_sub(s1, 0));
         assert_eq!(
-            p.sub_lane(s1)[0].start, 90,
+            p.sub_lane(s1)[0].start,
+            90,
             "the follower stayed put: a lone caption's lift is a gap"
         );
     }
@@ -7248,7 +7387,11 @@ mod tests {
         // Same lane, further along: everyone moves by the same eight frames.
         p.move_sub(s1, 0, s1, 10).expect("room for all of it");
         assert_eq!(p.sub_lane(s1)[0].start, 10);
-        assert_eq!(p.lane(Lane::V1)[0].start, 8, "the clip follows by the delta");
+        assert_eq!(
+            p.lane(Lane::V1)[0].start,
+            8,
+            "the clip follows by the delta"
+        );
         assert!(links_are_consistent(&p.lanes).is_ok());
 
         // ...and an ungrouped caption is the caption it always was.
@@ -7257,11 +7400,12 @@ mod tests {
         let s1 = q.add_lane(LaneKind::Subtitle);
         q.place_sub(s1, 0, caption(0, 4)).expect("placed");
         q.place_sub(s1, 5, caption(5, 4)).expect("placed");
-        assert!(q
-            .move_sub(s1, 0, s1, 3)
-            .unwrap_err()
-            .to_string()
-            .contains("already covers"));
+        assert!(
+            q.move_sub(s1, 0, s1, 3)
+                .unwrap_err()
+                .to_string()
+                .contains("already covers")
+        );
     }
 
     /// A trim carries a group's caption by the same delta as its clips, clamped
@@ -7478,8 +7622,14 @@ mod tests {
         // The clipboard's clamp lives in `PlaybackSession::paste_at`.
         assert!(p.paste(1_000, PASTED));
         assert_eq!(p.timeline_frames(), 1_002);
-        assert_eq!(p.lane(Lane::V1).last().expect("the pasted clip").start, 1_000);
-        assert_eq!(p.lane(Lane::A1).last().expect("its other half").start, 1_000);
+        assert_eq!(
+            p.lane(Lane::V1).last().expect("the pasted clip").start,
+            1_000
+        );
+        assert_eq!(
+            p.lane(Lane::A1).last().expect("its other half").start,
+            1_000
+        );
 
         // An empty clip is the one thing refused, and it pushes no history.
         let mut p = three();
@@ -7681,7 +7831,8 @@ mod tests {
         assert!(p.lift(Lane::V1, 0));
         let (sources, lanes, eq, color, _transform) = p.without_orphan_sources();
         assert_eq!(sources.len(), 1, "source 0 survives an emptied timeline");
-        let back = Project::from_parts(sources, lanes, eq, color, Vec::new()).expect("an empty project loads");
+        let back = Project::from_parts(sources, lanes, eq, color, Vec::new())
+            .expect("an empty project loads");
         assert_eq!(back.timeline_frames(), 0);
         assert_eq!(back.lanes().len(), 2, "and it kept its lanes");
     }
@@ -7789,7 +7940,10 @@ mod tests {
         assert!(p.lane(v2).is_empty());
 
         // Refusals cost nothing: sound placed alone is `place`'s door.
-        assert!(!p.place_take(Lane::A1, 0, clip(0, 100, 102, 0)), "audio lane");
+        assert!(
+            !p.place_take(Lane::A1, 0, clip(0, 100, 102, 0)),
+            "audio lane"
+        );
         assert!(!p.place_take(v2, 0, clip(0, 7, 7, 0)), "empty clip");
         assert!(
             !p.place_take(Lane::new(LaneKind::Video, 9), 0, clip(0, 1, 2, 0)),
@@ -7855,7 +8009,8 @@ mod tests {
             (LaneKind::Video, vec![clip(0, 0, 3, 0), clip(10, 3, 6, 0)]),
             (LaneKind::Audio, vec![clip(0, 0, 3, 0)]),
         ];
-        let mut p = Project::from_parts(sources, lanes, vec![], vec![], Vec::new()).expect("valid parts");
+        let mut p =
+            Project::from_parts(sources, lanes, vec![], vec![], Vec::new()).expect("valid parts");
         let before = shape(&p);
 
         // Into the gap, exactly where it was let go -- nothing else moves.
@@ -8167,7 +8322,10 @@ mod tests {
         assert_eq!(p.gap_at(v, 8), None);
         assert_eq!(p.gap_at(v, 100), None);
 
-        assert!(p.place(v, 12, clip(12, 0, 2, 0)), "a second clip at [12,14)");
+        assert!(
+            p.place(v, 12, clip(12, 0, 2, 0)),
+            "a second clip at [12,14)"
+        );
         // Between the two: the gap [8,12).
         assert_eq!(p.gap_at(v, 8), Some((8, 4)));
         assert_eq!(p.gap_at(v, 11), Some((8, 4)));
@@ -8177,7 +8335,11 @@ mod tests {
             p.place(v, 8, clip(8, 0, 4, 0)),
             "fills [8,12) exactly, meeting both neighbours"
         );
-        assert_eq!(p.gap_at(v, 8), None, "adjacent clips leave no frame to name a gap");
+        assert_eq!(
+            p.gap_at(v, 8),
+            None,
+            "adjacent clips leave no frame to name a gap"
+        );
         assert_eq!(p.gap_at(v, 11), None);
     }
 
@@ -8200,7 +8362,11 @@ mod tests {
         assert_eq!((start, len), (0, 5));
         assert!(p.cut_regions(&[(start, len)], &[v]).is_ok());
         assert_eq!(p.lane(v)[0].start, 0, "the clip slid back to close the gap");
-        assert_eq!(p.lane(a)[0].start, 0, "the untouched lane's clip did not move");
+        assert_eq!(
+            p.lane(a)[0].start,
+            0,
+            "the untouched lane's clip did not move"
+        );
         assert!(p.undo(), "one press undoes the whole close");
         assert_eq!(shape(&p), before, "back to exactly where it was");
     }
@@ -8238,11 +8404,21 @@ mod tests {
         let sources = vec![Source::new(FILE, 0)];
         let video = vec![linked(0, 0, 3, 1), linked(5, 5, 9, 3)];
         let audio = vec![linked(0, 0, 3, 1), linked(5, 5, 9, 3)];
-        let mut p = Project::from_parts(sources, two(video, audio), Vec::new(), Vec::new(), Vec::new())
-            .expect("valid parts");
+        let mut p = Project::from_parts(
+            sources,
+            two(video, audio),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("valid parts");
         let before = shape(&p);
         assert_eq!(p.gap_at(Lane::V1, 3), Some((3, 2)));
-        assert_eq!(p.gap_at(Lane::A1, 3), Some((3, 2)), "the same stretch is empty on A1 too");
+        assert_eq!(
+            p.gap_at(Lane::A1, 3),
+            Some((3, 2)),
+            "the same stretch is empty on A1 too"
+        );
 
         let scope = p
             .gap_take_scope(Lane::V1, 3, 2)
@@ -8252,7 +8428,11 @@ mod tests {
 
         assert!(p.cut_regions(&[(3, 2)], &scope).is_ok());
         assert_eq!(p.lane(Lane::V1)[1].start, 3, "V1's far half slid back");
-        assert_eq!(p.lane(Lane::A1)[1].start, 3, "A1's far half rode along, in sync");
+        assert_eq!(
+            p.lane(Lane::A1)[1].start,
+            3,
+            "A1's far half rode along, in sync"
+        );
         assert!(p.undo(), "one press undoes the whole close");
         assert_eq!(shape(&p), before, "back to exactly where it was");
     }
@@ -8270,8 +8450,14 @@ mod tests {
         // shorter than V1's [3,5) -- a legal offset-preserving group, and
         // still one take.
         let audio = vec![linked(0, 0, 3, 1), linked(4, 5, 9, 3)];
-        let p = Project::from_parts(sources, two(video, audio), Vec::new(), Vec::new(), Vec::new())
-            .expect("valid parts");
+        let p = Project::from_parts(
+            sources,
+            two(video, audio),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("valid parts");
         assert_eq!(p.gap_at(Lane::V1, 3), Some((3, 2)));
         assert_eq!(p.gap_at(Lane::A1, 3), Some((3, 1)), "a shorter gap on A1");
 
@@ -8293,10 +8479,20 @@ mod tests {
         // A1 plays through the whole span as one continuous clip, sharing
         // V1's first-half link: nothing empty at frame 3 there at all.
         let audio = vec![linked(0, 0, 9, 1)];
-        let p = Project::from_parts(sources, two(video, audio), Vec::new(), Vec::new(), Vec::new())
-            .expect("valid parts");
+        let p = Project::from_parts(
+            sources,
+            two(video, audio),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("valid parts");
         assert_eq!(p.gap_at(Lane::V1, 3), Some((3, 2)));
-        assert_eq!(p.gap_at(Lane::A1, 3), None, "A1 plays through, no gap there");
+        assert_eq!(
+            p.gap_at(Lane::A1, 3),
+            None,
+            "A1 plays through, no gap there"
+        );
 
         let err = p
             .gap_take_scope(Lane::V1, 3, 2)
@@ -8305,7 +8501,6 @@ mod tests {
         assert!(err.contains("A1"), "{err}");
         assert!(err.contains("detach"), "{err}");
     }
-
 
     /// The sweep is the single-gap close repeated on one lane, but measured once
     /// and applied from the right. The differing gap lengths here expose a
@@ -8342,14 +8537,20 @@ mod tests {
         let v = p.add_lane(LaneKind::Video);
         let history = p.history.len();
         let report = p.close_all_gaps_on_lane(v).expect("empty lane exists");
-        assert_eq!(report, GapSweep::default(), "an empty lane has no bounded gap");
+        assert_eq!(
+            report,
+            GapSweep::default(),
+            "an empty lane has no bounded gap"
+        );
         assert_eq!(p.history.len(), history, "no undo step for a no-op");
 
         let mut p = Project::single(FILE, 9);
         let v = p.add_lane(LaneKind::Video);
         assert!(p.place(v, 5, clip(5, 0, 3, 0)));
         let before = shape(&p);
-        let report = p.close_all_gaps_on_lane(v).expect("single clip lane exists");
+        let report = p
+            .close_all_gaps_on_lane(v)
+            .expect("single clip lane exists");
         assert_eq!(report.closed, 1, "the head gap closes");
         assert_eq!(p.lane(v), &[clip(0, 0, 3, 0)]);
         assert!(p.undo());
@@ -8366,7 +8567,11 @@ mod tests {
         assert!(p.place(v, 0, clip(0, 0, 3, 0)));
         let history = p.history.len();
         let report = p.close_all_gaps_on_lane(v).expect("tail-only lane exists");
-        assert_eq!(report, GapSweep::default(), "the open-ended tail is not closed");
+        assert_eq!(
+            report,
+            GapSweep::default(),
+            "the open-ended tail is not closed"
+        );
         assert_eq!(p.lane(v), &[clip(0, 0, 3, 0)]);
         assert_eq!(p.history.len(), history);
     }
@@ -8377,19 +8582,16 @@ mod tests {
     #[test]
     fn close_all_gaps_on_one_lane_partially_closes_linked_takes_and_reports_skips() {
         let sources = vec![Source::new(FILE, 0)];
-        let video = vec![
-            linked(0, 0, 2, 1),
-            linked(4, 4, 6, 2),
-            clip(9, 9, 11, 0),
-        ];
-        let audio = vec![
-            linked(0, 0, 2, 1),
-            linked(4, 4, 6, 2),
-            clip(8, 8, 11, 0),
-        ];
-        let mut p =
-            Project::from_parts(sources, two(video, audio), Vec::new(), Vec::new(), Vec::new())
-            .expect("valid parts");
+        let video = vec![linked(0, 0, 2, 1), linked(4, 4, 6, 2), clip(9, 9, 11, 0)];
+        let audio = vec![linked(0, 0, 2, 1), linked(4, 4, 6, 2), clip(8, 8, 11, 0)];
+        let mut p = Project::from_parts(
+            sources,
+            two(video, audio),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("valid parts");
         let before = shape(&p);
 
         let report = p.close_all_gaps_on_lane(Lane::V1).expect("V1 exists");
@@ -8397,12 +8599,27 @@ mod tests {
         assert_eq!(report.skipped.len(), 1);
         assert_eq!(report.skipped[0].start, 6);
         assert!(report.skipped[0].reason.contains("A1"), "{report:?}");
-        assert!(report.skipped[0].reason.contains("out of sync"), "{report:?}");
+        assert!(
+            report.skipped[0].reason.contains("out of sync"),
+            "{report:?}"
+        );
 
         assert_eq!(p.lane(Lane::V1)[1].start, 2, "the matched take moved");
-        assert_eq!(p.lane(Lane::A1)[1].start, 2, "and its other half stayed in sync");
-        assert_eq!(p.lane(Lane::V1)[2].start, 7, "the skipped later gap remains");
-        assert_eq!(p.lane(Lane::A1)[2].start, 6, "A1's shorter gap remains shorter");
+        assert_eq!(
+            p.lane(Lane::A1)[1].start,
+            2,
+            "and its other half stayed in sync"
+        );
+        assert_eq!(
+            p.lane(Lane::V1)[2].start,
+            7,
+            "the skipped later gap remains"
+        );
+        assert_eq!(
+            p.lane(Lane::A1)[2].start,
+            6,
+            "A1's shorter gap remains shorter"
+        );
         links_are_consistent(&p.lanes).expect("every linked take that moved stayed whole");
         assert!(p.undo(), "one undo restores every closed gap");
         assert_eq!(shape(&p), before);
@@ -8415,18 +8632,28 @@ mod tests {
     fn gap_at_finds_the_hole_a_caption_frame_sits_in() {
         let mut p = Project::single(FILE, 20).with_subtitles(vec![subtitle_track()]);
         let s = p.add_lane(LaneKind::Subtitle);
-        assert_eq!(p.gap_at(s, 0), None, "an empty subtitle lane has nothing to close");
+        assert_eq!(
+            p.gap_at(s, 0),
+            None,
+            "an empty subtitle lane has nothing to close"
+        );
 
-        p.place_sub(s, 5, caption(0, 3)).expect("single cue at [5,8)");
+        p.place_sub(s, 5, caption(0, 3))
+            .expect("single cue at [5,8)");
         assert_eq!(p.gap_at(s, 0), Some((0, 5)), "head gap before first cue");
         assert_eq!(p.gap_at(s, 4), Some((0, 5)));
         assert_eq!(p.gap_at(s, 5), None, "inside the cue");
         assert_eq!(p.gap_at(s, 8), None, "tail after a single cue is not a gap");
 
-        p.place_sub(s, 12, caption(0, 2)).expect("second cue at [12,14)");
+        p.place_sub(s, 12, caption(0, 2))
+            .expect("second cue at [12,14)");
         assert_eq!(p.gap_at(s, 8), Some((8, 4)), "gap between cues");
         assert_eq!(p.gap_at(s, 11), Some((8, 4)));
-        assert_eq!(p.gap_at(s, 14), None, "tail after the last cue is still open-ended");
+        assert_eq!(
+            p.gap_at(s, 14),
+            None,
+            "tail after the last cue is still open-ended"
+        );
     }
 
     /// Closing a caption gap ripples the subtitle lane only. It is not a media
@@ -8435,13 +8662,15 @@ mod tests {
     fn closing_a_caption_gap_ripples_no_video_or_audio_clips() {
         let mut p = Project::single(FILE, 20).with_subtitles(vec![subtitle_track()]);
         let s = p.add_lane(LaneKind::Subtitle);
-        p.place_sub(s, 5, caption(0, 3)).expect("single cue at [5,8)");
+        p.place_sub(s, 5, caption(0, 3))
+            .expect("single cue at [5,8)");
         let before_clips = shape(&p);
         let before_subs = p.sub_lane(s).to_vec();
 
         let (start, len) = p.gap_at(s, 0).expect("gap before the caption");
         assert_eq!((start, len), (0, 5));
-        p.cut_regions(&[(start, len)], &[s]).expect("caption lane gap closes");
+        p.cut_regions(&[(start, len)], &[s])
+            .expect("caption lane gap closes");
 
         assert_eq!(shape(&p), before_clips, "media lanes did not move");
         assert_eq!(p.sub_lane(s), &[caption(0, 3)], "caption slid left");
@@ -8458,13 +8687,20 @@ mod tests {
         let mut p = Project::single(FILE, 30).with_subtitles(vec![subtitle_track()]);
         let s = p.add_lane(LaneKind::Subtitle);
         let history = p.history.len();
-        let report = p.close_all_gaps_on_lane(s).expect("empty subtitle lane exists");
-        assert_eq!(report, GapSweep::default(), "empty subtitle lane has no bounded gap");
+        let report = p
+            .close_all_gaps_on_lane(s)
+            .expect("empty subtitle lane exists");
+        assert_eq!(
+            report,
+            GapSweep::default(),
+            "empty subtitle lane has no bounded gap"
+        );
         assert_eq!(p.history.len(), history, "empty sweep is not an undo step");
 
         p.place_sub(s, 2, caption(0, 2)).expect("head gap [0,2)");
         p.place_sub(s, 7, caption(0, 2)).expect("middle gap [4,7)");
-        p.place_sub(s, 14, caption(0, 1)).expect("middle gap [9,14), tail after 15");
+        p.place_sub(s, 14, caption(0, 1))
+            .expect("middle gap [9,14), tail after 15");
         let before = p.sub_lane(s).to_vec();
 
         assert_eq!(p.gap_count(s), 3);
@@ -8481,7 +8717,8 @@ mod tests {
 
         let mut p = Project::single(FILE, 30).with_subtitles(vec![subtitle_track()]);
         let s = p.add_lane(LaneKind::Subtitle);
-        p.place_sub(s, 0, caption(0, 3)).expect("contiguous at the head");
+        p.place_sub(s, 0, caption(0, 3))
+            .expect("contiguous at the head");
         let history = p.history.len();
         let report = p.close_all_gaps_on_lane(s).expect("subtitle lane exists");
         assert_eq!(report, GapSweep::default(), "the open tail is not closed");
@@ -8789,7 +9026,8 @@ mod tests {
             [0, 1]
         );
         // ...and what comes out is loadable, with the same timeline.
-        let reloaded = Project::from_parts(sources, lanes, eq, color, Vec::new()).expect("from_parts");
+        let reloaded =
+            Project::from_parts(sources, lanes, eq, color, Vec::new()).expect("from_parts");
         assert_eq!(reloaded.timeline_frames(), p.timeline_frames());
         assert_eq!(reloaded.sources().len(), 2);
     }
@@ -9279,8 +9517,14 @@ mod tests {
     fn from_parts_has_no_history_and_checks_the_invariants() {
         let (sources, lanes, eq, color, _transform) = three().without_orphan_sources();
         let (video, audio) = (lanes[0].1.clone(), lanes[1].1.clone());
-        let mut p = Project::from_parts(sources.clone(), lanes.clone(), eq.clone(), color.clone(), Vec::new())
-            .expect("valid parts");
+        let mut p = Project::from_parts(
+            sources.clone(),
+            lanes.clone(),
+            eq.clone(),
+            color.clone(),
+            Vec::new(),
+        )
+        .expect("valid parts");
         assert_eq!(p.clips(), three().clips());
         assert!(!p.undo(), "a loaded project has nothing to undo");
         assert!(p.split(4), "...and is editable from there");
@@ -9308,7 +9552,16 @@ mod tests {
             )
             .is_ok()
         );
-        assert!(Project::from_parts(sources.clone(), Vec::new(), Vec::new(), Vec::new(), Vec::new()).is_err());
+        assert!(
+            Project::from_parts(
+                sources.clone(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new()
+            )
+            .is_err()
+        );
         let bad: [Vec<Clip>; 5] = [
             vec![clip(0, 0, 3, 1)],                   // source that is not there
             vec![clip(0, 3, 3, 0)],                   // empty clip
@@ -9449,7 +9702,8 @@ mod tests {
         assert_eq!(loaded.color_of(Lane::V1, 0), Some(&grade_at(1)));
 
         // Group ids survive a load, and the next split gets a fresh one.
-        let mut p = Project::from_parts(sources, lanes, eq, color, Vec::new()).expect("valid parts");
+        let mut p =
+            Project::from_parts(sources, lanes, eq, color, Vec::new()).expect("valid parts");
         assert!(p.split(4));
         assert!(p.clips().iter().all(|c| c.link.is_some()));
     }
@@ -9487,9 +9741,15 @@ mod tests {
 
         // The door: a doubled id inside one lane, refused by name.
         let err = |video: Vec<Clip>, audio: Vec<Clip>| {
-            Project::from_parts(sources.clone(), two(video, audio), Vec::new(), Vec::new(), Vec::new())
-                .expect_err("refused")
-                .to_string()
+            Project::from_parts(
+                sources.clone(),
+                two(video, audio),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect_err("refused")
+            .to_string()
         };
         assert!(
             err(vec![linked(0, 0, 3, 7), linked(3, 3, 5, 7)], Vec::new())
@@ -10197,7 +10457,8 @@ mod tests {
             lanes.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
             [LaneKind::Video, LaneKind::Video, LaneKind::Audio]
         );
-        let back = Project::from_parts(sources, lanes, eq, color, Vec::new()).expect("three lanes load");
+        let back =
+            Project::from_parts(sources, lanes, eq, color, Vec::new()).expect("three lanes load");
         assert_eq!(back.lanes(), p.lanes());
         assert_eq!(shape(&back), shape(&p), "the same lane is still on top");
 
@@ -10215,7 +10476,10 @@ mod tests {
         let mut p = Project::single(FILE, 9);
         let take = p.clips()[0].link.expect("a fresh project is one take");
         let v2 = p.add_lane(LaneKind::Video);
-        assert!(p.place(v2, 0, clip(0, 0, 9, 0)), "a placement joins no group");
+        assert!(
+            p.place(v2, 0, clip(0, 0, 9, 0)),
+            "a placement joins no group"
+        );
         assert!(p.split(4));
         let side = |p: &Project, i: usize| -> Vec<Option<u32>> {
             p.lanes().into_iter().map(|l| p.lane(l)[i].link).collect()
@@ -10345,7 +10609,8 @@ mod tests {
         assert_eq!(lanes[2].1, p.lane(v2), "V2's clips are written");
         assert!(lanes[3].1.is_empty(), "and the empty A2 is still a lane");
         // ...and all four load again as the same four.
-        let back = Project::from_parts(sources, lanes, eq, color, Vec::new()).expect("four lanes load");
+        let back =
+            Project::from_parts(sources, lanes, eq, color, Vec::new()).expect("four lanes load");
         assert_eq!(back.lanes(), p.lanes());
         assert_eq!(back.lane(a2), p.lane(a2));
 
@@ -10438,7 +10703,8 @@ mod tests {
             (LaneKind::Video, vec![clip(10, 5, 15, 1)]),
             (LaneKind::Audio, vec![clip(0, 0, 30, 0)]),
         ];
-        let p = Project::from_parts(sources, lanes, vec![], vec![], Vec::new()).expect("valid parts");
+        let p =
+            Project::from_parts(sources, lanes, vec![], vec![], Vec::new()).expect("valid parts");
         assert_eq!(
             p.composite_spans_from(0),
             vec![
@@ -10483,7 +10749,8 @@ mod tests {
             (LaneKind::Video, vec![clip(10, 0, 10, 1)]),
             (LaneKind::Audio, vec![clip(0, 0, 30, 0)]),
         ];
-        let p = Project::from_parts(sources, holed, vec![], vec![], Vec::new()).expect("valid parts");
+        let p =
+            Project::from_parts(sources, holed, vec![], vec![], Vec::new()).expect("valid parts");
         assert_eq!(
             p.composite_spans_from(0),
             vec![
@@ -10531,7 +10798,8 @@ mod tests {
             (LaneKind::Audio, vec![clip(15, 0, 15, 1)]),
             (LaneKind::Audio, Vec::new()),
         ];
-        let p = Project::from_parts(sources, lanes, vec![], vec![], Vec::new()).expect("valid parts");
+        let p =
+            Project::from_parts(sources, lanes, vec![], vec![], Vec::new()).expect("valid parts");
         let lists = p.audio_segments_from(0, FPS);
         assert_eq!(lists.len(), 2, "the empty lane is not mixed in");
         assert_eq!(lists[0], p.segments_from(0, FPS), "A1 is unchanged");
@@ -10554,41 +10822,47 @@ mod tests {
         assert_eq!(p.audio_segments_from(0, FPS), vec![vec![(None, 0.0, 1.0)]]);
     }
 
-/// D4: removing a subtitle column used to clear the whole undo history,
-/// because a placement names its track by index into the palette and the
-/// reindex left every later entry naming the wrong one. The entry holds the
-/// palette beside the lanes now, so the reindex undoes with it.
-#[test]
-fn removing_a_subtitle_column_undoes_with_its_reindex() {
-    let track = |label: &str| SubtitleTrack {
-        path: FILE.into(),
-        track: None,
-        language: "eng".into(),
-        name: String::new(),
-        label: label.into(),
-        cues: Vec::new(),
-        bitmap: false,
-        refused: None,
-    };
-    let mut p = Project::single(FILE, 300)
-        .with_subtitles(vec![track("one"), track("two"), track("three")]);
-    assert_eq!(p.subtitles().len(), 3);
-    let before = p.parts();
-    let palette = p.subtitles().to_vec();
-    // Column 0 goes, which renumbers the two behind it.
-    p.remove_subtitles(0).expect("a column with nothing on it");
-    assert_eq!(p.subtitles().len(), 2);
-    assert_eq!(p.subtitles()[0].label, "two");
-    assert!(p.undo(), "the removal is a step like any other cut");
-    // The palette itself, and not only what `parts` happens to compare: this
-    // is the assertion that cannot go vacuous if the restore below it ever
-    // leaves a field of it behind.
-    assert_eq!(p.subtitles(), palette.as_slice(), "the palette itself, back");
-    assert_eq!(p.parts(), before, "the palette and the lanes, both back");
-    assert!(p.redo(), "and forward again");
-    assert_eq!(p.subtitles().len(), 2, "the column goes again");
-    assert_eq!(p.subtitles()[0].label, "two");
-    assert_ne!(p.subtitles(), palette.as_slice(), "and it is not back");
-}
-
+    /// D4: removing a subtitle column used to clear the whole undo history,
+    /// because a placement names its track by index into the palette and the
+    /// reindex left every later entry naming the wrong one. The entry holds the
+    /// palette beside the lanes now, so the reindex undoes with it.
+    #[test]
+    fn removing_a_subtitle_column_undoes_with_its_reindex() {
+        let track = |label: &str| SubtitleTrack {
+            path: FILE.into(),
+            track: None,
+            language: "eng".into(),
+            name: String::new(),
+            label: label.into(),
+            cues: Vec::new(),
+            bitmap: false,
+            refused: None,
+        };
+        let mut p = Project::single(FILE, 300).with_subtitles(vec![
+            track("one"),
+            track("two"),
+            track("three"),
+        ]);
+        assert_eq!(p.subtitles().len(), 3);
+        let before = p.parts();
+        let palette = p.subtitles().to_vec();
+        // Column 0 goes, which renumbers the two behind it.
+        p.remove_subtitles(0).expect("a column with nothing on it");
+        assert_eq!(p.subtitles().len(), 2);
+        assert_eq!(p.subtitles()[0].label, "two");
+        assert!(p.undo(), "the removal is a step like any other cut");
+        // The palette itself, and not only what `parts` happens to compare: this
+        // is the assertion that cannot go vacuous if the restore below it ever
+        // leaves a field of it behind.
+        assert_eq!(
+            p.subtitles(),
+            palette.as_slice(),
+            "the palette itself, back"
+        );
+        assert_eq!(p.parts(), before, "the palette and the lanes, both back");
+        assert!(p.redo(), "and forward again");
+        assert_eq!(p.subtitles().len(), 2, "the column goes again");
+        assert_eq!(p.subtitles()[0].label, "two");
+        assert_ne!(p.subtitles(), palette.as_slice(), "and it is not back");
+    }
 }

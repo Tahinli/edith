@@ -1823,6 +1823,90 @@ fn a_transition_step_or_a_retyped_number_arms_only_what_moved() {
     );
 }
 
+/// The three doors the action table used to arm on their behalf. The table
+/// fires *before* any door is asked, so an entry for a door that can refuse
+/// dirties an untouched project -- and the dissolve is the sharpest case,
+/// because the clip-menu row reaches [`Player::dissolve_selected`] directly
+/// ([`crate::ui::bench_stance`]) and so was armed by nothing at all while the
+/// key chord beside it armed on every press, refused or not.
+///
+/// The engine half of the premise is not a scan but a run: see
+/// `engine::project::tests::a_transition_door_says_yes_to_a_write_that_moved_nothing`,
+/// which drives `set_transition_out` and `crossfade` and shows they answer
+/// `true` for a write that changed nothing. That is why these three need a
+/// before/after comparison and not just the door's own answer.
+#[test]
+fn the_action_table_arms_nothing_a_door_answers_for_itself() {
+    // The two transition doors, in the same shape as the duration row's.
+    for (name, door) in [
+        ("crossfade_selected", "session.crossfade(lane, idx, frames)"),
+        (
+            "dissolve_selected",
+            "session.set_transition_out(lane, idx, frames)",
+        ),
+    ] {
+        let body = fn_body(name);
+        assert!(body.contains(door), "{name} no longer goes through {door}");
+        let gate = "if took && self.transition_edges(lane, idx) != before {";
+        let arm = body
+            .split_once(gate)
+            .unwrap_or_else(|| panic!("{name} no longer arms on the write that took"))
+            .1;
+        assert!(
+            arm.contains("mark_dirty()"),
+            "{name} arms outside its gate, so a crossfade already at the room \
+             the two clips offer would dirty an unchanged project"
+        );
+        let before = body.split_once(gate).unwrap().0;
+        assert!(
+            !before.contains("mark_dirty()"),
+            "{name} still arms ahead of the comparison"
+        );
+    }
+    // ...and the two actions are out of the table's list, or the key path is
+    // armed twice over and the menu path not at all.
+    let act = fn_body("act");
+    let listed = act
+        .split_once("if matches!(")
+        .unwrap()
+        .1
+        .split_once(") {")
+        .unwrap()
+        .0;
+    for gone in ["ActionId::Crossfade", "ActionId::Dissolve"] {
+        assert!(
+            !listed.contains(gone),
+            "{gone} is back in the pre-arm list, so the key path arms before \
+             the door is asked while the clip-menu row arms by nothing"
+        );
+    }
+    // The track removal, whose two callers are a key and a header button.
+    let body = fn_body("remove_lane");
+    let arm = body
+        .split_once("Some(Ok(())) => {")
+        .expect("the track door no longer answers which arm means the track went")
+        .1;
+    assert!(
+        arm.contains("mark_dirty()"),
+        "a track that went arms nothing, so the removal is invisible to \
+         autosave, the unsaved ghost and the close question"
+    );
+    // ...and the header door no longer arms on its own before asking, which
+    // would be a second arm for the same step.
+    let lane_act = fn_body("act_lane");
+    assert!(
+        !lane_act.contains("mark_dirty"),
+        "act_lane arms before remove_lane, so a track still holding clips \
+         refuses with the unsaved ghost already lit"
+    );
+    assert!(
+        lane_act.contains(
+            "ActionId::RemoveVideoLane | ActionId::RemoveAudioLane => self.remove_lane(lane, cx)"
+        ),
+        "act_lane no longer routes the header's remove to the one armed door"
+    );
+}
+
 /// [`crate::ui::dock_stance::transition_of`]: the dock's duration row
 /// appears only for an anchor that actually carries a dissolve or a
 /// crossfade, and the room it offers is capped at what the successor clip
