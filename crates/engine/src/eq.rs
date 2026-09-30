@@ -91,16 +91,46 @@ struct Coeffs {
     a2: f32,
 }
 
+/// How far a band's gain may go either side of flat, in dB: the bound
+/// [`Coeffs::new`] holds the one field [`Band`]'s doc says is clamped for it.
+///
+/// Deliberately far past anything a card offers -- the UI's own limit is a
+/// card decision, not a project one, and a project is allowed to be more
+/// extreme than the control that set it -- but bounded all the same, because
+/// the gain is not a magnitude anywhere else in this struct: it enters as
+/// `a = 10^(gain_db/40)`, and `a` drives the peak section's pole radius toward
+/// the unit circle. A few hundred dB puts the poles *on* it, and a section
+/// whose poles are on the unit circle does not decay, it rings -- growing the
+/// samples without limit until the device clamp and the export's own [-1, 1]
+/// turn the whole clip into a full-scale square. Past 10_000 dB `a` is not even
+/// finite any more and the coefficients come out `inf`.
+///
+/// 40 dB is the ceiling because it is where the arithmetic stays comfortably
+/// inside f32 (a linear gain of 100) while being louder than any boost a
+/// mixing console offers. Clamped, not refused: the struct's contract is that
+/// a deserializer may hand this over unchecked, and a project that says
+/// +400 dB gets +40 dB rather than a project that will not open.
+pub const MAX_BAND_GAIN_DB: f32 = 40.0;
+/// ...and the floor, the same distance the other way. Symmetric because a
+/// wide cut and a wide boost are the same filter run at two gains.
+pub const MIN_BAND_GAIN_DB: f32 = -40.0;
+
 impl Coeffs {
     /// Cookbook peaking/shelving section for `band` at `sample_rate`.
     fn new(band: &Band, sample_rate: u32) -> Self {
         // A frequency at or past Nyquist has no cookbook answer (sin(w0) folds),
-        // and Q of zero divides by zero: clamp rather than reject, the caller's
-        // value came out of a text file.
+        // Q of zero divides by zero, and a gain of a few hundred dB walks the
+        // peak's poles onto the unit circle: clamp rather than reject, the
+        // caller's value came out of a text file. The gain is the fourth of
+        // these four clamps, and the one the struct's own doc promised.
         let fs = f64::from(sample_rate.max(1));
         let f0 = f64::from(band.freq_hz).clamp(1.0, fs * 0.49);
         let q = f64::from(band.q).clamp(0.05, 40.0);
-        let a = 10f64.powf(f64::from(band.gain_db) / 40.0);
+        let gain = f64::from(band.gain_db).clamp(
+            f64::from(MIN_BAND_GAIN_DB),
+            f64::from(MAX_BAND_GAIN_DB),
+        );
+        let a = 10f64.powf(gain / 40.0);
         let w0 = 2.0 * PI * f0 / fs;
         let (sin_w0, cos_w0) = (w0.sin(), w0.cos());
         let alpha = sin_w0 / (2.0 * q);
@@ -425,6 +455,82 @@ mod tests {
             assert_eq!(
                 pair[1], 0.0,
                 "frame {frame}: right channel picked up {pair:?}"
+            );
+        }
+    }
+
+    /// A gain a `.edith` line can name, and the pole radius that comes of it.
+    ///
+    /// The invariant [`Band`] documents is that out-of-range values are clamped
+    /// when the coefficients are built, so a deserializer may hand one over
+    /// unchecked -- and three of the four fields were clamped at
+    /// [`Coeffs::new`] while `gain_db` was not. `a = 10^(gain_db/40)` feeds the
+    /// peak's `sqrt(a2/a0)` pole radius straight to 1 as the gain grows, and at
+    /// a few hundred dB the f32 rounding puts the poles *exactly* on the unit
+    /// circle: a marginally-stable section that rings for seconds, blowing up
+    /// the samples until the device clamp turns the whole clip into a
+    /// full-scale square (in monitoring and in the export alike). This is an
+    /// arithmetic claim about the pole radius, not an audibility claim: nothing
+    /// here says what the filter sounds like, only that it is stable.
+    ///
+    /// The poles are solved off the normalized coefficients, so this is the
+    /// filter the sample loop actually runs rather than a restatement of the
+    /// formula that built it.
+    #[test]
+    fn a_gain_a_file_can_name_leaves_the_poles_strictly_inside_the_unit_circle() {
+        for gain in [12.0f32, 40.0, 100.0, 200.0, 400.0, 10_000.0, -200.0, -10_000.0] {
+            let c = super::Coeffs::new(
+                &Band {
+                    freq_hz: 1000.0,
+                    gain_db: gain,
+                    q: 1.0,
+                    kind: BandKind::Peak,
+                },
+                FS,
+            );
+            // The poles of `z^2 + a1 z + a2`, solved: the number the sample
+            // loop's homogeneous solution is actually made of, and the only
+            // place a section's stability is decided. `radius` is the larger
+            // of the two, so a section is stable exactly when it is `< 1`.
+            let (a1, a2) = (c.a1 as f64, c.a2 as f64);
+            let disc = (a1 * a1 - 4.0 * a2).max(0.0).sqrt();
+            let radius = [(-a1 + disc) / 2.0, (-a1 - disc) / 2.0]
+                .into_iter()
+                .fold(0.0f64, |m, r| m.max(r.abs()));
+            assert!(
+                radius < 0.999,
+                "gain {gain} dB gives a pole radius of {radius:.9} -- \
+                 the section rings instead of decaying"
+            );
+            assert!(
+                c.b0.is_finite() && c.b1.is_finite() && c.b2.is_finite(),
+                "gain {gain} dB produced non-finite coefficients {c:?}"
+            );
+        }
+    }
+
+    /// The same claim about the samples rather than the coefficients: a
+    /// full-scale burst through a band whose gain a file named, with the gain
+    /// far past the card's own 12 dB limit, has to come out at the gain the
+    /// clamp ceiling *is*. +40 dB is a linear gain of 100, so a full-scale
+    /// burst peaks at ~100 and that is the answer, not a fault; anything past
+    /// it is the section ringing rather than a band being loud. Pre-fix, 200 dB
+    /// and 400 dB are past it by orders of magnitude.
+    #[test]
+    fn a_gain_a_file_can_name_does_not_blow_the_samples_up() {
+        for gain in [40.0f32, 100.0, 200.0, 400.0, 10_000.0] {
+            let mut out = vec![0.0f32; 48_000 * 2];
+            // A full-scale 1 kHz burst for a tenth of a second, then silence:
+            // whatever the section rings into is what shows up after it.
+            for i in 0..4_800 * 2 {
+                out[i] = (TAU * 1000.0 * (i / 2) as f32 / FS as f32).sin();
+            }
+            EqState::new(&peak(1000.0, gain, 1.0), FS, 2).process(&mut out);
+            let peak = out.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            assert!(
+                peak.is_finite() && peak < 200.0,
+                "gain {gain} dB sent a full-scale burst to {peak}: the clamp ceiling is \
+                 +40 dB, a linear gain of 100, and 200x that is a section ringing, not a band"
             );
         }
     }
