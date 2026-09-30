@@ -92,6 +92,53 @@ pub const MIN_GAIN_DB: f32 = -60.0;
 /// a mix bus can take before the limiter is doing all the work.
 pub const MAX_GAIN_DB: f32 = 12.0;
 
+/// The longest `[in_us, out_us)` window a [`SubClip`] may show, in
+/// microseconds: **30 days** of track.
+///
+/// A window is a stretch of *source media*, not of the timeline, so its width
+/// is the length of the recording a caption was cut from -- and that is not
+/// bounded by anything a day. A two-day conference stream, a lecture archive, a
+/// long interview session: all produce a palette row whose `out_us` is tens of
+/// hours, and a ceiling that refuses those refuses the user's own media back at
+/// them. The value is therefore "past any recording", and nothing more
+/// sophisticated: 30 days is a round number four orders of magnitude above the
+/// longest thing anybody captions and three orders below the point where a
+/// typed number becomes plausible as a duration at all.
+///
+/// What it has to clear, concretely, and the honest arithmetic for each:
+///
+/// - **The i64 multiply in [`SubClip::window_at`].** `window_us() * into`,
+///   where `into` is a `u32` frame offset, so at most 4.29e9. It is a
+///   `saturating_mul`, so this is not about safety -- saturation is total --
+///   but about the result still *meaning* something: 30 days x 4.29e9 is
+///   1.1e22, which does NOT fit an i64. So the multiply saturates for any
+///   window above `i64::MAX / u32::MAX` = 2.1e9 us (~35 minutes), and 30 days
+///   is 1200x past that. The value is then finite but the proportion is not
+///   exact, and `set_window`'s clamp on the answer keeps the result inside the
+///   window rather than trusting it. That is the real precision cost, and it
+///   is why this is not "unlimited": past 35 minutes the cut degrades, past
+///   this it has degraded to "the far end of the window".
+/// - **`sub_lane_cues`'s f64 mapping.** `(t - in_us) as f64 * per`, where `per`
+///   is `frames / fps * 1e6 / window_us`. Here f64 exactness genuinely does
+///   apply: an i64 is exact in f64 to 2^53 = 9.0e15, and 30 days is 2.6e12 --
+///   about 3.5 orders of magnitude inside it, so the cue mapping is exact and
+///   not merely close.
+/// - **Nothing else.** There is no allocation, no index and no length derived
+///   from a window, so a wider value costs no memory. The ceiling is a claim
+///   about meaning, not about resource.
+///
+/// Past it, the value is not a caption any project holds -- a `.edith` a hand
+/// edited (or a hostile actor wrote) reaches this with a line the never-empty
+/// check at the parser cannot see past, because `out_us > in_us` says the
+/// window is *open* and never how wide it is. Every door -- the parse,
+/// [`Project::with_subs`], [`Project::place_sub`] -- refuses such a line by
+/// name, next to every other range check a `.edith` line has to pass. Every
+/// *composer* instead clamps to it through [`set_window`], which is the only
+/// function that writes a window; a trim that ran out of window stops at the
+/// window's end rather than failing, exactly like the frame walls it already
+/// has.
+pub const MAX_WINDOW_US: i64 = 30 * 24 * 60 * 60 * 1_000_000;
+
 /// How fast a clip plays, in **thousandths of real time**: 1000 is the speed it
 /// was shot at, 2000 twice that, 500 half. An integer and not an `f32` for
 /// [`Clip`]'s sake -- a clip is `Copy` *and* `Eq`, a float is neither exactly
@@ -636,9 +683,10 @@ impl SubClip {
     }
 
     /// How much of its track it shows, in microseconds; `>= 1` by the
-    /// never-empty invariant.
+    /// never-empty invariant, and never more than [`MAX_WINDOW_US`] for one
+    /// that came through a door.
     pub fn window_us(&self) -> i64 {
-        self.out_us - self.in_us
+        self.out_us.saturating_sub(self.in_us)
     }
 
     /// Where in its window the timeline frame `frame` falls, in microseconds --
@@ -649,9 +697,19 @@ impl SubClip {
     /// before `frame` is the fraction of the microseconds before it. That is
     /// what lets a subtitle be cut by [`clear`]'s and [`open_room`]'s twins
     /// without either of them learning an fps.
+    ///
+    /// Total arithmetic, and clamped to the window it is cutting: the
+    /// `saturating_mul` is what a `SubClip` built by a caller rather than a
+    /// door gets (a hand-built one, a unit test, a future door that forgot the
+    /// bound) -- a wrapped window would put a caption's clock *before* its own
+    /// start, and the split that produced it would then hand back two halves
+    /// whose windows do not meet. The clamp is the never-empty invariant
+    /// restated: the answer is a point inside `[in_us, out_us]` or nothing.
     fn window_at(&self, frame: u32) -> i64 {
         let into = i64::from(frame.saturating_sub(self.start));
-        self.in_us + self.window_us() * into / i64::from(self.frames.max(1))
+        let window = self.window_us().max(0);
+        let at = window.saturating_mul(into) / i64::from(self.frames.max(1));
+        self.in_us.saturating_add(at.min(window))
     }
 }
 
@@ -1703,6 +1761,20 @@ impl Project {
                     )
                     .into());
                 }
+                // The width of that window, which the check above cannot see:
+                // [`edith`](crate::edith) asks the same question at the parse
+                // and this repeats it, because `with_subs` is the door a
+                // hand-built `Project` comes through and a caller is not more
+                // trustworthy than a file.
+                if s.out_us - s.in_us > MAX_WINDOW_US {
+                    return Err(format!(
+                        "{name} caption at {} is a {}us window, past the {}us a caption can hold",
+                        s.start,
+                        s.out_us - s.in_us,
+                        MAX_WINDOW_US
+                    )
+                    .into());
+                }
                 if s.track >= palette {
                     return Err(format!(
                         "{name} caption at {} names subtitle track {} of {palette}",
@@ -1969,6 +2041,19 @@ impl Project {
             )
             .into());
         }
+        // The width of that window, which the check above cannot see: the same
+        // bound the two file doors hold a placement to
+        // ([`edith`](crate::edith)'s parse and [`with_subs`]), asked here
+        // because this is the door a *dragged* caption comes through and the
+        // hand that dragged it builds the `SubClip` itself.
+        if sub.out_us - sub.in_us > MAX_WINDOW_US {
+            return Err(format!(
+                "that placement is a {}us window, past the {}us a caption can hold",
+                sub.out_us - sub.in_us,
+                MAX_WINDOW_US
+            )
+            .into());
+        }
         if sub.track >= self.subtitles.len() {
             return Err(format!(
                 "it names subtitle track {} of {}",
@@ -2197,17 +2282,31 @@ impl Project {
             // The words that stay are the words that were there, so the window
             // moves with the head -- a trim, not a slip.
             Edge::Start => {
-                // Clamped to a window that is still a window: the walls above
-                // are frames and the rounding between the two clocks is not
-                // exact, and neither is a caller's hand-built placement.
-                s.in_us = (s.in_us + us_of(i64::from(to) - i64::from(s.start), fps))
-                    .clamp(0, s.out_us - 1);
+                // The head moves and the words that stay are the words that
+                // were there, so `in_us` follows it -- a trim, not a slip.
+                // Falling `in_us` makes the window *wider* (the ceiling bounds
+                // a difference), which is the half of this nothing here can
+                // see: `set_window` is what puts the width back inside.
+                set_window(
+                    s,
+                    s.in_us
+                        .saturating_add(us_of(i64::from(to) - i64::from(s.start), fps)),
+                    s.out_us,
+                );
                 s.frames = s.end() - to;
                 s.start = to;
             }
             Edge::End => {
-                s.out_us =
-                    (s.out_us + us_of(i64::from(to) - i64::from(s.end()), fps)).max(s.in_us + 1);
+                // ...and the tail, for [`set_window`]'s reason: the End room
+                // is walled at the ceiling, but `set_window` is what holds it
+                // for every other composer too, including this one when a
+                // caller hands `trim_sub` a `to` past its own room.
+                set_window(
+                    s,
+                    s.in_us,
+                    s.out_us
+                        .saturating_add(us_of(i64::from(to) - i64::from(s.end()), fps)),
+                );
                 s.frames = to - s.start;
             }
         }
@@ -2267,10 +2366,17 @@ impl Project {
                     .get(s.track)
                     .and_then(|t| t.cues.iter().map(|c| c.end_us).max())
                     .unwrap_or(s.out_us);
+                // ...and never past [`grow_window`]'s ceiling, which is the
+                // wall that matters here: a front-end asks this to draw the
+                // drag, then trims to whatever it is told. An engine that
+                // offers room its own trim would refuse is a drag that snaps
+                // back at the end of the gesture -- so the room stops where
+                // the window stops, and the two agree by construction.
+                let wall_us = track_end.min(s.in_us.saturating_add(MAX_WINDOW_US));
                 (
                     s.start + 1,
                     s.start
-                        .saturating_add(frames_of(track_end - s.in_us).max(1))
+                        .saturating_add(frames_of((wall_us - s.in_us).max(1)))
                         .min(subs.get(idx + 1).map_or(u32::MAX, |n| n.start)),
                 )
             }
@@ -3395,7 +3501,15 @@ impl Project {
         for (data, sub) in self.lanes.iter_mut().zip(join_subs) {
             if let Some(idx) = sub {
                 data.subs[idx].frames += data.subs[idx + 1].frames;
-                data.subs[idx].out_us = data.subs[idx + 1].out_us;
+                // The left half's `in_us`, the right half's `out_us` -- which
+                // is the SUM of two legal widths, because `sub_joinable` has
+                // just established that the two halves are consecutive in the
+                // *source* (`next.in_us == subs[idx].out_us`). Neither half
+                // broke the ceiling and the whole does, so this is a composer
+                // a per-arm check on one writer could never have found:
+                // `set_window` is what makes the closed set closed.
+                let (in_us, out_us) = (data.subs[idx].in_us, data.subs[idx + 1].out_us);
+                set_window(&mut data.subs[idx], in_us, out_us);
                 data.subs.remove(idx + 1);
                 debug_assert!(subs_sorted_disjoint(&data.subs));
             }
@@ -5608,6 +5722,56 @@ fn us_of(frames: i64, fps: f64) -> i64 {
     }
 }
 
+/// **The one function in this file that writes a caption's window.** Every
+/// composer -- a trim, a split, a ripple, a group follow, a rejoin -- routes
+/// through it, and the invariant it holds is total:
+///
+/// ```text
+/// 0 <= in_us  and  in_us < out_us  and  out_us - in_us <= MAX_WINDOW_US
+/// ```
+///
+/// which is the never-empty invariant plus the width ceiling, restated as one
+/// shape both ends of it come from. Note that the ceiling bounds a
+/// **difference**, which is why a per-arm check is not enough and this is:
+///
+/// - Growing `out_us` (a tail trim) makes the width larger, so the *upper*
+///   wall bites.
+/// - Falling `in_us` (a head trim) makes the width larger too, from the other
+///   side -- so bounding `in_us` alone, which is what a head trim's own clamp
+///   (`in_us <= out_us - 1`) does, says nothing at all about the ceiling.
+/// - A rejoin takes the left half's `in_us` and the right half's `out_us`, and
+///   the two halves are consecutive in the *source* (that is what
+///   [`sub_joinable`] requires), so the joined width is the **sum** of two
+///   legal widths. Each half passes its own door; the whole does not.
+///
+/// Three rounds of review each found one more composer this way, so the
+/// function is the fix rather than any single call site: clamping a new
+/// caller into shape is a two-line change, and forgetting one is silent.
+/// `every_window_write_goes_through_set_window` (in the tests below) is the
+/// other half of that promise -- it scans the file and fails if a write
+/// appears anywhere else.
+///
+/// **Why it clamps where the doors refuse.** The doors -- the parser,
+/// [`Project::with_subs`], [`Project::place_sub`] -- see a value on the way
+/// IN, from a file or a foreign caller, where nobody was mid-gesture, so a
+/// value that wide is named and refused rather than quietly changed. Every
+/// composer below is an edit a person is watching happen, so the same value is
+/// clamped to the end of the window: a drag that stops, exactly like the frame
+/// walls these trims already apply.
+fn set_window(s: &mut SubClip, in_us: i64, out_us: i64) {
+    let in_us = in_us.max(0);
+    // The `+ 1` is the never-empty invariant: the window is open, always, so a
+    // composer that would otherwise clamp it shut lands on one microsecond.
+    let out_us = out_us.clamp(in_us + 1, in_us.saturating_add(MAX_WINDOW_US));
+    s.in_us = in_us;
+    s.out_us = out_us;
+    debug_assert!(
+        s.in_us >= 0 && s.out_us > s.in_us && s.out_us - s.in_us <= MAX_WINDOW_US,
+        "set_window left an illegal window: {:?}",
+        (s.in_us, s.out_us)
+    );
+}
+
 /// [`clear`] for a subtitle lane: removes the timeline frames `[start, end)`,
 /// dropping what is inside the hole, splitting what straddles it and trimming
 /// what overlaps an edge. The windows follow the cut by proportion
@@ -5620,24 +5784,31 @@ fn sub_clear(subs: &mut Vec<SubClip>, start: u32, end: u32) {
             continue;
         }
         if s.start < start {
-            out.push(SubClip {
+            let cut = s.window_at(start);
+            let mut head = SubClip {
                 frames: start - s.start,
-                out_us: s.window_at(start),
                 // Both pieces lose the group id, for [`clear`]'s reason: one
                 // id on two boxes of one lane is the one thing it may never
                 // mean.
                 link: None,
                 ..s
-            });
+            };
+            // `window_at` already answers inside the window, and `set_window`
+            // is the shape that says so once, for every composer, rather than
+            // leaving each of them to re-derive it.
+            set_window(&mut head, s.in_us, cut);
+            out.push(head);
         }
         if s.end() > end {
-            out.push(SubClip {
+            let cut = s.window_at(end);
+            let mut tail = SubClip {
                 start: end,
                 frames: s.end() - end,
-                in_us: s.window_at(end),
                 link: None,
                 ..s
-            });
+            };
+            set_window(&mut tail, cut, s.out_us);
+            out.push(tail);
         }
     }
     *subs = out;
@@ -5651,22 +5822,21 @@ fn sub_open_room(subs: &mut Vec<SubClip>, at: u32, len: u32) {
     if let Some(idx) = subs.iter().position(|s| s.start < at && at < s.end()) {
         let s = subs[idx];
         let cut = s.window_at(at);
-        subs[idx] = SubClip {
+        let mut head = SubClip {
             frames: at - s.start,
-            out_us: cut,
             link: None,
             ..s
         };
-        subs.insert(
-            idx + 1,
-            SubClip {
-                start: at,
-                frames: s.end() - at,
-                in_us: cut,
-                link: None,
-                ..s
-            },
-        );
+        set_window(&mut head, s.in_us, cut);
+        subs[idx] = head;
+        let mut tail = SubClip {
+            start: at,
+            frames: s.end() - at,
+            link: None,
+            ..s
+        };
+        set_window(&mut tail, cut, s.out_us);
+        subs.insert(idx + 1, tail);
     }
     for s in subs.iter_mut().filter(|s| s.start >= at) {
         s.start += len;
@@ -5704,15 +5874,21 @@ fn sub_edge_room(subs: &[SubClip], idx: usize, edge: Edge) -> (u32, u32) {
 /// the window it already shows over the frames it already takes.
 fn write_sub_edge(s: &mut SubClip, edge: Edge, to: u32) {
     let per_frame = s.window_us() / i64::from(s.frames.max(1));
+    // The `saturating_mul` keeps a `SubClip` that reached here without a door
+    // behind it from wrapping the window negative; `set_window` is what keeps
+    // the result legal rather than merely finite. This is the group-follow twin
+    // of [`Project::trim_sub`], and it reaches the same field from both edges --
+    // so a fix that only walled the primary trim's End arm left the head (and
+    // the whole group path) open.
     let by = |from: u32, to: u32| per_frame.saturating_mul(i64::from(to) - i64::from(from));
     match edge {
         Edge::Start => {
-            s.in_us = (s.in_us + by(s.start, to)).clamp(0, s.out_us - 1);
+            set_window(s, s.in_us.saturating_add(by(s.start, to)), s.out_us);
             s.frames = s.end() - to;
             s.start = to;
         }
         Edge::End => {
-            s.out_us = (s.out_us + by(s.end(), to)).max(s.in_us + 1);
+            set_window(s, s.in_us, s.out_us.saturating_add(by(s.end(), to)));
             s.frames = to - s.start;
         }
     }
@@ -10864,5 +11040,357 @@ mod tests {
         assert_eq!(p.subtitles().len(), 2, "the column goes again");
         assert_eq!(p.subtitles()[0].label, "two");
         assert_ne!(p.subtitles(), palette.as_slice(), "and it is not back");
+    }
+
+    /// Finds every line that **writes** a caption's clock, in three forms: an
+    /// assignment through any operator (`.out_us = `, `.out_us += `,
+    /// `.out_us <<= `), a struct-literal field (`out_us: ...`) and the
+    /// shorthand form (`out_us,`). A `let` binding is skipped for the literal
+    /// forms only, so `let x: &mut SubClip = ..; (*x).in_us = 5;` is still
+    /// caught while `let out_us = s.out_us;` is not.
+    ///
+    /// The operator list is `=` plus one assignment operator each, and
+    /// deliberately excludes `<=`: the first version of this matcher counted
+    /// `s.out_us <= s.in_us` as a write, which would have flagged every
+    /// never-empty check in the file.
+    fn window_writes(text: &str) -> Vec<(usize, String)> {
+        const FIELDS: [&str; 2] = ["in_us", "out_us"];
+        const OPS: [&str; 11] = [
+            "=", "+=", "-=", "*=", "/=", "%=", "^=", "&=", "|=", "<<=", ">>=",
+        ];
+        let mut found = Vec::new();
+        for (n, raw) in text.lines().enumerate() {
+            let line = raw.trim();
+            if line.starts_with("//") {
+                continue;
+            }
+            let is_binding = line.starts_with("let ");
+            // `let (a, b) = ..` is a tuple pattern, not a struct literal: the
+            // commas there bind names. `let half = SubClip { frames: n, in_us,
+            // out_us, ..s };` is the opposite -- the same commas are shorthand
+            // fields -- and what separates them is the paren, not the `let`.
+            let tuple_pattern = line.starts_with("let (");
+            for field in FIELDS {
+                let access = format!(".{field}");
+                if let Some(at) = line.find(&access) {
+                    let after = &line[at + access.len()..];
+                    let after = after.trim_start();
+                    if OPS
+                        .iter()
+                        .any(|op| after.starts_with(op) && !after[op.len()..].starts_with('='))
+                    {
+                        found.push((n + 1, line.to_owned()));
+                        continue;
+                    }
+                }
+                // A bare name: a literal field, a shorthand, or a local
+                // binding. Skipped when a `.` or an identifier character
+                // precedes it -- that is a read, not a field being set.
+                //
+                // The `let` exclusion is per-occurrence and keyed on what
+                // FOLLOWS, not on the line. `let out_us = s.out_us;` names a
+                // local, so the `=` form is skipped; but `let tail = SubClip {
+                // in_us: cut, out_us: s.out_us, ..s };` is a struct literal
+                // behind a `let`, and an earlier version of this matcher
+                // skipped the whole line for being a `let` -- so that shape,
+                // which is exactly what a plausible composer looks like, went
+                // through green. Keyed on the follower, a `let` hides nothing.
+                for (at, _) in line.match_indices(field) {
+                    let preceded_by_name = line[..at]
+                        .chars()
+                        .next_back()
+                        .is_some_and(|c| c == '.' || c.is_alphanumeric() || c == '_');
+                    if preceded_by_name {
+                        continue;
+                    }
+                    let after = line[at + field.len()..].trim_start();
+                    let sets_a_field =
+                        after.starts_with(':') || (after.starts_with(',') && !tuple_pattern);
+                    let names_a_local = after.starts_with('=') && !after[1..].starts_with('=');
+                    if sets_a_field || (names_a_local && !is_binding) {
+                        found.push((n + 1, line.to_owned()));
+                        break;
+                    }
+                }
+            }
+        }
+        found
+    }
+
+    /// A **heuristic guard**, not a proof. The honest reading of a green here
+    /// is the residual risk in this comment, not the green itself.
+    ///
+    /// Three rounds of review each found one more composer a per-arm check had
+    /// missed -- a tail trim, a head trim, a rejoin that SUMS two legal
+    /// widths -- and each produced the same failure: the editor wrote a
+    /// `.edith` its own loader then refused, with no in-app way back. The
+    /// invariant is now structural in the code (every composer calls
+    /// [`set_window`]); this is what keeps that structure from quietly losing
+    /// a caller.
+    ///
+    /// **Why this is a scan and not the compiler**, which is the better answer
+    /// and was priced rather than skipped: making `in_us`/`out_us` private to
+    /// this module turns every outside write into a compile error, which no
+    /// one-token edit can defeat. It costs 74 `SubClip` construction sites
+    /// (31 of them in this crate's own integration tests) plus a public
+    /// constructor, and it reaches `crates/app`'s `timeline_edit.rs` and
+    /// `timeline_math.rs`, which other lanes own. That is a refactor of a
+    /// door's public shape rather than a bound, and the wrong size for this
+    /// lane -- so the guard stands here with its limits written down instead.
+    ///
+    /// **Residual risk, by class, most likely first.** These are not all
+    /// equally hypothetical; the first is the one a real composer would reach
+    /// for, and it is the one this matcher cannot see at all:
+    ///
+    /// 1. **Field-less writes.** `*a = *b;`, `*a = other;`,
+    ///    `std::mem::swap(a, b)`, `a.clone_from(b)`, and any macro that
+    ///    expands to a field write (`bump!(s.out_us, by)`). None of these ever
+    ///    spell `in_us` or `out_us` on the line, so `window_writes` returns
+    ///    nothing for all of them. A *helper* that writes the field directly IS
+    ///    caught; it is specifically the whole-struct and macro forms that go
+    ///    through. This is the class most likely to be used, and it is
+    ///    unmatched by construction rather than by oversight.
+    /// 2. **A rename.** The matcher keys on the literal strings `in_us` and
+    ///    `out_us`. Renaming the fields silences it entirely while it stays
+    ///    green -- the sharpest failure here, because the guard is supposed to
+    ///    be the thing that notices a rule drifting.
+    /// 3. **A writer inside a test.** `/tests/` paths and `mod tests` blocks
+    ///    are cut. A test cannot produce a file a user loses, so the line is
+    ///    drawn there deliberately, not by omission.
+    /// 4. **A file the walk does not reach**: a path outside `crates/`, or one
+    ///    under a directory named `target`, `.git` or `vendor`.
+    ///
+    /// What the matcher DOES now cover, after four rounds of it not doing so:
+    /// every assignment operator; struct-literal fields and the shorthand form,
+    /// including behind a `let`; writes through an indirect `&mut`; and every
+    /// `.rs` under `crates/` with no filter on what the file contains, so a
+    /// glob import or a type alias can no longer hide a module.
+    #[test]
+    fn every_window_write_outside_set_window_is_named() {
+        // `CARGO_MANIFEST_DIR`, not `file!()`: a test runs with the WORKSPACE
+        // root as its working directory, so `file!()`'s crate-relative path
+        // does not resolve from where the binary actually starts.
+        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("crates/engine sits two levels under the workspace root")
+            .to_path_buf();
+        // Every line in the workspace that names a clock and is not a
+        // composer, each with its reason. A new entry is a claim someone has
+        // to defend in review, which is the point of writing the list out.
+        let allowed = [
+            ("pub in_us: i64,", "the field declaration"),
+            ("pub out_us: i64,", "the field declaration"),
+            (
+                "fn set_window(s: &mut SubClip, in_us: i64, out_us: i64) {",
+                "set_window's own signature",
+            ),
+            ("s.in_us = in_us;", "set_window"),
+            ("s.out_us = out_us;", "set_window"),
+            (
+                "set_window(&mut data.subs[idx], in_us, out_us);",
+                "regroup naming the two values it is about to set",
+            ),
+            ("in_us: micros(f[3], n)?,", "edith.rs: the parse door"),
+            ("out_us: micros(f[4], n)?,", "edith.rs: the parse door"),
+            // Non-test helpers that build a value to hand `place_sub`, which is
+            // a door. Not composers: nobody was mid-gesture, which is exactly
+            // why a door refuses where a composer clamps.
+            (
+                "in_us: 0,",
+                "sweep.rs caption helper, and timeline_edit.rs's palette row, -> place_sub",
+            ),
+            (
+                "out_us: i64::from(frames) * 1_000_000,",
+                "sweep.rs caption helper -> place_sub",
+            ),
+            (
+                "frames: frames_of_us(out_us, self.fps),",
+                "timeline_edit.rs's palette row -> place_sub",
+            ),
+            (
+                "out_us,",
+                "timeline_edit.rs's palette row shorthand -> place_sub",
+            ),
+        ];
+
+        let mut found: Vec<String> = Vec::new();
+        let (mut files, mut lines) = (0usize, 0usize);
+        let mut seen_app = false;
+        for (file, text) in read_workspace_rust(&workspace) {
+            // Test code, by path or by module: a test builds `SubClip`s by hand
+            // and its value is not one the loader ever reads, so the 31 sites in
+            // `crates/engine/tests/` and three in `crates/app/src/tests/` are
+            // not composers. A real limit rather than a technicality -- the
+            // guard does not cover a writer hidden inside a test -- but a test
+            // cannot produce a file a user loses, so it is where the line goes.
+            let path = file.to_string_lossy().replace('\\', "/");
+            if path.contains("/tests/") {
+                continue;
+            }
+            let code = match text.find("\n#[cfg(test)]\nmod tests {") {
+                Some(at) => &text[..at],
+                None => text.as_str(),
+            };
+            lines += code.lines().count();
+            files += 1;
+            seen_app |= path.contains("crates/app/");
+            for (n, line) in window_writes(code) {
+                if !allowed.iter().any(|(text, _)| *text == line) {
+                    let at = file.strip_prefix(&workspace).unwrap_or(&file);
+                    found.push(format!("{}:{n}: {line}", at.display()));
+                }
+            }
+        }
+        // A floor, not a census: the walk now opens EVERY `.rs` under
+        // `crates/` that is not test code -- 86 files and ~77,600 lines today,
+        // which is 141 files and ~116,000 before `/tests/` and `mod tests` are
+        // cut. The point is only to catch a walk rooted in the wrong place,
+        // which reads a file or two.
+        // The `seen_app` half is the one that matters: the two-file version of
+        // this guard read `project.rs` and `edith.rs` and was silently
+        // certifying a claim about the app it had never opened, and the
+        // `contains("SubClip")` filter that came next
+        // was the same mistake wearing a derived hat -- a file that reached
+        // the type by glob import or alias was never opened either.
+        assert!(
+            lines > 70_000 && files >= 80 && seen_app,
+            "the walk read {lines} lines in {files} files (app reached: \
+             {seen_app}) -- it is not covering the workspace, and a guard that \
+             reads nothing is worse than no guard because it reads as one"
+        );
+        // The assertion this whole test exists for. It was DELETED by a clumsy
+        // edit while the coverage floor above was being retuned, and for a
+        // moment the test reported green while `found` held a real offender --
+        // the fourth version of this guard failing in the one way that looks
+        // exactly like success. If you retune anything here, check this line
+        // still exists.
+        assert!(
+            found.is_empty(),
+            "a caption window is written outside set_window:\n  {}",
+            found.join("\n  ")
+        );
+    }
+
+    /// The blind spot, pinned as cases. Every one of these is a write, and the
+    /// guard exists because each of its earlier versions caught none of them --
+    /// `s.out_us += by(...)` being a one-token edit that made it green while a
+    /// grouped caption really did grow past the ceiling. A matcher that has
+    /// quietly stopped matching is the failure mode that looks most like a
+    /// pass, so it gets its own test rather than a comment.
+    ///
+    /// The last group is the opposite: the field-less forms that are a write
+    /// and that this matcher CANNOT see. They are asserted to be missed, on
+    /// purpose, so that the day someone can match them the test says so --
+    /// and so nobody reads this file as claiming more than it does.
+    #[test]
+    fn the_window_write_matcher_catches_the_ways_a_composer_hides() {
+        for (what, code) in [
+            (
+                "the one-token compound assignment",
+                "            s.out_us += by(s.end(), to);",
+            ),
+            ("a plain compound assignment", "            s.in_us -= 1;"),
+            ("a shift-assign", "            s.out_us <<= 1;"),
+            (
+                "a write through a &mut the matcher cannot see past",
+                "        let x: &mut SubClip = q; (*x).in_us = 5;",
+            ),
+            (
+                "a struct literal",
+                "        out.push(SubClip { in_us: 0, out_us: 1, ..s });",
+            ),
+            (
+                "the shorthand form",
+                "        SubClip { in_us, out_us, ..s }",
+            ),
+            (
+                "a struct literal behind a `let`, which the old line-wide `let` \
+                 exclusion skipped whole",
+                "        let tail = SubClip { in_us: cut, out_us: s.out_us, ..s };",
+            ),
+            (
+                "a struct literal behind a `let` using the shorthand too",
+                "        let half = SubClip { frames: n, in_us, out_us, ..s };",
+            ),
+        ] {
+            assert!(
+                !window_writes(code).is_empty(),
+                "the matcher misses {what}: {code:?}"
+            );
+        }
+        // ...and the other side, so the allowlist is not padded with reads.
+        for quiet in [
+            "    if sub.frames == 0 || sub.out_us <= sub.in_us || sub.in_us < 0 {",
+            "    debug_assert!(s.frames >= 1 && s.out_us > s.in_us && s.in_us >= 0);",
+            "    let out_us = s.out_us;",
+            "    (next.start == frame && next.in_us == subs[idx].out_us)",
+            "    let total = s.out_us - s.in_us;",
+        ] {
+            assert!(
+                window_writes(quiet).is_empty(),
+                "the matcher flags a read as a write: {quiet:?}"
+            );
+        }
+        // The class this matcher CANNOT see, asserted as missed. Each of these
+        // really does write a caption's window and none of them spell the field
+        // name, so a field matcher returns nothing -- that is a property of the
+        // approach, not a bug to be fixed here, and the test exists so the
+        // doc comment's residual-risk list cannot quietly grow a claim this
+        // matcher has not earned. If one of these ever starts matching, this
+        // test fails and asks which side of the line moved.
+        for unmatchable in [
+            "        *a = *b;",
+            "        *a = other;",
+            "        std::mem::swap(a, b);",
+            "        a.clone_from(b);",
+            "        bump!(s.out_us, by);",
+        ] {
+            assert!(
+                window_writes(unmatchable).is_empty(),
+                "the matcher now matches a field-less form it documented as \
+                 unmatched -- update the residual-risk list too: {unmatchable:?}"
+            );
+        }
+    }
+
+    /// Every `.rs` under the workspace, paired with its text. Recursive
+    /// because the set of files that can name `SubClip` is a fact about the
+    /// tree, and a hardcoded pair of names goes stale the moment a lane adds a
+    /// module -- which is how the two-file version of this guard came to
+    /// certify a claim about `crates/app` it had never read.
+    fn read_workspace_rust(root: &std::path::Path) -> Vec<(std::path::PathBuf, String)> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    // `target` is not source and `vendor` is not ours to rule on.
+                    let skip = path
+                        .file_name()
+                        .is_some_and(|n| n == "target" || n == ".git" || n == "vendor");
+                    if !skip {
+                        stack.push(path);
+                    }
+                // EVERY `.rs`, with no filter on what it contains. The filter
+                // that was here (`text.contains("SubClip")`) was a name-based
+                // guess about which files can reach the type, and a glob import
+                // or a type alias defeats it exactly as it defeats a
+                // hardcoded file list: a new module holding the struct behind
+                // `use engine::project::*;` was never opened, and stayed green.
+                // The scan is text-only and the tree is small, so the honest
+                // thing costs nothing here.
+                } else if path.extension().is_some_and(|e| e == "rs")
+                    && let Ok(text) = std::fs::read_to_string(&path)
+                {
+                    out.push((path, text));
+                }
+            }
+        }
+        out
     }
 }

@@ -1151,6 +1151,28 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
                     )
                     .into());
                 }
+                // The width of that window, which the check above cannot see:
+                // it asks whether the window is *open*, never how wide it is,
+                // and a `sub` line is the one number in this format a hand (or
+                // a hostile actor) can set to `i64::MAX` and have accepted.
+                // Every cut, split, ripple and group trim re-derives the two
+                // halves of the window by proportion
+                // ([`crate::project::SubClip::window_at`]), a multiply that
+                // overflowed on the first frame inside the caption -- a panic
+                // on the UI thread the first time a hand ripple-deleted across
+                // it, and in a release build a silently wrapped clock. The
+                // same bound [`crate::is_resolution`] holds a `resolution`
+                // line to, and for the same reason: refused by name at the
+                // door rather than clamped into something nobody wrote.
+                if sub.out_us - sub.in_us > crate::project::MAX_WINDOW_US {
+                    return Err(format!(
+                        "line {n}: caption at {} is a {}us window, past the {}us a caption can hold",
+                        sub.start,
+                        sub.out_us - sub.in_us,
+                        crate::project::MAX_WINDOW_US
+                    )
+                    .into());
+                }
                 // The palette bound, which is a clip's source bound for words:
                 // the `subtitle` lines are written before these and a caption
                 // names one of them by position.
@@ -2721,8 +2743,8 @@ mod tests {
     #[test]
     fn a_strand_colour_round_trips_and_a_v22_look_stays_32_bit() {
         use crate::decode::{
-            viz_hue_ui, viz_sat_ui, viz_strand_set, with_viz_paint_strand_hue,
-            with_viz_paint_strand_sat, VIZ_PAINT_AZURE,
+            VIZ_PAINT_AZURE, viz_hue_ui, viz_sat_ui, viz_strand_set, with_viz_paint_strand_hue,
+            with_viz_paint_strand_sat,
         };
         let (dir, sources, lanes) = doc();
         let mut painted = lanes.clone();
@@ -3280,11 +3302,13 @@ mod tests {
             assert!(err.starts_with("line 4: clip at "), "{err}");
         }
         // The lanes are independent, so a video line never crowds an audio one.
-        assert!(parse(
-            b"edith 2\nsource a.mp4\nvideo 0 0 30 0 -\naudio 0 0 30 0 -\n",
-            &dir
-        )
-        .is_ok());
+        assert!(
+            parse(
+                b"edith 2\nsource a.mp4\nvideo 0 0 30 0 -\naudio 0 0 30 0 -\n",
+                &dir
+            )
+            .is_ok()
+        );
         // ...and a lane may be empty as long as the other one is not.
         let only_audio = parse(b"edith 2\nsource a.mp4\naudio 0 0 30 0 -\n", &dir).expect("parse");
         assert!(only_audio.lanes[0].1.is_empty(), "V1 is there and empty");
@@ -3487,10 +3511,12 @@ mod tests {
             parse(b"edith 1\nsource a.mp4\n", &dir).expect("v1").lanes,
             two(Vec::new(), Vec::new())
         );
-        assert!(parse(b"edith 1\n", &dir)
-            .expect("a project of nothing")
-            .sources
-            .is_empty());
+        assert!(
+            parse(b"edith 1\n", &dir)
+                .expect("a project of nothing")
+                .sources
+                .is_empty()
+        );
     }
 
     /// Every truncation of a good file either parses or refuses; none panics.
