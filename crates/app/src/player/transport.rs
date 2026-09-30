@@ -50,19 +50,19 @@ impl Player {
     /// without the key a preview opening or closing would read the *other*
     /// session's reason and announce a device loss that never happened.
     pub(crate) fn watch_audio(&mut self) {
-        let step = audio_step(
+        let step = reason_step(
             self.audio_watch_gen,
             self.session_gen,
             self.audio_reason.as_deref(),
             self.sound_reason(),
         );
-        if step == AudioStep::Nothing {
+        if step == ReasonStep::Nothing {
             return;
         }
         let was = self.audio_reason.take();
         self.audio_reason = self.sound_reason().map(str::to_owned);
         self.audio_watch_gen = self.session_gen;
-        if step == AudioStep::Seed {
+        if step == ReasonStep::Seed {
             // A session swap is not a change: the new session's own open line
             // carries its reason, so only a line left over from the session
             // before is taken back -- and only when this one's sound is up.
@@ -82,6 +82,61 @@ impl Player {
         );
     }
 
+    /// The engine's word on the *picture*, watched rather than asked once --
+    /// [`Self::watch_audio`]'s twin, and the reason a damaged file stops being
+    /// indistinguishable from a finished one.
+    ///
+    /// `PlaybackSession::video_failure_reason` is the writer's side: a decode
+    /// worker that gave up on a broken packet used to print it to stderr and
+    /// drop the channel, and a closed channel is what a film reaching its own
+    /// end looks like from here -- so the transport said ENDED, the picture
+    /// froze on the last good frame, and nothing in the window said why.
+    ///
+    /// Keyed to the session exactly as the sound watch is, for the same reason:
+    /// `pump` serves the preview while one is up and the timeline otherwise, so
+    /// an unkeyed cache would read the other session's reason and announce a
+    /// failure that never happened.
+    pub(crate) fn watch_decode(&mut self) {
+        let now = self.decode_reason();
+        let step = reason_step(
+            self.decode_watch_gen,
+            self.session_gen,
+            self.decode_reason_cache.as_deref(),
+            now.as_deref(),
+        );
+        if step == ReasonStep::Nothing {
+            return;
+        }
+        let was = self.decode_reason_cache.take();
+        self.decode_reason_cache = now;
+        self.decode_watch_gen = self.session_gen;
+        if step == ReasonStep::Seed {
+            // A session swap is not a change: the new session's own open line
+            // carries its reason, so only a line left over from the session
+            // before is taken back -- and only when this one is healthy.
+            if self.decode_reason_cache.is_none()
+                && let Some(was) = was
+            {
+                let line = decode_failed_line(&was);
+                self.notices
+                    .retain(|notice| notice.as_ref() != line.as_str());
+            }
+            return;
+        }
+        decode_change_notice(
+            &mut self.notices,
+            was.as_deref(),
+            self.decode_reason_cache.as_deref(),
+        );
+    }
+
+    /// The engine's word on the picture for the session the pump serves, read
+    /// off that session and no other -- the same rule as [`Self::sound_reason`].
+    fn decode_reason(&self) -> Option<String> {
+        self.active_session()
+            .and_then(PlaybackSession::video_failure_reason)
+    }
+
     /// Catches the display up to the clock: everything already due is taken off
     /// the channel and only the last of them is shown, which *is* the
     /// drop-when-behind policy. A frame that is not due yet waits in `held`, and
@@ -90,8 +145,10 @@ impl Player {
     pub(crate) fn pump(&mut self, window: &mut Window) {
         // Before the drain, on the one read that does not need the session
         // mutably: the sound can die at any point in a frame, and the notice it
-        // earns is owed to the frame it died in.
+        // earns is owed to the frame it died in. The picture can fail for the
+        // same reason and earns the same courtesy.
         self.watch_audio();
+        self.watch_decode();
         // Where the transport was before this drain, so the crossing into
         // `Ended` can be recognised as the one transition it is.
         let was = self.transport();
