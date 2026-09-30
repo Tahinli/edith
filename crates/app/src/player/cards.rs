@@ -1,8 +1,8 @@
 //! The cards the window opens over itself: the pickers, colour, speed,
 //! silence, the mixer and the equalizer.
 
-use crate::*;
 use crate::ui::settings_stance::SettingsTab;
+use crate::*;
 
 impl Player {
     /// Cycles the *project's* resolution through [`RESOLUTIONS`], starting from
@@ -279,10 +279,7 @@ impl Player {
                 match caption_media_half(session, (lane, idx), LaneKind::Video) {
                     Some(half) => Some(half),
                     None => {
-                        self.notify_user(
-                            "NOTHING TO GRADE — a caption has no picture"
-                                .into(),
-                        );
+                        self.notify_user("NOTHING TO GRADE — a caption has no picture".into());
                         cx.notify();
                         return;
                     }
@@ -426,10 +423,7 @@ impl Player {
                 match caption_media_half(session, (lane, idx), LaneKind::Video) {
                     Some(half) => Some(half),
                     None => {
-                        self.notify_user(
-                            "NOTHING TO PLACE — a caption has no picture"
-                                .into(),
-                        );
+                        self.notify_user("NOTHING TO PLACE — a caption has no picture".into());
                         cx.notify();
                         return;
                     }
@@ -567,8 +561,7 @@ impl Player {
                     Some(half) => Some(half),
                     None => {
                         self.notify_user(
-                            "NOTHING TO RE-TIME — a caption has no speed of its own"
-                                .into(),
+                            "NOTHING TO RE-TIME — a caption has no speed of its own".into(),
                         );
                         cx.notify();
                         return;
@@ -734,8 +727,7 @@ impl Player {
                     Some(half) => Some(half),
                     None => {
                         self.notify_user(
-                            "NOTHING TO SCAN — a caption has no sound of its own"
-                                .into(),
+                            "NOTHING TO SCAN — a caption has no sound of its own".into(),
                         );
                         cx.notify();
                         return;
@@ -856,14 +848,20 @@ impl Player {
         if self.session.is_none() {
             return;
         }
-        self.mark_dirty();
         let Some(session) = self.session.as_mut() else {
             return;
         };
-        match lanes.get(self.mix_field) {
+        // The arm rides the door's answer, not the press: a fader already
+        // against its wall, a ceiling already at its clamp and a limiter
+        // switch that did not move are *not* edits, and `set_lane_gain_db` /
+        // `set_limiter` each answer `false` for exactly those (an unchanged
+        // value). Arming before the ask lit the ledger's `unsaved` ghost,
+        // wrote an autosave sidecar and put the close prompt up over a
+        // project whose bytes had not moved.
+        let took = match lanes.get(self.mix_field) {
             Some(&lane) => {
                 let at = session.lane_gain_db(lane) + steps as f32 * MIX_DB_STEP;
-                session.set_lane_gain_db(lane, at);
+                session.set_lane_gain_db(lane, at)
             }
             None => {
                 let limiter = session.limiter();
@@ -878,8 +876,11 @@ impl Player {
                         ..limiter
                     },
                 };
-                session.set_limiter(at);
+                session.set_limiter(at)
             }
+        };
+        if took {
+            self.mark_dirty();
         }
         cx.notify();
     }
@@ -1246,17 +1247,15 @@ impl Player {
     /// nothing.
     pub(crate) fn previewed(&mut self) -> Option<(Vec<(u32, u32)>, Vec<Lane>)> {
         if self.silence_marks.is_empty() {
-            self.notify_user(
-                if self.silence_keep_only {
-                    "NO SPEECH TO CUT — keep-only-silence needs silence and speech".into()
-                } else {
-                    format!(
-                        "NO SILENCE — under {:.0} dBFS lasting {:.2} s",
-                        self.silence.threshold_db, self.silence.min_silence
-                    )
-                    .into()
-                },
-            );
+            self.notify_user(if self.silence_keep_only {
+                "NO SPEECH TO CUT — keep-only-silence needs silence and speech".into()
+            } else {
+                format!(
+                    "NO SILENCE — under {:.0} dBFS lasting {:.2} s",
+                    self.silence.threshold_db, self.silence.min_silence
+                )
+                .into()
+            });
             return None;
         }
         Some((self.silence_marks.clone(), self.silence_lanes()))
@@ -1302,7 +1301,11 @@ impl Player {
                 // moves indexes (a delete, a paste, an undo).
                 self.selected.clear();
                 self.reset_after_reseek();
-                let what = if self.silence_keep_only { "SPEECH" } else { "SILENCES" };
+                let what = if self.silence_keep_only {
+                    "SPEECH"
+                } else {
+                    "SILENCES"
+                };
                 self.notify_user(
                     format!(
                         "{count} {what} CUT {reach} — {} shorter · undo {}",
@@ -1342,7 +1345,11 @@ impl Player {
                 // goes with them.
                 self.selected.clear();
                 self.reset_after_reseek();
-                let what = if self.silence_keep_only { "SPEECH" } else { "SILENCES" };
+                let what = if self.silence_keep_only {
+                    "SPEECH"
+                } else {
+                    "SILENCES"
+                };
                 self.notify_user(
                     format!(
                         "{count} {what} AT {rate} {reach} · undo {}",
@@ -1494,9 +1501,9 @@ impl Player {
                 "NOTHING SELECTED · select all {}",
                 self.keymap.display(ActionId::Select)
             )),
-            (Some((lane, _)), _) if lane.kind != LaneKind::Audio => Some(
-                "NOT AN AUDIO CLIP — the equalizer works on sound".to_string(),
-            ),
+            (Some((lane, _)), _) if lane.kind != LaneKind::Audio => {
+                Some("NOT AN AUDIO CLIP — the equalizer works on sound".to_string())
+            }
             _ => None,
         };
         if let Some(refusal) = refusal {
@@ -1538,9 +1545,6 @@ impl Player {
             session.set_eq(lane, idx, params);
             self.mark_dirty();
         }
-        // `set_eq` reseeks inside the engine -- that is what makes the change
-        // audible at once -- and a reseek is what these flags are about.
-        self.reset_after_reseek();
         cx.notify();
     }
 
@@ -1590,12 +1594,7 @@ impl Player {
     /// band that was just made. Refused rather than silently ignored at the cap.
     pub(crate) fn add_band(&mut self, cx: &mut Context<Self>) {
         if self.eq_params.bands.len() >= EQ_BANDS_MAX {
-            self.notify_user(
-                format!(
-                    "EQUALIZER FULL — {EQ_BANDS_MAX} bands"
-                )
-                .into(),
-            );
+            self.notify_user(format!("EQUALIZER FULL — {EQ_BANDS_MAX} bands").into());
             cx.notify();
             return;
         }
