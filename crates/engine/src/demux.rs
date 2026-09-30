@@ -441,6 +441,41 @@ impl PixelAspect {
         (h / a <= Self::MAX_ASPECT_TERM && v / a <= Self::MAX_ASPECT_TERM).then_some(Self { h, v })
     }
 
+    /// The ratio a Matroska `DisplayUnit 0` `Display*` pair names, or [`None`]
+    /// when the pair is not a picture.
+    ///
+    /// This is deliberately *not* [`Self::stated`], and the reason is what a
+    /// unit-0 pair reduces to. The pair is a pixel SIZE, so reducing it
+    /// against the coded size carries the sizes, not terms: 1920x1080 over
+    /// 1440x1080 reduces to 4:3, but a 1920x803 scope -- one of the two most
+    /// common letterbox ratios there are -- reduces to 1440:803, and a
+    /// 1920x1037 flat to 1440:1037. A term bound tight enough to catch chosen
+    /// bytes refuses exactly the pictures this arm exists to show.
+    ///
+    /// Only the *width* half is taken, because width is the only axis an
+    /// aspect moves in this engine: `VideoMeta::height` is the coded height
+    /// for every file, by design and by its own documentation. So the pair
+    /// states the display width and the height is left where it is -- the same
+    /// answer a 4:3 SAR over 1440x1080 gives, 1920x1080.
+    ///
+    /// What needs bounding is the raster, and [`Self::width_factor`] bounds
+    /// that with [`Self::MAX_DISPLAY_WIDTH`] on every path. So this has only
+    /// to refuse the degenerate claims: a zero half.
+    pub fn stated_size(display_width: u64, display_height: u64, coded: (u32, u32)) -> Option<Self> {
+        // The height is checked for the degenerate claim and then goes unused:
+        // a zero-height pair is a header that lies, and one this engine reads
+        // as stating nothing. A real height cannot reach an allocation on this
+        // path, because `VideoMeta::height` is the *coded* height, which both
+        // doors already bound against [`crate::MAX_RESOLUTION`].
+        if display_width == 0 || display_height == 0 || coded.0 == 0 {
+            return None;
+        }
+        Some(Self {
+            h: display_width.min(u64::from(u32::MAX)) as u32,
+            v: coded.0,
+        })
+    }
+
     /// Whether the displayed picture is the coded one, drawn one to one.
     ///
     /// Both halves of the ratio are untrusted bytes -- four of them in an mp4
@@ -460,26 +495,32 @@ impl PixelAspect {
     /// cover -- the same rounding swscale applies, and the same one that keeps
     /// the stretch a whole-sample operation rather than a smear.
     pub fn width_factor(self, coded_width: u32) -> u32 {
-        // The same judgement [`Self::stated`] makes at the read, repeated here
-        // because this is the one function every door reaches: a ratio built
-        // rather than read still has to survive the multiply that follows.
-        if Self::stated(self.h, self.v).is_none() {
+        if self.is_square() {
             return coded_width;
         }
         // (coded * h / v), rounded up to even: 1440 at 4:3 gives 1920 exactly,
         // and a ratio that does not divide evenly is widened to the nearest
         // even column count rather than shown cropped or squeezed.
         //
-        // Every step is checked, because the whole point of this arithmetic is
-        // that it sizes an allocation from bytes a file chose. `coded * h` is
-        // at most 2^64-ish and cannot overflow a u64, but the quotient is
-        // then *narrowed* to a u32 and can wrap -- 1920 * 0x00FF_FFFF narrows
-        // to 2_147_481_728 -- and a narrowed zero becomes a zero-column
-        // raster. A display that does not fit [`Self::MAX_DISPLAY_WIDTH`] is
-        // drawn at the coded size instead: the picture is shown slightly
-        // wrong, which is what every unrenderable header deserves, rather than
-        // aborting the decode worker on a capacity overflow before a pixel is
-        // drawn.
+        // This is the one function every door reaches, so it is also where the
+        // arithmetic is made total -- a ratio may be *read* here ([`Self::stated`]),
+        // *built* here from a `Display*` pixel pair ([`Self::stated_size`]), or
+        // both, and this cannot tell which. So it bounds the one thing all
+        // three agree on: the raster. `coded * h` cannot overflow a u64, but
+        // the quotient is then *narrowed* to a u32 and can wrap -- 1920 *
+        // 0x00FF_FFFF narrows to 2_147_481_728 -- and a narrowed zero becomes a
+        // zero-column raster. Anything outside [`Self::MAX_DISPLAY_WIDTH`], in
+        // either direction, is drawn at the coded size instead: the picture is
+        // shown slightly wrong, which is what every unrenderable header
+        // deserves, rather than aborting the decode worker on a capacity
+        // overflow before a pixel is drawn.
+        //
+        // Judging the *ratio* instead would be the wrong test here: a
+        // `DisplayUnit 0` pair is a pixel size, so its reduced form carries
+        // the sizes (a 1920x803 scope reduces to 1440:803) and no term bound
+        // can be both tight enough to catch chosen bytes and loose enough to
+        // admit the two most common letterbox ratios. The raster bound has no
+        // such conflict.
         let wide = u64::from(coded_width) * u64::from(self.h);
         let scaled = (wide + u64::from(self.v) - 1) / u64::from(self.v);
         let rounded = scaled.next_multiple_of(2);
@@ -3062,29 +3103,42 @@ fn pixel_aspect_of(
     if display_width == 0 || display_height == 0 || coded_width == 0 || coded_height == 0 {
         return PixelAspect::SQUARE;
     }
-    // A stated pair, whichever unit spells it, is a claim about a real
-    // picture and is judged by [`PixelAspect::stated`] like every other
-    // header read: a ratio that reduces to nothing usable is square, and the
-    // caller learns that by being handed it rather than by a zero-width
-    // raster later on.
-    let stated = |h: u64, v: u64| {
-        PixelAspect::stated(h.min(u64::from(u32::MAX)) as u32, v.min(u64::from(u32::MAX)) as u32)
-            .unwrap_or(PixelAspect::SQUARE)
+    // A stated pair is a claim about a real picture, and each unit is judged
+    // by what it means rather than by its digits: a unit that spells a *ratio*
+    // by [`PixelAspect::stated`], a unit that spells a *pixel size* by
+    // [`PixelAspect::stated_size`]. Conflating those two is what would refuse
+    // a 1920x803 scope, whose reduced form carries sizes rather than terms.
+    let coded = (coded_width, coded_height);
+    // `saturating_mul` throughout: the pair is untrusted and a product past a
+    // u64 is a claim with no picture behind it.
+    let as_ratio = || {
+        PixelAspect::stated(
+            display_width
+                .saturating_mul(u64::from(coded_height))
+                .min(u64::from(u32::MAX)) as u32,
+            display_height
+                .saturating_mul(u64::from(coded_width))
+                .min(u64::from(u32::MAX)) as u32,
+        )
+        .unwrap_or(PixelAspect::SQUARE)
     };
     match display_unit {
         // 4: the pair *is* the sample aspect ratio.
-        4 => stated(display_width, display_height),
-        // 3: the pair is a display *aspect ratio*, and 0: the pair is a
-        // display *pixel size*. Both reduce to the same SAR -- the ratio
-        // against the coded one -- and that they do is the point: 16/9 over
-        // 1440x1080 and 1920x1080 over 1440x1080 are the same claim about the
-        // same picture, and both land on 4/3. `saturating_mul` because the
-        // pair is untrusted and a product past a u64 is a claim with no
-        // picture behind it.
-        0 | 3 => stated(
-            display_width.saturating_mul(u64::from(coded_height)),
-            display_height.saturating_mul(u64::from(coded_width)),
-        ),
+        4 => PixelAspect::stated(
+            display_width.min(u64::from(u32::MAX)) as u32,
+            display_height.min(u64::from(u32::MAX)) as u32,
+        )
+        .unwrap_or(PixelAspect::SQUARE),
+        // 3: the pair is a display *aspect ratio* -- 16/9 over a 1440x1080
+        // coded track lands on 4/3 -- which is a small pair of terms however
+        // it was spelled, so the term bound is the right test for it.
+        3 => as_ratio(),
+        // 0: the pair is a display *pixel size*, the size the picture is drawn
+        // at. 1920x1080 over 1440x1080 is the 4/3 stretch; 1920x803 over it is
+        // a 2.39:1 scope. Bounded by the raster [`PixelAspect::width_factor`]
+        // produces, not by the terms it reduces to.
+        0 => PixelAspect::stated_size(display_width, display_height, coded)
+            .unwrap_or(PixelAspect::SQUARE),
         // A physical unit this engine cannot interpret: square.
         _ => PixelAspect::SQUARE,
     }
@@ -5764,8 +5818,41 @@ mod tests {
     /// wrapped raster the decode worker tries to allocate.
     #[test]
     fn an_untrusted_pixel_aspect_cannot_size_a_zero_or_wrapped_raster() {
-        // Collected, not asserted one at a time: a witness that stops at the
-        // first degenerate hides whether the other classes are caught too.
+        // Two contracts, held separately, because they are enforced in two
+        // places and conflating them is what would break a real ratio.
+        //
+        // 1. At the READ, a ratio is refused: a zero half, or a *reduced*
+        //    pair carrying a term past the bound. This is where an mp4 `pasp`
+        //    is judged, and it is right there because a `pasp` pair IS the
+        //    ratio.
+        for hostile in [
+            PixelAspect { h: 0, v: 1 },
+            PixelAspect { h: 1, v: 0 },
+            PixelAspect { h: 0, v: 0 },
+            // Four chosen bytes, not a ratio: reduced terms stay enormous.
+            PixelAspect { h: 0xFFFF_FFFF, v: 0xFFFF_FFFF - 1 },
+            PixelAspect { h: 1, v: 0x00FF_FFFF },
+        ] {
+            assert_eq!(
+                PixelAspect::stated(hostile.h, hostile.v),
+                None,
+                "{hostile:?} is not a ratio this engine can draw"
+            );
+        }
+        // A `DisplayUnit 0` pixel pair is NOT a ratio, so it is judged by
+        // `stated_size` instead -- and the two most common letterbox ratios
+        // must survive that arm, because its reduced form carries sizes:
+        for (dw, dh) in [(1920u64, 1080u64), (1920, 803), (1920, 1037)] {
+            assert!(
+                PixelAspect::stated_size(dw, dh, (1440, 1080)).is_some(),
+                "a {dw}x{dh} Display pair over a 1440x1080 coded track is a real picture"
+            );
+        }
+
+        // 2. In the ARITHMETIC, whatever ratio arrived -- read or built --
+        //    cannot produce a zero column or a raster past the bound. This is
+        //    the contract that holds for every door, including the one that
+        //    builds its ratio from a pixel size rather than reading one.
         let wrong: Vec<String> = [
             PixelAspect { h: 0, v: 1 },
             PixelAspect { h: 1, v: 0 },
@@ -5774,23 +5861,27 @@ mod tests {
             // 2_147_483_648, which is a plausible-looking "width" and an
             // impossible one to allocate.
             PixelAspect { h: 0x00FF_FFFF, v: 1 },
-            PixelAspect { h: 0xFFFF_FFFF, v: 0xFFFF_FFFF - 1 },
-            // A ratio that is not a raster anybody has: 1:0x00FF_FFFF.
-            PixelAspect { h: 1, v: 0x00FF_FFFF },
         ]
         .into_iter()
         .filter_map(|hostile| {
             let factor = hostile.width_factor(1920);
-            (factor != 1920).then(|| {
-                format!("{hostile:?} -> {factor} (a zero column or an oversized raster)")
-            })
+            (factor == 0 || factor > PixelAspect::MAX_DISPLAY_WIDTH)
+                .then(|| format!("{hostile:?} -> {factor} (a zero column or an oversized raster)"))
         })
         .collect();
         assert!(
             wrong.is_empty(),
-            "a degenerate pixel aspect must read as square:\n{}",
+            "an unusable ratio must not size a raster:\n{}",
             wrong.join("\n")
         );
+        // The wrap case lands on the coded width rather than on the wrapped
+        // number, which is the specific refusal the defect turned on.
+        assert_eq!(
+            PixelAspect { h: 0x00FF_FFFF, v: 1 }.width_factor(1920),
+            1920,
+            "a wrapped multiply is drawn at the coded width, not at 2_147_481_728"
+        );
+
         // The sane ratios still stretch, bit for bit as they always did: the
         // hardening refuses the untrusted, it does not round the ordinary.
         assert_eq!(PixelAspect { h: 4, v: 3 }.width_factor(1440), 1920);
@@ -5798,6 +5889,15 @@ mod tests {
         assert_eq!(PixelAspect::SQUARE.width_factor(1920), 1920);
         // An unreduced spelling of the same 4:3 lands on the same picture.
         assert_eq!(PixelAspect { h: 16, v: 12 }.width_factor(1440), 1920);
+        // And a 2.39:1 scope built from a pixel size widens the coded frame
+        // by its own ratio rather than being refused for carrying sizes.
+        assert_eq!(
+            PixelAspect::stated_size(1920, 803, (1440, 1080))
+                .expect("a scope is a picture")
+                .width_factor(1440),
+            1920,
+            "a 1920-wide scope over 1440 coded columns widens to 1920"
+        );
     }
 
     #[test]

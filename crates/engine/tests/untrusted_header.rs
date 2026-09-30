@@ -205,3 +205,43 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .windows(needle.len())
         .position(|window| window == needle)
 }
+
+/// The boundary of the bound, stated as a test rather than left as a surprise:
+/// 7680 -- 8K UHD -- opens, and 8192 -- 8K DCI, a real ProRes 4444 XQ master
+/// width -- is refused by name.
+///
+/// The refusal of a DCI-width master is a behaviour change this lane
+/// introduced: before it, the bound was asked only of a keystroke and a
+/// `.edith` line, never of a file's own header, so a container could state any
+/// size at all. `MAX_RESOLUTION` stays 7680 rather than being raised to 8192,
+/// because it gates those two doors at 7680 too and widening the ceiling on
+/// every path to accommodate a container is a wider decision than a header fix
+/// should make.
+#[test]
+fn the_resolution_bound_admits_uhd_and_refuses_dci_width_by_name() {
+    let scratch = Scratch::new("dci");
+    let coded_height = 720u16;
+
+    let uhd = scratch.path("uhd_7680.mp4");
+    patch_sample_entry_size(&asset("test_baseline.mp4"), &uhd, 7680, coded_height);
+    let (meta, _) = Demuxer::open(&uhd).expect("8K UHD is inside the bound and opens");
+    assert_eq!(
+        (meta.coded_width, meta.coded_height),
+        (7680, u32::from(coded_height)),
+        "an 8K UHD header is read as stated"
+    );
+
+    let dci = scratch.path("dci_8192.mp4");
+    patch_sample_entry_size(&asset("test_baseline.mp4"), &dci, 8192, coded_height);
+    let Err(why) = Demuxer::open(&dci) else {
+        panic!("an 8192-wide DCI master is refused by name, never opened");
+    };
+    assert!(
+        engine::demux::UnsupportedDisplaySize::is_it(&why),
+        "the refusal is the named one a caller can match: {why}"
+    );
+    assert!(
+        why.to_string().contains("8192"),
+        "and it names the width claimed: {why}"
+    );
+}

@@ -86,6 +86,25 @@ const VIDEO_UNIT_0: &str = concat!(
     "54b28100", // DisplayUnit   0 -- pixels
     "55b085", "55b9820001" // Colour { MatrixCoefficients 1 }
 );
+
+/// The same `DisplayUnit 0` element with a different `Display*` pixel pair,
+/// for the ratios whose reduced form is not a small pair of integers.
+fn video_unit_0(display_width: u16, display_height: u16) -> String {
+    // Both `Display*` values are two-byte payloads, so a width past 0x7FFF
+    // would need three and change the element's length. The lengths here are
+    // all inside that range, which is what keeps every offset in the file
+    // honest.
+    format!(
+        "e09e\
+         b08205a0\
+         ba820438\
+         54b082{display_width:04x}\
+         54ba82{display_height:04x}\
+         54b28100\
+         55b085\
+         55b9820001"
+    )
+}
 fn with_video_element(source: &Path, into: &Path, element: &str) {
     let from = hex(VIDEO_UNIT_3);
     let to = hex(element);
@@ -264,4 +283,62 @@ fn a_real_size_up_to_the_bound_still_opens() {
         "the ordinary fixture is inside the bound, which is what keeps the \
          bound from refusing the library"
     );
+}
+
+/// The regression this arm must not carry: a `DisplayUnit 0` pair is a pixel
+/// SIZE, so its *reduced* form is the size against the coded size, not a small
+/// pair of integers -- and the common cinematic display ratios do not reduce
+/// small. A 1920x803 scope over a 1440x1080 coded track reduces to 1440:803,
+/// and 1920x1037 (1.85:1 flat) likewise.
+///
+/// The reduced-term bound is the right test for an mp4 `pasp`, where the pair
+/// *is* the ratio, and the wrong test here: applying it made the two most
+/// common letterbox ratios open square, on exactly the arm this fix newly
+/// enabled. The quantity that needs bounding on this door is the resulting
+/// display WIDTH, which `width_factor` already caps.
+#[test]
+fn a_cinematic_display_unit_zero_stretches_rather_than_reading_square() {
+    let scratch = Scratch::new("cinema");
+    for (dw, dh, ratio, tag) in [
+        (1920u16, 803u16, "2.39:1 scope", "scope"),
+        (1920, 1037, "1.85:1 flat", "flat"),
+    ] {
+        let into = scratch.path(&format!("{tag}.mkv"));
+        with_video_element(
+            &asset("test_anamorphic.mkv"),
+            &into,
+            &video_unit_0(dw, dh),
+        );
+
+        let (meta, _) = Demuxer::open(&into)
+            .unwrap_or_else(|why| panic!("{tag} ({ratio}): open failed: {why}"));
+        assert!(
+            !meta.pixel_aspect.is_square(),
+            "{tag} ({ratio}): a DisplayUnit 0 pixel pair of {dw}x{dh} over a \
+             1440x1080 coded track is a stretch, not square: got {:?}",
+            meta.pixel_aspect
+        );
+        // The stated DISPLAY WIDTH is the drawn width: unit 0 states it in
+        // pixels, so it is taken as stated, not re-derived. The height stays
+        // the coded one because a pixel aspect moves the width only in this
+        // engine -- `VideoMeta::height` is the coded height for every file, by
+        // design. A 1920x803 scope is therefore drawn 1920x1080 here: the
+        // width is the file's own claim and the height is this engine's
+        // documented model, and the two are not the same thing.
+        assert_eq!(
+            meta.width,
+            u32::from(dw),
+            "{tag} ({ratio}): the stated Display width is the drawn width"
+        );
+        assert_eq!(
+            meta.height,
+            1080,
+            "{tag} ({ratio}): a pixel aspect never moves the height; the coded one stands"
+        );
+        assert_eq!(
+            (meta.coded_width, meta.coded_height),
+            (1440, 1080),
+            "{tag} ({ratio}): the samples are still stored at the coded size"
+        );
+    }
 }
