@@ -363,6 +363,10 @@ pub struct PlaybackSession {
     /// Replaced with the stream at every seek, so it always describes the
     /// pictures currently arriving and never the clip before them.
     backend: BackendCell,
+    /// Why the current span stopped before the end of its range, if it did.
+    /// Replaced with the stream at every seek for the same reason `backend` is,
+    /// and read by [`video_failure_reason`](Self::video_failure_reason).
+    video_failure: crate::decode::DecodeFailure,
     /// Workers cancelled by a seek or a clip change, waiting to be reaped.
     /// Joining one inline costs whatever VA-API init it is still inside (98 ms
     /// measured worst case), which is a visible hitch on the caller's thread;
@@ -650,6 +654,7 @@ impl PlaybackSession {
             frames: stream.frames,
             worker: stream.worker,
             backend: stream.backend,
+            video_failure: stream.failure,
             retired: Vec::new(),
             restarts: 0,
             clock: PlaybackClock::new(source),
@@ -780,6 +785,7 @@ impl PlaybackSession {
             frames: stream.frames,
             worker: stream.worker,
             backend: stream.backend,
+            video_failure: stream.failure,
             retired: Vec::new(),
             restarts: 0,
             // The song keeps the clock, as a video's own sound does -- and wall
@@ -890,6 +896,7 @@ impl PlaybackSession {
             frames: stream.frames,
             worker: stream.worker,
             backend: stream.backend,
+            video_failure: stream.failure,
             retired: Vec::new(),
             restarts: 0,
             clock: PlaybackClock::new(ClockSource::Wall),
@@ -1280,6 +1287,7 @@ impl PlaybackSession {
             frames: stream.frames,
             worker: stream.worker,
             backend: stream.backend,
+            video_failure: stream.failure,
             retired: Vec::new(),
             restarts: 0,
             clock: PlaybackClock::new(match audio {
@@ -1404,6 +1412,25 @@ impl PlaybackSession {
     /// shows it once, at open: without it the whole thing is a stderr line.
     pub fn audio_disabled_reason(&self) -> Option<&str> {
         self.audio_disabled.as_deref()
+    }
+
+    /// Why the picture stopped short of the end of its range, if it did -- the
+    /// video twin of [`Self::audio_disabled_reason`], and the reason a corrupt
+    /// file used to be indistinguishable from a finished one.
+    ///
+    /// A closed frame channel is not an answer: a span that ran to the end of
+    /// the file and a span that gave up on a broken packet both drop the
+    /// sender, and [`Self::try_frame`] returns `None` for either. The app read
+    /// that as end-of-stream, so a file with a damaged middle froze on its last
+    /// good picture and the transport said ENDED -- no notice, no banner, and
+    /// nothing on the screen to say the film had stopped being the film.
+    ///
+    /// `None` for a span that played its whole range, which is the ordinary
+    /// case and the one that must stay silent: a notice that fires on every
+    /// film is a notice nobody reads. The reason is the engine's own words, for
+    /// the same reason the sound one is.
+    pub fn video_failure_reason(&self) -> Option<String> {
+        self.video_failure.reason()
     }
 
     /// The files this timeline plays from, index 0 first -- a caller needs it

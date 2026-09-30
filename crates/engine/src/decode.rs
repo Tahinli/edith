@@ -2,9 +2,9 @@
 //! thread (the UI thread) never blocks on decode and memory stays capped.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use ec_av1::encode::Picture as Av1Picture;
@@ -408,6 +408,56 @@ pub(crate) struct FrameStream {
     /// What this stream's pictures are being decoded by. Dropped last and read
     /// by the caller, so it outlives nothing and blocks nothing.
     pub(crate) backend: BackendCell,
+    /// Why this stream stopped early, if it did -- the answer a closed channel
+    /// cannot give. Cloned into the worker, so it outlives the span that set it.
+    pub(crate) failure: DecodeFailure,
+}
+
+/// Why a decode worker stopped **before** the end of its stream, if it did.
+///
+/// The reason channel the sound path already has ([`crate::playback::Audio`]'s
+/// `died` flag, read back as `audio_disabled_reason`), for the picture side. It
+/// exists because a closed channel is not an answer: a worker that ran to the end
+/// of the file and a worker that gave up on a corrupt packet both drop the
+/// sender, and to a caller reading [`std::sync::mpsc::Receiver::try_recv`]
+/// those are one event. The app read that as `Transport::Ended`, so a file with
+/// a broken middle froze on its last good picture and said nothing -- identical
+/// to the film finishing, with no notice and no banner.
+///
+/// The **first** reason wins: a span that fails and is then reseeked keeps the
+/// failure that stopped it until a span succeeds, which is what makes this a
+/// statement about the file rather than about the last attempt. A clean
+/// end-of-stream sets nothing at all -- silence is not a fault, and a notice
+/// that fires on every film would be a notice nobody reads.
+#[derive(Clone, Default)]
+pub struct DecodeFailure(Arc<Mutex<Option<String>>>);
+
+impl DecodeFailure {
+    /// The reason the last span failed, if one did.
+    pub fn reason(&self) -> Option<String> {
+        self.0.lock().ok().and_then(|reason| reason.clone())
+    }
+
+    /// Records a failure and says so on stderr, which is where these used to go
+    /// and where they still belong: the stderr line is for whoever is reading a
+    /// log, and this cell is for whoever is looking at a window.
+    pub(crate) fn set(&self, reason: String) {
+        eprintln!("{reason}");
+        let Ok(mut slot) = self.0.lock() else {
+            return; // poisoned by a panic elsewhere: the stderr line still stands
+        };
+        if slot.is_none() {
+            *slot = Some(reason);
+        }
+    }
+
+    /// Takes the reason back, for a caller that has read it: a fresh span that
+    /// gets all the way through its range has answered the question.
+    pub(crate) fn clear(&self) {
+        if let Ok(mut slot) = self.0.lock() {
+            slot.take();
+        }
+    }
 }
 
 pub struct DecodeSession;
@@ -483,6 +533,7 @@ impl DecodeSession {
                     reuse: None,
                 },
                 backend: BackendCell::new(Backend::Gap),
+                failure: DecodeFailure::default(),
             };
         }
         let worker_cancel = Arc::clone(&cancel);
@@ -516,6 +567,7 @@ impl DecodeSession {
                 reuse: None,
             },
             backend: BackendCell::new(Backend::Gap),
+            failure: DecodeFailure::default(),
         }
     }
 
@@ -548,6 +600,10 @@ impl DecodeSession {
                     reuse: None,
                 },
                 backend: BackendCell::new(Backend::Still),
+                // A still has no stream to fail in: `Still::open` raised
+                // anything that was wrong with the file at the door, before a
+                // worker existed.
+                failure: DecodeFailure::default(),
             });
         }
         // The one conversion, on this thread: it is a few milliseconds and the
@@ -611,6 +667,7 @@ impl DecodeSession {
                 reuse: None,
             },
             backend: BackendCell::new(Backend::Still),
+            failure: DecodeFailure::default(),
         })
     }
 
@@ -649,6 +706,9 @@ impl DecodeSession {
                     reuse: None,
                 },
                 backend: BackendCell::new(Backend::Visualizer),
+                // A painted picture has no decoder to fail: an unreadable audio
+                // file is `VizEnvelope::Silent`, which is what silence looks like.
+                failure: DecodeFailure::default(),
             });
         }
         // Painted at the canvas's own size, so the composite places nothing:
@@ -735,6 +795,9 @@ impl DecodeSession {
                 reuse: None,
             },
             backend: BackendCell::new(Backend::Visualizer),
+            // ...and nothing in the paint loop can fail either, for the same
+            // reason.
+            failure: DecodeFailure::default(),
         })
     }
 
@@ -823,6 +886,7 @@ impl DecodeSession {
                         reuse: None,
                     },
                     backend: BackendCell::default(),
+                    failure: DecodeFailure::default(),
                 },
             ));
         }
@@ -919,6 +983,11 @@ fn span_worker(
     // what opened rather than what was hoped for -- and kept across the spans
     // that follow, since they are decoded by that very decoder.
     let backend = BackendCell::default();
+    // One cell for the whole worker, not one per span: the thread outlives its
+    // spans (that is what a reseek costs nothing for), so the reason a span
+    // failed has to outlive the span too, and be visible to whoever opened this
+    // stream.
+    let failure = DecodeFailure::default();
     let generation = Arc::new(AtomicU64::new(0));
     // The playhead starts where the span does: nothing is behind it yet.
     let floor = Arc::new(AtomicU32::new(start_frame));
@@ -936,6 +1005,7 @@ fn span_worker(
     };
     let worker_cancel = Arc::clone(&cancel);
     let worker_backend = backend.clone();
+    let worker_failure = failure.clone();
     let worker_generation = Arc::clone(&generation);
     let worker_floor = Arc::clone(&floor);
     let worker_path = path.clone();
@@ -957,7 +1027,14 @@ fn span_worker(
                 // interrupt. A scrub abandons spans by the dozen and this is
                 // where all but the last of them stop.
                 if !abort.hit() {
-                    run_span(&worker_path, &mut source, cmd, &abort, &worker_backend);
+                    run_span(
+                        &worker_path,
+                        &mut source,
+                        cmd,
+                        &abort,
+                        &worker_backend,
+                        &worker_failure,
+                    );
                 }
                 // Parked between spans. A seek and a clip boundary arrive in
                 // milliseconds and find the decoder still open, which is the
@@ -1009,6 +1086,7 @@ fn span_worker(
             }),
         },
         backend,
+        failure,
     }
 }
 
@@ -1111,6 +1189,7 @@ fn run_span(
     cmd: SpanCmd,
     abort: &Abort,
     backend: &BackendCell,
+    worker_failure: &DecodeFailure,
 ) {
     let SpanCmd {
         start,
@@ -1123,11 +1202,21 @@ fn run_span(
         tx,
         ..
     } = cmd;
+    // A span is a fresh question, so it starts from a clean answer: the
+    // failure that stopped the span before this one was already reported, and
+    // carrying it would keep saying a fault that this range may not have. Only
+    // a span that is actually going to run clears it -- a span superseded on its
+    // way through the queue decoded nothing and has nothing to say.
+    worker_failure.clear();
     let opened = match source {
         Some(opened) => opened,
         None => {
             let Some(fresh) = Source::open(path) else {
                 backend.set(Backend::Gap);
+                worker_failure.set(format!(
+                    "{}: could not be opened for decoding",
+                    path.display()
+                ));
                 return;
             };
             source.insert(fresh)
@@ -1208,6 +1297,7 @@ fn run_span(
                 &mut render,
                 abort,
                 speed,
+                worker_failure,
             );
         }
         Codec::Av1 => {
@@ -1221,6 +1311,7 @@ fn run_span(
                 &mut render,
                 abort,
                 speed,
+                worker_failure,
             );
         }
         // Nothing decodes from here -- no software seat exists for this codec.
@@ -1229,7 +1320,7 @@ fn run_span(
         // was hoped for.
         other => {
             backend.set(Backend::Gap);
-            eprintln!("{}", other.needs_plugin());
+            worker_failure.set(format!("{}: {}", path.display(), other.needs_plugin()));
         }
     }
 }
@@ -3321,6 +3412,7 @@ mod tests {
         };
         let (tx, rx) = sync_channel(2);
         let cell = BackendCell::new(Backend::Opening);
+        let failure = DecodeFailure::default();
         run_span(
             &path,
             &mut source,
@@ -3337,6 +3429,7 @@ mod tests {
             },
             &abort,
             &cell,
+            &failure,
         );
         assert_eq!(
             cell.get(),
@@ -3346,6 +3439,11 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "a gap decodes nothing: no picture may come down the channel"
+        );
+        assert!(
+            failure.reason().is_some(),
+            "and it says why: a span that decoded nothing is the one case where \
+             a closed channel is definitely not the end of the file"
         );
     }
 
@@ -3644,6 +3742,7 @@ fn run(
     render: &mut Render,
     abort: &Abort,
     speed: Speed,
+    failure: &DecodeFailure,
 ) {
     // A decoder per span, and cheap: it is a parameter-set map and a picture
     // buffer, while the *demuxer* -- whose index cost seconds to build -- is the
@@ -3681,19 +3780,19 @@ fn run(
             Ok(Some(au)) => {
                 let packet = Packet::new(0, TimeBase::new(1, 1), au);
                 if let Err(e) = decoder.send_packet(&packet) {
-                    eprintln!("decode error at access unit {index}: {e}");
+                    failure.set(format!("decode error at access unit {index}: {e}"));
                     break;
                 }
             }
             Ok(None) => {
                 flushed = true;
                 if let Err(e) = decoder.flush() {
-                    eprintln!("decode error at end of stream: {e}");
+                    failure.set(format!("decode error at end of stream: {e}"));
                     break;
                 }
             }
             Err(e) => {
-                eprintln!("demux error: {e}");
+                failure.set(format!("demux error: {e}"));
                 break;
             }
         }
@@ -3704,7 +3803,7 @@ fn run(
                 Ok(pic) => pic,
                 Err(e) if e.is_need_more() || e.is_eof() => break,
                 Err(e) => {
-                    eprintln!("decode error at access unit {index}: {e}");
+                    failure.set(format!("decode error at access unit {index}: {e}"));
                     break;
                 }
             };
@@ -3831,6 +3930,7 @@ fn run_av1(
     render: &mut Render,
     abort: &Abort,
     speed: Speed,
+    failure: &DecodeFailure,
 ) {
     // Signed, for the same reason [`run`]'s is: the landing sync sample can
     // sit inside what an mp4's edit list trims, i.e. before frame 0.
@@ -3862,7 +3962,7 @@ fn run_av1(
                 }
                 Ok(None) => demux_dry = true,
                 Err(e) => {
-                    eprintln!("demux error: {e}");
+                    failure.set(format!("demux error: {e}"));
                     return;
                 }
             }

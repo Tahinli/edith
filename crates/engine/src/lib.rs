@@ -37,7 +37,7 @@ pub use audio::{
 };
 pub use clock::PlaybackClock;
 pub use decode::{
-    DecodeSession, Frame, UnsupportedStillOrientation, image_orientation, image_size,
+    DecodeFailure, DecodeSession, Frame, UnsupportedStillOrientation, image_orientation, image_size,
 };
 pub use demux::{Codec, MediaBitrate, Rotation, UnsupportedRotation, VideoMeta, probe_bitrate};
 pub use export::ExportHandle;
