@@ -180,13 +180,15 @@ impl Player {
         // a frame of it plays. Off the render thread like the streams above: a
         // stream the plugin takes costs one VA-API init (~90 ms) to answer.
         for path in unseen_paths(session.sources(), &self.decoders) {
-            self.decoders.insert(path.clone(), None);
+            self.decoders.insert(path.clone(), Decoder::Pending);
             let probed = cx.background_executor().spawn({
                 let path = path.clone();
-                // A song and a source no decoder here takes are both `None`:
-                // the row says nothing about them rather than guessing, and
-                // import refused the second at the door anyway.
-                async move { engine::decode::probe(&path).ok() }
+                // A refusal is kept in the decoder's own words, and the row
+                // shows them: a file this machine cannot decode is the one
+                // whose second line has to say so. A song is a different
+                // answer entirely -- it has no coded stream, and the probe
+                // says so by naming the still seat.
+                async move { Decoder::from(engine::decode::probe(&path)) }
             });
             cx.spawn(async move |this, cx| {
                 let probed = probed.await;
@@ -644,7 +646,12 @@ impl Player {
     ///
     /// Escape retreats one step at a time (DESIGN.md:146): the field first,
     /// the moment second.
-    pub(crate) fn export_moment_key(&mut self, key: &str, shift: bool, cx: &mut Context<Self>) -> bool {
+    pub(crate) fn export_moment_key(
+        &mut self,
+        key: &str,
+        shift: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
         if !self.export_open {
             return false;
         }

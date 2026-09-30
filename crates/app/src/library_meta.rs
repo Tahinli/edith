@@ -64,7 +64,7 @@ pub(crate) struct Row {
 pub(crate) fn library_rows(
     sources: &[Source],
     streams: &HashMap<PathBuf, Vec<StreamInfo>>,
-    decoders: &HashMap<PathBuf, Option<(Option<Codec>, Backend)>>,
+    decoders: &HashMap<PathBuf, Decoder>,
     timeline_audio: Option<(u32, u16)>,
     frames: impl Fn(&Path) -> u32,
 ) -> Vec<Row> {
@@ -89,9 +89,7 @@ pub(crate) fn library_rows(
             detail: join_detail(
                 &decoders
                     .get(&source.path)
-                    .copied()
-                    .flatten()
-                    .map_or_else(String::new, |(codec, backend)| decode_label(codec, backend)),
+                    .map_or_else(|| Decoder::Pending.detail(), Decoder::detail),
                 &info
                     .filter(|_| of_file.len() > 1)
                     .map_or_else(String::new, stream_detail),
@@ -193,6 +191,49 @@ pub(crate) fn decode_label(codec: Option<Codec>, backend: Backend) -> String {
     match codec {
         Some(codec) => format!("{} · {}", codec.name(), backend.label()),
         None => backend.label().to_string(),
+    }
+}
+
+/// What the one-shot probe said about a file: the seat it will open on, or --
+/// when the decoder itself refused -- the refusal, in the decoder's own words.
+///
+/// Three answers, not two, because "asked" and "refused" are not the same
+/// answer. Both used to be a missing entry, and a missing entry drew an empty
+/// second line -- the same line a song draws -- so a file this machine cannot
+/// decode was indistinguishable from one that needs no word at all.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Decoder {
+    /// Asked and not yet answered: the probe is still walking the file. A
+    /// real wait, and one that claims nothing while it lasts.
+    Pending,
+    /// The codec (`None` for a still, which has no coded stream) and the seat
+    /// the engine picked for it.
+    Seat(Option<Codec>, Backend),
+    /// The decoder refused this file, and these are its words. Not a message
+    /// of this program's own making: the probe is `engine::decode::probe`,
+    /// and the refusal is the one opening the file would give.
+    Refused(String),
+}
+
+impl From<engine::Result<(Option<Codec>, Backend)>> for Decoder {
+    fn from(probed: engine::Result<(Option<Codec>, Backend)>) -> Self {
+        match probed {
+            Ok((codec, backend)) => Self::Seat(codec, backend),
+            Err(why) => Self::Refused(why.to_string()),
+        }
+    }
+}
+
+impl Decoder {
+    /// What the row's second line says about the file's decoder: the seat for
+    /// a file that opens, the refusal for one that does not, and nothing for a
+    /// probe still running.
+    pub(crate) fn detail(&self) -> String {
+        match self {
+            Self::Pending => String::new(),
+            Self::Seat(codec, backend) => decode_label(*codec, *backend),
+            Self::Refused(why) => why.clone(),
+        }
     }
 }
 
