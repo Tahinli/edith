@@ -7,13 +7,14 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::thread;
 
-use ec_core::frame::VideoFrame;
 use ec_av1::encode::Picture as Av1Picture;
 use ec_av1::stream::decode_stream_with;
-use ec_core::registry::{CodecId, CodecParameters};
+use ec_core::frame::VideoFrame;
 use ec_core::registry::Decoder as _;
+use ec_core::registry::{CodecId, CodecParameters};
 use ec_core::{Error as Av1Error, Packet, TimeBase};
 use ec_h264::H264Decoder;
+use image::ImageDecoder as _;
 
 use crate::color::ColorParams;
 use crate::colorspace::{ColorDescription, Matrix, Transfer};
@@ -560,7 +561,9 @@ impl DecodeSession {
         let first = Render::new(
             color,
             transform,
-            // A still has no display matrix: what the file holds is what it is.
+            // A still's own turn is already in these planes: `Still::open` made
+            // it before the conversion above, exactly where the video door
+            // makes a display matrix, so the render must not make it twice.
             Rotation::None,
             // ...and no sample aspect either: a still is authored square.
             PixelAspect::SQUARE,
@@ -684,7 +687,11 @@ impl DecodeSession {
                 if worker_cancel.load(Ordering::Relaxed) {
                     return;
                 }
-                let fps = if fps.is_finite() && fps > 0.0 { fps } else { 30.0 };
+                let fps = if fps.is_finite() && fps > 0.0 {
+                    fps
+                } else {
+                    30.0
+                };
                 // One frame's painting no longer allocates per strand per
                 // frame: this thread lives for the span.
                 let mut scratch = VizScratch::default();
@@ -711,9 +718,8 @@ impl DecodeSession {
                     // the same thirty seconds, and no decode at all for the
                     // rebuilds of a look edit.
                     let view = envelope.view_at(t);
-                    let (y, u, v) = visualizer_window_i420(
-                        &mut scratch, &view, t, width, height, flags, paint,
-                    );
+                    let (y, u, v) =
+                        visualizer_window_i420(&mut scratch, &view, t, width, height, flags, paint);
                     let frame = render.frame(start_frame + index, &y, &u, &v, width, height);
                     if tx.send(frame).is_err() {
                         return; // caller moved on
@@ -762,6 +768,34 @@ impl DecodeSession {
         tone: tonemap::Preset,
     ) -> crate::Result<(VideoMeta, FrameStream)> {
         let path = path.as_ref().to_path_buf();
+        // A still is not a stream: handing one to the mp4 demuxer answers "a
+        // box with a larger size than it", which is a true sentence about a
+        // container and nothing a person can act on -- and it made this door,
+        // the one a front-end opens a file through, refuse every picture
+        // outright. The still door answers with a meta of its own, so a poster
+        // thumbnail and a preview window get the same picture the timeline
+        // does, at the same size. No `tone` argument is passed on and none is
+        // wanted: a still is decoded into BT.601 SDR planes, so there is no
+        // map to build whichever rendition the project is watching.
+        if crate::is_image(&path) {
+            let still = Still::open(&path)?;
+            let meta = VideoMeta {
+                width: still.width,
+                height: still.height,
+                frame_rate: 1.0,
+                frame_count: 1,
+                codec: Codec::H264,
+                color: ColorDescription::default(),
+                // A still's own turn was made in `Still::open`, before these
+                // planes were written, so there is nothing left to state here.
+                rotation: Rotation::None,
+                coded_width: still.width,
+                coded_height: still.height,
+                pixel_aspect: PixelAspect::SQUARE,
+            };
+            return Self::open_still(&path, start_frame, 1, color, transform, canvas)
+                .map(|stream| (meta, stream));
+        }
         let (meta, demuxer) = Demuxer::open(&path)?;
         // No software HEVC, VP9 or VP8 decoder exists, so such a file the plugin will
         // not take is refused *here*, where the caller still has somewhere to
@@ -1049,7 +1083,9 @@ impl Source {
     fn position_hw(&mut self, path: &Path, start: u32) -> Option<bool> {
         if let Some(hw) = &mut self.hw {
             if hw.seek(start) {
-                eprintln!("decode backend: hardware (VA-API plugin, session kept, seek to {start})");
+                eprintln!(
+                    "decode backend: hardware (VA-API plugin, session kept, seek to {start})"
+                );
                 return Some(true);
             }
             // A plugin too old to reposition, or a decoder that would not
@@ -1140,7 +1176,9 @@ fn run_span(
         // is a software fallback. Without this a single unfollowed seek would
         // collapse the rest of the file to software.
         if !decoded && reused {
-            eprintln!("hardware decode produced nothing after a reseek; reopening at frame {start}");
+            eprintln!(
+                "hardware decode produced nothing after a reseek; reopening at frame {start}"
+            );
             opened.hw = open_hw(path, start);
             if let Some(hw) = opened.hw.as_mut() {
                 decoded = run_hw(hw, &tx, start, end, &mut render, abort, speed);
@@ -1162,12 +1200,28 @@ fn run_span(
         Codec::H264 => {
             eprintln!("decode backend: software (ec-h264)");
             backend.set(Backend::Software);
-            run(&mut opened.demuxer, &tx, start, end, &mut render, abort, speed);
+            run(
+                &mut opened.demuxer,
+                &tx,
+                start,
+                end,
+                &mut render,
+                abort,
+                speed,
+            );
         }
         Codec::Av1 => {
             eprintln!("decode backend: software (ec-av1)");
             backend.set(Backend::Software);
-            run_av1(&mut opened.demuxer, &tx, start, end, &mut render, abort, speed);
+            run_av1(
+                &mut opened.demuxer,
+                &tx,
+                start,
+                end,
+                &mut render,
+                abort,
+                speed,
+            );
         }
         // Nothing decodes from here -- no software seat exists for this codec.
         // Say so: the cell was left claiming the hardware session that opened
@@ -1388,36 +1442,35 @@ impl Render {
         // picture a viewer is shown, so its brightness and saturation mean what
         // they say in the SDR the tone map just produced, not in the 10-stop
         // HDR the file was in.
-        let (y, u, v, desc) = if self.tone.is_some()
-            || (!skip_placement && !self.color.is_identity())
-        {
-            let (gy, gu, gv) = &mut self.graded;
-            gy.clear();
-            gy.extend_from_slice(y);
-            gu.clear();
-            gu.extend_from_slice(u);
-            gv.clear();
-            gv.extend_from_slice(v);
-            if let Some(tone) = &self.tone {
-                tone.map(gy, gu, gv, width as usize, height as usize);
-            }
-            // The same terms the branch was entered on: anywhere the fused
-            // conversion below will not apply the grade (a placement is
-            // happening, so the canvas conversion is plain), it lands here --
-            // including the passthrough-sized clip a transform moves, whose
-            // grade used to be dropped on the floor between these two guards.
-            if !skip_placement && !self.color.is_identity() {
-                crate::color::apply_yuv(&self.color, gy, gu, gv);
-            }
-            let desc = if self.tone.is_some() {
-                TONE_MAPPED
+        let (y, u, v, desc) =
+            if self.tone.is_some() || (!skip_placement && !self.color.is_identity()) {
+                let (gy, gu, gv) = &mut self.graded;
+                gy.clear();
+                gy.extend_from_slice(y);
+                gu.clear();
+                gu.extend_from_slice(u);
+                gv.clear();
+                gv.extend_from_slice(v);
+                if let Some(tone) = &self.tone {
+                    tone.map(gy, gu, gv, width as usize, height as usize);
+                }
+                // The same terms the branch was entered on: anywhere the fused
+                // conversion below will not apply the grade (a placement is
+                // happening, so the canvas conversion is plain), it lands here --
+                // including the passthrough-sized clip a transform moves, whose
+                // grade used to be dropped on the floor between these two guards.
+                if !skip_placement && !self.color.is_identity() {
+                    crate::color::apply_yuv(&self.color, gy, gu, gv);
+                }
+                let desc = if self.tone.is_some() {
+                    TONE_MAPPED
+                } else {
+                    self.desc
+                };
+                (&gy[..], &gu[..], &gv[..], desc)
             } else {
-                self.desc
+                (y, u, v, self.desc)
             };
-            (&gy[..], &gu[..], &gv[..], desc)
-        } else {
-            (y, u, v, self.desc)
-        };
         if skip_placement {
             return Frame {
                 index,
@@ -1435,11 +1488,17 @@ impl Render {
             };
         }
         let (y, u, v, width, height) = if transform_active {
-            let (py, pu, pv, w, h) = self
-                .canvas
-                .place_transformed(y, u, v, width, height, &self.transform);
+            let (py, pu, pv, w, h) =
+                self.canvas
+                    .place_transformed(y, u, v, width, height, &self.transform);
             self.placed = (py, pu, pv);
-            (&self.placed.0[..], &self.placed.1[..], &self.placed.2[..], w, h)
+            (
+                &self.placed.0[..],
+                &self.placed.1[..],
+                &self.placed.2[..],
+                w,
+                h,
+            )
         } else {
             self.canvas.place(y, u, v, width, height)
         };
@@ -1465,8 +1524,98 @@ pub(crate) struct Still {
     pub(crate) y: Vec<u8>,
     pub(crate) u: Vec<u8>,
     pub(crate) v: Vec<u8>,
+    /// The picture as it is *shown*, which for a phone's portrait photo is not
+    /// the picture as it was stored: the turn its EXIF block asks for was made
+    /// in [`Still::open`] before these planes were written, exactly where the
+    /// video doors make a display matrix, so the pair every reader takes is
+    /// the displayed one ([`crate::demux::Rotation`]'s own contract).
     pub(crate) width: u32,
     pub(crate) height: u32,
+}
+
+/// A still whose EXIF orientation is not a quarter turn: values 2, 4, 5 and 7
+/// are mirrorings, and this engine has no flip anywhere in its pipeline -- not
+/// in [`crate::scale::rotate_i420_90s`], not in [`Render`], not in an export's
+/// `place_picture`. Refused **by name** at the door, for
+/// [`crate::demux::UnsupportedRotation`]'s reason: showing a mirrored photo the
+/// wrong way round is a wrong picture rather than a missing feature, and
+/// quietly treating a mirror as a turn is exactly the bug this door exists to
+/// stop. The `Display` is what a user is refused by.
+#[derive(Debug)]
+pub struct UnsupportedStillOrientation {
+    /// The EXIF value the file states, which is what the sentence names: the
+    /// eight legal values are 1 (upright) through 8, and the four mirrorings
+    /// are the even-odd pairs.
+    pub exif: u8,
+}
+
+impl std::fmt::Display for UnsupportedStillOrientation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "this picture's EXIF orientation is {}, which is a mirror and not a turn; only \
+             upright, 90°, 180° and 270° can be straightened here",
+            self.exif
+        )
+    }
+}
+
+impl std::error::Error for UnsupportedStillOrientation {}
+
+impl UnsupportedStillOrientation {
+    /// Whether `error` is one of these, however deep in a `Box` it is --
+    /// [`crate::demux::UnsupportedRotation::is_it`]'s twin.
+    pub fn is_it(error: &crate::Error) -> bool {
+        error.downcast_ref::<Self>().is_some()
+    }
+}
+
+/// The quarter turns an EXIF orientation asks for, as the one
+/// [`Rotation`] every other door in this engine already uses -- no second
+/// shape mechanism for a still, so the same turn is made by the same code
+/// that makes a video's display matrix turn.
+///
+/// EXIF 1, 6, 8 and 3 are the four quarter turns; **2, 4, 5 and 7 are
+/// mirrorings** and are refused ([`UnsupportedStillOrientation`]) rather than
+/// approximated by the nearest rotation. A value the standard does not define
+/// (0, or above 8) states no orientation this can read, and is likewise
+/// refused rather than guessed at.
+fn rotation_of_exif(orientation: image::metadata::Orientation) -> crate::Result<Rotation> {
+    use image::metadata::Orientation as O;
+    Ok(match orientation {
+        O::NoTransforms => Rotation::None,
+        O::Rotate90 => Rotation::Cw90,
+        O::Rotate180 => Rotation::Cw180,
+        O::Rotate270 => Rotation::Cw270,
+        // The `image` crate keeps the raw number alongside: an orientation it
+        // could not read is `NoTransforms`, and saying "0" for a mirror would
+        // be a claim rather than a reading.
+        mirrored => {
+            return Err(UnsupportedStillOrientation {
+                exif: mirrored.to_exif(),
+            }
+            .into());
+        }
+    })
+}
+
+/// What turn `path` asks for, read off its **header** alone -- what a library
+/// row says about a file it has not placed anywhere, and what
+/// [`image_size`] needs to report the size the picture is shown at.
+///
+/// Header-only on purpose: the whole file is not decoded, exactly as
+/// [`image_size`] has always been. `into_decoder` parses the container and
+/// stops there; the pixels are never touched.
+pub fn image_orientation(path: &Path) -> crate::Result<Rotation> {
+    let mut decoder = image::ImageReader::open(path)?
+        .with_guessed_format()?
+        .into_decoder()
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    // The refusal is handed on **unchanged**, not folded into a sentence with
+    // the file's name: a `String` is not an error a caller can downcast, and
+    // `is_it` is how a front-end tells this refusal from any other failure.
+    // The path is not lost -- every caller that has one puts it in front.
+    rotation_of_exif(decoder.orientation()?)
 }
 
 impl Still {
@@ -1484,12 +1633,41 @@ impl Still {
     /// lands as a rectangle. Upgrade path is keeping the alpha plane here and
     /// giving `scale::Composer` a blend over the lane below.
     pub(crate) fn open(path: &Path) -> crate::Result<Self> {
-        let reader = image::ImageReader::open(path)?.with_guessed_format()?;
-        let rgb = reader
-            .decode()
+        // The turn is read and made **here**, once, before a single pair of
+        // numbers leaves this function: `image`'s decoder keeps an EXIF
+        // orientation in its own field and applies nothing, so a portrait
+        // phone photo arrived as landscape planes and every consumer below --
+        // the `Render`, the `VideoMeta`, `image_size` -- reported the shape the
+        // camera stored rather than the one it was shot at. This is the same
+        // step the video doors make, at the same place in the pipeline
+        // (before the grade, the canvas and the conversion all see the
+        // picture), and it uses the same [`Rotation`].
+        let mut decoder = image::ImageReader::open(path)?
+            .with_guessed_format()?
+            .into_decoder()
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        // Unchanged for the reason `image_orientation` gives: a caller has to
+        // be able to downcast this refusal, and a sentence with the file's name
+        // in it is not one.
+        let rotation = rotation_of_exif(decoder.orientation()?)?;
+        let rgb = image::DynamicImage::from_decoder(decoder)
             .map_err(|e| format!("{}: {e}", path.display()))?
             .to_rgb8();
-        let (width, height) = rgb.dimensions();
+        let (coded_width, coded_height) = rgb.dimensions();
+        // Turned here rather than left to each consumer, so there is exactly
+        // one place the turn is made and no consumer can be forgotten: the
+        // planes handed out below are the *shown* picture, so the `Render`, the
+        // `VideoMeta`, an export's `place_picture` and `image_size` all agree
+        // without any of them re-deriving it. A file that states no turn takes
+        // the branch by a bool and not one byte is copied.
+        let (rgb, width, height) = match rotation.is_none() {
+            true => (rgb, coded_width, coded_height),
+            false => {
+                let turned = turn_rgb(&rgb, rotation.steps());
+                let (width, height) = turned.dimensions();
+                (turned, width, height)
+            }
+        };
         if !crate::is_resolution(width, height) {
             return Err(format!(
                 "{} is {width}x{height}, which is not a picture this engine composes",
@@ -1508,19 +1686,49 @@ impl Still {
     }
 
     /// The planes as an export's decoder hands them over, so a still and a
-    /// decoded picture are the same value to `export::run`.
+    /// decoded picture are the same value to `export::run` -- and, for a
+    /// turned still, the same value in the only sense that matters: the turn
+    /// is already in them, so an export places what the preview showed without
+    /// being told a second time.
     pub(crate) fn picture(&self) -> (&[u8], &[u8], &[u8], u32, u32) {
         (&self.y, &self.u, &self.v, self.width, self.height)
     }
 }
 
-/// How big the picture in `path` is, from its header alone -- what a library row
-/// says about a file it has not placed anywhere. The whole file is not decoded.
+/// `steps` quarter turns clockwise over a packed RGB8 picture -- the same
+/// direction and the same count [`crate::scale::rotate_i420_90s`] takes, on the
+/// still's own buffer rather than on its planes: a still is turned exactly once
+/// in its whole life, so there is no steady-state cost to make the allocating
+/// call the one that happens.
+fn turn_rgb(rgb: &image::RgbImage, steps: u8) -> image::RgbImage {
+    match steps % 4 {
+        1 => image::imageops::rotate90(rgb),
+        2 => image::imageops::rotate180(rgb),
+        3 => image::imageops::rotate270(rgb),
+        _ => rgb.clone(),
+    }
+}
+
+/// How big the picture in `path` is as it is **shown**, from its header alone --
+/// what a library row says about a file it has not placed anywhere. The whole
+/// file is not decoded.
+///
+/// The turn is applied to the answer for the same reason
+/// [`DecodeSession::open_still`]'s is: a portrait phone photo stores landscape
+/// and says so in its EXIF block, and a row that answered 4000x3000 for a
+/// picture that is shown 3000x4000 states the wrong shape on the one surface
+/// that exists before anything places the file. Header-only still --
+/// `into_decoder` parses the container and stops.
 pub fn image_size(path: &Path) -> crate::Result<(u32, u32)> {
-    Ok(image::ImageReader::open(path)?
+    let rotation = image_orientation(path)?;
+    let (width, height) = image::ImageReader::open(path)?
         .with_guessed_format()?
         .into_dimensions()
-        .map_err(|e| format!("{}: {e}", path.display()))?)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(match rotation.swaps_axes() {
+        true => (height, width),
+        false => (width, height),
+    })
 }
 
 /// Packed RGB8 -> tightly packed I420, BT.601 limited range: the exact inverse
@@ -1599,11 +1807,7 @@ const VIZ_STRAND_SAT_SHIFT: u32 = 40;
 const VIZ_STRAND_CHOSEN: u64 = 1 << 63;
 
 pub fn viz_materialize(paint: u64) -> u64 {
-    if paint == 0 {
-        VIZ_PAINT_AZURE
-    } else {
-        paint
-    }
+    if paint == 0 { VIZ_PAINT_AZURE } else { paint }
 }
 
 pub fn viz_ink_from_paint(paint: u64) -> (u8, u8, u8) {
@@ -1638,7 +1842,11 @@ pub fn with_viz_paint_glow(paint: u64, n: u8) -> u64 {
 }
 
 pub fn viz_hue_ui(paint: u64) -> u8 {
-    if paint == 0 { 150 } else { (paint & 0xFF) as u8 }
+    if paint == 0 {
+        150
+    } else {
+        (paint & 0xFF) as u8
+    }
 }
 
 pub fn viz_sat_ui(paint: u64) -> u8 {
@@ -1688,9 +1896,10 @@ pub fn with_viz_paint_strand_sat(paint: u64, sat: u8) -> u64 {
 /// Drop the chosen strand colour: the dual half of a ring goes back to the
 /// automatic complement, and both strand bytes go with the flag.
 pub fn viz_strand_clear(paint: u64) -> u64 {
-    paint & !(VIZ_STRAND_CHOSEN
-        | (0xFF_u64 << VIZ_STRAND_HUE_SHIFT)
-        | (0xFF_u64 << VIZ_STRAND_SAT_SHIFT))
+    paint
+        & !(VIZ_STRAND_CHOSEN
+            | (0xFF_u64 << VIZ_STRAND_HUE_SHIFT)
+            | (0xFF_u64 << VIZ_STRAND_SAT_SHIFT))
 }
 
 /// `#RRGGBB` for an ink, at the same fixed value the painter draws at, so
@@ -1837,8 +2046,7 @@ fn viz_stamp(
     if x < 0 || row < 0 || x >= w as i32 || row >= h as i32 {
         return;
     }
-    let lum =
-        (f32::from(bg_y) + (f32::from(ink_y) - f32::from(bg_y)) * fall.clamp(0.0, 1.0)) as u8;
+    let lum = (f32::from(bg_y) + (f32::from(ink_y) - f32::from(bg_y)) * fall.clamp(0.0, 1.0)) as u8;
     let idx = row as usize * w + x as usize;
     if lum > y[idx] {
         y[idx] = lum;
@@ -1871,7 +2079,9 @@ fn viz_span(
 ) {
     let (a, b) = if top <= bot { (top, bot) } else { (bot, top) };
     for row in a..=b {
-        viz_stamp(y, u, v, w, h, cw, ch, x, row, 1.0, bg_y, ink_y, ink_u, ink_v);
+        viz_stamp(
+            y, u, v, w, h, cw, ch, x, row, 1.0, bg_y, ink_y, ink_u, ink_v,
+        );
     }
 }
 
@@ -1935,7 +2145,22 @@ fn viz_line(
                     let d2 = (ox * ox + oy * oy) as f32;
                     (-0.45 * d2 / (g * g).max(1) as f32).exp()
                 };
-                viz_stamp(y, u, v, w, h, cw, ch, x0 + ox, y0 + oy, fall, bg_y, ink_y, ink_u, ink_v);
+                viz_stamp(
+                    y,
+                    u,
+                    v,
+                    w,
+                    h,
+                    cw,
+                    ch,
+                    x0 + ox,
+                    y0 + oy,
+                    fall,
+                    bg_y,
+                    ink_y,
+                    ink_u,
+                    ink_v,
+                );
             }
         }
         if x0 == x1 && y0 == y1 {
@@ -2034,7 +2259,14 @@ fn viz_chain(
     ink_v: u8,
     glow: u8,
 ) {
-    let VizScratch { pts, chain, rows, cand, hull, .. } = scratch;
+    let VizScratch {
+        pts,
+        chain,
+        rows,
+        cand,
+        hull,
+        ..
+    } = scratch;
     chain.clear();
     for pair in pts.windows(2) {
         viz_walk(pair[0].0, pair[0].1, pair[1].0, pair[1].1, chain);
@@ -2047,7 +2279,9 @@ fn viz_chain(
         // full ink -- which is exactly what the row/by/band machinery below
         // works out, one sort later.
         for &(x, row) in chain.iter() {
-            viz_stamp(y, u, v, w, h, cw, ch, x, row, 1.0, bg_y, ink_y, ink_u, ink_v);
+            viz_stamp(
+                y, u, v, w, h, cw, ch, x, row, 1.0, bg_y, ink_y, ink_u, ink_v,
+            );
         }
         return;
     }
@@ -2173,7 +2407,9 @@ fn viz_chain(
                     } else {
                         (-0.45 * d2 as f32 / (g * g).max(1) as f32).exp()
                     };
-                    viz_stamp(y, u, v, w, h, cw, ch, x, row, fall, bg_y, ink_y, ink_u, ink_v);
+                    viz_stamp(
+                        y, u, v, w, h, cw, ch, x, row, fall, bg_y, ink_y, ink_u, ink_v,
+                    );
                 }
             }
         }
@@ -2197,7 +2433,15 @@ pub(crate) fn visualizer_i420(
     flags: u8,
     paint: u64,
 ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
-    visualizer_window_i420(scratch, &VizView::whole(peaks), t_secs, width, height, flags, paint)
+    visualizer_window_i420(
+        scratch,
+        &VizView::whole(peaks),
+        t_secs,
+        width,
+        height,
+        flags,
+        paint,
+    )
 }
 
 /// The envelope a visualizer frame is painted from: the whole file, or one
@@ -2404,12 +2648,36 @@ pub(crate) fn visualizer_window_i420(
                     for dy in 1..=glow {
                         let fall = 0.5 / dy as f32;
                         viz_stamp(
-                            &mut y, &mut u, &mut v, w, h, cw, ch, col as i32, row - dy, fall, bg_y,
-                            ink_y, ink_u, ink_v,
+                            &mut y,
+                            &mut u,
+                            &mut v,
+                            w,
+                            h,
+                            cw,
+                            ch,
+                            col as i32,
+                            row - dy,
+                            fall,
+                            bg_y,
+                            ink_y,
+                            ink_u,
+                            ink_v,
                         );
                         viz_stamp(
-                            &mut y, &mut u, &mut v, w, h, cw, ch, col as i32, row + dy, fall, bg_y,
-                            ink_y, ink_u, ink_v,
+                            &mut y,
+                            &mut u,
+                            &mut v,
+                            w,
+                            h,
+                            cw,
+                            ch,
+                            col as i32,
+                            row + dy,
+                            fall,
+                            bg_y,
+                            ink_y,
+                            ink_u,
+                            ink_v,
                         );
                     }
                 }
@@ -2474,9 +2742,10 @@ pub(crate) fn visualizer_window_i420(
         VIZ_STYLE_WAVE => {
             scratch.pts.clear();
             for col in 0..w {
-                scratch
-                    .pts
-                    .push((col as i32, (center - scratch.sig[col] * half).round() as i32));
+                scratch.pts.push((
+                    col as i32,
+                    (center - scratch.sig[col] * half).round() as i32,
+                ));
             }
             let glow = viz_glow_of(paint);
             if viz_discs_are_cheaper(scratch.pts.len(), chain_cells(&scratch.pts), glow) {
@@ -2488,8 +2757,7 @@ pub(crate) fn visualizer_window_i420(
                 }
             } else {
                 viz_chain(
-                    &mut y, &mut u, &mut v, w, h, cw, ch, scratch, bg_y, ink_y, ink_u, ink_v,
-                    glow,
+                    &mut y, &mut u, &mut v, w, h, cw, ch, scratch, bg_y, ink_y, ink_u, ink_v, glow,
                 );
             }
         }
@@ -2507,12 +2775,36 @@ pub(crate) fn visualizer_window_i420(
                 for dy in 1..=glow {
                     let fall = 0.55 / dy as f32;
                     viz_stamp(
-                        &mut y, &mut u, &mut v, w, h, cw, ch, col as i32, top - dy, fall, bg_y,
-                        ink_y, ink_u, ink_v,
+                        &mut y,
+                        &mut u,
+                        &mut v,
+                        w,
+                        h,
+                        cw,
+                        ch,
+                        col as i32,
+                        top - dy,
+                        fall,
+                        bg_y,
+                        ink_y,
+                        ink_u,
+                        ink_v,
                     );
                     viz_stamp(
-                        &mut y, &mut u, &mut v, w, h, cw, ch, col as i32, bot + dy, fall, bg_y,
-                        ink_y, ink_u, ink_v,
+                        &mut y,
+                        &mut u,
+                        &mut v,
+                        w,
+                        h,
+                        cw,
+                        ch,
+                        col as i32,
+                        bot + dy,
+                        fall,
+                        bg_y,
+                        ink_y,
+                        ink_u,
+                        ink_v,
                     );
                 }
             }
@@ -2695,7 +2987,10 @@ mod tests {
             "deferred open returned in {returned:?}, first frame at {first_frame:?}; \
              sync open returned in {sync_returned:?}"
         );
-        assert_eq!(frame.index, 0, "the deferred worker starts where it is told");
+        assert_eq!(
+            frame.index, 0,
+            "the deferred worker starts where it is told"
+        );
         assert!(
             returned < Duration::from_millis(10),
             "the caller waited {returned:?} -- something is still being read \
@@ -2848,7 +3143,10 @@ mod tests {
         let w = 320u32;
         let h = 180u32;
         let (y, _u, _v) = visualizer_i420(&mut VizScratch::default(), &[], 0.0, w, h, 1, 0);
-        assert_eq!((y.len(), _u.len(), _v.len()), (320 * 180, 160 * 90, 160 * 90));
+        assert_eq!(
+            (y.len(), _u.len(), _v.len()),
+            (320 * 180, 160 * 90, 160 * 90)
+        );
         // The ink's top and bottom row for a given peaks slice: one unbroken
         // band, and where it sits.
         let band = |peaks: &[(f32, f32)]| {
@@ -3059,10 +3357,14 @@ mod tests {
             *p = (-a.abs(), a.abs());
         }
         let flags = 1u8;
-        let (y, u, v) = visualizer_i420(&mut VizScratch::default(), &peaks, 1.0, 320, 180, flags, 0);
+        let (y, u, v) =
+            visualizer_i420(&mut VizScratch::default(), &peaks, 1.0, 320, 180, flags, 0);
         let ink = y.iter().filter(|&&p| p > 40).count();
         assert!(ink > 200, "envelope missing: {ink}");
-        assert!(ink < y.len() * 9 / 10, "solid frame, not an envelope: {ink}");
+        assert!(
+            ink < y.len() * 9 / 10,
+            "solid frame, not an envelope: {ink}"
+        );
         let mut blue = 0usize;
         for i in 0..u.len() {
             if u[i] > 145 && v[i] < 120 {
@@ -3072,13 +3374,22 @@ mod tests {
         assert!(blue > 10, "default ink was not timeline blue: {blue}");
 
         let ring = with_viz_style(flags, VIZ_STYLE_RING);
-        let (yr, _, _) = visualizer_i420(&mut VizScratch::default(), &peaks, 1.0, 320, 180, ring, 0);
+        let (yr, _, _) =
+            visualizer_i420(&mut VizScratch::default(), &peaks, 1.0, 320, 180, ring, 0);
         let ring_ink = yr.iter().filter(|&&p| p > 40).count();
         assert!(ring_ink > 80, "ring missing: {ring_ink}");
         assert!(ring_ink < ink, "ring should be a stroke, not a fill");
 
         let hue_paint = with_viz_paint_hue(0, 40);
-        let (_, u2, v2) = visualizer_i420(&mut VizScratch::default(), &peaks, 1.0, 64, 32, flags, hue_paint);
+        let (_, u2, v2) = visualizer_i420(
+            &mut VizScratch::default(),
+            &peaks,
+            1.0,
+            64,
+            32,
+            flags,
+            hue_paint,
+        );
         let mut shifted = 0usize;
         for i in 0..u2.len() {
             if u2[i] < 120 && v2[i] > 130 {
@@ -3175,7 +3486,15 @@ mod tests {
         }
         let ring = with_viz_style(1, VIZ_STYLE_RING);
         let auto = VIZ_PAINT_AZURE;
-        let (y0, u0, v0) = visualizer_i420(&mut VizScratch::default(), &peaks, 1.0, 320, 180, ring, auto);
+        let (y0, u0, v0) = visualizer_i420(
+            &mut VizScratch::default(),
+            &peaks,
+            1.0,
+            320,
+            180,
+            ring,
+            auto,
+        );
 
         // The automatic dual is half a wheel from the clip's hue at the
         // clip's own saturation; choosing exactly that colour changes
@@ -3185,24 +3504,54 @@ mod tests {
             viz_sat_ui(auto),
         );
         assert!(viz_strand_set(same));
-        let (ys, us, vs) = visualizer_i420(&mut VizScratch::default(), &peaks, 1.0, 320, 180, ring, same);
-        assert_eq!(ys, y0, "the automatic complement, spelled out, is the same frame");
+        let (ys, us, vs) = visualizer_i420(
+            &mut VizScratch::default(),
+            &peaks,
+            1.0,
+            320,
+            180,
+            ring,
+            same,
+        );
+        assert_eq!(
+            ys, y0,
+            "the automatic complement, spelled out, is the same frame"
+        );
         assert_eq!(us, u0);
         assert_eq!(vs, v0);
 
         // A colour of its own repaints the dual strands in it.
         let red = with_viz_paint_strand_sat(with_viz_paint_strand_hue(auto, 0), 255);
-        let (_, u1, v1) = visualizer_i420(&mut VizScratch::default(), &peaks, 1.0, 320, 180, ring, red);
-        let red_px = (0..u1.len()).filter(|&i| u1[i] < 110 && v1[i] > 200).count();
-        let auto_px = (0..u0.len()).filter(|&i| u0[i] < 110 && v0[i] > 200).count();
-        assert!(red_px > 20, "the chosen colour did not reach the frame: {red_px}");
-        assert_eq!(auto_px, 0, "the automatic ring already painted red: {auto_px}");
+        let (_, u1, v1) =
+            visualizer_i420(&mut VizScratch::default(), &peaks, 1.0, 320, 180, ring, red);
+        let red_px = (0..u1.len())
+            .filter(|&i| u1[i] < 110 && v1[i] > 200)
+            .count();
+        let auto_px = (0..u0.len())
+            .filter(|&i| u0[i] < 110 && v0[i] > 200)
+            .count();
+        assert!(
+            red_px > 20,
+            "the chosen colour did not reach the frame: {red_px}"
+        );
+        assert_eq!(
+            auto_px, 0,
+            "the automatic ring already painted red: {auto_px}"
+        );
 
         // ...and the flag is what decides: strand bytes with it clear are
         // the unset picture, byte for byte.
         let stale = auto | (77u64 << 32) | (9u64 << 40);
         assert!(!viz_strand_set(stale));
-        let (yt, ut, vt) = visualizer_i420(&mut VizScratch::default(), &peaks, 1.0, 320, 180, ring, stale);
+        let (yt, ut, vt) = visualizer_i420(
+            &mut VizScratch::default(),
+            &peaks,
+            1.0,
+            320,
+            180,
+            ring,
+            stale,
+        );
         assert_eq!(yt, y0, "an unset strand colour is the frame it always was");
         assert_eq!(ut, u0);
         assert_eq!(vt, v0);
@@ -3250,7 +3599,15 @@ mod tests {
             };
             let flags = with_viz_style(1, style);
             let paint = with_viz_paint_glow(VIZ_PAINT_AZURE, glow);
-            let (y, u, v) = visualizer_i420(&mut VizScratch::default(), &peaks, 37.5, 1920, 1080, flags, paint);
+            let (y, u, v) = visualizer_i420(
+                &mut VizScratch::default(),
+                &peaks,
+                37.5,
+                1920,
+                1080,
+                flags,
+                paint,
+            );
             let mut hash = 0xcbf2_9ce4_8422_2325u64;
             for buf in [&y, &u, &v] {
                 for &b in buf.iter() {
@@ -3566,7 +3923,6 @@ fn run_av1(
             }
         }
     }
-
 }
 
 /// Converts one decoded picture and queues it. `true` when the consumer went

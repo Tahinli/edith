@@ -205,5 +205,7 @@ oxideav-sub-image = "0.0.7"
 
 [dev-dependencies]
 # The still-image suite compares what the timeline shows against the file's own
-# pixels rather than against a constant. Already built for the engine itself.
-image = { version = "0.25", default-features = false, features = ["png"] }
+# pixels rather than against a constant, and the EXIF suite has to *write* one:
+# no fixture in `assets/` carries an orientation tag, so the turned-still test
+# builds its own JPEG here. Already built for the engine itself.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }

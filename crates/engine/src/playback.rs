@@ -26,8 +26,9 @@ use crate::colorspace::{ColorDescription, ContentLight};
 use crate::decode::{Backend, BackendCell, DecodeSession, Frame, Worker};
 use crate::demux::{Codec, Demuxer, NoVideoTrack, Rotation, VideoMeta};
 use crate::eq::EqParams;
-use crate::project::{ProjectSettings,
-    Clip, Edge, GapSweep, Lane, LaneKind, Project, Rate, Source, Span, Speed, SubClip,
+use crate::project::{
+    Clip, Edge, GapSweep, Lane, LaneKind, Project, ProjectSettings, Rate, Source, Span, Speed,
+    SubClip,
 };
 use crate::scale::{Composer, FitPolicy};
 use crate::transform::TransformParams;
@@ -638,7 +639,9 @@ impl PlaybackSession {
         // hands it back out. The same trade the audio header cache above this
         // makes -- a second container open, paid once at open rather than never
         // -- since nothing here decodes a single picture.
-        let content_light = Demuxer::open(&path).map(|(_, d)| d.light()).unwrap_or_default();
+        let content_light = Demuxer::open(&path)
+            .map(|(_, d)| d.light())
+            .unwrap_or_default();
         Ok(Self {
             meta,
             content_light,
@@ -831,6 +834,10 @@ impl PlaybackSession {
             frame_count: image_frames(IMAGE_ONLY_RATE),
             codec: Codec::H264,
             color: ColorDescription::default(),
+            // `Rotation::None` is honest, not a shrug: a still's own turn was
+            // made in `Still::open`, before these planes were written, so the
+            // pair below is already the displayed one and there is nothing left
+            // for a consumer to make.
             rotation: Rotation::None,
             // No container said anything about these: the picture this engine
             // decoded itself is square pixels at the size it was decoded at.
@@ -980,7 +987,9 @@ impl PlaybackSession {
         let content_light = if crate::is_audio(&first.path) || crate::is_image(&first.path) {
             ContentLight::default()
         } else {
-            Demuxer::open(&first.path).map(|(_, d)| d.light()).unwrap_or_default()
+            Demuxer::open(&first.path)
+                .map(|(_, d)| d.light())
+                .unwrap_or_default()
         };
         // The extension's word, corrected below the moment the header disagrees
         // with it (`NoVideoTrack`, the same fallback `open_stream` takes): every
@@ -1001,11 +1010,11 @@ impl PlaybackSession {
                     codec: Codec::H264,
                     color: ColorDescription::default(),
                     rotation: Rotation::None,
-            // No container said anything about these: the canvas this engine drew
-            // itself is square pixels at the size it was drawn at.
-            coded_width: width,
-            coded_height: height,
-            pixel_aspect: crate::demux::PixelAspect::SQUARE,
+                    // No container said anything about these: the canvas this engine drew
+                    // itself is square pixels at the size it was drawn at.
+                    coded_width: width,
+                    coded_height: height,
+                    pixel_aspect: crate::demux::PixelAspect::SQUARE,
                 };
                 (meta, DecodeSession::open_black(width, height, 1))
             }
@@ -1023,6 +1032,9 @@ impl PlaybackSession {
                     frame_count: image_frames(frame_rate),
                     codec: Codec::H264,
                     color: ColorDescription::default(),
+                    // `Rotation::None` is honest, not a shrug: `Still::open`
+                    // made the file's own turn before these planes were
+                    // written, so the pair below is already the displayed one.
                     rotation: Rotation::None,
                     // No container said anything about these: the picture this
                     // engine decoded itself is square pixels at its own size.
@@ -1071,11 +1083,11 @@ impl PlaybackSession {
                         codec: Codec::H264,
                         color: ColorDescription::default(),
                         rotation: Rotation::None,
-            // No container said anything about these: the canvas this engine drew
-            // itself is square pixels at the size it was drawn at.
-            coded_width: width,
-            coded_height: height,
-            pixel_aspect: crate::demux::PixelAspect::SQUARE,
+                        // No container said anything about these: the canvas this engine drew
+                        // itself is square pixels at the size it was drawn at.
+                        coded_width: width,
+                        coded_height: height,
+                        pixel_aspect: crate::demux::PixelAspect::SQUARE,
                     };
                     (meta, DecodeSession::open_black(width, height, 1))
                 }
@@ -1207,24 +1219,24 @@ impl PlaybackSession {
         let subtitles = crate::subtitle::open_all(&doc.subtitles);
         let project =
             Project::from_parts(doc.sources, doc.lanes, doc.eq, doc.color, doc.transform)?
-            .with_mix(&doc.gains, doc.limiter)
-            .with_tone(doc.tone)
-            // The palette before what is placed on it: a caption names a row of
-            // it, and [`Project::with_subs`] refuses one naming a row that is
-            // not there.
-            .with_subtitles(subtitles)
-            .with_subs(doc.subs)?
-            // The header a load puts back: the canvas and rate above, which a
-            // save's own `resolution`/`fps` lines may have moved off the
-            // scaffold's, and the switches the literal below carries -- handed
-            // in here because they are the project's own and a door that moved
-            // one after this would snapshot whatever copy it holds, which until
-            // this line is the placeholder's. No undo step for
-            // [`Project::with_mix`]'s reason: a project that arrived one `z`
-            // from a state it was never in is a project whose first undo is a
-            // surprise.
-            .with_canvas(meta.width, meta.height, meta.frame_rate)
-            .with_switches(doc.proxy, doc.auto_proxy, doc.encoder, doc.sample_rate);
+                .with_mix(&doc.gains, doc.limiter)
+                .with_tone(doc.tone)
+                // The palette before what is placed on it: a caption names a row of
+                // it, and [`Project::with_subs`] refuses one naming a row that is
+                // not there.
+                .with_subtitles(subtitles)
+                .with_subs(doc.subs)?
+                // The header a load puts back: the canvas and rate above, which a
+                // save's own `resolution`/`fps` lines may have moved off the
+                // scaffold's, and the switches the literal below carries -- handed
+                // in here because they are the project's own and a door that moved
+                // one after this would snapshot whatever copy it holds, which until
+                // this line is the placeholder's. No undo step for
+                // [`Project::with_mix`]'s reason: a project that arrived one `z`
+                // from a state it was never in is a project whose first undo is a
+                // surprise.
+                .with_canvas(meta.width, meta.height, meta.frame_rate)
+                .with_switches(doc.proxy, doc.auto_proxy, doc.encoder, doc.sample_rate);
         let span = project.composite_span_at(0);
         // Last, because it is the one thing here that cannot be taken back: the
         // feeder thread outlives the `Audio` value (it holds its own clones) and
@@ -1248,7 +1260,11 @@ impl PlaybackSession {
         // source's silence is not worth reporting over an earlier one's).
         let (audio, audio_disabled) = {
             let mut opened = (None, None);
-            for source in project.sources().iter().filter(|s| !crate::is_image(&s.path)) {
+            for source in project
+                .sources()
+                .iter()
+                .filter(|s| !crate::is_image(&s.path))
+            {
                 opened = open_audio(&source.path, source.audio_stream);
                 if opened.0.is_some() {
                     break;
@@ -1713,8 +1729,10 @@ impl PlaybackSession {
         };
         let now = secs_to_frame(self.clock.now(), self.meta.frame_rate);
         let offset = now.saturating_sub(span.start).min(span.len);
-        self.worker
-            .playhead(self.span_rate.source_at(in_frame + span.speed.source_at(offset)));
+        self.worker.playhead(
+            self.span_rate
+                .source_at(in_frame + span.speed.source_at(offset)),
+        );
     }
 
     /// Installs `replacement` as the decode worker, parking the outgoing one in
@@ -1908,11 +1926,7 @@ impl PlaybackSession {
                         .composite_transform_at(start)
                         .copied()
                         .unwrap_or_default(),
-                    Composer::new(
-                        canvas_w,
-                        canvas_h,
-                        self.project.composite_fit_at(start),
-                    ),
+                    Composer::new(canvas_w, canvas_h, self.project.composite_fit_at(start)),
                 )
                 .inspect_err(|e| eprintln!("timeline frame {start}: image open failed: {e}"))
             }
@@ -1941,17 +1955,11 @@ impl PlaybackSession {
                         .composite_transform_at(start)
                         .copied()
                         .unwrap_or_default(),
-                    Composer::new(
-                        canvas_w,
-                        canvas_h,
-                        self.project.composite_fit_at(start),
-                    ),
+                    Composer::new(canvas_w, canvas_h, self.project.composite_fit_at(start)),
                     self.project.composite_visualizer_at(start),
                     self.project.composite_viz_paint_at(start),
                 )
-                .inspect_err(|e| {
-                    eprintln!("timeline frame {start}: visualizer open failed: {e}")
-                })
+                .inspect_err(|e| eprintln!("timeline frame {start}: visualizer open failed: {e}"))
             }
             Some(Span {
                 start,
@@ -2119,11 +2127,7 @@ impl PlaybackSession {
             .composite_transform_at(b_start)
             .copied()
             .unwrap_or_default();
-        let canvas = Composer::new(
-            canvas_w,
-            canvas_h,
-            self.project.composite_fit_at(b_start),
-        );
+        let canvas = Composer::new(canvas_w, canvas_h, self.project.composite_fit_at(b_start));
         let tone = self.project.tone();
         let stream = DecodeSession::open_worker_deferred(
             &path,
@@ -2301,7 +2305,9 @@ impl PlaybackSession {
     /// changes only the words, which are drawn over whatever is decoded.
     pub fn trim_sub(&mut self, lane: Lane, idx: usize, edge: Edge, to: u32) -> crate::Result<()> {
         let grouped = self.caption_grouped_with_clips(lane, idx);
-        let trimmed = self.project.trim_sub(lane, idx, edge, to, self.meta.frame_rate);
+        let trimmed = self
+            .project
+            .trim_sub(lane, idx, edge, to, self.meta.frame_rate);
         if trimmed.is_ok() && grouped {
             self.invalidate(Dirty::Both);
         }
@@ -2312,7 +2318,8 @@ impl PlaybackSession {
     /// ([`Project::trim_sub_room`]) -- what a front-end drawing the box during
     /// a drag asks, at this timeline's rate.
     pub fn trim_sub_room(&self, lane: Lane, idx: usize, edge: Edge) -> Option<(u32, u32)> {
-        self.project.trim_sub_room(lane, idx, edge, self.meta.frame_rate)
+        self.project
+            .trim_sub_room(lane, idx, edge, self.meta.frame_rate)
     }
 
     /// Takes one placement off a subtitle lane, leaving a gap
@@ -2390,7 +2397,11 @@ impl PlaybackSession {
         // one this dispatch needs; a caption carries a link at all only once
         // grouped (`place_sub` always starts one at `None`), so that alone is
         // "this delete ripples more than its own lane".
-        match self.sub_lane(lane).get(idx).is_some_and(|s| s.link.is_some()) {
+        match self
+            .sub_lane(lane)
+            .get(idx)
+            .is_some_and(|s| s.link.is_some())
+        {
             true => self.edit(Dirty::Both, |p| p.delete_sub_in(lane, idx)),
             // A caption in no group is the plain lift that touches nothing
             // else: no reseek owed.
@@ -2555,7 +2566,9 @@ impl PlaybackSession {
         to: Lane,
         start: u32,
     ) -> bool {
-        self.edit(Dirty::Both, |p| p.move_selection(picks, from, idx, to, start))
+        self.edit(Dirty::Both, |p| {
+            p.move_selection(picks, from, idx, to, start)
+        })
     }
 
     /// Drags one end of that clip to timeline frame `to`, changing how much of
@@ -3267,8 +3280,8 @@ impl PlaybackSession {
         // end is an append, never a clip with black in front of it. The frame
         // itself is honoured in [`Project::paste`], because a *drop* names a
         // place on the bed and means it.
-        let at = secs_to_frame(timeline_secs, self.meta.frame_rate)
-            .min(self.project.timeline_frames());
+        let at =
+            secs_to_frame(timeline_secs, self.meta.frame_rate).min(self.project.timeline_frames());
         self.edit(Dirty::Both, |p| p.paste(at, clip))
     }
 
@@ -3277,8 +3290,8 @@ impl PlaybackSession {
     /// past the last frame lands there rather than carrying black in front of
     /// it, exactly as a lone clip's paste does.
     pub fn paste_set_at(&mut self, timeline_secs: f64, items: &[(Lane, Clip)]) -> bool {
-        let at = secs_to_frame(timeline_secs, self.meta.frame_rate)
-            .min(self.project.timeline_frames());
+        let at =
+            secs_to_frame(timeline_secs, self.meta.frame_rate).min(self.project.timeline_frames());
         self.edit(Dirty::Both, |p| p.paste_set(at, items))
     }
 
@@ -4828,8 +4841,8 @@ fn blend_bgra(a: &[u8], b: &[u8], t: f32) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Edge, Lane, PlaybackSession, Source, TransformParams, audio_source_of, blend_bgra, secs_to_frame,
-        AUDIO_LOST,
+        AUDIO_LOST, Edge, Lane, PlaybackSession, Source, TransformParams, audio_source_of,
+        blend_bgra, secs_to_frame,
     };
     use std::path::PathBuf;
     use std::sync::atomic::Ordering;
@@ -4874,7 +4887,12 @@ mod tests {
             "a dead output went to wall time without a word"
         );
         assert!(
-            session.audio.as_ref().expect("audio").died.load(Ordering::Acquire),
+            session
+                .audio
+                .as_ref()
+                .expect("audio")
+                .died
+                .load(Ordering::Acquire),
             "a tick opened the output again inside the cooldown"
         );
         assert!(
@@ -4900,7 +4918,12 @@ mod tests {
             "playing after a dead output fed nothing: the session cannot come back"
         );
         assert!(
-            !session.audio.as_ref().expect("audio").died.load(Ordering::Acquire),
+            !session
+                .audio
+                .as_ref()
+                .expect("audio")
+                .died
+                .load(Ordering::Acquire),
             "the death flag stood after the output was replaced"
         );
         assert_eq!(
@@ -4941,7 +4964,11 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
             let frame = frame.unwrap_or_else(|| panic!("no frame from a {w}x{h} canvas"));
-            assert_eq!((frame.width, frame.height), (w, h), "a frame at the canvas's own size");
+            assert_eq!(
+                (frame.width, frame.height),
+                (w, h),
+                "a frame at the canvas's own size"
+            );
         }
     }
 
@@ -5026,18 +5053,27 @@ mod tests {
         let file = asset("test_av.mp4");
         let sources = [(file, 0)];
         let segs = [(Some(0), 0., 1.)];
-        let derived = crate::AudioSession::open_multi_streams_speed_at(&sources, &segs, &[], &[], None)
-            .expect("open the fixture")
-            .expect("the fixture has sound")
-            .0
-            .sample_rate;
-        let picked =
-            crate::AudioSession::open_multi_streams_speed_at(&sources, &segs, &[], &[], Some(32000))
+        let derived =
+            crate::AudioSession::open_multi_streams_speed_at(&sources, &segs, &[], &[], None)
                 .expect("open the fixture")
                 .expect("the fixture has sound")
                 .0
                 .sample_rate;
-        assert_ne!(derived, 32000, "a fixture at the picked rate proves nothing");
+        let picked = crate::AudioSession::open_multi_streams_speed_at(
+            &sources,
+            &segs,
+            &[],
+            &[],
+            Some(32000),
+        )
+        .expect("open the fixture")
+        .expect("the fixture has sound")
+        .0
+        .sample_rate;
+        assert_ne!(
+            derived, 32000,
+            "a fixture at the picked rate proves nothing"
+        );
         assert_eq!(picked, 32000);
     }
 
@@ -5099,7 +5135,8 @@ mod tests {
             "an import must not move the project's own canvas size"
         );
         assert_eq!(
-            session.meta().frame_rate, picked_fps,
+            session.meta().frame_rate,
+            picked_fps,
             "an import must not move the project's own rate"
         );
     }
@@ -5216,9 +5253,11 @@ mod tests {
         let zero = PlaybackSession::open_with_audio_stream(&multi, 0).expect("stream 0 opens");
         let one = PlaybackSession::open_with_audio_stream(&multi, 1).expect("stream 1 opens");
         let default = PlaybackSession::open(&multi).expect("default open");
-        let (Some(a0), Some(a1), Some(ad)) =
-            (zero.audio.as_ref(), one.audio.as_ref(), default.audio.as_ref())
-        else {
+        let (Some(a0), Some(a1), Some(ad)) = (
+            zero.audio.as_ref(),
+            one.audio.as_ref(),
+            default.audio.as_ref(),
+        ) else {
             // No audio device on this machine: nothing further to check --
             // the device is the machine's business, not this door's.
             return;
@@ -5226,7 +5265,10 @@ mod tests {
         assert_eq!(a0.channels, 2, "stream 0 is the stereo pair");
         assert_eq!(a1.channels, 1, "stream 1 is the mono track");
         assert_ne!(a0.channels, a1.channels, "the two streams must differ");
-        assert_eq!(ad.channels, a0.channels, "open() still defaults to stream 0");
+        assert_eq!(
+            ad.channels, a0.channels,
+            "open() still defaults to stream 0"
+        );
     }
 
     /// The bug this regression pins: a preview paused (or scrubbed) to a
@@ -5260,7 +5302,10 @@ mod tests {
 
         let fps = on.meta().frame_rate;
         let clip0_len = on.lane_clips(Lane::V1)[0].len();
-        assert!(clip0_len > window, "the fixture needs to outlast the window");
+        assert!(
+            clip0_len > window,
+            "the fixture needs to outlast the window"
+        );
         let mid_of_window = clip0_len - window / 2;
         let t = f64::from(mid_of_window) / fps;
 
@@ -5276,7 +5321,10 @@ mod tests {
                 if let Some(f) = s.try_frame() {
                     return f;
                 }
-                assert!(std::time::Instant::now() < deadline, "no frame within 20s of the seek");
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "no frame within 20s of the seek"
+                );
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
         };
@@ -5337,11 +5385,21 @@ mod tests {
             scale: 1.2,
             ..Default::default()
         };
-        assert!(s.set_transform_live(clip.0, clip.1, Some(params)), "the edit took");
+        assert!(
+            s.set_transform_live(clip.0, clip.1, Some(params)),
+            "the edit took"
+        );
         let next = poll(&mut s);
 
-        assert_eq!(before, s.restarts(), "a live transform edit must reuse the worker");
-        assert_eq!(next.index, first.index, "paused: same timeline position before and after");
+        assert_eq!(
+            before,
+            s.restarts(),
+            "a live transform edit must reuse the worker"
+        );
+        assert_eq!(
+            next.index, first.index,
+            "paused: same timeline position before and after"
+        );
     }
 
     /// A rate undo lands the picture where the playhead is, in the rate that
@@ -5413,4 +5471,3 @@ mod tests {
         );
     }
 }
-
