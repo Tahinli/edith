@@ -177,9 +177,7 @@ impl Player {
                 self.reset_after_reseek();
             }
             Err(e) => self.notify_user(format!("NO VISUALIZER — {e}").into()),
-            Ok(false) => {
-                self.notify_user("NO VISUALIZER — that clip could not be placed".into())
-            }
+            Ok(false) => self.notify_user("NO VISUALIZER — that clip could not be placed".into()),
         }
         cx.notify();
     }
@@ -453,10 +451,7 @@ impl Player {
                 {
                     true => {
                         self.close_session();
-                        format!(
-                            "REMOVED {} — the library is empty",
-                            file_name(path)
-                        )
+                        format!("REMOVED {} — the library is empty", file_name(path))
                     }
                     // The undo stack goes with it (`Project::remove_source`):
                     // said here, because a `z` that does nothing afterwards
@@ -673,11 +668,16 @@ impl Player {
         match PlaybackSession::open_with_audio_stream(path, stream) {
             Ok(mut session) => {
                 session.drop_late_pictures(true);
-                session.set_gain(self.volume.gain());
                 // The button says "plays it" -- a preview that opens paused
                 // reads as a frozen picture, not as a player awaiting a click.
                 session.play();
                 self.preview_session = Some(session);
+                // The one place the window's level reaches a session
+                // ([`Player::apply_volume`]) -- and it goes at the timeline
+                // under the preview too, which is what makes closing the
+                // preview hand back a session already at the shown level
+                // rather than the one it had before the preview opened.
+                self.apply_volume();
                 self.session_swapped();
                 self.notify_user(
                     format!(
@@ -716,6 +716,13 @@ impl Player {
                 cx.notify();
             }
         }
+        // The session on screen is the timeline's again, and it is told the
+        // window's level here rather than being trusted to have kept it: a
+        // level changed while the preview was up reaches every session
+        // ([`Player::apply_volume`]), and this is the belt to that pair of
+        // braces -- the session that takes the picture is the one that must be
+        // heard at the level the control shows.
+        self.apply_volume();
         // The picture swaps back to the timeline's, so everything keyed to a
         // session hears it (`Player::session_swapped`) -- the sound watch among
         // them, or the timeline's own unchanged reason would read as a device
@@ -1196,9 +1203,7 @@ impl Player {
             .count();
         let text = match (on, ready, making) {
             (false, ..) => "PROXIES OFF — the films themselves are what play".to_string(),
-            (true, 0, 0) => {
-                "PROXIES ON — no film here has one".to_string()
-            }
+            (true, 0, 0) => "PROXIES ON — no film here has one".to_string(),
             (true, 0, n) => format!("PROXIES ON — {n} still being made"),
             (true, n, 0) => format!("PROXIES ON — cutting on {n}"),
             (true, n, m) => format!("PROXIES ON — cutting on {n}, {m} still being made"),

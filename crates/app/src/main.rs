@@ -68,11 +68,11 @@ use engine::transform::TransformParams;
 use engine::{Clip, Codec, ExportHandle, Frame, MediaBitrate, PlaybackSession};
 use gpui::{
     AnyElement, App, Application, Bounds, ClickEvent, Context, Corners, CursorStyle, Div,
-    DragMoveEvent, FocusHandle, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseExitEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point, RenderImage,
-    ScrollDelta, ScrollHandle, ScrollWheelEvent, SharedString, Size, Stateful, TextAlign,
-    TitlebarOptions, Window, WindowBounds, WindowOptions, canvas, div, point, prelude::*, px,
-    relative, rgb, rgba, size,
+    DragMoveEvent, FocusHandle, KeyDownEvent, MouseButton, MouseDownEvent, MouseExitEvent,
+    MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point, RenderImage, ScrollDelta,
+    ScrollHandle, ScrollWheelEvent, SharedString, Size, Stateful, TextAlign, TitlebarOptions,
+    Window, WindowBounds, WindowOptions, canvas, div, point, prelude::*, px, relative, rgb, rgba,
+    size,
 };
 
 struct Player {
@@ -535,7 +535,11 @@ struct Player {
     /// than in the session so it survives closing one file and opening the
     /// next -- it is a setting of the player, not of the timeline, which is
     /// also why it is not written to the project file and cannot reach an
-    /// export. [`Player::apply_volume`] is what pushes it at a session.
+    /// export. This is the *owner*: the engine holds the level per session, on
+    /// the device that runs it, and restores it when that device is replaced
+    /// ([`engine::PlaybackSession::set_gain`]), so every session is a
+    /// follower of this one copy and none of them can answer for it.
+    /// [`Player::apply_volume`] is what pushes it, at every session there is.
     volume: Volume,
     /// Where the volume slider was last painted, and whether a hand is on it --
     /// the speed bar's pair, for the speed bar's reason: the pointer moves
