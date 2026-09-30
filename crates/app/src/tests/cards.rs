@@ -1739,6 +1739,39 @@ fn every_click_door_that_writes_the_project_arms_autosave() {
         "nudge_mix still arms ahead of the door, so a clamped no-op nudge \
          leaves the project looking edited"
     );
+    // The equalizer card's commit, the same rule against a door whose bool is
+    // the WEAKER of the two shapes: `set_eq` answers "the index was there and
+    // the curve is finite" and rewrites the very slot it already holds for a
+    // curve already in force, so the arm needs the comparison too -- the same
+    // pair of conditions `apply_fit` rides.
+    let body = fn_body("commit_eq");
+    let arm = body
+        .split_once("if moved && session.set_eq(lane, idx, params) {")
+        .expect("the EQ commit no longer rides the curve having moved and then the door")
+        .1;
+    assert!(
+        arm.contains("mark_dirty()"),
+        "commit_eq arms outside its gate, so re-committing the curve already \
+         in force would dirty the project"
+    );
+    assert!(
+        body.contains("session.eq_of(lane, idx).cloned() != params"),
+        "commit_eq rides the engine's bool alone, which is true for a \
+         re-commit of the curve already in force"
+    );
+    // ...and the reseek bookkeeping rides with the arm, not instead of it.
+    assert!(
+        arm.contains("reset_after_reseek()"),
+        "commit_eq's reseek flags no longer clear on a write that took"
+    );
+    let before = body
+        .split_once("if moved && session.set_eq(lane, idx, params) {")
+        .unwrap()
+        .0;
+    assert!(
+        !before.contains("mark_dirty()"),
+        "commit_eq still arms ahead of the door"
+    );
 }
 
 /// The transition doors, which are the class's other shape: both engine

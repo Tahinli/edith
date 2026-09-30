@@ -1542,8 +1542,22 @@ impl Player {
         };
         let params = (!self.eq_params.is_identity()).then(|| self.eq_params.clone());
         if let Some(session) = &mut self.session {
-            session.set_eq(lane, idx, params);
-            self.mark_dirty();
+            // `set_eq` answers "the index was there and the curve is finite"
+            // -- it snapshots and rewrites the very slot it already holds for
+            // a curve that is already in force -- so on its own bool a
+            // re-commit of the same curve armed autosave, the ledger's
+            // `unsaved` ghost and the close prompt over a project whose bytes
+            // had not moved. The arm rides the curve having moved, the
+            // comparison `apply_fit` reads for `set_fit`
+            // ([`Player::apply_fit`]), and then the door's own answer.
+            let moved = session.eq_of(lane, idx).cloned() != params;
+            if moved && session.set_eq(lane, idx, params) {
+                self.mark_dirty();
+                // `set_eq` reseeks inside the engine -- that is what makes the
+                // change audible at once -- and a reseek is what these flags
+                // are about. Nothing was written, so nothing was reseeked.
+                self.reset_after_reseek();
+            }
         }
         cx.notify();
     }
