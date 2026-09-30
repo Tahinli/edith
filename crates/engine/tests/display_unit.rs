@@ -105,6 +105,22 @@ fn video_unit_0(display_width: u16, display_height: u16) -> String {
          55b9820001"
     )
 }
+/// A `DisplayUnit 3` (DAR) `Video` element: the coded size and the display
+/// aspect ratio, both length-preserving.
+fn video_unit_3(dar_width: u16, dar_height: u16, coded_width: u16, coded_height: u16) -> String {
+    format!(
+        "e09e\
+         b082{coded_width:04x}\
+         ba82{coded_height:04x}\
+         9a8102\
+         54b081{dar_width:02x}\
+         54ba81{dar_height:02x}\
+         54b28103\
+         55b084\
+         55b98101"
+    )
+}
+
 fn with_video_element(source: &Path, into: &Path, element: &str) {
     let from = hex(VIDEO_UNIT_3);
     let to = hex(element);
@@ -341,4 +357,87 @@ fn a_cinematic_display_unit_zero_stretches_rather_than_reading_square() {
             "{tag} ({ratio}): the samples are still stored at the coded size"
         );
     }
+}
+
+/// The unit-3 arm, which is the same rule as unit 0 one arm away: a DAR is
+/// not a ratio either, because bringing it onto the coded frame multiplies by
+/// the coded size, and what reduces afterwards carries the *sizes*.
+///
+/// So the same 2.39:1 scope is judged differently by the frame it sits on,
+/// which is a bound measuring the wrong thing. Over a 1920x1080 coded track a
+/// 239:100 DAR derives 2151:1600 and over 3840x2160 the same -- both past any
+/// term bound -- while over 1440x1080 it derives 717:400 and passes. Base
+/// `9f780f7` opened all three at the widths below; the bound made the first
+/// two open square, a measured regression rather than a latent gap.
+///
+/// The expected widths are the ones BASE produced, measured by running base
+/// over these same fixtures. This is the property that matters: the arm must
+/// read the DAR the way it always did, so the test pins base's answers rather
+/// than a fresh computation of them.
+#[test]
+fn a_display_unit_three_dar_reads_the_same_on_every_coded_frame() {
+    let scratch = Scratch::new("dar");
+    for (coded, expected, tag) in [
+        ((1920u16, 1080u16), 2582u32, "1920x1080"),  // 239:100 -> 2151:1600
+        ((3840, 2160), 5162, "3840x2160"),           // 239:100 -> 2151:1600
+        ((720, 576), 1376, "720x576"),               // 239:100 -> 239:125
+    ] {
+        let into = scratch.path(&format!("dar_{tag}.mkv"));
+        with_video_element(
+            &asset("test_anamorphic.mkv"),
+            &into,
+            &video_unit_3(239, 100, coded.0, coded.1),
+        );
+
+        let (meta, _) = Demuxer::open(&into)
+            .unwrap_or_else(|why| panic!("{tag}: open failed: {why}"));
+        assert_eq!(
+            (meta.coded_width, meta.coded_height),
+            (u32::from(coded.0), u32::from(coded.1)),
+            "{tag}: the coded frame the DAR is stated over"
+        );
+        assert!(
+            !meta.pixel_aspect.is_square(),
+            "{tag}: a 239:100 DAR is a 2.39:1 stretch whatever frame it sits \
+             on: got square ({:?})",
+            meta.pixel_aspect
+        );
+        assert_eq!(
+            meta.width, expected,
+            "{tag}: the display width base 9f780f7 produced for this DAR"
+        );
+        assert_eq!(
+            meta.height,
+            u32::from(coded.1),
+            "{tag}: a pixel aspect never moves the height; the coded one stands"
+        );
+    }
+}
+
+/// The term bound must survive where it belongs. The unit-4 SAR pair IS a
+/// ratio, so a hostile one is still refused -- this arm is what stops the
+/// split from reading as "the bound was dropped".
+#[test]
+fn a_hostile_sar_pair_is_still_refused_by_the_term_bound() {
+    // Reduced terms far past the bound, stated as a SAR pair: four chosen
+    // bytes, not a ratio.
+    for hostile in [(0xFFFF_FFFFu32, 0xFFFF_FFFFu32 - 1), (1, 0x00FF_FFFF)] {
+        assert_eq!(
+            PixelAspect::stated(hostile.0, hostile.1),
+            None,
+            "{hostile:?} is chosen bytes, not a ratio, and is refused as one"
+        );
+    }
+    // ...and a real SAR pair is still taken, so the bound is not simply
+    // refusing everything on this arm.
+    assert_eq!(
+        PixelAspect::stated(4, 3),
+        Some(PixelAspect { h: 4, v: 3 }),
+        "a 4:3 SAR is a ratio and is read as one"
+    );
+    assert_eq!(
+        PixelAspect::stated(16, 12),
+        Some(PixelAspect { h: 16, v: 12 }),
+        "an unreduced 4:3 spelling is judged by the ratio it names"
+    );
 }

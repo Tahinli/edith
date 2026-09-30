@@ -476,6 +476,39 @@ impl PixelAspect {
         })
     }
 
+    /// The ratio a Matroska `DisplayUnit 3` display *aspect ratio* names against
+    /// the coded frame, or [`None`] when the ratio is degenerate.
+    ///
+    /// Deliberately not [`Self::stated`], and for the same reason as
+    /// [`Self::stated_size`]: the SAR is the DAR brought onto the coded frame,
+    /// which multiplies by the coded size, so what the result reduces to
+    /// carries *sizes* rather than terms. A 239:100 scope -- 2.39:1, one of the
+    /// most common letterbox ratios there are -- derives 2151:1600 over a
+    /// 1920x1080 coded frame and the same over 3840x2160, both past any term
+    /// bound, while over a 1440x1080 frame it derives 717:400 and passes. The
+    /// same ratio judged differently by the frame it happens to sit on is a
+    /// bound measuring the wrong thing.
+    ///
+    /// The pair itself is the engine's own model, unchanged: the DAR against
+    /// the coded frame, `dar_w * coded_h : dar_h * coded_w`, which is what
+    /// [`Self::width_factor`] has always multiplied the coded width by. So this
+    /// returns it unreduced and lets `width_factor` do the arithmetic and apply
+    /// [`Self::MAX_DISPLAY_WIDTH`] to the raster it produces -- a bound on the
+    /// picture, rather than on the digits of a derivation.
+    pub fn stated_ratio(dar_width: u64, dar_height: u64, coded: (u32, u32)) -> Option<Self> {
+        if dar_width == 0 || dar_height == 0 || coded.0 == 0 || coded.1 == 0 {
+            return None;
+        }
+        Some(Self {
+            h: dar_width
+                .saturating_mul(u64::from(coded.1))
+                .min(u64::from(u32::MAX)) as u32,
+            v: dar_height
+                .saturating_mul(u64::from(coded.0))
+                .min(u64::from(u32::MAX)) as u32,
+        })
+    }
+
     /// Whether the displayed picture is the coded one, drawn one to one.
     ///
     /// Both halves of the ratio are untrusted bytes -- four of them in an mp4
@@ -523,7 +556,13 @@ impl PixelAspect {
         // such conflict.
         let wide = u64::from(coded_width) * u64::from(self.h);
         let scaled = (wide + u64::from(self.v) - 1) / u64::from(self.v);
-        let rounded = scaled.next_multiple_of(2);
+        // Down to the even grid, not up: `(x | 1) & !1` is what this has always
+        // done, and it is what an odd quotient rounds to. A 239:100 scope over
+        // a 3840x2160 coded frame scales to 5163 and has always displayed
+        // 5162, not 5164 -- `next_multiple_of` would round the other way and
+        // silently change every existing anamorphic picture by two columns.
+        let rounded = scaled | 1;
+        let rounded = rounded & !1;
         if rounded == 0 || rounded > u64::from(Self::MAX_DISPLAY_WIDTH) {
             return coded_width;
         }
@@ -3103,25 +3142,26 @@ fn pixel_aspect_of(
     if display_width == 0 || display_height == 0 || coded_width == 0 || coded_height == 0 {
         return PixelAspect::SQUARE;
     }
-    // A stated pair is a claim about a real picture, and each unit is judged
-    // by what it means rather than by its digits: a unit that spells a *ratio*
-    // by [`PixelAspect::stated`], a unit that spells a *pixel size* by
-    // [`PixelAspect::stated_size`]. Conflating those two is what would refuse
-    // a 1920x803 scope, whose reduced form carries sizes rather than terms.
+    // A stated pair is judged by what it *means*, never by how it was spelled,
+    // and the three units mean three different things:
+    //
+    //   4 -- the pair IS the sample aspect ratio. It is read as a ratio and
+    //        judged by its terms, because a `pasp`-shaped claim is a claim
+    //        about a ratio and chosen bytes do not reduce small.
+    //   3 -- the pair is a display aspect ratio, which has to be brought onto
+    //        the coded frame to become one. That derivation multiplies by the
+    //        coded size, so what reduces afterwards carries the *sizes*: a
+    //        239:100 DAR over a 1920x1080 coded track derives 2151:1600, over
+    //        3840x2160 the same, and both are past any term bound. So the
+    //        width is computed directly from the ratio instead and only the
+    //        degenerate case is refused.
+    //   0 -- the pair is a display pixel size, taken as the display width.
+    //
+    // Units 3 and 0 are the same rule: neither is a ratio, so neither may be
+    // judged by the terms its derived pair reduces to. What bounds both is the
+    // raster [`PixelAspect::width_factor`] produces, which cannot refuse a real
+    // ratio because it never looks at the ratio's terms at all.
     let coded = (coded_width, coded_height);
-    // `saturating_mul` throughout: the pair is untrusted and a product past a
-    // u64 is a claim with no picture behind it.
-    let as_ratio = || {
-        PixelAspect::stated(
-            display_width
-                .saturating_mul(u64::from(coded_height))
-                .min(u64::from(u32::MAX)) as u32,
-            display_height
-                .saturating_mul(u64::from(coded_width))
-                .min(u64::from(u32::MAX)) as u32,
-        )
-        .unwrap_or(PixelAspect::SQUARE)
-    };
     match display_unit {
         // 4: the pair *is* the sample aspect ratio.
         4 => PixelAspect::stated(
@@ -3129,14 +3169,15 @@ fn pixel_aspect_of(
             display_height.min(u64::from(u32::MAX)) as u32,
         )
         .unwrap_or(PixelAspect::SQUARE),
-        // 3: the pair is a display *aspect ratio* -- 16/9 over a 1440x1080
-        // coded track lands on 4/3 -- which is a small pair of terms however
-        // it was spelled, so the term bound is the right test for it.
-        3 => as_ratio(),
-        // 0: the pair is a display *pixel size*, the size the picture is drawn
-        // at. 1920x1080 over 1440x1080 is the 4/3 stretch; 1920x803 over it is
-        // a 2.39:1 scope. Bounded by the raster [`PixelAspect::width_factor`]
-        // produces, not by the terms it reduces to.
+        // 3: a display aspect ratio against the coded frame, taken unreduced so
+        // the term bound never judges it -- `width_factor` multiplies the coded
+        // width by this and bounds the raster it produces, and a bound on the
+        // picture has no conflict with a real ratio.
+        3 => PixelAspect::stated_ratio(display_width, display_height, coded)
+            .unwrap_or(PixelAspect::SQUARE),
+        // 0: a display pixel size -- the width the picture is drawn at.
+        // 1920x1080 over 1440x1080 is the 4/3 stretch; 1920x803 is a 2.39:1
+        // scope. Bounded by the raster, not by the terms it reduces to.
         0 => PixelAspect::stated_size(display_width, display_height, coded)
             .unwrap_or(PixelAspect::SQUARE),
         // A physical unit this engine cannot interpret: square.
@@ -5897,6 +5938,62 @@ mod tests {
                 .width_factor(1440),
             1920,
             "a 1920-wide scope over 1440 coded columns widens to 1920"
+        );
+    }
+
+    /// The rule the two `Display*` units that are not ratios share, in one
+    /// place: bringing a pair onto the coded frame makes what reduces carry the
+    /// coded *sizes*, so no term bound can judge it. A 2.39:1 scope is the case
+    /// that proves it -- the same DAR over three coded frames, which a term
+    /// bound reads three different ways.
+    #[test]
+    fn a_derived_pair_is_read_by_its_raster_on_every_coded_frame() {
+        for (coded, display) in [
+            ((1920u32, 1080u32), 2582u32),
+            ((3840, 2160), 5162),
+            ((720, 576), 1376),
+        ] {
+            let derived = PixelAspect::stated_ratio(239, 100, coded).expect("a scope is a picture");
+            assert_eq!(
+                derived.width_factor(coded.0),
+                display,
+                "a 239:100 DAR over {coded:?} displays {display}, as base did"
+            );
+            // The trap this exists to hold, measured rather than described: the
+            // same DAR derives pairs that reduce on *both* sides of the bound,
+            // so a term bound judges the same ratio differently depending only
+            // on the frame it happens to sit on.
+            let (mut a, mut b) = (derived.h, derived.v);
+            while b != 0 {
+                (a, b) = (b, a % b);
+            }
+            let reduced = (derived.h / a, derived.v / a);
+            let past = reduced.0 > PixelAspect::MAX_ASPECT_TERM;
+            assert_eq!(
+                past,
+                coded.0 != 720,
+                "{coded:?}: a 239:100 DAR derives {reduced:?}, {} the {} bound -- \
+                 the same ratio, on both sides of it",
+                if past { "past" } else { "inside" },
+                PixelAspect::MAX_ASPECT_TERM
+            );
+        }
+        // And the 1440x1080 frame -- the one this lane's own fixture sits on --
+        // reduces to 717:400, which the bound admits. So the same ratio is
+        // refused on two frames and accepted on a third, which is why the
+        // bound cannot be tuned instead of replaced: any threshold catching
+        // 2151:1600 would be chosen by the frame rather than by the picture.
+        let over_1440 = PixelAspect::stated_ratio(239, 100, (1440, 1080)).expect("a picture");
+        let (mut a, mut b) = (over_1440.h, over_1440.v);
+        while b != 0 {
+            (a, b) = (b, a % b);
+        }
+        assert!(
+            over_1440.h / a <= PixelAspect::MAX_ASPECT_TERM,
+            "the same DAR over a 1440x1080 frame reduces to {}:{}, which the \
+             bound admits -- the same ratio, judged either way by its frame",
+            over_1440.h / a,
+            over_1440.v / a
         );
     }
 
