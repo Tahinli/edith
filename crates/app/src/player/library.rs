@@ -177,9 +177,7 @@ impl Player {
                 self.reset_after_reseek();
             }
             Err(e) => self.notify_user(format!("NO VISUALIZER — {e}").into()),
-            Ok(false) => {
-                self.notify_user("NO VISUALIZER — that clip could not be placed".into())
-            }
+            Ok(false) => self.notify_user("NO VISUALIZER — that clip could not be placed".into()),
         }
         cx.notify();
     }
@@ -453,10 +451,7 @@ impl Player {
                 {
                     true => {
                         self.close_session();
-                        format!(
-                            "REMOVED {} — the library is empty",
-                            file_name(path)
-                        )
+                        format!("REMOVED {} — the library is empty", file_name(path))
                     }
                     // The undo stack goes with it (`Project::remove_source`):
                     // said here, because a `z` that does nothing afterwards
@@ -1196,9 +1191,7 @@ impl Player {
             .count();
         let text = match (on, ready, making) {
             (false, ..) => "PROXIES OFF — the films themselves are what play".to_string(),
-            (true, 0, 0) => {
-                "PROXIES ON — no film here has one".to_string()
-            }
+            (true, 0, 0) => "PROXIES ON — no film here has one".to_string(),
             (true, 0, n) => format!("PROXIES ON — {n} still being made"),
             (true, n, 0) => format!("PROXIES ON — cutting on {n}"),
             (true, n, m) => format!("PROXIES ON — cutting on {n}, {m} still being made"),
@@ -2156,6 +2149,11 @@ impl Player {
             .map(|session| session.remove_lane(lane));
         let text = match removed {
             Some(Ok(())) => {
+                // The arm lives here, on the one answer that means the track
+                // went: `remove_lane` refuses a track still holding clips or
+                // captions, and the last of its kind, and both used to arrive
+                // with the `unsaved` ghost already lit behind them.
+                self.mark_dirty();
                 self.selected.clear();
                 self.context_menu = None;
                 self.eq_open = None;

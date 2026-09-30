@@ -1172,7 +1172,7 @@ fn row_three_wears_the_encode_options_and_the_door_to_the_rest() {
 /// and can't turn it back to video"). One cycle, and it wraps.
 #[test]
 fn the_picture_cycle_wraps_out_of_the_sound_only_formats() {
-    use crate::ui::settings_stance::{next_picture, PICTURE_CYCLE};
+    use crate::ui::settings_stance::{PICTURE_CYCLE, next_picture};
     // Nothing refused: every stop is the next one, and the last wraps to the
     // first -- OGG, the tail of the list, back to MP4.
     let mut at = PICTURE_CYCLE[0];
@@ -1710,6 +1710,201 @@ fn every_click_door_that_writes_the_project_arms_autosave() {
              one for the same step"
         );
     }
+    // The mix card's own doors. Both answer "the value moved" -- a fader
+    // already against its wall, a ceiling already at its clamp, a limiter
+    // switch whose value is the one in force are each `false` -- so the arm
+    // rides the bool, and `nudge_mix` does not arm before the ask the way it
+    // did: a held arrow key at the top of the fader lit `unsaved`, wrote a
+    // sidecar and put the close prompt up over a project whose bytes had not
+    // moved.
+    let body = fn_body("nudge_mix");
+    for door in ["set_lane_gain_db", "set_limiter"] {
+        assert!(
+            body.contains(door),
+            "nudge_mix no longer goes through {door}"
+        );
+    }
+    let arm = body
+        .split_once("if took {")
+        .expect("the mix arm no longer rides the door's own answer")
+        .1;
+    assert!(
+        arm.contains("mark_dirty()"),
+        "nudge_mix arms outside its gate, so a fader held against its wall \
+         would dirty the project"
+    );
+    let before = body.split_once("if took {").unwrap().0;
+    assert!(
+        !before.contains("mark_dirty()"),
+        "nudge_mix still arms ahead of the door, so a clamped no-op nudge \
+         leaves the project looking edited"
+    );
+    // The equalizer card's commit, the same rule against a door whose bool is
+    // the WEAKER of the two shapes: `set_eq` answers "the index was there and
+    // the curve is finite" and rewrites the very slot it already holds for a
+    // curve already in force, so the arm needs the comparison too -- the same
+    // pair of conditions `apply_fit` rides.
+    let body = fn_body("commit_eq");
+    let arm = body
+        .split_once("if moved && session.set_eq(lane, idx, params) {")
+        .expect("the EQ commit no longer rides the curve having moved and then the door")
+        .1;
+    assert!(
+        arm.contains("mark_dirty()"),
+        "commit_eq arms outside its gate, so re-committing the curve already \
+         in force would dirty the project"
+    );
+    assert!(
+        body.contains("session.eq_of(lane, idx).cloned() != params"),
+        "commit_eq rides the engine's bool alone, which is true for a \
+         re-commit of the curve already in force"
+    );
+    // ...and the reseek bookkeeping rides with the arm, not instead of it.
+    assert!(
+        arm.contains("reset_after_reseek()"),
+        "commit_eq's reseek flags no longer clear on a write that took"
+    );
+    let before = body
+        .split_once("if moved && session.set_eq(lane, idx, params) {")
+        .unwrap()
+        .0;
+    assert!(
+        !before.contains("mark_dirty()"),
+        "commit_eq still arms ahead of the door"
+    );
+}
+
+/// The transition doors, which are the class's other shape: both engine
+/// setters ([`engine::project::Project::set_transition_out`],
+/// [`engine::project::Project::crossfade`]) answer `true` for any two
+/// adjacent clips, snapshot and clamp included -- so a step past the
+/// successor's length, or a number retyped into the field, wrote the value the
+/// join already carried and still said yes. [`Player::set_transition_frames`]
+/// reads the join's own edges back and rides those, and the crossfade side
+/// compares *both* edges: it writes the anchor's `fade_out` and the
+/// neighbour's `fade_in`, and a comparison of the anchor alone would miss a
+/// neighbour-side no-op.
+#[test]
+fn a_transition_step_or_a_retyped_number_arms_only_what_moved() {
+    let body = fn_body("set_transition_frames");
+    for door in ["set_transition_out", "crossfade"] {
+        assert!(
+            body.contains(door),
+            "the duration doors no longer include {door}"
+        );
+    }
+    let gate = "if ok && self.transition_edges(lane, idx) != before {";
+    let arm = body
+        .split_once(gate)
+        .unwrap_or_else(|| panic!("the transition arm no longer rides the join's own edges"))
+        .1;
+    assert!(
+        arm.contains("mark_dirty()"),
+        "the transition arm is outside its gate, so a step past the cap or a \
+         retyped number would dirty an unchanged project"
+    );
+    let before = body.split_once(gate).unwrap().0;
+    assert!(
+        !before.contains("mark_dirty()"),
+        "the transition arm is still ahead of the comparison"
+    );
+    assert!(
+        body.contains("let before = self.transition_edges(lane, idx);"),
+        "the join's edges are no longer read before the write"
+    );
+    // The helper both sides call, and the pair it must compare: an anchor-only
+    // comparison cannot see the neighbour's `fade_in` not moving.
+    let helper = fn_body("transition_edges");
+    assert!(
+        helper.contains("clips.get(idx)?.fade_out")
+            && helper.contains("clips.get(idx + 1)?.fade_in"),
+        "the edge reader no longer reads both sides of the join, so a \
+         crossfade that only moves the neighbour is invisible"
+    );
+}
+
+/// The three doors the action table used to arm on their behalf. The table
+/// fires *before* any door is asked, so an entry for a door that can refuse
+/// dirties an untouched project -- and the dissolve is the sharpest case,
+/// because the clip-menu row reaches [`Player::dissolve_selected`] directly
+/// ([`crate::ui::bench_stance`]) and so was armed by nothing at all while the
+/// key chord beside it armed on every press, refused or not.
+///
+/// The engine half of the premise is not a scan but a run: see
+/// `engine::project::tests::a_transition_door_says_yes_to_a_write_that_moved_nothing`,
+/// which drives `set_transition_out` and `crossfade` and shows they answer
+/// `true` for a write that changed nothing. That is why these three need a
+/// before/after comparison and not just the door's own answer.
+#[test]
+fn the_action_table_arms_nothing_a_door_answers_for_itself() {
+    // The two transition doors, in the same shape as the duration row's.
+    for (name, door) in [
+        ("crossfade_selected", "session.crossfade(lane, idx, frames)"),
+        (
+            "dissolve_selected",
+            "session.set_transition_out(lane, idx, frames)",
+        ),
+    ] {
+        let body = fn_body(name);
+        assert!(body.contains(door), "{name} no longer goes through {door}");
+        let gate = "if took && self.transition_edges(lane, idx) != before {";
+        let arm = body
+            .split_once(gate)
+            .unwrap_or_else(|| panic!("{name} no longer arms on the write that took"))
+            .1;
+        assert!(
+            arm.contains("mark_dirty()"),
+            "{name} arms outside its gate, so a crossfade already at the room \
+             the two clips offer would dirty an unchanged project"
+        );
+        let before = body.split_once(gate).unwrap().0;
+        assert!(
+            !before.contains("mark_dirty()"),
+            "{name} still arms ahead of the comparison"
+        );
+    }
+    // ...and the two actions are out of the table's list, or the key path is
+    // armed twice over and the menu path not at all.
+    let act = fn_body("act");
+    let listed = act
+        .split_once("if matches!(")
+        .unwrap()
+        .1
+        .split_once(") {")
+        .unwrap()
+        .0;
+    for gone in ["ActionId::Crossfade", "ActionId::Dissolve"] {
+        assert!(
+            !listed.contains(gone),
+            "{gone} is back in the pre-arm list, so the key path arms before \
+             the door is asked while the clip-menu row arms by nothing"
+        );
+    }
+    // The track removal, whose two callers are a key and a header button.
+    let body = fn_body("remove_lane");
+    let arm = body
+        .split_once("Some(Ok(())) => {")
+        .expect("the track door no longer answers which arm means the track went")
+        .1;
+    assert!(
+        arm.contains("mark_dirty()"),
+        "a track that went arms nothing, so the removal is invisible to \
+         autosave, the unsaved ghost and the close question"
+    );
+    // ...and the header door no longer arms on its own before asking, which
+    // would be a second arm for the same step.
+    let lane_act = fn_body("act_lane");
+    assert!(
+        !lane_act.contains("mark_dirty"),
+        "act_lane arms before remove_lane, so a track still holding clips \
+         refuses with the unsaved ghost already lit"
+    );
+    assert!(
+        lane_act.contains(
+            "ActionId::RemoveVideoLane | ActionId::RemoveAudioLane => self.remove_lane(lane, cx)"
+        ),
+        "act_lane no longer routes the header's remove to the one armed door"
+    );
 }
 
 /// [`crate::ui::dock_stance::transition_of`]: the dock's duration row
@@ -1928,9 +2123,11 @@ fn a_choice_list_offers_every_value_and_fits_the_smallest_window() {
     assert!(native_detail.ends_with(" source"), "{native_detail}");
     // A project at a size nobody listed still gets the whole list, with
     // nothing marked rather than a wrong row marked.
-    assert!(resolution_choices((1000, 1000), native)
-        .iter()
-        .all(|(.., picked)| !picked));
+    assert!(
+        resolution_choices((1000, 1000), native)
+            .iter()
+            .all(|(.., picked)| !picked)
+    );
     // Picking a row means that row, and stepping means the next one: the
     // list and the stroke read the same ladder.
     assert_eq!(next_resolution(ladder[1], native), ladder[2]);
@@ -2387,8 +2584,8 @@ fn maximizing_a_card_grows_its_box_without_moving_where_a_value_sits_in_it() {
 /// inside the dock, or hands it the dock's width again, fails this.
 #[test]
 fn a_maximized_cards_room_is_bigger_than_the_docked_rooms_not_smaller() {
-    use crate::layout::{split_size, Split};
     use crate::SPLIT_W;
+    use crate::layout::{Split, split_size};
 
     // `layout::SPLIT_W` is the one divider between `stance-centre` and the
     // dock; the 56px rail that used to eat the centre's left edge is gone
@@ -2435,7 +2632,7 @@ fn a_maximized_cards_room_is_bigger_than_the_docked_rooms_not_smaller() {
 /// assumption.
 #[test]
 fn a_maximized_card_can_never_rise_above_the_picture_no_matter_the_bench_height() {
-    use crate::ui::stance::{below_picture_floor, LEDGER_H, TIME_BAND_H};
+    use crate::ui::stance::{LEDGER_H, TIME_BAND_H, below_picture_floor};
     let viewport_h = 1080.;
     for bench_h in [140., 200., 400.] {
         assert_eq!(

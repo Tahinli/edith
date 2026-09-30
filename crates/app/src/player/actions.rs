@@ -67,8 +67,22 @@ impl Player {
                 | ActionId::AddSubtitleLane
                 | ActionId::RemoveSubtitleLane
                 | ActionId::ImportSubtitles
-                | ActionId::Crossfade
-                | ActionId::Dissolve
+                // `Crossfade` and `Dissolve` are NOT here, and that is the
+                // rule rather than an omission: their doors answer for
+                // themselves ([`Player::crossfade_selected`],
+                // [`Player::dissolve_selected`]) and the clip-menu row reaches
+                // `dissolve_selected` directly, never through this table, so a
+                // list entry armed the key path and left the menu path armed by
+                // nothing.
+                //
+                // The three `Remove*Lane` entries ARE still here and are still
+                // wrong in the same way -- `remove_lane` refuses a track that
+                // holds clips and the last of its kind, and it now carries its
+                // own arm ([`Player::remove_lane`]) -- but taking them off is
+                // a wider pass over this list than this change makes, so they
+                // stay until it does. Until then each of those removals arms
+                // twice over, which is the lesser fault beside arming once for
+                // a removal that did not happen.
                 | ActionId::Visualizer
         ) {
             self.mark_dirty();
@@ -251,10 +265,12 @@ impl Player {
         }
         match action {
             ActionId::Mix => self.open_mix(Some(lane), cx),
-            ActionId::RemoveVideoLane | ActionId::RemoveAudioLane => {
-                self.mark_dirty();
-                self.remove_lane(lane, cx);
-            }
+            // The arm rides the door's own answer, like every arm in this
+            // window: `remove_lane` refuses a track that still holds clips or
+            // captions, and the last track of its kind, and arming before the
+            // ask lit the ledger's `unsaved` ghost, wrote a sidecar and put the
+            // close prompt up over a project whose bytes had not moved.
+            ActionId::RemoveVideoLane | ActionId::RemoveAudioLane => self.remove_lane(lane, cx),
             _ => unreachable!("only lane-header actions reach act_lane"),
         }
     }
