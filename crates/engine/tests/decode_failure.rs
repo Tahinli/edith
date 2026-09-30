@@ -43,20 +43,21 @@ fn pin_software() {
 /// `test_av.mp4` with the last eighth of its **sample data** overwritten, and
 /// the file otherwise untouched: `moov` still claims every frame the header
 /// ever did, and the demuxer hands the decoder exactly what it always handed
-/// it. The damage is bounded to the `mdat` payload on purpose -- `moov` sits
-/// after `mdat` in this fixture, so a damage that ran to the end of the file
-/// would take the index with it and produce an unopenable file rather than a
-/// decodable one with a bad tail, which is a different defect.
+/// it.
+///
+/// The damage is bounded to the `mdat` payload on purpose. `moov` sits *after*
+/// `mdat` in this fixture, so a damage that ran to the end of the file would
+/// take the index with it and leave a file that will not open at all -- a
+/// different defect, reached before a single frame is decoded and invisible to
+/// the thing this test is about.
 ///
 /// Returns the scratch guard too, so the directory goes when the test ends.
 fn damaged() -> (Scratch, PathBuf) {
     let bytes = std::fs::read(asset("test_av.mp4")).expect("the fixture");
-    let (data_start, data_end) = mdat_payload(&bytes).expect("an mdat");
-    let mut damaged_bytes = bytes.clone();
-    // What a transfer that dies part-way leaves behind, over the last eighth of
-    // the samples it did not finish writing.
-    let tail = data_start + (data_end - data_start) * 7 / 8;
-    damaged_bytes[tail..data_end].fill(0);
+    let (start, end) = mdat_payload(&bytes).expect("an mdat payload");
+    let mut damaged_bytes = bytes;
+    let tail = start + (end - start) * 7 / 8;
+    damaged_bytes[tail..end].fill(0);
     let scratch = Scratch::file("ve_decode_failure", "mp4");
     let path = PathBuf::from(&*scratch);
     std::fs::write(&path, &damaged_bytes).expect("write the damaged fixture");

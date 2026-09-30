@@ -1258,6 +1258,7 @@ fn run_span(
             &mut render,
             abort,
             speed,
+            worker_failure,
         );
         // A *reused* session that produced nothing may simply be one this
         // reseek left where the driver would not follow; a session opened fresh
@@ -1270,7 +1271,16 @@ fn run_span(
             );
             opened.hw = open_hw(path, start);
             if let Some(hw) = opened.hw.as_mut() {
-                decoded = run_hw(hw, &tx, start, end, &mut render, abort, speed);
+                decoded = run_hw(
+                    hw,
+                    &tx,
+                    start,
+                    end,
+                    &mut render,
+                    abort,
+                    speed,
+                    worker_failure,
+                );
             }
         }
         if decoded {
@@ -2950,6 +2960,7 @@ fn run_hw(
     render: &mut Render,
     abort: &Abort,
     speed: Speed,
+    failure: &DecodeFailure,
 ) -> bool {
     let mut index = start_frame;
     // Pictures dropped for being late since the last one handed over; see
@@ -2989,10 +3000,15 @@ fn run_hw(
             }
             Ok(None) => return true,
             Err(e) => {
+                // Before the first picture this is not a failure to report but
+                // the signal that software should take over, and it is reported
+                // by the caller that does the falling back -- saying it here as
+                // well would put a fault on the strip for a span that is about
+                // to decode cleanly.
                 if index == start_frame {
                     return false;
                 }
-                eprintln!("hardware decode error at frame {index}: {e}");
+                failure.set(format!("hardware decode error at frame {index}: {e}"));
                 return true;
             }
         }
@@ -4018,7 +4034,7 @@ fn run_av1(
         // the pictures decoded so far stand and the span ends.
         if let Err(e) = decode {
             if !done {
-                eprintln!("software AV1 decode failed at frame {index}: {e}");
+                failure.set(format!("software AV1 decode failed at frame {index}: {e}"));
                 done = true;
             }
         }
