@@ -801,6 +801,13 @@ struct Player {
     /// while the sound is up; seeded by [`Player::session_swapped`], which every
     /// door that installs or drops a session already calls.
     audio_reason: Option<String>,
+    /// The engine's last word on the *picture*, cached so a frame can tell a
+    /// reason that changed from one that was merely read again. Keyed to
+    /// `session_gen` for the same reason `audio_watch_gen` is: `pump` serves
+    /// the preview while one is up and the timeline otherwise, and an unkeyed
+    /// cache would read the other session's reason.
+    decode_reason_cache: Option<String>,
+    decode_watch_gen: u64,
     /// Which session generation (`session_gen`) the cached reason above describes:
     /// the watch is keyed to the session it is a statement about, so a preview
     /// opening or closing seeds the cache instead of announcing the *other*
@@ -1139,6 +1146,8 @@ fn main() {
                     // it serves.
                     audio_reason: None,
                     audio_watch_gen: 0,
+                    decode_reason_cache: None,
+                    decode_watch_gen: 0,
                     viz_slot: VizSlot::Main,
                     viz_hex_edit: None,
                     pending_viz: None,

@@ -15,6 +15,7 @@ pub mod export;
 pub mod hw;
 pub mod hwproc;
 pub mod limiter;
+pub(crate) mod map;
 pub mod mux;
 pub mod playback;
 pub mod project;
@@ -23,11 +24,10 @@ pub mod real_library;
 pub mod scale;
 pub mod scratch;
 pub mod silence;
+pub(crate) mod stretch;
 pub mod subtitle;
-pub(crate) mod map;
 #[cfg(test)]
 mod sweep;
-pub(crate) mod stretch;
 pub mod tonemap;
 pub mod transform;
 pub mod waveform;
@@ -36,7 +36,9 @@ pub use audio::{
     AacPacket, AacTrackParams, AudioChunk, AudioMeta, AudioProbe, AudioSession, StreamInfo,
 };
 pub use clock::PlaybackClock;
-pub use decode::{DecodeSession, Frame, image_size};
+pub use decode::{
+    DecodeFailure, DecodeSession, Frame, UnsupportedStillOrientation, image_orientation, image_size,
+};
 pub use demux::{Codec, MediaBitrate, Rotation, UnsupportedRotation, VideoMeta, probe_bitrate};
 pub use export::ExportHandle;
 pub use mux::{AudioParams, Mp4Muxer, VideoParams};
@@ -72,7 +74,17 @@ pub fn is_audio(path: &std::path::Path) -> bool {
     path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
         matches!(
             e.to_ascii_lowercase().as_str(),
-            "mp3" | "mpeg" | "mpg" | "wav" | "flac" | "ogg" | "oga" | "opus" | "mka" | "m4a" | "aac"
+            "mp3"
+                | "mpeg"
+                | "mpg"
+                | "wav"
+                | "flac"
+                | "ogg"
+                | "oga"
+                | "opus"
+                | "mka"
+                | "m4a"
+                | "aac"
         )
     })
 }
@@ -130,18 +142,8 @@ mod tests {
     #[test]
     fn is_audio_admits_the_containers_the_decoder_reads() {
         for name in [
-            "song.mp3",
-            "a.WAV",
-            "b.flac",
-            "c.ogg",
-            "d.oga",
-            "e.m4a",
-            "f.aac",
-            "g.opus",
-            "h.OPUS",
-            "i.mka",
-            "j.MPEG",
-            "k.mpg",
+            "song.mp3", "a.WAV", "b.flac", "c.ogg", "d.oga", "e.m4a", "f.aac", "g.opus", "h.OPUS",
+            "i.mka", "j.MPEG", "k.mpg",
         ] {
             assert!(super::is_audio(Path::new(name)), "{name}");
         }

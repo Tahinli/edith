@@ -14,7 +14,76 @@ use crate::ui::preview::{bgra_to_rgba, screenshot_path};
 /// The notice queue's own half of the sound watch, and the three words it is
 /// spelled with -- reached by name because the app's own glob does not carry
 /// them (`notices` is a private module re-exported for the window).
-use crate::notices::{audio_change_notice, audio_lost_line, audio_tail};
+use crate::notices::{
+    audio_change_notice, audio_lost_line, audio_tail, decode_change_notice, decode_failed_line,
+};
+
+/// The picture twin of the sound watch above, and the same shape for the same
+/// reason: a decode failure that arrives between two frames used to reach no
+/// consumer at all, because the worker printed it to stderr and dropped the
+/// channel -- and a closed channel is what a finished film looks like from the
+/// app's side, so the transport said ENDED over a frozen frame with nothing in
+/// the window saying why.
+///
+/// Driven through the queue step, because a test cannot make a decoder fail on
+/// cue; the engine's writer is the decode worker's, and
+/// `engine::tests::decode_failure` observes it end to end on the engine side.
+#[test]
+fn a_decode_that_fails_under_an_open_file_says_so_and_unsays_it() {
+    let mut notices: std::collections::VecDeque<gpui::SharedString> =
+        ["OPENED take.mp4".into()].into_iter().collect();
+    let failed = decode_failed_line("decode error at access unit 130");
+    assert!(
+        failed.starts_with("DECODE FAILED"),
+        "the line lost the state word the strip reads first: {failed}"
+    );
+    // The file was fine, and then the picture stopped: the reason arrives
+    // between two frames.
+    decode_change_notice(&mut notices, None, Some("decode error at access unit 130"));
+    assert_eq!(
+        notices.back().map(|notice| &***notice),
+        Some(failed.as_str()),
+        "a decode failure that arrives mid-session is never pushed"
+    );
+    // The same reason read again on the next frame is not news.
+    decode_change_notice(
+        &mut notices,
+        Some("decode error at access unit 130"),
+        Some("decode error at access unit 130"),
+    );
+    assert_eq!(notices.len(), 2, "one failure was announced twice");
+    // Seeked away from, and it decodes again: the line goes with it, or the
+    // strip keeps saying DECODE FAILED over a film that plays.
+    decode_change_notice(&mut notices, Some("decode error at access unit 130"), None);
+    assert_eq!(
+        notices.iter().map(|notice| &***notice).collect::<Vec<_>>(),
+        vec!["OPENED take.mp4"],
+        "the DECODE FAILED line is still on the strip over a film that plays"
+    );
+    // The sound line is a different line and is none of this step's business.
+    audio_change_notice(&mut notices, None, Some("AUDIO_LOST"));
+    decode_change_notice(&mut notices, None, Some("decode error at access unit 7"));
+    decode_change_notice(&mut notices, Some("decode error at access unit 7"), None);
+    assert_eq!(
+        notices.iter().map(|notice| &***notice).collect::<Vec<_>>(),
+        vec!["OPENED take.mp4", audio_lost_line("AUDIO_LOST").as_str()],
+        "one reason's retraction took the other one's line with it"
+    );
+    // The wiring: the pump is the one place every frame passes through, and a
+    // watcher nothing calls is a message nobody reads.
+    assert!(
+        fn_body("pump").contains("self.watch_decode();"),
+        "the pump stopped watching the engine's decode reason, so a corrupt \
+         file is a silent freeze again"
+    );
+    // ...and it reads the reason off the session the pump is serving, the same
+    // rule the sound watch follows.
+    assert!(
+        fn_body("decode_reason").contains("self.active_session()"),
+        "the decode watch reads a reason off a session the pump is not \
+         serving, so a preview flip announces the other session's failure"
+    );
+}
 
 /// A reason that changes under a session that is already open says so, and stops
 /// saying so when it clears. This side is the *reader*: the writer of a reason is
@@ -72,7 +141,7 @@ fn a_device_that_dies_under_an_open_file_says_so_and_unsays_it() {
     // cannot be answered as if it were the cached session's own change.
     let watch = fn_body("watch_audio");
     let args = watch
-        .split_once("audio_step(")
+        .split_once("reason_step(")
         .expect(
             "the watch decides for itself instead of through the pure step the flip test drives",
         )
@@ -106,29 +175,41 @@ fn a_device_that_dies_under_an_open_file_says_so_and_unsays_it() {
 /// speaks.
 #[test]
 fn a_preview_flip_is_not_a_device_that_came_back() {
-    use crate::notices::{AudioStep, audio_step};
+    use crate::notices::{ReasonStep, reason_step};
     // A swap, every way round: seeded, never announced.
-    assert_eq!(audio_step(7, 8, None, Some("AUDIO_LOST")), AudioStep::Seed);
-    assert_eq!(audio_step(7, 8, Some("AUDIO_LOST"), None), AudioStep::Seed);
     assert_eq!(
-        audio_step(7, 8, Some("AUDIO_LOST"), Some("AUDIO_LOST")),
-        AudioStep::Seed,
+        reason_step(7, 8, None, Some("AUDIO_LOST")),
+        ReasonStep::Seed
+    );
+    assert_eq!(
+        reason_step(7, 8, Some("AUDIO_LOST"), None),
+        ReasonStep::Seed
+    );
+    assert_eq!(
+        reason_step(7, 8, Some("AUDIO_LOST"), Some("AUDIO_LOST")),
+        ReasonStep::Seed,
         "a flip whose reason reads the same on both sides is still a flip"
     );
     // The same session, the reason arriving, changing, and going.
-    assert_eq!(audio_step(7, 7, None, Some("AUDIO_LOST")), AudioStep::Push);
     assert_eq!(
-        audio_step(7, 7, Some("AUDIO_LOST"), Some("device gone")),
-        AudioStep::Push
+        reason_step(7, 7, None, Some("AUDIO_LOST")),
+        ReasonStep::Push
     );
-    assert_eq!(audio_step(7, 7, Some("AUDIO_LOST"), None), AudioStep::Clear);
     assert_eq!(
-        audio_step(7, 7, Some("AUDIO_LOST"), Some("AUDIO_LOST")),
-        AudioStep::Nothing,
+        reason_step(7, 7, Some("AUDIO_LOST"), Some("device gone")),
+        ReasonStep::Push
+    );
+    assert_eq!(
+        reason_step(7, 7, Some("AUDIO_LOST"), None),
+        ReasonStep::Clear
+    );
+    assert_eq!(
+        reason_step(7, 7, Some("AUDIO_LOST"), Some("AUDIO_LOST")),
+        ReasonStep::Nothing,
         "the same reason read again on the next frame is not news"
     );
-    assert_eq!(audio_step(7, 7, None, None), AudioStep::Nothing);
-    assert_eq!(audio_step(0, 0, None, None), AudioStep::Nothing);
+    assert_eq!(reason_step(7, 7, None, None), ReasonStep::Nothing);
+    assert_eq!(reason_step(0, 0, None, None), ReasonStep::Nothing);
 }
 
 /// The toast tail an audio import earns: rate, channel count and rounded

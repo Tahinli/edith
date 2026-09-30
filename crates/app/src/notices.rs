@@ -64,11 +64,30 @@ pub(crate) fn audio_lost_line(reason: &str) -> String {
     format!("AUDIO LOST{}", audio_tail(reason))
 }
 
-/// What a frame of the sound watch decides, as a pure value: the cache's own
+/// A decode failure that arrives *after* a file was opened, said on its own
+/// line: the same shape as [`audio_lost_line`] and for the same reason -- a
+/// death mid-session has no open line to hang a tail off, so it leads with the
+/// state word the strip reads first.
+///
+/// The picture twin of the sound line above, and it exists because a decode
+/// failure used to reach nobody at all: the worker printed it to stderr and
+/// dropped the channel, and a closed channel is what a finished film looks like
+/// from the app's side. A file with a damaged middle froze on its last good
+/// picture and the transport said ENDED. The reason is the engine's own words,
+/// verbatim -- the app spells none of them.
+pub(crate) fn decode_failed_line(reason: &str) -> String {
+    format!("DECODE FAILED — {reason}")
+}
+
+/// What a frame of a reason watch decides, as a pure value: the cache's own
 /// session generation against the frame's says whether the two are even talking
 /// about the same session, and only then what the reason did.
+///
+/// One type for every reason the engine states, not one per source: the sound
+/// device and the decode worker both write a string the app has to notice
+/// changed, and the thing that decides is the same comparison in both cases.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum AudioStep {
+pub(crate) enum ReasonStep {
     /// The cache describes the session *before* this one
     /// (`Player::session_swapped`): it is seeded and nothing is announced -- a
     /// preview that opens or closes is not a device that came back.
@@ -81,7 +100,8 @@ pub(crate) enum AudioStep {
     Nothing,
 }
 
-/// [`Player::watch_audio`]'s whole decision, pure: `cached_gen` is the session
+/// [`Player::watch_audio`]'s and [`Player::watch_decode`]'s whole decision,
+/// pure: `cached_gen` is the session
 /// generation the cache describes, `session_gen` the one the frame is serving, and
 /// two reasons are what the engine says the sound is (`None` for sound that is
 /// up).
@@ -91,20 +111,20 @@ pub(crate) enum AudioStep {
 /// so a flip reads a reason that was never about the cached session at all -- a
 /// live device on one side and a dead one on the other is not a change, it is
 /// two different questions.
-pub(crate) fn audio_step(
+pub(crate) fn reason_step(
     cached_gen: u64,
     session_gen: u64,
     was: Option<&str>,
     now: Option<&str>,
-) -> AudioStep {
+) -> ReasonStep {
     if cached_gen != session_gen {
-        return AudioStep::Seed;
+        return ReasonStep::Seed;
     }
     match (was, now) {
-        (Some(was), Some(now)) if was == now => AudioStep::Nothing,
-        (_, Some(_)) => AudioStep::Push,
-        (Some(_), None) => AudioStep::Clear,
-        (None, None) => AudioStep::Nothing,
+        (Some(was), Some(now)) if was == now => ReasonStep::Nothing,
+        (_, Some(_)) => ReasonStep::Push,
+        (Some(_), None) => ReasonStep::Clear,
+        (None, None) => ReasonStep::Nothing,
     }
 }
 
@@ -134,6 +154,32 @@ pub(crate) fn audio_change_notice(
         // queued is none of this step's business.
         (Some(was), None) => {
             let line = audio_lost_line(was);
+            notices.retain(|notice| notice.as_ref() != line.as_str());
+        }
+        _ => {}
+    }
+}
+
+/// What a *change* in the engine's **decode** reason does to the notice queue:
+/// the line pushed when a reason arrives, the same line taken back when the
+/// reason clears. [`audio_change_notice`]'s twin, step for step, because the
+/// thing that changed is the same kind of thing -- a reason the engine started
+/// or stopped stating between two frames.
+///
+/// The retraction is what keeps this from becoming noise: a decode that fails,
+/// is seeked away from and succeeds has to take its line back, or the strip
+/// keeps saying DECODE FAILED over a film that plays.
+pub(crate) fn decode_change_notice(
+    notices: &mut std::collections::VecDeque<SharedString>,
+    was: Option<&str>,
+    now: Option<&str>,
+) {
+    match (was, now) {
+        (_, Some(reason)) if was != Some(reason) => {
+            push_notice(notices, decode_failed_line(reason).into());
+        }
+        (Some(was), None) => {
+            let line = decode_failed_line(was);
             notices.retain(|notice| notice.as_ref() != line.as_str());
         }
         _ => {}

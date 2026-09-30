@@ -62,8 +62,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use ec_core::frame::VideoFrame;
-use ec_core::registry::{CodecId, CodecParameters};
 use ec_core::registry::Decoder as _;
+use ec_core::registry::{CodecId, CodecParameters};
 use ec_core::{Packet, TimeBase};
 use ec_h264::{Encoder, EncoderConfig, H264Decoder, PictureView, Preset};
 use ec_h265::encoder::{Encoder as HevcEncoder, EncoderConfig as HevcEncoderConfig, RateControl};
@@ -86,7 +86,7 @@ use crate::mux::{
     AudioParams, Av1Params, CopyParams, HevcParams, MkvMuxer, Mp4Muxer, SubParams, VideoParams,
 };
 use crate::project::{Lane, LaneKind, Project, Rate};
-use crate::scale::{blend_i420, Composer};
+use crate::scale::{Composer, blend_i420};
 use crate::subtitle::{Cue, SubtitleTrack};
 use crate::tonemap::{self, ToneMapper};
 use crate::transform::TransformParams;
@@ -559,84 +559,84 @@ pub fn start(
     let part = PathBuf::from(part);
     let spawned = thread::Builder::new().name("export".into()).spawn(move || {
         let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        // Every file this export will read, named before a byte of one is.
-        // These are the project's own sources and can be nothing else: a
-        // stand-in ([`crate::proxy`]) is a substitution playback makes when it
-        // opens a span, and nothing here knows such a thing exists. Printed so
-        // that "the delivery came off the film itself" is a grep rather than a
-        // belief.
-        for source in project.sources() {
-            eprintln!("export source: {}", source.path.display());
-        }
-        // The rename is the last step and the only one that publishes a file
-        // under the name the caller asked for; it stays on the same directory,
-        // so it is atomic.
-        //
-        // An emptied timeline is a legal project and an illegal file: no
-        // picture, no sound, and a muxer that is never created because no coded
-        // frame arrives. Refused by name here -- before the format is even
-        // looked at, so an mp4 and a WAV refuse in the same words -- rather than
-        // left to write a file of no frames that nothing opens. Every caller of
-        // `start` comes through this, the app's own door
-        // (`PlaybackSession::is_empty`) being only the first fence.
-        //
-        // An audio-only timeline is the other legal project no mp4 can be made
-        // of: every frame of it is a gap, so the file would be black picture
-        // over the sound -- minutes of encoding for a video of nothing. Refused
-        // by name, with the two formats that *are* that timeline, rather than
-        // written; the app says the same on the format row before a destination
-        // is even picked (`mp4_refusal`).
-        let written = match settings.format {
-            _ if project.timeline_frames() == 0 => {
-                Err("the timeline is empty: there is nothing to export".into())
+            // Every file this export will read, named before a byte of one is.
+            // These are the project's own sources and can be nothing else: a
+            // stand-in ([`crate::proxy`]) is a substitution playback makes when it
+            // opens a span, and nothing here knows such a thing exists. Printed so
+            // that "the delivery came off the film itself" is a grep rather than a
+            // belief.
+            for source in project.sources() {
+                eprintln!("export source: {}", source.path.display());
             }
-            format if format.has_video() && !has_picture(&project) => Err(format!(
-                "the timeline has no picture: {} would be black. Export WAV, \
-                 FLAC or MP3, which are the sound itself",
-                format.name()
-            )
-            .into()),
-            format if format.has_video() => {
-                let first = run(&project, &meta, &part, &worker, &settings, sample_rate);
-                match first {
-                    // The hardware encoder's *process* died under the driver
-                    // ([`crate::hwproc`]) -- the editor is still here, and the
-                    // file is still owed. Written again by the software encoder
-                    // for this codec, from the first frame: the pictures the
-                    // dead seat coded are not ones this one may continue from.
-                    //
-                    // Not where a person picked the GPU by name: that export
-                    // refuses in words, the same answer [`hw_seat`] already
-                    // gives a machine with no seat at all, rather than quietly
-                    // spending an hour in an encoder nobody chose.
-                    Err(e)
-                        if crate::hwproc::is_lost(&e)
-                            && settings.seat != EncoderSeat::Hardware =>
-                    {
-                        eprintln!("export video: {e}; writing it again in software");
-                        let _ = std::fs::remove_file(&part);
-                        // The bar is *not* put back to zero: the rerun writes
-                        // it with `fetch_max` like everything else
-                        // ([`Shared::progress`]), so it holds where the dead
-                        // seat left it and moves again once the software
-                        // encoder passes that mark. A person whose GPU has just
-                        // died is the last one who should also watch the bar
-                        // run backwards.
-                        let mut software = settings.clone();
-                        software.seat = EncoderSeat::Software;
-                        run(&project, &meta, &part, &worker, &software, sample_rate)
-                    }
-                    other => other,
+            // The rename is the last step and the only one that publishes a file
+            // under the name the caller asked for; it stays on the same directory,
+            // so it is atomic.
+            //
+            // An emptied timeline is a legal project and an illegal file: no
+            // picture, no sound, and a muxer that is never created because no coded
+            // frame arrives. Refused by name here -- before the format is even
+            // looked at, so an mp4 and a WAV refuse in the same words -- rather than
+            // left to write a file of no frames that nothing opens. Every caller of
+            // `start` comes through this, the app's own door
+            // (`PlaybackSession::is_empty`) being only the first fence.
+            //
+            // An audio-only timeline is the other legal project no mp4 can be made
+            // of: every frame of it is a gap, so the file would be black picture
+            // over the sound -- minutes of encoding for a video of nothing. Refused
+            // by name, with the two formats that *are* that timeline, rather than
+            // written; the app says the same on the format row before a destination
+            // is even picked (`mp4_refusal`).
+            let written = match settings.format {
+                _ if project.timeline_frames() == 0 => {
+                    Err("the timeline is empty: there is nothing to export".into())
                 }
+                format if format.has_video() && !has_picture(&project) => Err(format!(
+                    "the timeline has no picture: {} would be black. Export WAV, \
+                 FLAC or MP3, which are the sound itself",
+                    format.name()
+                )
+                .into()),
+                format if format.has_video() => {
+                    let first = run(&project, &meta, &part, &worker, &settings, sample_rate);
+                    match first {
+                        // The hardware encoder's *process* died under the driver
+                        // ([`crate::hwproc`]) -- the editor is still here, and the
+                        // file is still owed. Written again by the software encoder
+                        // for this codec, from the first frame: the pictures the
+                        // dead seat coded are not ones this one may continue from.
+                        //
+                        // Not where a person picked the GPU by name: that export
+                        // refuses in words, the same answer [`hw_seat`] already
+                        // gives a machine with no seat at all, rather than quietly
+                        // spending an hour in an encoder nobody chose.
+                        Err(e)
+                            if crate::hwproc::is_lost(&e)
+                                && settings.seat != EncoderSeat::Hardware =>
+                        {
+                            eprintln!("export video: {e}; writing it again in software");
+                            let _ = std::fs::remove_file(&part);
+                            // The bar is *not* put back to zero: the rerun writes
+                            // it with `fetch_max` like everything else
+                            // ([`Shared::progress`]), so it holds where the dead
+                            // seat left it and moves again once the software
+                            // encoder passes that mark. A person whose GPU has just
+                            // died is the last one who should also watch the bar
+                            // run backwards.
+                            let mut software = settings.clone();
+                            software.seat = EncoderSeat::Software;
+                            run(&project, &meta, &part, &worker, &software, sample_rate)
+                        }
+                        other => other,
+                    }
+                }
+                _ => run_audio(&project, &meta, &part, &worker, &settings, sample_rate),
+            };
+            let result = written.and_then(|()| std::fs::rename(&part, &out).map_err(Into::into));
+            if result.is_err() {
+                // The muxer -- and with it the file handle -- died with `run`.
+                let _ = std::fs::remove_file(&part);
             }
-            _ => run_audio(&project, &meta, &part, &worker, &settings, sample_rate),
-        };
-        let result = written.and_then(|()| std::fs::rename(&part, &out).map_err(Into::into));
-        if result.is_err() {
-            // The muxer -- and with it the file handle -- died with `run`.
-            let _ = std::fs::remove_file(&part);
-        }
-        settle(&worker, result);
+            settle(&worker, result);
         }));
         if let Err(payload) = caught {
             // The body above panicked before it could settle its own slot --
@@ -654,7 +654,10 @@ pub fn start(
                 // a panic never reaches. Done inside this branch only -- a body
                 // that *did* settle has already renamed or deleted the file.
                 let _ = std::fs::remove_file(&part);
-                settle(&panic_worker, Err(format!("export worker panicked: {message}").into()));
+                settle(
+                    &panic_worker,
+                    Err(format!("export worker panicked: {message}").into()),
+                );
             }
         }
     });
@@ -710,10 +713,12 @@ fn mastered(project: &Project) -> bool {
 /// packet copy carries neither an equalizer nor a fade. An mp4 whose timeline
 /// has one is decoded and re-encoded so the fade actually reaches the file.
 fn faded(project: &Project) -> bool {
-    project
-        .audio_lanes()
-        .into_iter()
-        .any(|lane| project.lane(lane).iter().any(|c| c.fade_in > 0 || c.fade_out > 0))
+    project.audio_lanes().into_iter().any(|lane| {
+        project
+            .lane(lane)
+            .iter()
+            .any(|c| c.fade_in > 0 || c.fade_out > 0)
+    })
 }
 
 /// The bitrate an export codes at: the caller's number clamped into what an
@@ -1439,7 +1444,10 @@ fn planned_lanes(project: &Project, format: Format, lanes: &[Lane]) -> String {
             // Drawn over the picture, written into no file -- the same sentence
             // a picked track gets, because it is the track and not the lane that
             // cannot be carried.
-            dropped.push(format!("{label} {} — pictures; drawn, not written", t.label));
+            dropped.push(format!(
+                "{label} {} — pictures; drawn, not written",
+                t.label
+            ));
         } else if first.start >= end {
             dropped.push(format!("{label} {name}— past the last picture"));
         } else {
@@ -1480,12 +1488,15 @@ fn planned_lanes(project: &Project, format: Format, lanes: &[Lane]) -> String {
 /// Costs that open (~100 ms here): ask it off a render thread and keep the
 /// answer until the format, the resolution or the bitrate changes.
 pub fn planned_video(meta: &VideoMeta, settings: &ExportSettings) -> Option<&'static str> {
-    settings.format.has_video().then(|| match hw_seat(meta, settings) {
-        Ok(hw) => video_label(settings.format, hw.is_some()),
-        // The seat the settings demand and this machine has not: the very
-        // refusal [`start`] would settle with, said on the card instead.
-        Err(_) => NO_HW_SEAT,
-    })
+    settings
+        .format
+        .has_video()
+        .then(|| match hw_seat(meta, settings) {
+            Ok(hw) => video_label(settings.format, hw.is_some()),
+            // The seat the settings demand and this machine has not: the very
+            // refusal [`start`] would settle with, said on the card instead.
+            Err(_) => NO_HW_SEAT,
+        })
 }
 
 /// What [`start`] would open for *this* timeline: the picture's seat -- or the
@@ -1781,7 +1792,11 @@ struct CopyRegion {
 /// clip -- which the same format would carry exactly if the edit let it, so
 /// those six [`CopyPlan::of`] gates are named together rather than picked
 /// apart into six different sentences.
-pub fn exact_refusal(project: &Project, meta: &VideoMeta, settings: &ExportSettings) -> Option<String> {
+pub fn exact_refusal(
+    project: &Project,
+    meta: &VideoMeta,
+    settings: &ExportSettings,
+) -> Option<String> {
     if !settings.exact || CopyPlan::of(project, meta, settings).is_some() {
         return None;
     }
@@ -2246,9 +2261,9 @@ fn encode_audio(
     let out_frames = range.map_or(project.media_frames(), |(s, e)| {
         e.min(project.media_frames()).saturating_sub(s)
     });
-    let total =
-        (f64::from(out_frames) / meta.frame_rate * f64::from(audio.sample_rate)).round() as usize
-            * channels;
+    let total = (f64::from(out_frames) / meta.frame_rate * f64::from(audio.sample_rate)).round()
+        as usize
+        * channels;
     let mut samples: Vec<f32> = Vec::with_capacity(total);
     for chunk in chunks {
         // The only place a cancelled export can be answered before the whole
@@ -2567,9 +2582,15 @@ fn opus_fidelity(
     for w in 0..FIDELITY_WINDOWS {
         let at = w * step;
         let from = at.saturating_sub(FIDELITY_WARMUP);
-        let Some(fidelity) =
-            window_fidelity(packets, samples, pre_skip, channels, from, at, at + FIDELITY_WINDOW)
-        else {
+        let Some(fidelity) = window_fidelity(
+            packets,
+            samples,
+            pre_skip,
+            channels,
+            from,
+            at,
+            at + FIDELITY_WINDOW,
+        ) else {
             continue; // silence: nothing to correlate, and not a failure
         };
         scores.push(fidelity);
@@ -2758,9 +2779,9 @@ fn run(
     // The range's own length where one is marked, the media's otherwise --
     // `export_spans` walks the same window, so `done` ends on this `total`
     // exactly as it always did.
-    let total = settings
-        .range
-        .map_or(project.media_frames(), |(s, e)| e.min(project.media_frames()).saturating_sub(s));
+    let total = settings.range.map_or(project.media_frames(), |(s, e)| {
+        e.min(project.media_frames()).saturating_sub(s)
+    });
     // The two preview switches are the H.264 mp4 pair's alone. Only that
     // container carries a colour of its own back out ([`write_video`] tags it
     // there), so asking any other for a source-space file would write pictures
@@ -2807,12 +2828,8 @@ fn run(
     // of the two. On this project's own film that is 168 s of AC-3 that no
     // longer stands in front of 733 s of hardware H.264.
     let audio_job = {
-        let (project, meta, settings, shared) = (
-            project.clone(),
-            *meta,
-            settings.clone(),
-            Arc::clone(shared),
-        );
+        let (project, meta, settings, shared) =
+            (project.clone(), *meta, settings.clone(), Arc::clone(shared));
         thread::Builder::new()
             .name("export-audio".into())
             .spawn(move || {
@@ -2955,7 +2972,15 @@ fn run(
     // it replaced -- and the sound says whether it was copied or encoded, which
     // only `copy_audio` knows and, on the overlapped path, does not know yet.
     let seat = encoder.label();
-    publish_seats(shared, seat, project, settings, sound, opus, audio_job.running());
+    publish_seats(
+        shared,
+        seat,
+        project,
+        settings,
+        sound,
+        opus,
+        audio_job.running(),
+    );
     // When the picture started, so the stage line below can say where under it
     // the sound landed -- the one number that says whether the two passes
     // really overlapped, in the same voice as `encode_audio`'s own timers.
@@ -2994,9 +3019,8 @@ fn run(
         // A's pixels on the CPU, so a dissolving span never asks for a GPU
         // buffer, not even outside its own window.
         let dissolve = dissolve_window(project, &span);
-        let (mut pictures, rate, in_frame, color, mapper, rotation, pixel_aspect) =
-            match span.from
-            {
+        let (mut pictures, rate, in_frame, color, mapper, rotation, pixel_aspect) = match span.from
+        {
             Some((source, in_frame)) => {
                 let entry = sources
                     .get(source)
@@ -3046,7 +3070,15 @@ fn run(
                 } else {
                     ClipDecoder::open(&entry.path, rate.source_at(in_frame), want)?
                 };
-                (Some(pictures), rate, in_frame, Some(color), mapper, rotation, pixel_aspect)
+                (
+                    Some(pictures),
+                    rate,
+                    in_frame,
+                    Some(color),
+                    mapper,
+                    rotation,
+                    pixel_aspect,
+                )
             }
             // A gap's black is 16/128/128, which is black in every matrix here
             // and on every curve: nothing to remap and nothing to tone-map,
@@ -3105,52 +3137,54 @@ fn run(
         // files together for exactly the frames the tail below blends, and
         // nothing else in this span ever touches it.
         let mut b = dissolve
-            .map(|(b_source, b_in_frame, window, b_start)| -> crate::Result<_> {
-                let entry = sources.get(b_source).ok_or_else(|| {
-                    format!("clip names source {b_source} of {}", sources.len())
-                })?;
-                let (b_rate, b_color, _peak, b_rotation, b_pixel_aspect) = rates[b_source];
-                let b_mapper = tone[b_source].as_ref();
-                let b_remap = remap_into(Some(b_color), b_mapper.is_some(), out_color.matrix);
-                Ok(Dissolve {
-                    window,
-                    tail_start: span.len - window,
-                    decoder: if crate::is_audio(&entry.path)
-                        || project.composite_visualizer_at(b_start) & 1 != 0
-                    {
-                        ClipDecoder::visualizer(
-                            &entry.path,
-                            entry.audio_stream,
-                            b_rate.source_at(b_in_frame),
+            .map(
+                |(b_source, b_in_frame, window, b_start)| -> crate::Result<_> {
+                    let entry = sources.get(b_source).ok_or_else(|| {
+                        format!("clip names source {b_source} of {}", sources.len())
+                    })?;
+                    let (b_rate, b_color, _peak, b_rotation, b_pixel_aspect) = rates[b_source];
+                    let b_mapper = tone[b_source].as_ref();
+                    let b_remap = remap_into(Some(b_color), b_mapper.is_some(), out_color.matrix);
+                    Ok(Dissolve {
+                        window,
+                        tail_start: span.len - window,
+                        decoder: if crate::is_audio(&entry.path)
+                            || project.composite_visualizer_at(b_start) & 1 != 0
+                        {
+                            ClipDecoder::visualizer(
+                                &entry.path,
+                                entry.audio_stream,
+                                b_rate.source_at(b_in_frame),
+                                meta.width,
+                                meta.height,
+                                meta.frame_rate,
+                                project.composite_visualizer_at(b_start),
+                                project.composite_viz_paint_at(b_start),
+                            )?
+                        } else {
+                            ClipDecoder::open(&entry.path, b_rate.source_at(b_in_frame), None)?
+                        },
+                        mapper: b_mapper,
+                        remap: b_remap,
+                        grade: project.composite_color_at(b_start).copied(),
+                        transform: project
+                            .composite_transform_at(b_start)
+                            .copied()
+                            .unwrap_or_default(),
+                        rotation: b_rotation,
+                        pixel_aspect: b_pixel_aspect,
+                        canvas: Composer::new(
                             meta.width,
                             meta.height,
-                            meta.frame_rate,
-                            project.composite_visualizer_at(b_start),
-                            project.composite_viz_paint_at(b_start),
-                        )?
-                    } else {
-                        ClipDecoder::open(&entry.path, b_rate.source_at(b_in_frame), None)?
-                    },
-                    mapper: b_mapper,
-                    remap: b_remap,
-                    grade: project.composite_color_at(b_start).copied(),
-                    transform: project
-                        .composite_transform_at(b_start)
-                        .copied()
-                        .unwrap_or_default(),
-                    rotation: b_rotation,
-                    pixel_aspect: b_pixel_aspect,
-                    canvas: Composer::new(
-                        meta.width,
-                        meta.height,
-                        project.composite_fit_at(b_start),
-                    ),
-                    rotated: (Vec::new(), Vec::new(), Vec::new()),
-                    stretched: (Vec::new(), Vec::new(), Vec::new()),
-                    graded: (Vec::new(), Vec::new(), Vec::new()),
-                    transformed: (Vec::new(), Vec::new(), Vec::new()),
-                })
-            })
+                            project.composite_fit_at(b_start),
+                        ),
+                        rotated: (Vec::new(), Vec::new(), Vec::new()),
+                        stretched: (Vec::new(), Vec::new(), Vec::new()),
+                        graded: (Vec::new(), Vec::new(), Vec::new()),
+                        transformed: (Vec::new(), Vec::new(), Vec::new()),
+                    })
+                },
+            )
             .transpose()?;
         // Timeline frames, taken a *source* frame at a time: at a rate other
         // than real time the two are not the same count, and the span says which
@@ -3287,9 +3321,21 @@ fn run(
                             }
                             Some(Frame::Pixels(by, bu, bv, bw, bh)) => {
                                 let (by, bu, bv, _, _) = place_picture(
-                                    by, bu, bv, bw, bh, d.rotation, d.pixel_aspect, d.grade,
-                                    d.transform, d.remap, d.mapper, &mut d.rotated,
-                                    &mut d.stretched, &mut d.graded, &mut d.transformed,
+                                    by,
+                                    bu,
+                                    bv,
+                                    bw,
+                                    bh,
+                                    d.rotation,
+                                    d.pixel_aspect,
+                                    d.grade,
+                                    d.transform,
+                                    d.remap,
+                                    d.mapper,
+                                    &mut d.rotated,
+                                    &mut d.stretched,
+                                    &mut d.graded,
+                                    &mut d.transformed,
                                     &mut d.canvas,
                                 );
                                 let idx_in_window = done_here + r - d.tail_start;
@@ -3470,7 +3516,9 @@ fn place_picture<'a>(
             display_width.div_ceil(2) as usize,
             height.div_ceil(2) as usize,
         );
-        stretched.0.resize(display_width as usize * height as usize, 0);
+        stretched
+            .0
+            .resize(display_width as usize * height as usize, 0);
         stretched.1.resize(dcw * dch, 0);
         stretched.2.resize(dcw * dch, 0);
         crate::scale::scale_i420(
@@ -3549,7 +3597,13 @@ fn place_picture<'a>(
     } else {
         let (py, pu, pv, w, h) = canvas.place_transformed(y, u, v, width, height, &transform);
         *transformed = (py, pu, pv);
-        (&transformed.0[..], &transformed.1[..], &transformed.2[..], w, h)
+        (
+            &transformed.0[..],
+            &transformed.1[..],
+            &transformed.2[..],
+            w,
+            h,
+        )
     }
 }
 
@@ -3594,7 +3648,10 @@ fn source_rate(
         // `decode::rgb_to_i420` is the one matrix that turns its pixels into
         // planes. A song has no picture and the answer is never read. Neither
         // has a display matrix to be turned by, nor an aspect to be widened
-        // by: both are authored square.
+        // by: both are authored square. A still's *EXIF* turn is not in this
+        // arm either, and for a better reason -- `decode::Still::open` already
+        // made it before the planes were written, so `place_picture` is handed
+        // the picture the preview showed and must not be told to turn it again.
         return (
             Rate::REAL_TIME,
             ColorDescription::default(),
@@ -3694,9 +3751,8 @@ fn run_audio(
     };
     // The picture path's line, for a file that is sound alone: there is sound
     // by the line above, so this names the encoder writing it.
-    *shared.encoders.lock().unwrap() = Some(
-        audio_label(project, format, true, None, settings.range.is_some()).to_string(),
-    );
+    *shared.encoders.lock().unwrap() =
+        Some(audio_label(project, format, true, None, settings.range.is_some()).to_string());
     let channels = usize::from(audio.channels);
     let out_frames = settings.range.map_or(project.media_frames(), |(s, e)| {
         e.min(project.media_frames()).saturating_sub(s)
@@ -4516,9 +4572,7 @@ impl Enc {
             cfg.timing = Some((fps_den, fps_num));
             cfg.video_signal_type = Some(video_signal_type(meta.height));
             cfg.threads = per_lane;
-            lanes.push(
-                HevcEncoder::new(cfg).map_err(|e| format!("HEVC software encoder: {e}"))?,
-            );
+            lanes.push(HevcEncoder::new(cfg).map_err(|e| format!("HEVC software encoder: {e}"))?);
         }
         Ok(Self::Hevc(HevcEnc {
             pending: Vec::new(),
@@ -4579,7 +4633,9 @@ impl Enc {
             // them is a sync point -- said as a constant rather than parsed back
             // out of the bitstream, because it is this encoder's configuration
             // and not a driver's choice.
-            Self::HevcHw(hw) => Ok(hw.encode(y, u, v, width, height, true)?.map(|au| (au, true))),
+            Self::HevcHw(hw) => Ok(hw
+                .encode(y, u, v, width, height, true)?
+                .map(|au| (au, true))),
             Self::Hevc(hevc) => {
                 // The display-size planes are kept as they came: `ec-h265`
                 // pads to its own coded grid and crops back through the SPS
@@ -4970,7 +5026,11 @@ impl ClipDecoder {
             .ok()
             .flatten()
             .unwrap_or_default();
-        let fps = if fps.is_finite() && fps > 0.0 { fps } else { 30.0 };
+        let fps = if fps.is_finite() && fps > 0.0 {
+            fps
+        } else {
+            30.0
+        };
         Ok(Self::Visualizer {
             peaks,
             width,
@@ -5236,9 +5296,7 @@ impl SwDecoder {
                 // either answer means go back for the next access unit.
                 Err(e) if e.is_eof() && self.flushed => return Ok(false),
                 Err(e) if e.is_need_more() || e.is_eof() => {}
-                Err(e) => {
-                    return Err(format!("decode at picture {}: {e}", self.index).into())
-                }
+                Err(e) => return Err(format!("decode at picture {}: {e}", self.index).into()),
             }
         }
     }
@@ -5767,7 +5825,11 @@ mod tests {
         // 1280 * 720 * 30 * 0.1
         assert_eq!(bitrate_for(&meta(1280, 720, 30.0)), 2_764_800);
         assert_eq!(bitrate_for(&meta(320, 240, 30.0)), 230_400, "tiny");
-        assert_eq!(bitrate_for(&meta(160, 120, 15.0)), MIN_BITRATE, "tinier floors");
+        assert_eq!(
+            bitrate_for(&meta(160, 120, 15.0)),
+            MIN_BITRATE,
+            "tinier floors"
+        );
         assert_eq!(bitrate_for(&meta(3840, 2160, 60.0)), MAX_BITRATE, "huge");
         // A rate somebody typed goes through untouched to its own ceiling, which
         // is above where the derived one stops: the card offers 50 Mbps, and a
@@ -5799,7 +5861,11 @@ mod tests {
     fn a_fade_forces_the_audio_to_be_re_encoded() {
         let mut project = Project::single("/nonexistent/film.mp4", 90);
         assert!(!forces_encode(&project, false), "flat, so a copy is fine");
-        assert!(project.set_fade_in(crate::project::Lane::new(crate::project::LaneKind::Audio, 0), 0, 15));
+        assert!(project.set_fade_in(
+            crate::project::Lane::new(crate::project::LaneKind::Audio, 0),
+            0,
+            15
+        ));
         assert!(
             forces_encode(&project, false),
             "a fade-in on the only clip must force a re-encode"
@@ -5908,7 +5974,11 @@ mod tests {
     /// B, and the window itself never quite repeats a hard cut's own instant.
     #[test]
     fn dissolve_weight_ramps_strictly_between_zero_and_one() {
-        assert_eq!(dissolve_weight(0, 1), 0.5, "a one-frame window is the midpoint");
+        assert_eq!(
+            dissolve_weight(0, 1),
+            0.5,
+            "a one-frame window is the midpoint"
+        );
         assert_eq!(dissolve_weight(0, 4), 0.2);
         assert_eq!(dissolve_weight(1, 4), 0.4);
         assert_eq!(dissolve_weight(2, 4), 0.6);
