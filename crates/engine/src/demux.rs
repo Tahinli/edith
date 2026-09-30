@@ -250,6 +250,40 @@ fn mp4_codec(fourcc: &[u8; 4]) -> Option<Codec> {
 #[derive(Debug)]
 pub struct NoVideoTrack(String);
 
+/// A container that states a picture larger than this engine will compose:
+/// past [`crate::MAX_RESOLUTION`], where a per-frame buffer stops being a
+/// sane thing to allocate. Refused by name, like the other named refusals,
+/// because "this file is too big to open" is something a user can act on and
+/// a capacity overflow one layer down is not.
+#[derive(Debug)]
+pub struct UnsupportedDisplaySize(u64);
+
+impl std::fmt::Display for UnsupportedDisplaySize {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "this file states a {} pixel picture, past the {} pixel maximum",
+            self.0,
+            crate::MAX_RESOLUTION
+        )
+    }
+}
+
+impl std::error::Error for UnsupportedDisplaySize {}
+
+fn unsupported_display_size(stated: u64) -> crate::Error {
+    UnsupportedDisplaySize(stated).into()
+}
+
+impl UnsupportedDisplaySize {
+    /// Whether an `error` is one of these, however deep in a `Box` it is --
+    /// [`NoVideoTrack::is_it`]'s and [`UnsupportedRotation::is_it`]'s twin,
+    /// for a caller that shows the refusal differently from the others.
+    pub fn is_it(error: &crate::Error) -> bool {
+        error.downcast_ref::<Self>().is_some()
+    }
+}
+
 impl std::fmt::Display for NoVideoTrack {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
@@ -2609,8 +2643,32 @@ fn mkv_track_entry(
                 let mut at = body;
                 while let Some(e) = ebml_element(file, at, stop)? {
                     match e.0 {
-                        PIXEL_WIDTH => width = ebml_uint(file, e.1, e.2)? as u32,
-                        PIXEL_HEIGHT => height = ebml_uint(file, e.1, e.2)? as u32,
+                        // A container may state any size at all, and these
+                        // two reach a per-frame allocation directly
+                        // (`decode.rs` sizes its planes as
+                        // `display_width * height`). The engine already has
+                        // the bound for this -- [`crate::MAX_RESOLUTION`],
+                        // 8K -- and it was applied to a keystroke and to a
+                        // `.edith` line but never to a header, so a
+                        // 65535x65535 track opened and asked for a
+                        // gigabyte-scale buffer. A size past the bound is
+                        // refused by name here, where the file can be
+                        // refused, rather than discovered as a capacity
+                        // overflow one layer down.
+                        PIXEL_WIDTH => {
+                            let stated = ebml_uint(file, e.1, e.2)?;
+                            if stated > u64::from(crate::MAX_RESOLUTION) {
+                                return Err(unsupported_display_size(stated));
+                            }
+                            width = stated as u32;
+                        }
+                        PIXEL_HEIGHT => {
+                            let stated = ebml_uint(file, e.1, e.2)?;
+                            if stated > u64::from(crate::MAX_RESOLUTION) {
+                                return Err(unsupported_display_size(stated));
+                            }
+                            height = stated as u32;
+                        }
                         DISPLAY_WIDTH => display_width = ebml_uint(file, e.1, e.2)?,
                         DISPLAY_HEIGHT => display_height = ebml_uint(file, e.1, e.2)?,
                         DISPLAY_UNIT => display_unit = ebml_uint(file, e.1, e.2)?,

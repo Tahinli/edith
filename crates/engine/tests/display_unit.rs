@@ -216,3 +216,52 @@ fn a_physical_display_unit_is_read_as_square() {
         );
     }
 }
+/// The coded size is untrusted too, and it reaches an allocation directly:
+/// `decode.rs` sizes its stretched planes as `display_width * height`. The
+/// engine already has a bound for exactly this -- [`engine::MAX_RESOLUTION`],
+/// 8K, the size a per-frame buffer stops being sane at -- and the demux
+/// readers never applied it to a container-stated width or height.
+///
+/// The fixture patches the `PixelWidth`/`PixelHeight` payloads to 65535 each,
+/// which is a legal two-byte EBML integer, so the element keeps its exact
+/// length and the copy stays seekable.
+#[test]
+fn a_coded_size_past_the_resolution_bound_is_refused_not_allocated() {
+    let scratch = Scratch::new("huge");
+    let into = scratch.path("huge_dims.mkv");
+    with_video_element(
+        &asset("test_anamorphic.mkv"),
+        &into,
+        &VIDEO_UNIT_3
+            .replacen("b08205a0", "b082ffff", 1)
+            .replacen("ba820438", "ba82ffff", 1),
+    );
+
+    // Refused, and refused by name: the open fails with a message that says
+    // what the file claimed and what the maximum is, rather than succeeding
+    // and handing a caller a 65535x65535 to allocate.
+    let Err(why) = Demuxer::open(&into) else {
+        panic!("a 65535x65535 header is refused by name, never opened");
+    };
+    let said = why.to_string();
+    assert!(
+        said.contains("65535") && said.contains(&engine::MAX_RESOLUTION.to_string()),
+        "the refusal names the size claimed and the maximum: {said}"
+    );
+    assert!(
+        engine::demux::UnsupportedDisplaySize::is_it(&why),
+        "and it is the named refusal a caller can match on, not a string"
+    );
+}
+
+/// The bound is a ceiling on a real picture, not a floor on a file: the
+/// largest size a real source states still opens, untouched.
+#[test]
+fn a_real_size_up_to_the_bound_still_opens() {
+    let (meta, _) = Demuxer::open(&asset("test_anamorphic.mkv")).expect("open the fixture");
+    assert!(
+        engine::is_resolution(meta.coded_width, meta.coded_height),
+        "the ordinary fixture is inside the bound, which is what keeps the \
+         bound from refusing the library"
+    );
+}
