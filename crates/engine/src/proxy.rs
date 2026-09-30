@@ -32,8 +32,8 @@
 //! cancel a file export has ([`Job`]).
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::UNIX_EPOCH;
 
 use crate::demux::{Codec, Demuxer, NoVideoTrack, VideoMeta};
@@ -93,8 +93,20 @@ const BITS_PER_PIXEL: f64 = 0.3;
 /// Whether this is a file worth standing in for: bigger than 1080p, or coded in
 /// something this machine decodes slowly even at 1080p. H.264 at or under 1080p
 /// plays natively and a proxy of it would cost time and buy nothing.
+///
+/// The size test reads the **coded** pair, not the displayed one
+/// ([`VideoMeta::coded_width`]): those differ wherever the file carries a
+/// display matrix or a non-square pixel, and a 1920x1080 H.264 phone clip with
+/// a 90-degree turn *displays* as 1080x1920 -- so judging the displayed pair
+/// called a clip that plays natively proxy-worthy and put a whole film through
+/// a decoder and an encoder to stand in for something already at speed. What a
+/// decoder is asked to chew through is the stored raster, so the stored raster
+/// is what this is about; the codec test is not a size question and is
+/// unchanged.
 pub fn wanted(meta: &VideoMeta) -> bool {
-    meta.width > 1920 || meta.height > 1080 || matches!(meta.codec, Codec::Hevc | Codec::Av1)
+    meta.coded_width > 1920
+        || meta.coded_height > 1080
+        || matches!(meta.codec, Codec::Hevc | Codec::Av1)
 }
 
 /// The picture a proxy of `meta` is coded at: aspect kept, long edge at most
@@ -628,7 +640,27 @@ mod tests {
         Arc::new(AtomicBool::new(false))
     }
 
-    fn meta(width: u32, height: u32, codec: Codec) -> VideoMeta {
+    /// A meta as no container wrote it: square pixels, no turn, the displayed
+    /// pair the same pair the samples are stored at.
+    fn meta(coded_width: u32, coded_height: u32, codec: Codec) -> VideoMeta {
+        turned_meta(coded_width, coded_height, Rotation::None, codec)
+    }
+
+    /// The same, but with the display pair built the way `demux` builds it for
+    /// a file carrying a display matrix: the stored pair with its axes swapped
+    /// where the turn says they are. A phone clip shot 1920x1080 and turned to
+    /// portrait is the case that matters -- it *displays* 1080x1920, and a
+    /// predicate that reads the displayed pair calls it a tall 1080p film.
+    fn turned_meta(
+        coded_width: u32,
+        coded_height: u32,
+        rotation: Rotation,
+        codec: Codec,
+    ) -> VideoMeta {
+        let (width, height) = match rotation.swaps_axes() {
+            true => (coded_height, coded_width),
+            false => (coded_width, coded_height),
+        };
         VideoMeta {
             width,
             height,
@@ -636,11 +668,9 @@ mod tests {
             frame_count: 240,
             codec,
             color: ColorDescription::default(),
-            rotation: Rotation::None,
-            // Square pixels, coded where they are declared: a meta no
-            // container wrote, so nothing was read to disagree with it.
-            coded_width: width,
-            coded_height: height,
+            rotation,
+            coded_width,
+            coded_height,
             pixel_aspect: crate::demux::PixelAspect::SQUARE,
         }
     }
@@ -657,6 +687,39 @@ mod tests {
             "1080p H.264 plays natively"
         );
         assert!(!wanted(&meta(1280, 720, Codec::H264)), "720p H.264");
+
+        // A turn must not turn a native file into a proxy job. What a decoder
+        // is handed is the stored raster -- 1920x1080 of H.264 -- and that is
+        // what plays at speed; the 1080x1920 the file *displays* is a metadata
+        // turn, not a bigger picture. Judged on the displayed pair this file
+        // was handed to a background decoder and an encoder to be stood in for,
+        // which is a whole film of CPU and cache for a clip already at rate.
+        let phone = turned_meta(1920, 1080, Rotation::Cw90, Codec::H264);
+        assert_eq!(
+            (phone.coded_width, phone.coded_height),
+            (1920, 1080),
+            "the samples are stored landscape"
+        );
+        assert_eq!(
+            (phone.width, phone.height),
+            (1080, 1920),
+            "and the file only claims to display portrait"
+        );
+        assert!(
+            !wanted(&phone),
+            "a rotated 1080p H.264 clip plays natively: the turn is not height"
+        );
+        // ...while the same turn on a codec this machine decodes slowly is
+        // still wanted, and so is a genuinely tall stored raster: the two
+        // tests are about the stored pair, not about `rotation` itself.
+        assert!(
+            wanted(&turned_meta(1920, 1080, Rotation::Cw90, Codec::Hevc)),
+            "1080p HEVC is wanted whatever turn it carries"
+        );
+        assert!(
+            wanted(&turned_meta(1080, 1920, Rotation::None, Codec::H264)),
+            "a stored 1080x1920 raster is a big one, turn or not"
+        );
     }
 
     /// Aspect kept, long edge capped, both axes even -- and a small source left
