@@ -988,9 +988,13 @@ pub fn start(source: &Path, lo: u32, hi: u32) -> Status {
         return status(source, lo, hi);
     };
     let job = Arc::new(Job { progress: AtomicU32::new(0), cancel: AtomicBool::new(false), outcome: Mutex::new(None) });
-    if let Ok(mut j) = jobs().lock() {
-        j.insert(key.clone(), job.clone());
+    // The check and the insert share one lock, so two starts cannot both see the range as missing.
+    let mut map = jobs().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(running) = map.get(&key).filter(|j| j.outcome.lock().unwrap_or_else(|e| e.into_inner()).is_none()) {
+        return Status::Running(running.progress.load(Ordering::Relaxed) as f32 / 1000.0);
     }
+    map.insert(key.clone(), job.clone());
+    drop(map);
     let source = source.to_path_buf();
     std::thread::spawn(move || {
         let measured = analyse(&source, lo, hi, &job.progress, &job.cancel);
