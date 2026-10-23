@@ -1,8 +1,20 @@
 //! Editing the timeline itself: the cuts, the clipboard, the drags, the
 //! snapping and the trims.
 
-use crate::ui::widgets::NumberEdit;
+use crate::ui::kit::NumberEdit;
+use crate::ui::widgets::CueEdit;
 use crate::*;
+use crate::ui::bench_stance::TrackSize;
+use crate::ui::bench_stance::clip_envelope::{self, EnvHit};
+
+/// One of a lane's three head switches (DESIGN §7): the eye hides a video or
+/// subtitle lane, the note mutes an audio lane, the lock refuses edits to any.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Switch {
+    Hidden,
+    Muted,
+    Locked,
+}
 
 /// Whether a seam that just lost its drag owes a disk write -- exactly the
 /// two persisted seams ([`Split::PERSISTED`]), same rule `drag_release`'s own
@@ -16,11 +28,29 @@ pub(crate) fn split_drag_owes_save(split: Option<Split>) -> bool {
     split.is_some_and(|split| Split::PERSISTED.contains(&split))
 }
 
+/// How far (px) the pointer must travel from the press before a seam follows it.
+pub(crate) const SPLIT_CLICK_SLOP: f32 = 3.;
+
+/// Whether the pointer has gone far enough from where a seam was pressed to call it a drag.
+pub(crate) fn split_travelled(origin: Point<Pixels>, at: Point<Pixels>) -> bool {
+    let d = at - origin;
+    f32::from(d.x).hypot(f32::from(d.y)) >= SPLIT_CLICK_SLOP
+}
+
 impl Player {
+    /// Whether the seam being held has been dragged, not merely clicked.
+    fn split_moved(&self) -> bool {
+        self.split_press.is_some_and(|(_, moved)| moved)
+    }
+
     /// Splits the clip under the playhead. Metadata only: the timeline->source
     /// mapping is unchanged, so nothing reseeks and no flag is touched.
     pub(crate) fn cut(&mut self, cx: &mut Context<Self>) {
         if self.exporting().is_some() {
+            return;
+        }
+        if let Some(lane) = self.marked_locked_lane() {
+            self.lane_locked_refusal(lane);
             return;
         }
         // Snapped to the source's own grid where one is within reach
@@ -51,7 +81,7 @@ impl Player {
             let cut = session.cut_at(f64::from(at) / self.fps);
             if cut {
                 // Only a split that happened drops the selection: a refusal is
-                // "NOTHING TO SPLIT", and the clip in hand is still the clip the
+                // "Nothing to split", and the clip in hand is still the clip the
                 // next Delete, `x` or menu acts on -- clearing it there left the
                 // user with nothing picked and told them nothing about it. A
                 // real split is the other way round: the cut it leaves makes the
@@ -60,9 +90,9 @@ impl Player {
                 // success branch; this is the same rule on the other half of the
                 // pair.
                 self.selected.clear();
-                self.notify_user("SPLIT".into());
+                self.notify_user("Split".into());
             } else {
-                self.notify_user("NOTHING TO SPLIT — the playhead is already on a cut".into());
+                self.notify_user("Nothing to split — the playhead is already on a cut".into());
             }
         }
         cx.notify();
@@ -81,7 +111,7 @@ impl Player {
             if session.regroup_at(session.now()) {
                 self.selected.clear();
             } else {
-                self.notify_user("NOTHING TO REGROUP — no cut under the playhead".into());
+                self.notify_user("Nothing to rejoin — no cut under the playhead".into());
             }
         }
         cx.notify();
@@ -99,11 +129,11 @@ impl Player {
             (Some(session), Some((lane, idx))) => {
                 if !session.ungroup(lane, idx) {
                     self.notify_user(
-                        "NOTHING DETACHED — that clip is not grouped with another".into(),
+                        "Nothing detached — that clip is not grouped with another".into(),
                     );
                 }
             }
-            (Some(_), None) => self.notify_user("NOTHING DETACHED — nothing selected".into()),
+            (Some(_), None) => self.notify_user("Nothing detached — nothing selected".into()),
             (None, _) => {}
         }
         cx.notify();
@@ -130,26 +160,26 @@ impl Player {
         // index (a stroke nobody saw) is not a thing to group.
         let picks = self.marks().0;
         match (&mut self.session, self.selected.anchor(), picks.len()) {
-            (_, None, _) => self.notify_user("NOTHING GROUPED — nothing selected".into()),
+            (_, None, _) => self.notify_user("Nothing grouped — nothing selected".into()),
             // The hand's group: every pick, one id.
             (Some(session), _, 2..) => {
                 if let Err(e) = session.group_all(&picks) {
-                    self.notify_user(format!("NOT GROUPED — {e}").into());
+                    self.notify_user(format!("Not grouped — {e}").into());
                 }
             }
             // One pick that no longer names anything.
             (Some(_), Some(_), 0) => {
-                self.notify_user("NOTHING GROUPED — that clip is no longer there".into())
+                self.notify_user("Nothing grouped — that clip is no longer there".into())
             }
             // One pick: the partner flow it always was.
             (Some(session), Some((lane, idx)), _) => match span_partner(session, lane, idx) {
                 Some((other, o_idx)) => {
                     if let Err(e) = session.group(lane, idx, other, o_idx) {
-                        self.notify_user(format!("NOT GROUPED — {e}").into());
+                        self.notify_user(format!("Not grouped — {e}").into());
                     }
                 }
                 None => {
-                    self.notify_user("NOTHING TO GROUP WITH — no clip covers these frames".into())
+                    self.notify_user("Nothing to group with — no clip covers these frames".into())
                 }
             },
             (None, ..) => {}
@@ -164,6 +194,15 @@ impl Player {
     /// this owes is the flag reset.
     pub(crate) fn delete_selected(&mut self, cx: &mut Context<Self>) {
         if self.exporting().is_some() {
+            return;
+        }
+        if let Some(lane) = self.marked_locked_lane() {
+            self.lane_locked_refusal(lane);
+            return;
+        }
+        // A title selected in the Clip tab (no clip picked) is what the key takes off.
+        if self.title_target().is_some() {
+            self.remove_title_selected(cx);
             return;
         }
         let selected = self.selected.anchor();
@@ -192,6 +231,7 @@ impl Player {
                         .is_some_and(|session| session.delete_sub(lane, idx))
                     {
                         self.reset_after_reseek();
+                        self.notify_user_action("Caption deleted".into(), ToastAction::Undo);
                     }
                 }
                 false => self.lift_sub(lane, idx, cx),
@@ -207,38 +247,127 @@ impl Player {
         // added track ([`whole_take`]).
         let deleted = match (&mut self.session, selected) {
             (Some(session), Some((lane, idx))) => match whole_take(session, lane, idx) {
-                true => session.delete_clip(lane, idx),
-                false => session.lift_clip(lane, idx),
+                true => session.delete_clip(lane, idx).then_some("Clip deleted"),
+                false => session.lift_clip(lane, idx).then_some("Clip lifted"),
             },
-            _ => false,
+            _ => None,
         };
-        if selected.is_some() && !deleted {
-            self.notify_user("NOTHING DELETED — that clip is no longer there".into());
+        if selected.is_some() && deleted.is_none() {
+            self.notify_user("Nothing deleted — that clip is no longer there".into());
         }
-        if deleted {
+        if let Some(text) = deleted {
             self.reset_after_reseek();
+            self.notify_user_action(text.into(), ToastAction::Undo);
         }
         cx.notify();
     }
 
+    /// The placements linked to `target` -- one take with it -- on every lane
+    /// they sit on, `target` itself left out. Empty for a clip in no group.
+    pub(crate) fn linked_partners(&self, target: (Lane, usize)) -> Vec<(Lane, usize)> {
+        let Some(session) = self.session.as_ref() else {
+            return Vec::new();
+        };
+        let link = match target.0.kind {
+            LaneKind::Subtitle => session.sub_lane(target.0).get(target.1).and_then(|s| s.link),
+            LaneKind::Video | LaneKind::Audio => {
+                session.lane_clips(target.0).get(target.1).and_then(|c| c.link)
+            }
+        };
+        let Some(link) = link else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for lane in session.lanes() {
+            if session.lane_locked(lane) {
+                continue;
+            }
+            match lane.kind {
+                LaneKind::Subtitle => out.extend(
+                    session
+                        .sub_lane(lane)
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, s)| s.link == Some(link))
+                        .map(|(i, _)| (lane, i)),
+                ),
+                LaneKind::Video | LaneKind::Audio => out.extend(
+                    session
+                        .lane_clips(lane)
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, c)| c.link == Some(link))
+                        .map(|(i, _)| (lane, i)),
+                ),
+            }
+        }
+        out.retain(|&p| p != target);
+        out
+    }
+
+    /// A plain click on a clip selects its whole take: a click on either half
+    /// picks both, with the one clicked last, so Delete and Lift act on the pair.
+    /// `alt` picks the one half alone, as Premiere does.
+    pub(crate) fn select_take(&mut self, target: (Lane, usize), alt: bool, cx: &mut Context<Self>) {
+        self.select(target, cx);
+        // A refused select (a locked lane) leaves the selection as it was, and so does Alt.
+        if alt || self.selected.anchor() != Some(target) {
+            return;
+        }
+        let mut picks = Selection::new();
+        for partner in self.linked_partners(target) {
+            picks.add(partner);
+        }
+        picks.add(target);
+        self.selected = picks;
+        cx.notify();
+    }
+
+    /// A press on a clip: a press on a clip already picked keeps the set (a set
+    /// drag needs it), and any other plain press selects the take as a click does.
+    /// Ctrl and Alt presses go through [`Player::pick`] as they always did.
+    pub(crate) fn press_take(&mut self, target: (Lane, usize), ctrl: bool, alt: bool, cx: &mut Context<Self>) {
+        if ctrl || alt || self.selected.contains(target) {
+            self.pick(target, ctrl, cx);
+            return;
+        }
+        self.select_take(target, false, cx);
+    }
+
     /// Lifts the selected half out and leaves the hole: black picture there if
     /// it was the video lane, silence if it was the audio one, and nothing else
-    /// moves. What Delete is not.
+    /// moves. A half of a take lifts its partners too, in one undo step, so the
+    /// take is never left with a hole on one lane only. What Delete is not.
     pub(crate) fn lift_selected(&mut self, cx: &mut Context<Self>) {
         if self.exporting().is_some() {
             return;
         }
+        if let Some(lane) = self.marked_locked_lane() {
+            self.lane_locked_refusal(lane);
+            return;
+        }
         let selected = self.selected.anchor();
+        let lifts: Vec<(Lane, usize)> = match selected {
+            Some(anchor) => std::iter::once(anchor).chain(self.linked_partners(anchor)).collect(),
+            None => Vec::new(),
+        };
         self.selected.clear();
         match (&mut self.session, selected) {
-            (Some(session), Some((lane, idx))) => {
-                if session.lift_clip(lane, idx) {
+            (Some(session), Some(_)) => {
+                session.begin_batch();
+                let lifted = lifts
+                    .iter()
+                    .filter(|(lane, _)| lane.kind != LaneKind::Subtitle)
+                    .fold(false, |any, &(lane, idx)| session.lift_clip(lane, idx) | any);
+                session.end_batch();
+                if lifted {
                     self.reset_after_reseek();
+                    self.notify_user_action("Clip lifted".into(), ToastAction::Undo);
                 } else {
-                    self.notify_user("NOTHING LIFTED — that half is no longer there".into());
+                    self.notify_user("Nothing lifted — that half is no longer there".into());
                 }
             }
-            (Some(_), None) => self.notify_user("NOTHING LIFTED — nothing selected".into()),
+            (Some(_), None) => self.notify_user("Nothing lifted — nothing selected".into()),
             (None, _) => {}
         }
         cx.notify();
@@ -260,10 +389,11 @@ impl Player {
             .selected
             .picks()
             .iter()
-            .filter_map(|&(lane, idx)| Some((lane, session.lane_clips(lane).get(idx).copied()?)))
+            .filter_map(|&(lane, idx)| Some((lane, session.lane_clips(lane).get(idx).cloned()?)))
             .collect();
         if !picks.is_empty() {
             self.clipboard = picks;
+            self.copied_look = self.capture_look();
         }
     }
 
@@ -302,8 +432,19 @@ impl Player {
     /// engine reseeks itself either way, so like a delete this owes the flag
     /// reset -- and the selection, whose index the insert has just moved.
     pub(crate) fn paste(&mut self, cx: &mut Context<Self>) {
+        // Paste lands on the lanes the copied items came from, so one of them
+        // being locked refuses the whole paste.
+        let locked = self
+            .clipboard
+            .iter()
+            .map(|&(lane, _)| lane)
+            .find(|&lane| self.session.as_ref().is_some_and(|s| s.lane_locked(lane)));
+        if let Some(lane) = locked {
+            self.lane_locked_refusal(lane);
+            return;
+        }
         let pasted = match (&mut self.session, self.clipboard.as_slice()) {
-            (Some(session), [(_, clip)]) => session.paste_at(session.now(), *clip),
+            (Some(session), [(_, clip)]) => session.paste_at(session.now(), clip.clone()),
             (Some(session), items) if !items.is_empty() => {
                 session.paste_set_at(session.now(), items)
             }
@@ -317,7 +458,7 @@ impl Player {
             // ([`Player::move_clip`]) -- a single-clip paste stays silent on
             // failure exactly as it always has.
             self.notify_user(
-                "NOT PASTED — another clip already covers where one of the copied clips would \
+                "Not pasted — another clip already covers where one of the copied clips would \
                  land"
                     .into(),
             );
@@ -339,15 +480,22 @@ impl Player {
     /// survive the move -- their indices remapped rather than cleared, since a
     /// pick that travels still names the clip it named before. A clip dragged
     /// from outside the selection moves alone, exactly as it always has.
-    pub(crate) fn move_clip(
-        &mut self,
-        from: Lane,
-        idx: usize,
-        to: Lane,
-        x: Pixels,
-        cx: &mut Context<Self>,
-    ) {
-        if self.exporting().is_some() {
+    pub(crate) fn move_clip(&mut self, from: Lane, idx: usize, to: Lane, x: Pixels, cx: &mut Context<Self>) {
+        self.named_step("Move clip", |this| this.move_clip_now(from, idx, to, x, cx));
+    }
+
+    fn move_clip_now(&mut self, from: Lane, idx: usize, to: Lane, x: Pixels, cx: &mut Context<Self>) {
+        // The drop ends the gesture whatever it does: the original is no
+        // longer carried, and the line promised a landing that is now made.
+        self.drag_src = None;
+        self.snap_cue = None;
+        // A shift-drag is a slip or a slide and its release lands in
+        // `drag_release`: the gpui drag the body also starts must not move it.
+        if self.exporting().is_some() || self.pro_drag.is_some() {
+            return;
+        }
+        // Lifted off a locked lane or dropped onto one: both are refused.
+        if self.lane_locked_refusal(from) || self.lane_locked_refusal(to) {
             return;
         }
         let (Some((start, _)), Some(was)) = (
@@ -358,6 +506,27 @@ impl Player {
         ) else {
             return;
         };
+        // A clip let go on another lane lands where the hand asked or not at all. The
+        // engine would clamp the travel into the gap instead, and that clamp moves the
+        // clip's linked partners in time along with it: a drop onto a lane beside
+        // another clip must not shift anything else.
+        if to != from {
+            let len = self
+                .session
+                .as_ref()
+                .and_then(|session| session.lane_clips(from).get(idx).map(|c| c.frames()))
+                .unwrap_or(0);
+            let neighbours = self.lane_neighbours(from, idx, to);
+            if !Self::cross_lane_fits(start, len, &neighbours) {
+                self.drag_lane = None;
+                self.notify_user(
+                    format!("Not moved — another clip already covers those frames on {}", to.label())
+                        .into(),
+                );
+                cx.notify();
+                return;
+            }
+        }
         let set_move = self.selected.contains((from, idx)) && self.selected.len() > 1;
         let picks: Vec<(Lane, usize)> = self.selected.picks().to_vec();
         // Every pick's own start, read before the move touches anything -- the
@@ -400,29 +569,29 @@ impl Player {
                 // they used to sit in.
                 if set_move {
                     self.selected =
-                        self.remap_selection(&picks, &pre_starts, from, idx, to, was, start);
+                        self.remap_selection(&picks, &pre_starts, from, idx, to, (was, start));
                 } else {
                     self.selected.clear();
                 }
                 self.reset_after_reseek();
                 // The strip names the edit that just happened: a move that
-                // lands silently leaves the last word (`SPLIT`) standing, and
+                // lands silently leaves the last word (`Split`) standing, and
                 // an editor reads that as the drag having done nothing.
-                self.notify_user("MOVED".into());
+                self.notify_user("Moved".into());
             }
             // The three ways a drag is refused, told apart by what the
             // front-end already knows: a lane's kind, and where the clip was.
             // Everything else that could refuse (a clip that is not there)
             // cannot be dragged.
             false if from.kind != to.kind => self.notify_user(
-                format!("NOT ON {} — a {kind} clip takes a {lanes} lane", to.label()).into(),
+                format!("Not on {} — a {kind} clip takes a {lanes} lane", to.label()).into(),
             ),
             // Picked up and put back down where it was: a click, and a click
             // says nothing.
             false if from == to && start == was => {}
             false if set_move => self.notify_user(
                 format!(
-                    "NOT MOVED — {} clips selected, and another clip already covers where one of \
+                    "Not moved — {} clips selected, and another clip already covers where one of \
                      them would land on {}",
                     picks.len(),
                     to.label()
@@ -431,7 +600,7 @@ impl Player {
             ),
             false => self.notify_user(
                 format!(
-                    "NOT MOVED — another clip already covers those frames on {}",
+                    "Not moved — another clip already covers those frames on {}",
                     to.label()
                 )
                 .into(),
@@ -459,8 +628,7 @@ impl Player {
         from: Lane,
         dragged: usize,
         to: Lane,
-        was: u32,
-        landed: u32,
+        (was, landed): (u32, u32),
     ) -> Selection {
         let mut out = Selection::new();
         let Some(session) = self.session.as_ref() else {
@@ -497,17 +665,10 @@ impl Player {
     /// one that genuinely has no cues.
     pub(crate) fn sub_of_track(&self, track: usize) -> Option<SubClip> {
         let cues = &self.session.as_ref()?.subtitles().get(track)?.cues;
-        let out_us = cues.iter().map(|c| c.end_us).max()?;
-        Some(SubClip {
-            start: 0,
-            frames: frames_of_us(out_us, self.fps),
-            track,
-            in_us: 0,
-            out_us,
-            // A palette row arrives in no group: pinning its words to a clip is
-            // a hand's decision, made with the Group row afterwards.
-            link: None,
-        })
+        let end_us = cues.iter().map(|c| c.end_us).max()?;
+        // A palette row arrives in no group: pinning its words to a clip is
+        // a hand's decision, made with the Group row afterwards.
+        Some(SubClip::whole_track(track, end_us, self.fps))
     }
 
     /// A palette row let go at window `x` over subtitle lane `to`: the whole
@@ -516,7 +677,7 @@ impl Player {
     /// overlap, a lane that is not a subtitle lane, a track that is not there --
     /// and they are shown as the engine worded them.
     pub(crate) fn place_sub(&mut self, track: usize, to: Lane, x: Pixels, cx: &mut Context<Self>) {
-        if self.exporting().is_some() {
+        if self.exporting().is_some() || self.lane_locked_refusal(to) {
             return;
         }
         self.snap_cue = None;
@@ -532,12 +693,12 @@ impl Player {
         let text = match (self.sub_of_track(track), &mut self.session) {
             (Some(sub), Some(session)) => match session.place_sub(to, at, sub) {
                 Ok(()) => None,
-                Err(e) => Some(format!("NOT PLACED — {e}")),
+                Err(e) => Some(format!("Not placed — {e}")),
             },
             // The row is greyed and says why in the list; here it says why at
             // the moment somebody tried to use it anyway.
-            (None, Some(_)) => Some("NOT PLACED — that subtitle track has no cues".to_string()),
-            (_, None) => Some("NOT PLACED — no file open".to_string()),
+            (None, Some(_)) => Some("Not placed — that subtitle track has no cues".to_string()),
+            (_, None) => Some("Not placed — no file open".to_string()),
         };
         // The arm rides the door's own answer: `text` is `None` exactly when
         // `Project::place_sub` took the track, and every refusal -- an overlap,
@@ -599,7 +760,7 @@ impl Player {
         live_idx(
             self.session.as_ref()?.sub_lane(drag.lane),
             drag.idx,
-            drag.sub,
+            &drag.sub,
         )
     }
 
@@ -609,7 +770,13 @@ impl Player {
     /// why an `Ok` is never a toast ([`Project::move_sub`]). An overlap and a
     /// lane of the wrong kind are refused in the engine's own words.
     pub(crate) fn move_sub(&mut self, drag: &SubDrag, to: Lane, x: Pixels, cx: &mut Context<Self>) {
-        if self.exporting().is_some() {
+        // The drop ends the gesture whatever it does, as `move_clip`'s does: the
+        // caption stops being dimmed where it stands.
+        self.drag_src = None;
+        if self.exporting().is_some()
+            || self.lane_locked_refusal(drag.lane)
+            || self.lane_locked_refusal(to)
+        {
             return;
         }
         self.snap_cue = None;
@@ -648,7 +815,7 @@ impl Player {
                 // covered that frame -- the drop at the left edge saturates to
                 // 0 ([`landing`]), so a refused drag marked, and the next
                 // Delete lifted, a caption the hand never touched.
-                self.notify_user(format!("NOT MOVED — {e}").into());
+                self.notify_user(format!("Not moved — {e}").into());
             }
             // A lane holds its captions in start order, so the drop moved the
             // mark as well as the box: it is re-read off where the caption
@@ -703,7 +870,7 @@ impl Player {
     /// land here, so there is one removal and one undo step however it is asked
     /// for.
     pub(crate) fn lift_sub(&mut self, lane: Lane, idx: usize, cx: &mut Context<Self>) {
-        if self.exporting().is_some() {
+        if self.exporting().is_some() || self.lane_locked_refusal(lane) {
             return;
         }
         let lifted = self
@@ -712,13 +879,13 @@ impl Player {
             .is_some_and(|session| session.lift_sub(lane, idx));
         let text = match lifted {
             true => format!(
-                "CAPTION LIFTED · undo {}",
+                "Caption lifted · undo {}",
                 self.keymap.display(ActionId::Undo)
             ),
-            false => "NOTHING LIFTED — that caption is not there any more".to_string(),
+            false => "Nothing lifted — that caption is not there any more".to_string(),
         };
         if lifted {
-            // The arm rides the door's own answer: `false` is "NOTHING LIFTED —
+            // The arm rides the door's own answer: `false` is "Nothing lifted —
             // that caption is not there any more", and the project is exactly
             // what it was, so the flag, the autosave sidecar and the
             // save-on-close question must stay off it.
@@ -736,7 +903,12 @@ impl Player {
             }
             self.context_menu = None;
         }
-        self.notify_user(text.into());
+        // A lifted caption's toast offers Undo (DESIGN §8); a refusal has
+        // nothing to take back.
+        match lifted {
+            true => self.notify_user_action(text.into(), ToastAction::Undo),
+            false => self.notify_user(text.into()),
+        }
         cx.notify();
     }
 
@@ -753,12 +925,12 @@ impl Player {
         self.sub_lane = Some(lane);
         let text = match was.filter(|&old| old != lane) {
             Some(old) => format!(
-                "{} IS SHOWN — {} is off the picture; every subtitle track is still exported",
+                "{} is shown — {} is off the picture; every subtitle track is still exported",
                 lane.label(),
                 old.label()
             ),
             None => format!(
-                "{} IS SHOWN — its captions are over the picture",
+                "{} is shown — its captions are over the picture",
                 lane.label()
             ),
         };
@@ -778,6 +950,97 @@ impl Player {
     /// that offers the pick and by the plate over the picture.
     pub(crate) fn sub_lane_on(&self, lane: Lane) -> bool {
         self.active_sub_lane() == Some(lane)
+    }
+
+    /// Whether one of `lane`'s three head switches is on (DESIGN §7).
+    pub(crate) fn lane_switch(&self, lane: Lane, which: Switch) -> bool {
+        let Some(session) = &self.session else {
+            return false;
+        };
+        match which {
+            Switch::Hidden => session.lane_hidden(lane),
+            Switch::Muted => session.lane_muted(lane),
+            Switch::Locked => session.lane_locked(lane),
+        }
+    }
+
+    /// Whether the source patch sends the source monitor's picture (video lane) or sound (audio
+    /// lane) to `lane` on Insert and Overwrite. A subtitle lane is never patched.
+    pub(crate) fn source_patch_on(&self, lane: Lane) -> bool {
+        match lane.kind {
+            LaneKind::Video => self.patch_video == lane,
+            LaneKind::Audio => self.patch_audio == lane,
+            LaneKind::Subtitle => false,
+        }
+    }
+
+    /// Whether the source patch boxes show on the lane heads: only while the source monitor has
+    /// an item loaded.
+    pub(crate) fn source_patch_shown(&self) -> bool {
+        self.preview_session.is_some()
+    }
+
+    /// Points the source patch at `lane`: its kind's half of an Insert or Overwrite goes there
+    /// from now on. Nothing is edited, so nothing is undone.
+    pub(crate) fn set_source_patch(&mut self, lane: Lane, cx: &mut Context<Self>) {
+        match lane.kind {
+            LaneKind::Video => self.patch_video = lane,
+            LaneKind::Audio => self.patch_audio = lane,
+            LaneKind::Subtitle => return,
+        }
+        cx.notify();
+    }
+
+    /// Flips one of a lane's head switches to `on`. One undo step, from the
+    /// engine. Deliberately not refused on a locked lane: locking is what
+    /// turns the lock off again, and hiding or muting a lane edits nothing.
+    pub(crate) fn set_lane_switch(
+        &mut self,
+        lane: Lane,
+        which: Switch,
+        on: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.exporting().is_some() {
+            return;
+        }
+        let changed = match self.session.as_mut() {
+            Some(session) => match which {
+                Switch::Hidden => session.set_lane_hidden(lane, on),
+                Switch::Muted => session.set_lane_muted(lane, on),
+                Switch::Locked => session.set_lane_locked(lane, on),
+            },
+            None => false,
+        };
+        if changed {
+            self.mark_dirty();
+        }
+        cx.notify();
+    }
+
+    /// The lock's door, for every entry point that would edit a lane's items
+    /// (DESIGN §7). `true`, and a toast offering Unlock, when `lane` is locked:
+    /// the caller returns before it touches anything.
+    pub(crate) fn lane_locked_refusal(&mut self, lane: Lane) -> bool {
+        let locked = self.session.as_ref().is_some_and(|s| s.lane_locked(lane));
+        if locked {
+            self.notify_user_action(
+                format!("{} is locked", lane.label()).into(),
+                ToastAction::Unlock(lane),
+            );
+        }
+        locked
+    }
+
+    /// The first locked lane among the marked items, for the edits that act on
+    /// the whole selection (delete, lift, paste's lanes).
+    pub(crate) fn marked_locked_lane(&self) -> Option<Lane> {
+        let session = self.session.as_ref()?;
+        self.marks()
+            .0
+            .iter()
+            .map(|&(lane, _)| lane)
+            .find(|&lane| session.lane_locked(lane))
     }
 
     /// Where a caption let go at window `x` wants its head: [`Player::drop_frame`]'s
@@ -807,7 +1070,7 @@ impl Player {
         x: Pixels,
         cx: &mut Context<Self>,
     ) {
-        let (start, _) = self.sub_drop_frame(drag.sub, x);
+        let (start, cue) = self.sub_drop_frame(drag.sub, x);
         let ghost = Ghost {
             lane: to,
             start,
@@ -815,6 +1078,7 @@ impl Player {
             tint: CLIP_TEXT(),
             refused: to.kind != LaneKind::Subtitle,
         };
+        self.set_cue(cue, x, cx);
         self.set_ghost(vec![ghost], cx);
     }
 
@@ -828,13 +1092,15 @@ impl Player {
         x: Pixels,
         cx: &mut Context<Self>,
     ) {
+        let (start, cue) = self.place_frame(x);
         let ghost = Ghost {
             lane: to,
-            start: self.place_frame(x).0,
+            start,
             frames: self.sub_of_track(track).map_or(0, |sub| sub.frames),
             tint: CLIP_TEXT(),
             refused: to.kind != LaneKind::Subtitle,
         };
+        self.set_cue(cue, x, cx);
         self.set_ghost(vec![ghost], cx);
     }
 
@@ -857,7 +1123,7 @@ impl Player {
         idx: usize,
         x: Pixels,
     ) -> Option<(u32, Option<u32>)> {
-        let clip = self.session.as_ref()?.lane_clips(from).get(idx).copied()?;
+        let clip = self.session.as_ref()?.lane_clips(from).get(idx).cloned()?;
         let marks = self.snap_targets(Some((from, idx)));
         Some(landing(
             self.frame_under(x),
@@ -867,6 +1133,32 @@ impl Player {
             self.drop_snap_frames(),
             &marks,
         ))
+    }
+
+    /// The spans on `to` a clip dragged from `from`/`idx` has to fit between: every
+    /// clip on `to` but the dragged one and its link group.
+    pub(crate) fn lane_neighbours(&self, from: Lane, idx: usize, to: Lane) -> Vec<(u32, u32)> {
+        let Some(session) = self.session.as_ref() else {
+            return Vec::new();
+        };
+        let dragged = session.lane_clips(from).get(idx).cloned();
+        session
+            .lane_clips(to)
+            .iter()
+            .enumerate()
+            .filter(|&(i, clip)| {
+                (to, i) != (from, idx)
+                    && !(clip.link.is_some()
+                        && dragged.as_ref().is_some_and(|d| clip.link == d.link))
+            })
+            .map(|(_, clip)| (clip.start, clip.end()))
+            .collect()
+    }
+
+    /// Whether a clip `len` frames long, let go on another lane with its head at `at`,
+    /// lands exactly there: [`cross_room`] answers `at` itself, not a clamped spot.
+    pub(crate) fn cross_lane_fits(at: u32, len: u32, neighbours: &[(u32, u32)]) -> bool {
+        cross_room(at, len, neighbours) == Some(at)
     }
 
     /// The same answer for a library row on its way down: nothing is in the hand
@@ -893,7 +1185,7 @@ impl Player {
     /// landing are made about one clip.
     pub(crate) fn dragged(&self, drag: &ClipDrag) -> Option<usize> {
         let session = self.session.as_ref()?;
-        live_idx(session.lane_clips(drag.lane), drag.idx, drag.clip)
+        live_idx(session.lane_clips(drag.lane), drag.idx, &drag.clip)
     }
 
     /// The shadow the clip in the hand would fill, on the lane the pointer is
@@ -919,10 +1211,12 @@ impl Player {
         cx: &mut Context<Self>,
     ) {
         let Some(idx) = self.dragged(drag) else {
+            self.set_cue(None, x, cx);
             self.set_ghost(Vec::new(), cx);
             return;
         };
-        let Some((start, _)) = self.drop_frame(drag.lane, idx, x) else {
+        let Some((asked, cue)) = self.drop_frame(drag.lane, idx, x) else {
+            self.set_cue(None, x, cx);
             self.set_ghost(Vec::new(), cx);
             return;
         };
@@ -932,37 +1226,22 @@ impl Player {
         // drop that will not happen is seen before the hand lets go, never as a
         // silent no-op. The neighbours are the destination lane's clips less
         // whatever travels with this one -- itself and its link group.
-        let neighbours: Vec<(u32, u32)> = self
-            .session
-            .as_ref()
-            .map(|session| {
-                session
-                    .lane_clips(to)
-                    .iter()
-                    .enumerate()
-                    .filter(|&(i, clip)| {
-                        (to, i) != (drag.lane, idx)
-                            && !(clip.link.is_some() && clip.link == drag.clip.link)
-                    })
-                    .map(|(_, clip)| (clip.start, clip.end()))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let neighbours = self.lane_neighbours(drag.lane, idx, to);
         // Staying on its own lane, the engine clamps the travel into the gap
         // the clip sits in rather than refusing it, so the shadow rests where
         // the release will: flush against the take it was dragged into. Landing
-        // on *another* lane it clamps too ([`cross_room`], the engine's own
-        // `move_room` rule) and refuses only a head let go *inside* a take or a
-        // gap too narrow to hold the clip -- the shadow says so before the hand
-        // lets go, and never claims a refusal the release would not make.
+        // on *another* lane there is no clamp: a head that does not fit exactly
+        // where the hand asked is refused, because a clamp would shift the
+        // clip's linked partners in time and a vertical drag must move nothing
+        // in time ([`Player::cross_lane_fits`]).
         let len = drag.clip.frames();
         let (start, refused) = match to == drag.lane {
-            true => (gap_clamp(drag.clip.start, len, start, &neighbours), false),
-            false => match cross_room(start, len, &neighbours) {
-                Some(landed) => (landed, false),
-                None => (start, true),
-            },
+            true => (gap_clamp(drag.clip.start, len, asked, &neighbours), false),
+            false => (asked, !Self::cross_lane_fits(asked, len, &neighbours)),
         };
+        // The line only stands where the head really lands on the mark: a
+        // neighbour's clamp or a refusal moved it off the frame the line names.
+        self.set_cue(cue.filter(|_| start == asked && !refused), x, cx);
         let anchor = Ghost {
             lane: to,
             start,
@@ -980,7 +1259,7 @@ impl Player {
                 let Some(clip) = self
                     .session
                     .as_ref()
-                    .and_then(|session| session.lane_clips(lane).get(i).copied())
+                    .and_then(|session| session.lane_clips(lane).get(i).cloned())
                 else {
                     continue;
                 };
@@ -1046,9 +1325,10 @@ impl Player {
         x: Pixels,
         cx: &mut Context<Self>,
     ) {
+        let (start, cue) = self.place_frame(x);
         let ghost = Ghost {
             lane: to,
-            start: self.place_frame(x).0,
+            start,
             frames: self
                 .session
                 .as_ref()
@@ -1058,6 +1338,7 @@ impl Player {
             tint: file_tint(self.sources(), path).unwrap_or(BG_RAISED()),
             refused: lane_refuses(path, to, self.has_video(path)).is_some(),
         };
+        self.set_cue(cue, x, cx);
         self.set_ghost(vec![ghost], cx);
     }
 
@@ -1122,12 +1403,21 @@ impl Player {
             .flatten()
         });
         let skip = skip.and_then(|(lane, idx)| Some((lanes.iter().position(|&l| l == lane)?, idx)));
+        // The comment markers' edges and the chapter starts: a drag lands on a note
+        // or a chapter as readily as on a cut.
+        let mut notes: Vec<u32> = session
+            .markers()
+            .iter()
+            .flat_map(|m| [m.frame, m.frame.saturating_add(m.length)])
+            .collect();
+        notes.extend(session.chapters().iter().map(|c| c.frame));
         snap_marks(
             &clips,
             skip,
             skip_link,
             frame_at(session.now(), self.fps),
             self.range,
+            &notes,
         )
     }
 
@@ -1158,7 +1448,7 @@ impl Player {
                 let Some(keys) = sources
                     .get(clip.source)
                     .and_then(|entry| self.syncs.get(&entry.path))
-                    .filter(|_| clip.speed.is_normal())
+                    .filter(|_| clip.speed.is_normal() && clip.speed_keys.is_empty())
                 else {
                     continue;
                 };
@@ -1213,10 +1503,10 @@ impl Player {
             // that has not answered yet and a source with no grid at all, and a
             // key that does nothing looks broken either way.
             None => self.notify_user(match marks.is_empty() {
-                true => "NO SYNC POINTS — this source has no keyframe grid to jump by (or it is \
+                true => "No sync points — this source has no keyframe grid to jump by (or it is \
                          still being read)"
                     .into(),
-                false => "NO SYNC POINT THAT WAY — the playhead is past the last one".into(),
+                false => "No sync point that way — the playhead is past the last one".into(),
             }),
         }
     }
@@ -1262,7 +1552,7 @@ impl Player {
         at: Point<Pixels>,
         cx: &mut Context<Self>,
     ) {
-        if self.modal() {
+        if !self.menu_allowed() {
             return;
         }
         if !self.selected.contains((lane, idx)) {
@@ -1273,6 +1563,8 @@ impl Player {
             on: MenuOn::Clip(idx),
             at,
             details: false,
+            adjust: false,
+            compound: false,
         });
         cx.notify();
     }
@@ -1288,7 +1580,7 @@ impl Player {
         at: Point<Pixels>,
         cx: &mut Context<Self>,
     ) {
-        if self.modal() {
+        if !self.menu_allowed() {
             return;
         }
         self.context_menu = Some(ContextMenu {
@@ -1296,6 +1588,8 @@ impl Player {
             on: MenuOn::Gap(start, frames),
             at,
             details: false,
+            adjust: false,
+            compound: false,
         });
         cx.notify();
     }
@@ -1308,15 +1602,82 @@ impl Player {
     /// Refused with no timeline open, like every menu here: a card that paints
     /// nothing while `overlaid()` swallows the keys is an invisible modal
     /// (`tests/cards.rs`'s FAULT 2 rule).
+    /// The ruler's menu, opened on the frame under the pointer ([`Self::menu_frame`]).
     pub(crate) fn open_bench_menu(&mut self, at: Point<Pixels>, cx: &mut Context<Self>) {
-        if self.modal() || self.session.is_none() {
+        if !self.menu_allowed() || self.session.is_none() {
             return;
         }
+        self.menu_frame = Some(self.frame_under(at.x));
         self.context_menu = Some(ContextMenu {
             lane: Lane::V1,
             on: MenuOn::Bench,
             at,
             details: false,
+            adjust: false,
+            compound: false,
+        });
+        cx.notify();
+    }
+
+    /// Opens the viewer's menu ([`VIEWER_ITEMS`]) at the pointer. Refused with
+    /// no timeline open, like every menu here.
+    /// An empty stretch of `lane`'s bed with no gap to close: the paste and track adds
+    /// ([`MenuOn::Empty`]), opened on the frame under the pointer.
+    pub(crate) fn open_empty_menu(&mut self, lane: Lane, at: Point<Pixels>, cx: &mut Context<Self>) {
+        if !self.menu_allowed() || self.session.is_none() {
+            return;
+        }
+        self.menu_frame = Some(self.frame_under(at.x));
+        self.context_menu = Some(ContextMenu {
+            lane,
+            on: MenuOn::Empty,
+            at,
+            details: false,
+            adjust: false,
+            compound: false,
+        });
+        cx.notify();
+    }
+
+    /// "Move playhead here": seeks to the frame the ruler or empty-track menu was opened on.
+    pub(crate) fn playhead_at_menu(&mut self, cx: &mut Context<Self>) {
+        if let Some(frame) = self.menu_frame {
+            self.seek(f64::from(frame) / self.fps, cx);
+        }
+    }
+
+    pub(crate) fn open_viewer_menu(&mut self, at: Point<Pixels>, cx: &mut Context<Self>) {
+        if !self.menu_allowed() || self.session.is_none() {
+            return;
+        }
+        self.context_menu = Some(ContextMenu {
+            lane: Lane::V1,
+            on: MenuOn::Viewer,
+            at,
+            details: false,
+            adjust: false,
+            compound: false,
+        });
+        cx.notify();
+    }
+
+    /// Opens a sequence tab's menu ([`SEQ_TAB_ITEMS`]) at the pointer. The tab is opened first,
+    /// so the verbs act on the sequence that was right-clicked.
+    pub(crate) fn open_seq_tab_menu(&mut self, id: u32, at: Point<Pixels>, cx: &mut Context<Self>) {
+        if !self.menu_allowed() || self.session.is_none() {
+            return;
+        }
+        self.switch_sequence_tab(id, cx);
+        // Hung from the tab's foot like the menu bar's popups, so the menu never covers the
+        // tab strip it was opened from.
+        let at = crate::ui::anchor::control_at(at).map_or(at, |tab| crate::ui::anchor::hang(tab).0);
+        self.context_menu = Some(ContextMenu {
+            lane: Lane::V1,
+            on: MenuOn::SeqTab,
+            at,
+            details: false,
+            adjust: false,
+            compound: false,
         });
         cx.notify();
     }
@@ -1326,7 +1687,7 @@ impl Player {
     /// ([`oracle::lane_items`]). Nothing is selected -- a head owns no clip --
     /// which is [`Player::open_gap_menu`]'s rule on the other empty target.
     pub(crate) fn open_head_menu(&mut self, lane: Lane, at: Point<Pixels>, cx: &mut Context<Self>) {
-        if self.modal() || self.session.is_none() {
+        if !self.menu_allowed() || self.session.is_none() {
             return;
         }
         self.context_menu = Some(ContextMenu {
@@ -1334,6 +1695,8 @@ impl Player {
             on: MenuOn::Head,
             at,
             details: false,
+            adjust: false,
+            compound: false,
         });
         cx.notify();
     }
@@ -1379,7 +1742,7 @@ impl Player {
                 };
                 self.notify_user(
                     format!(
-                        "GAP CLOSED on {where_} · undo {}",
+                        "Gap closed on {where_} · undo {}",
                         self.keymap.display(ActionId::Undo)
                     )
                     .into(),
@@ -1388,6 +1751,63 @@ impl Player {
             Err(e) => self.notify_user(e.to_string().into()),
         }
         cx.notify();
+    }
+
+    /// The gap that is picked and still there, if one is. A gap owns no clip
+    /// index, so nothing else keeps it honest: an edit or an undo can move or
+    /// remove the hole under it, and a clip mark means the pointer is on a clip
+    /// instead. Both answer `None` here, which is what keeps Delete, the
+    /// ledger's readout and the bed's outline from acting on a stale hole.
+    pub(crate) fn gap_pick(&self) -> Option<GapPick> {
+        if self.selected.anchor().is_some() {
+            return None;
+        }
+        live_gap(self.session.as_ref()?, self.gap?)
+    }
+
+    /// Picks the gap `(start, frames)` on `lane`: the clip marks go, since the
+    /// two are one selection and not two (a gap and a clip are never both picked).
+    pub(crate) fn select_gap(
+        &mut self,
+        lane: Lane,
+        start: u32,
+        frames: u32,
+        cx: &mut Context<Self>,
+    ) {
+        self.selected.clear();
+        self.drop_title_selection(cx);
+        self.drop_sel_cue();
+        self.gap = Some(GapPick {
+            lane,
+            start,
+            frames,
+        });
+        cx.notify();
+    }
+
+    /// Drops the gap pick, if any. A click on a clip or on bare bench does this.
+    pub(crate) fn clear_gap(&mut self, cx: &mut Context<Self>) {
+        if self.gap.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Delete with a gap picked: closes it through [`Player::close_gap`], so
+    /// the ripple and its one undo step are the ones a right-click gives. The
+    /// pick is dropped only when the hole is gone, so a refused close (a take
+    /// that does not match on its other lane) keeps the gap under the mark.
+    pub(crate) fn close_selected_gap(&mut self, cx: &mut Context<Self>) {
+        let Some(pick) = self.gap_pick() else {
+            self.gap = None;
+            return;
+        };
+        if self.exporting().is_some() {
+            return;
+        }
+        self.close_gap(pick.lane, pick.start, pick.frames, cx);
+        if self.gap_pick().is_none() {
+            self.gap = None;
+        }
     }
 
     /// Closes every bounded gap on `lane`, as one gesture. The scope stays the
@@ -1414,28 +1834,28 @@ impl Player {
         }
         let skipped = report.skipped.len();
         let notice = match (report.closed, skipped) {
-            (0, 0) => format!("NO GAPS TO CLOSE on {}", lane.label()),
+            (0, 0) => format!("No gaps to close on {}", lane.label()),
             (0, 1) => format!(
-                "NO GAPS CLOSED on {} — 1 linked gap skipped at {}",
+                "No gaps closed on {} — 1 linked gap skipped at {}",
                 lane.label(),
                 report.skipped[0].start
             ),
             (0, n) => format!(
-                "NO GAPS CLOSED on {} — {n} linked gaps skipped",
+                "No gaps closed on {} — {n} linked gaps skipped",
                 lane.label()
             ),
             (n, 0) => format!(
-                "{n} GAPS CLOSED on {} — {} takes them back",
+                "{n} gaps closed on {} — {} takes them back",
                 lane.label(),
                 self.keymap.display(ActionId::Undo)
             ),
             (n, 1) => format!(
-                "{n} GAPS CLOSED on {}; 1 skipped at {} — match linked gaps or detach",
+                "{n} gaps closed on {}; 1 skipped at {} — match linked gaps or detach",
                 lane.label(),
                 report.skipped[0].start
             ),
             (n, skipped) => format!(
-                "{n} GAPS CLOSED on {}; {skipped} skipped — match linked gaps or detach",
+                "{n} gaps closed on {}; {skipped} skipped — match linked gaps or detach",
                 lane.label()
             ),
         };
@@ -1456,7 +1876,7 @@ impl Player {
         ctrl: bool,
         cx: &mut Context<Self>,
     ) {
-        if self.modal() || self.exporting().is_some() {
+        if self.covers_room() || self.exporting().is_some() || self.lane_locked_refusal(lane) {
             return;
         }
         // A caption's edge, on a lane that holds no `Clip` at all: the same
@@ -1496,7 +1916,7 @@ impl Player {
         let Some(clip) = self
             .session
             .as_ref()
-            .and_then(|session| session.lane_clips(lane).get(idx).copied())
+            .and_then(|session| session.lane_clips(lane).get(idx).cloned())
         else {
             return;
         };
@@ -1557,6 +1977,47 @@ impl Player {
         // The line only stands where the edge actually stopped: a mark the
         // engine's own room clamped away was never reached.
         self.set_cue(cue.filter(|_| to == at), x, cx);
+        // A clip's edge that the pointer pulled past the source's own end
+        // flashes its handle warn -- the one stop a hand cannot see on the
+        // picture. Captions have no media wall ([`PlaybackSession::trim_sub_room`]
+        // is all they are asked), so they never flash.
+        let walls = match trim.lane.kind == LaneKind::Subtitle {
+            true => None,
+            false => self
+                .session
+                .as_ref()
+                .and_then(|session| session.trim_walls(trim.lane, trim.idx, trim.edge)),
+        };
+        match walls.and_then(|walls| media_wall_stop(at, to, walls)) {
+            // Armed once per stop: a pointer that stays past the same wall is
+            // one flash, not one every sample, and the timer below is the only
+            // repaint the flash needs.
+            Some(wall) => {
+                let pinned = self.trim_flash.is_some_and(|flash| {
+                    flash.lane == trim.lane
+                        && flash.idx == trim.idx
+                        && flash.edge == trim.edge
+                        && flash.wall == wall
+                });
+                if !pinned {
+                    self.trim_flash = Some(TrimFlash {
+                        lane: trim.lane,
+                        idx: trim.idx,
+                        edge: trim.edge,
+                        wall,
+                        since: Instant::now(),
+                    });
+                    cx.spawn(async move |this, cx| {
+                        cx.background_executor().timer(TRIM_FLASH).await;
+                        let _ = this.update(cx, |_, cx| cx.notify());
+                    })
+                    .detach();
+                }
+            }
+            // Back inside the room, or held by something other than the media:
+            // the next stop at a wall is a new one.
+            None => self.trim_flash = None,
+        }
         self.trim = Some(Trim { to, ..trim });
         cx.notify();
     }
@@ -1574,9 +2035,15 @@ impl Player {
     /// undo step. The selection survives it -- a trim inserts and removes
     /// nothing, so every index a lane had still names the clip it named.
     pub(crate) fn commit_trim(&mut self, cx: &mut Context<Self>) {
+        self.named_step("Trim", |this| this.commit_trim_now(cx));
+    }
+
+    fn commit_trim_now(&mut self, cx: &mut Context<Self>) {
         let Some(trim) = self.trim.take() else {
             return;
         };
+        // The strip the drag started on may be gone or moved: its hover is over with the drag.
+        self.hover_hint = None;
         // The arm rides each door's own answer or the caption's own edges --
         // never the call: a trim released where the edge already stood is
         // `Ok`/`true` with no undo step, and it must not leave the project
@@ -1613,7 +2080,7 @@ impl Player {
                 .as_mut()
                 .map(|session| session.trim_sub(trim.lane, trim.idx, trim.edge, trim.to));
             match trimmed {
-                Some(Err(e)) => self.notify_user(format!("NOT TRIMMED — {e}").into()),
+                Some(Err(e)) => self.notify_user(format!("Not trimmed — {e}").into()),
                 Some(Ok(())) => {
                     if edges(self) != before {
                         self.mark_dirty();
@@ -1654,13 +2121,13 @@ impl Player {
         x: Pixels,
         cx: &mut Context<Self>,
     ) {
-        if self.modal() || self.exporting().is_some() {
+        if self.covers_room() || self.exporting().is_some() || self.lane_locked_refusal(lane) {
             return;
         }
         let Some(clip) = self
             .session
             .as_ref()
-            .and_then(|session| session.lane_clips(lane).get(idx).copied())
+            .and_then(|session| session.lane_clips(lane).get(idx).cloned())
         else {
             return;
         };
@@ -1778,7 +2245,7 @@ impl Player {
             [a, b] if a.0 == b.0 && a.1.abs_diff(b.1) == 1 => Some((a.0, a.1.min(b.1))),
             _ => self.selected.anchor(),
         }) else {
-            self.notify_user("NOTHING TO CROSSFADE — no audio clip selected".into());
+            self.notify_user("Nothing to crossfade — no audio clip selected".into());
             cx.notify();
             return;
         };
@@ -1800,7 +2267,7 @@ impl Player {
         if took && self.transition_edges(lane, idx) != before {
             self.mark_dirty();
         } else if !took {
-            self.notify_user("NOTHING TO CROSSFADE — no neighbour end to end".into());
+            self.notify_user("Nothing to crossfade — no neighbour end to end".into());
         }
     }
 
@@ -1818,7 +2285,7 @@ impl Player {
             [a, b] if a.0 == b.0 && a.1.abs_diff(b.1) == 1 => Some((a.0, a.1.min(b.1))),
             _ => self.selected.anchor(),
         }) else {
-            self.notify_user("NOTHING TO DISSOLVE — no video clip selected".into());
+            self.notify_user("Nothing to dissolve — no video clip selected".into());
             cx.notify();
             return;
         };
@@ -1847,10 +2314,57 @@ impl Player {
         if took && self.transition_edges(lane, idx) != before {
             self.mark_dirty();
             if removing {
-                self.notify_user("DISSOLVE REMOVED — the clips cut again".into());
+                self.notify_user("Dissolve removed — the clips cut again".into());
+            } else {
+                self.notify_user_action("Dissolve added".into(), ToastAction::Undo);
             }
         } else if !took {
-            self.notify_user("NOTHING TO DISSOLVE — no neighbour end to end".into());
+            self.notify_user("Nothing to dissolve — no neighbour end to end".into());
+        }
+        cx.notify();
+    }
+
+    /// Sets how the join the selection names is drawn
+    /// ([`engine::transitions::TransitionKind`]), making it a second long if the
+    /// clip has none: the picker's and the palette's door. Two picks on one
+    /// video lane take the pair, one pick takes it and its right-hand neighbour,
+    /// as [`Player::dissolve_selected`] does. One undo step; a join that already
+    /// wears the kind writes nothing.
+    pub(crate) fn set_transition_kind(
+        &mut self,
+        kind: engine::transitions::TransitionKind,
+        cx: &mut Context<Self>,
+    ) {
+        if self.exporting().is_some() {
+            return;
+        }
+        let Some((lane, idx)) = (match self.selected.picks() {
+            [a, b] if a.0 == b.0 && a.1.abs_diff(b.1) == 1 => Some((a.0, a.1.min(b.1))),
+            _ => self.selected.anchor(),
+        }) else {
+            self.notify_user("Nothing to transition — no video clip selected".into());
+            cx.notify();
+            return;
+        };
+        let Some(session) = &self.session else {
+            cx.notify();
+            return;
+        };
+        let current = session.transition_out_of(lane, idx);
+        let frames = if current > 0 {
+            current
+        } else {
+            self.fps.round().max(1.) as u32
+        };
+        let before = self.transition_edges(lane, idx);
+        let took = match &mut self.session {
+            Some(session) => session.set_transition(lane, idx, kind, frames),
+            None => false,
+        };
+        if took && self.transition_edges(lane, idx) != before {
+            self.mark_dirty();
+        } else if !took {
+            self.notify_user("Nothing to transition — no neighbour end to end".into());
         }
         cx.notify();
     }
@@ -1864,38 +2378,11 @@ impl Player {
             .is_some_and(|session| session.transition_out_of(lane, idx) > 0)
     }
 
-    /// Widens or narrows the transition the anchor already carries, one
-    /// frame at a step, from the inspector's duration row -- ctrl+f/ctrl+x
-    /// stay the toggle that seeds a fresh one at one second; this is what
-    /// moves it afterwards. The engine clamps both kinds to what the two
-    /// clips actually offer ([`Project::set_transition_out`],
-    /// [`Project::crossfade`]), so a step past the successor's own length
-    /// lands at the successor's length instead of asking for more than
-    /// there is.
-    pub(crate) fn nudge_transition(
-        &mut self,
-        lane: Lane,
-        idx: usize,
-        step: i32,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(session) = &mut self.session else {
-            return;
-        };
-        let current = match lane.kind {
-            LaneKind::Video => session.transition_out_of(lane, idx),
-            LaneKind::Audio => session.lane_clips(lane).get(idx).map_or(0, |c| c.fade_out),
-            _ => return,
-        };
-        let frames = (current as i32 + step).max(0) as u32;
-        self.set_transition_frames(lane, idx, frames, cx);
-    }
-
-    /// The transition's absolute length, through the same setter the stepper
-    /// dispatches to (`set_transition_out`/`crossfade`, each already clamping
-    /// to the shorter neighbour's frames) -- the typed field
-    /// ([`Player::commit_transition`]) and the ± steps land a number the same
-    /// way, so undo and persistence never tell the two doors apart.
+    /// The transition's absolute length, through the setter the kind and
+    /// length controls share (`set_transition_out`/`crossfade`, each already
+    /// clamping to the shorter neighbour's frames), so the typed length
+    /// ([`Player::commit_transition`]) and the picker's "None" land a number
+    /// the same way, and undo and persistence never tell the doors apart.
     pub(crate) fn set_transition_frames(
         &mut self,
         lane: Lane,
@@ -1938,7 +2425,10 @@ impl Player {
     fn transition_edges(&self, lane: Lane, idx: usize) -> Option<(u32, u32)> {
         let session = self.session.as_ref()?;
         match lane.kind {
-            LaneKind::Video => Some((session.transition_out_of(lane, idx), 0)),
+            LaneKind::Video => Some((
+                session.transition_out_of(lane, idx),
+                session.transition_kind_of(lane, idx).ordinal() + 1,
+            )),
             LaneKind::Audio => {
                 let clips = session.lane_clips(lane);
                 Some((clips.get(idx)?.fade_out, clips.get(idx + 1)?.fade_in))
@@ -1947,32 +2437,139 @@ impl Player {
         }
     }
 
-    /// Opens the transition duration's field on the frame count the row is
-    /// carrying -- the mouse door for DEBT #111's type-in, the row's own
-    /// click, `Player::edit_mbps`'s convention. `cap` is the same ceiling the
-    /// stepper is already clamped to (`transition_of`), so the field never
-    /// offers a number a step could not also land on.
-    pub(crate) fn edit_transition(&mut self, frames: u32, cap: u32) {
-        let digits = cap.to_string().chars().count() + 1;
-        // The Clip tab's colour field is given up: one inline editor at a
-        // time, since both are driven by the one key branch that finds them.
+    /// Opens the transition length's field on the frame count the block is
+    /// carrying, in seconds -- the row's own click, `Player::edit_mbps`'s
+    /// convention. The engine clamps a typed length to what the two clips
+    /// offer ([`Player::set_transition_frames`]), so the field needs no cap.
+    pub(crate) fn edit_transition(&mut self, frames: u32) {
+        let fps = self.fps.max(1.);
         self.viz_hex_edit = None;
-        self.transition_edit = Some(NumberEdit::new(frames, 0, cap, digits, "frames"));
+        self.transition_edit = Some(NumberEdit::begin(&format!("{:.2}", f64::from(frames) / fps)));
     }
 
-    /// The typed field's enter: clamps into the anchor's own range
-    /// ([`NumberEdit::commit_clamped`]) rather than refusing, because the
-    /// stepper this field stands in for already clamps silently -- a typed
-    /// number stricter than the mouse door would be a rule the field alone
-    /// enforces.
-    pub(crate) fn commit_transition(&mut self, cx: &mut Context<Self>) {
+    /// One key while the transition length is typed: digits, `.` and `-`
+    /// are typed, Enter writes the length, Escape drops it, and backspace
+    /// erases. Any other key is ignored: the field keeps the keyboard, so no
+    /// shortcut runs from a stroke typed into it. `false` only when no length
+    /// is being typed.
+    pub(crate) fn transition_key(&mut self, key: &str, cx: &mut Context<Self>) -> bool {
+        use crate::player::text_field::FieldKey;
         let Some(mut edit) = self.transition_edit.take() else {
+            return false;
+        };
+        let typed = key.parse::<u32>().is_ok() || matches!(key, "." | "," | "-");
+        // A stroke that is not a number or an editing key is ignored, not passed on: the field
+        // holds the keyboard until it is left.
+        if !typed && !matches!(key, "enter" | "escape" | "backspace") {
+            self.transition_edit = Some(edit);
+            return true;
+        }
+        match edit.key(key, false, false, typed.then_some(key)) {
+            FieldKey::Edited => self.transition_edit = Some(edit),
+            FieldKey::Cancel => {}
+            FieldKey::Commit => {
+                self.transition_edit = Some(edit);
+                self.commit_transition(cx);
+            }
+        }
+        cx.notify();
+        true
+    }
+
+    /// The typed length's enter: the seconds become frames at the project's
+    /// rate and go through [`Player::set_transition_frames`], which clamps
+    /// into the neighbour's room. A buffer that is not a number writes nothing.
+    pub(crate) fn commit_transition(&mut self, cx: &mut Context<Self>) {
+        let Some(edit) = self.transition_edit.take() else {
             return;
         };
-        if let Some((lane, idx)) = self.selected.anchor() {
-            let frames = edit.commit_clamped();
-            self.set_transition_frames(lane, idx, frames, cx);
+        let fps = self.fps.max(1.);
+        if let (Some(secs), Some((lane, idx))) = (edit.commit(0., f64::from(u32::MAX) / fps), self.selected.anchor()) {
+            self.set_transition_frames(lane, idx, (secs * fps).round() as u32, cx);
         }
+        cx.notify();
+    }
+
+    /// Opens the in-place editor on one cue block: a double-click on it
+    /// (DESIGN §7). The buffer starts on the words the cue has now, with the
+    /// caret at the end. Refused on a locked lane, with the lock's own toast,
+    /// and not offered for a picture cue, which has no words to type over. One
+    /// inline editor at a time, so the colour and transition fields give way.
+    pub(crate) fn open_cue_edit(
+        &mut self,
+        lane: Lane,
+        track: usize,
+        cue: usize,
+        cx: &mut Context<Self>,
+    ) {
+        if self.exporting().is_some() || self.lane_locked_refusal(lane) {
+            return;
+        }
+        let words = self
+            .session
+            .as_ref()
+            .and_then(|s| s.subtitles().get(track))
+            .and_then(|t| t.cues.get(cue))
+            .filter(|c| c.image.is_none())
+            .map(|c| c.text.clone());
+        let Some(words) = words else {
+            return;
+        };
+        self.viz_hex_edit = None;
+        self.transition_edit = None;
+        self.cue_edit = Some(CueEdit::new(lane, track, cue, &words));
+        cx.notify();
+    }
+
+    /// The in-place editor's enter. Writes the words only when they differ from
+    /// the cue's ([`CueEdit::commit`]), as one undo step through
+    /// [`PlaybackSession::set_cue_text`]; an edit that changed nothing leaves the
+    /// project as it was. The editor is closed either way, and a lane that was
+    /// locked while the block was open writes nothing.
+    pub(crate) fn commit_cue_edit(&mut self, cx: &mut Context<Self>) {
+        let Some(edit) = self.cue_edit.take() else {
+            return;
+        };
+        if self.lane_locked_refusal(edit.lane) {
+            cx.notify();
+            return;
+        }
+        let current = self
+            .session
+            .as_ref()
+            .and_then(|s| s.subtitles().get(edit.track))
+            .and_then(|t| t.cues.get(edit.cue))
+            .map(|c| c.text.clone());
+        if let Some(words) = current.and_then(|current| edit.commit(&current))
+            && let Some(session) = self.session.as_mut()
+            && session.set_cue_text(edit.track, edit.cue, &words)
+        {
+            self.mark_dirty();
+        }
+        cx.notify();
+    }
+
+    /// A press anywhere outside the in-place editor's plate ends the edit the
+    /// way Enter does, so a click away is never a silent discard of the words.
+    /// The plate stops its own presses before they reach the root.
+    pub(crate) fn cue_edit_press_outside(
+        &mut self,
+        _: &MouseDownEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.cue_edit.is_some() {
+            self.commit_cue_edit(cx);
+        }
+        // A panel number typed and left is written the way Enter writes it.
+        if let Some((which, edit)) = self.cue_num.take() {
+            if let Some(secs) = edit.commit(0., 36_000.) {
+                self.set_cue_num(which, (secs * 1e6).round() as i64, cx);
+            }
+            cx.notify();
+        }
+        // The title's words are written the same way; the text field stops its own presses.
+        self.commit_title_draft(cx);
     }
 
     /// The clip as the drag is showing it: an edge under the pointer moves its
@@ -2092,8 +2689,12 @@ impl Player {
     /// `self.session` -- untouched by a preview's own clock -- for as long as
     /// one is up.
     pub(crate) fn playhead(&self, duration: f64) -> f64 {
-        let ended = self.preview_session.is_none() && self.transport() == Transport::Ended;
         let now = self.session.as_ref().map_or(0., PlaybackSession::now);
+        // A take runs the clock past the last frame, and the timecode goes on with it.
+        if self.record_running() {
+            return now;
+        }
+        let ended = self.preview_session.is_none() && self.transport() == Transport::Ended;
         playhead_position(now, ended, duration)
     }
 
@@ -2129,9 +2730,75 @@ impl Player {
     /// `window.on_mouse_event`, the low-level door `Interactivity`'s fluent
     /// `on_mouse_*` builders do not expose for `MouseExitEvent`.
     pub(crate) fn drag_left_window(&mut self, cx: &mut Context<Self>) {
-        if split_drag_owes_save(self.split_drag) {
+        if split_drag_owes_save(self.split_drag) && self.split_moved() {
             save_stance_splits(&self.splits);
         }
+        // A number being scrubbed (pan, title fields) is committed here too: its
+        // release outside the window never arrives, and it would otherwise be
+        // dropped on the next move back in.
+        self.pan_scrub_end(cx);
+        self.title_scrub_end(cx);
+        self.cue_num_scrub_end(cx);
+        cx.notify();
+    }
+
+    /// Sets a lane's height from the pointer while its edge is held: the
+    /// pointer's y less the grab `interact::lane_resize_band` took at the press,
+    /// held to the lane range. Live, so the lane follows the hand; the file is
+    /// written on release.
+    pub(crate) fn drag_lane_resize(
+        &mut self,
+        lane: Lane,
+        grab: f32,
+        y: Pixels,
+        cx: &mut Context<Self>,
+    ) {
+        let h = crate::ui::bench_stance::clamp_lane_h(f32::from(y) - grab);
+        let h = crate::ui::bench_stance::snap_lane_h(lane.kind, h);
+        crate::ui::bench_stance::save_lane_h(&mut self.lane_h, lane, h);
+        cx.notify();
+    }
+
+    /// A double-click on a lane's edge: the lane goes back to its kind's
+    /// default, and the file forgets the height it was dragged to.
+    pub(crate) fn reset_lane_h(&mut self, lane: Lane, cx: &mut Context<Self>) {
+        self.lane_resize = None;
+        crate::ui::bench_stance::forget_lane_h(&mut self.lane_h, lane);
+        self.save_view_state();
+        cx.notify();
+    }
+
+    /// Sets one lane to a height size from its header's menu, and keeps it
+    /// in the project's view state like a drag does.
+    pub(crate) fn set_lane_size(&mut self, lane: Lane, size: TrackSize, cx: &mut Context<Self>) {
+        self.lane_resize = None;
+        crate::ui::bench_stance::set_track_size(&mut self.lane_h, lane, size);
+        self.save_view_state();
+        cx.notify();
+    }
+
+    /// Sets every lane to one size: the Timeline menu's "All tracks" rows.
+    pub(crate) fn set_all_track_sizes(&mut self, size: TrackSize, cx: &mut Context<Self>) {
+        let lanes = self.session.as_ref().map_or_else(Vec::new, PlaybackSession::lanes);
+        for lane in lanes {
+            crate::ui::bench_stance::set_track_size(&mut self.lane_h, lane, size);
+        }
+        self.save_view_state();
+        cx.notify();
+    }
+
+    /// One size taller or shorter for every lane, from each lane's own size:
+    /// the keys that make the tracks larger or smaller.
+    pub(crate) fn step_track_sizes(&mut self, up: bool, cx: &mut Context<Self>) {
+        let lanes = self.session.as_ref().map_or_else(Vec::new, PlaybackSession::lanes);
+        let sizes: Vec<(Lane, TrackSize)> = lanes
+            .into_iter()
+            .map(|lane| (lane, crate::ui::bench_stance::track_size(self, lane).step(up)))
+            .collect();
+        for (lane, size) in sizes {
+            crate::ui::bench_stance::set_track_size(&mut self.lane_h, lane, size);
+        }
+        self.save_view_state();
         cx.notify();
     }
 
@@ -2141,6 +2808,58 @@ impl Player {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.pan_scrub.is_some() {
+            match event.pressed_button {
+                Some(MouseButton::Left) => self.pan_scrub_move(f32::from(event.position.x), cx),
+                _ => {
+                    self.pan_scrub_end(cx);
+                }
+            }
+            return;
+        }
+        // An envelope drag follows the pointer; a button-up move ends it with its commit.
+        if self.gain_edit.is_some() {
+            match event.pressed_button {
+                Some(MouseButton::Left) => self.gain_move(event.position, cx),
+                _ => self.gain_release(cx),
+            }
+            return;
+        }
+        // A title number or block being turned follows the pointer; a button-up move ends it.
+        if self.title_scrub.is_some() {
+            match event.pressed_button {
+                Some(MouseButton::Left) => self.title_scrub_move(f32::from(event.position.x), cx),
+                _ => {
+                    self.title_scrub_end(cx);
+                }
+            }
+            return;
+        }
+        // A caption panel number dragged sideways follows the pointer the same way.
+        if self.cue_num_scrub.is_some() {
+            match event.pressed_button {
+                Some(MouseButton::Left) => self.cue_num_scrub_move(f32::from(event.position.x), event.modifiers.shift, cx),
+                _ => {
+                    self.cue_num_scrub_end(cx);
+                }
+            }
+            return;
+        }
+        // A box select follows the pointer wherever it goes; a button-up move
+        // (released off the window) ends it without selecting.
+        if let Some(m) = self.marquee.as_mut() {
+            match event.pressed_button {
+                Some(MouseButton::Left) => {
+                    m.to = event.position;
+                    cx.notify();
+                }
+                _ => {
+                    self.marquee = None;
+                    cx.notify();
+                }
+            }
+            return;
+        }
         // The scrollbar's thumb first: the pointer leaves the 6 px strip on
         // the first move, so the gesture is followed here for the ruler's own
         // reason -- and it must outrank every other drag, because a hand
@@ -2166,6 +2885,21 @@ impl Player {
             }
             return;
         }
+        // A lane's bottom edge is held the same way: its band is the only thing
+        // under the pointer, and a release off the window ends it here, with the
+        // save `drag_release` would have paid.
+        if let Some((lane, grab)) = self.lane_resize {
+            match event.pressed_button {
+                Some(MouseButton::Left) => {
+                    self.drag_lane_resize(lane, grab, event.position.y, cx);
+                }
+                _ => {
+                    self.lane_resize = None;
+                    self.save_view_state();
+                }
+            }
+            return;
+        }
         // A divider is answered before every gesture below it: it is pressed on
         // a strip of its own that nothing else is under, so neither can swallow
         // the other -- a seam over the timeline never scrubs, and a scrub is
@@ -2180,9 +2914,10 @@ impl Player {
                 // holds for the session and reverts on restart.
                 _ => {
                     self.split_drag = None;
-                    if split_drag_owes_save(Some(split)) {
+                    if split_drag_owes_save(Some(split)) && self.split_moved() {
                         save_stance_splits(&self.splits);
                     }
+                    self.split_press = None;
                 }
             }
             return;
@@ -2205,6 +2940,21 @@ impl Player {
         // first drag, so the gesture is tracked here for the same
         // reason -- and it ends here too when the button came up
         // outside the window, still owing its one edit.
+        if self.pro_drag.is_some() {
+            match event.pressed_button {
+                Some(MouseButton::Left) => self.pro_to(event.position.x, cx),
+                _ => self.commit_pro(cx),
+            }
+            return;
+        }
+        // A caption held by its edge or body is tracked here too, for the same reason.
+        if self.cue_drag.is_some() {
+            match event.pressed_button {
+                Some(MouseButton::Left) => self.cue_drag_to(event.position.x, cx),
+                _ => self.commit_cue_drag(cx),
+            }
+            return;
+        }
         if self.trim.is_some() {
             match event.pressed_button {
                 Some(MouseButton::Left) => {
@@ -2240,6 +2990,16 @@ impl Player {
             }
             return;
         }
+        // A colour wheel's puck or master bar: the same live writes.
+        if let Some((wheel, master)) = self.color_wheel_drag {
+            if event.pressed_button == Some(MouseButton::Left) {
+                self.drag_wheel(wheel, master, event.position, false, cx);
+            } else {
+                self.color_wheel_drag = None;
+                self.flush_drag(cx);
+            }
+            return;
+        }
         // The ink wheel, on the root for the same 4 px reason and gated on the
         // worker like the bars above: one sample here is a whole picture
         // rebuilt, so what is written is one ink per frame the worker delivers
@@ -2265,6 +3025,15 @@ impl Player {
             }
             return;
         }
+        // The accent sliders in Settings: live while held, kept on release.
+        if let Some(slider) = self.accent_drag {
+            if event.pressed_button == Some(MouseButton::Left) {
+                self.drag_accent(slider, event.position.x, cx);
+            } else {
+                self.end_accent_drag();
+            }
+            return;
+        }
         // The speed bar, the same 4 px and the same live writes: the
         // press took the undo step and every sample since is live.
         if self.speed_dragging {
@@ -2273,6 +3042,15 @@ impl Player {
             } else {
                 self.speed_dragging = false;
                 self.flush_drag(cx);
+            }
+            return;
+        }
+        // The effects bars hold a draft and write it once, on release.
+        if self.effects_drag.is_some() {
+            if event.pressed_button == Some(MouseButton::Left) {
+                self.drag_effect(event.position.x, cx);
+            } else {
+                self.release_effect(cx);
             }
             return;
         }
@@ -2309,6 +3087,20 @@ impl Player {
         }
     }
 
+    /// Takes away what a clip drag shows while it is in the air: the dimmed
+    /// source, the snap line and the shadow. Escape calls it, because a drag
+    /// cancelled without a release sends no release to clear them. Repaints
+    /// only when something was up.
+    pub(crate) fn end_drag_preview(&mut self, cx: &mut Context<Self>) {
+        let showing = self.drag_src.take().is_some()
+            | self.snap_cue.take().is_some()
+            | !self.ghost.is_empty();
+        self.ghost.clear();
+        if showing {
+            cx.notify();
+        }
+    }
+
     /// Where a drag ends: the release lands exactly, and whatever the gesture
     /// owes -- one undo step for the equalizer and the trim, a flush for the
     /// live-writing bars -- is paid here. On the root and on a card's scrim
@@ -2322,6 +3114,26 @@ impl Player {
     ) {
         // The panel is left exactly where the hand let go, for the reason every
         // other release here lands one last sample.
+        // Any release ends a clip move in flight, including one let go off
+        // every lane (no drop fires there): the original stops being dimmed
+        // and the line stops promising a landing. A trim keeps its line until
+        // its own commit below.
+        self.drag_src = None;
+        if self.gain_edit.is_some() {
+            self.gain_release(cx);
+            return;
+        }
+        if self.pan_scrub_end(cx) || self.title_scrub_end(cx) || self.cue_num_scrub_end(cx) {
+            return;
+        }
+        if self.trim.is_none() && self.snap_cue.take().is_some() {
+            cx.notify();
+        }
+        if let Some(mut m) = self.marquee.take() {
+            m.to = event.position;
+            self.finish_marquee(m, event.modifiers.control, cx);
+            return;
+        }
         if self.scroll_drag.take().is_some() {
             self.scroll_drag_to(event.position.x, cx);
             return;
@@ -2330,13 +3142,22 @@ impl Player {
             self.lanes_drag_to(event.position.y, cx);
             return;
         }
+        if let Some((lane, grab)) = self.lane_resize.take() {
+            // The height lands where the hand let go, and the view is written
+            // once here -- the same round trip a seam's release makes.
+            self.drag_lane_resize(lane, grab, event.position.y, cx);
+            self.save_view_state();
+            return;
+        }
         if let Some(split) = self.split_drag.take() {
             self.drag_split(split, event.position, window, cx);
+            let moved = self.split_moved();
+            self.split_press = None;
             // Every seam outlives the window: written once, on the release
             // that ends the gesture, the same small-file round trip
             // `ui::dock_stance`'s tab pick uses -- not on every sample in
             // between, which `drag_move` above never owed a write.
-            if split_drag_owes_save(Some(split)) {
+            if split_drag_owes_save(Some(split)) && moved {
                 save_stance_splits(&self.splits);
             }
             return;
@@ -2348,11 +3169,22 @@ impl Player {
             self.commit_eq(cx);
             return;
         }
+        if self.pro_drag.is_some() {
+            self.pro_to(event.position.x, cx);
+            self.commit_pro(cx);
+            return;
+        }
+        if self.cue_drag.is_some() {
+            self.cue_drag_to(event.position.x, cx);
+            self.commit_cue_drag(cx);
+            return;
+        }
         if self.trim.is_some() {
             // The release lands exactly, then the gesture is
             // written once -- one edit, one undo step.
             self.drag_alt = event.modifiers.alt;
             self.trim_to(event.position.x, cx);
+            self.trim_flash = None;
             self.commit_trim(cx);
             return;
         }
@@ -2371,6 +3203,11 @@ impl Player {
             self.flush_drag(cx);
             return;
         }
+        if let Some((wheel, master)) = self.color_wheel_drag.take() {
+            self.drag_wheel(wheel, master, event.position, false, cx);
+            self.flush_drag(cx);
+            return;
+        }
         if std::mem::take(&mut self.viz_hs_dragging) {
             // The release lands exactly where the hand let go, and the flush
             // is what makes that true while the worker is still busy: the
@@ -2384,9 +3221,19 @@ impl Player {
             self.flush_drag(cx);
             return;
         }
+        if let Some(slider) = self.accent_drag {
+            self.drag_accent(slider, event.position.x, cx);
+            self.end_accent_drag();
+            return;
+        }
         if std::mem::take(&mut self.speed_dragging) {
             self.drag_speed(event.position.x, false, cx);
             self.flush_drag(cx);
+            return;
+        }
+        if self.effects_drag.is_some() {
+            self.drag_effect(event.position.x, cx);
+            self.release_effect(cx);
             return;
         }
         if std::mem::take(&mut self.volume_dragging) {
@@ -2415,6 +3262,17 @@ impl Player {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A press that has not travelled is a click, not a drag: the grab zone
+        // is wider than the seam, so taking the pointer's y as the seam's
+        // would move it by the offset of the click.
+        if let Some((origin, moved)) = &mut self.split_press
+            && !*moved
+        {
+            if !split_travelled(*origin, at) {
+                return;
+            }
+            *moved = true;
+        }
         let viewport = window.viewport_size();
         let raw = split_drag_size(split, at, viewport);
         // Clamped here, through the same door [`Player::split_px`] draws
@@ -2431,5 +3289,239 @@ impl Player {
         self.splits
             .set(split, split_size(split, Some(raw), lanes, viewport, scroll));
         cx.notify();
+    }
+}
+
+/// `pick`, if the session still has that exact hole on its lane: the same
+/// `(start, frames)` answered by [`PlaybackSession::gap_at`] at its first frame.
+/// A hole that moved, shrank or closed answers `None`, which is how a stale
+/// pick is dropped. Free, and not a method, so a test can ask it of a session.
+pub(crate) fn live_gap(session: &PlaybackSession, pick: GapPick) -> Option<GapPick> {
+    (session.gap_at(pick.lane, pick.start) == Some((pick.start, pick.frames))).then_some(pick)
+}
+
+/// The volume envelope's gestures on an audio clip: a press adds or grabs a key, a drag moves
+/// it (or a segment of the line), a release commits the whole drag as one undo step, and Delete
+/// or a double-click takes a key out. The geometry is [`clip_envelope`]'s own, so what is drawn
+/// is what is hit.
+impl Player {
+    /// The clip's envelope geometry at the timeline's current zoom: its keys, its clip gain, its
+    /// source range and speed, and the pixels per timeline frame. `None` for a video clip or a
+    /// clip that is not there.
+    fn gain_geometry(&self, lane: Lane, idx: usize) -> Option<(Vec<engine::GainKey>, f32, u32, u32, f64, f32)> {
+        let session = self.session.as_ref()?;
+        if lane.kind != LaneKind::Audio {
+            return None;
+        }
+        let clip = session.lane_clips(lane).get(idx)?;
+        let ppf = (self.scale.pps / self.fps) as f32;
+        Some((clip.gain_keys.clone(), clip.gain_db, clip.in_frame, clip.out_frame, clip.speed.as_f64(), ppf))
+    }
+
+    /// The envelope's keys as the drag shows them, for the clip that is being dragged.
+    pub(crate) fn shown_gain_keys(&self, lane: Lane, idx: usize) -> Option<Vec<engine::GainKey>> {
+        self.gain_edit
+            .as_ref()
+            .filter(|e| (e.lane, e.idx) == (lane, idx))
+            .map(|e| e.shown.clone())
+    }
+
+    /// Whether the pointer is over a key or the line of this clip's envelope: what makes its
+    /// layer take the press and show its cursor.
+    pub(crate) fn gain_hot(&self, lane: Lane, idx: usize) -> bool {
+        matches!(self.gain_hover, Some((l, i, _)) if (l, i) == (lane, idx))
+    }
+
+    /// The envelope's hit under the clip-local point `local` in a box of `size`, or `None`.
+    fn gain_hit_at(&self, lane: Lane, idx: usize, local: Point<Pixels>, size: Size<Pixels>) -> Option<EnvHit> {
+        let (keys, gain, in_frame, _, speed, ppf) = self.gain_geometry(lane, idx)?;
+        clip_envelope::hit(
+            &keys,
+            gain,
+            in_frame,
+            speed,
+            ppf,
+            (f32::from(size.width), f32::from(size.height)),
+            (f32::from(local.x), f32::from(local.y)),
+        )
+    }
+
+    /// The pointer moved over a clip's envelope layer: the hover that sets its cursor.
+    pub(crate) fn gain_hover_at(&mut self, lane: Lane, idx: usize, local: Point<Pixels>, size: Size<Pixels>, cx: &mut Context<Self>) {
+        let hit = self.gain_hit_at(lane, idx, local, size).filter(|h| matches!(h, EnvHit::Key(_)) || matches!(h, EnvHit::Line(_)));
+        let next = hit.map(|h| (lane, idx, h));
+        if self.gain_hover != next {
+            self.gain_hover = next;
+            cx.notify();
+        }
+    }
+
+    /// The pointer left a clip's envelope layer.
+    pub(crate) fn gain_hover_end(&mut self, lane: Lane, idx: usize, cx: &mut Context<Self>) {
+        if self.gain_hot(lane, idx) {
+            self.gain_hover = None;
+            cx.notify();
+        }
+    }
+
+    /// A press on a clip's envelope layer. Returns whether it was taken here (so the clip body
+    /// under it does not also select). Ctrl on the line adds a key where the line is; a press on a
+    /// key grabs it (two clicks take it out); a press on the line grabs its segment.
+    pub(crate) fn gain_press_at(
+        &mut self,
+        lane: Lane,
+        idx: usize,
+        event: &MouseDownEvent,
+        bounds: Bounds<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let (window, origin, size) = (event.position, bounds.origin, bounds.size);
+        let (ctrl, clicks) = (event.modifiers.control, event.click_count);
+        if self.covers_room() || self.exporting().is_some() || self.lane_locked_refusal(lane) {
+            return false;
+        }
+        let local = point(window.x - origin.x, window.y - origin.y);
+        let Some(hit) = self.gain_hit_at(lane, idx, local, size) else {
+            return false;
+        };
+        let Some((keys, gain, in_frame, out_frame, speed, ppf)) = self.gain_geometry(lane, idx) else {
+            return false;
+        };
+        let (lo, hi) = (engine::project::MIN_CLIP_GAIN_DB, engine::project::MAX_CLIP_GAIN_DB);
+        match (hit, ctrl) {
+            (EnvHit::Line(_), true) => {
+                // Where the line is, so the key adds no change of sound.
+                let src = f64::from(in_frame) + f64::from(local.x) / f64::from(ppf) * speed;
+                let at = (src.round().max(0.) as u32).clamp(in_frame, out_frame);
+                let db = engine::project::gain_keys_db_at(&keys, f64::from(at)).clamp(lo, hi);
+                if self.session.as_mut().is_some_and(|s| s.add_gain_key(lane, idx, engine::GainKey::new(at, db))) {
+                    self.mark_dirty();
+                }
+                self.gain_pick = Some((lane, idx, at));
+                self.pick((lane, idx), false, cx);
+                cx.notify();
+                true
+            }
+            (EnvHit::Key(i), _) => {
+                let at = keys[i].at;
+                if clicks >= 2 {
+                    if self.session.as_mut().is_some_and(|s| s.remove_gain_key(lane, idx, at)) {
+                        self.mark_dirty();
+                    }
+                    self.gain_pick = None;
+                    cx.notify();
+                    return true;
+                }
+                self.gain_pick = Some((lane, idx, at));
+                self.pick((lane, idx), false, cx);
+                let grab_db = (gain + keys[i].db) - clip_envelope::db_of_y(f32::from(local.y), f32::from(size.height));
+                self.gain_edit = Some(GainEdit {
+                    lane,
+                    idx,
+                    grab: GainGrab::Key(i),
+                    press: window,
+                    origin,
+                    size,
+                    shown: keys.clone(),
+                    keys,
+                    clip_gain: gain,
+                    in_frame,
+                    out_frame,
+                    speed,
+                    px_per_frame: ppf,
+                    grab_db,
+                });
+                cx.notify();
+                true
+            }
+            (EnvHit::Line(Some(i)), false) => {
+                let grab_db = clip_envelope::db_of_y(f32::from(local.y), f32::from(size.height));
+                self.pick((lane, idx), false, cx);
+                self.gain_edit = Some(GainEdit {
+                    lane,
+                    idx,
+                    grab: GainGrab::Segment(i),
+                    press: window,
+                    origin,
+                    size,
+                    shown: keys.clone(),
+                    keys,
+                    clip_gain: gain,
+                    in_frame,
+                    out_frame,
+                    speed,
+                    px_per_frame: ppf,
+                    grab_db,
+                });
+                cx.notify();
+                true
+            }
+            // The flat line past the keys is the clip's own, not the envelope's: the press
+            // falls through to the body.
+            (EnvHit::Line(_), false) => false,
+        }
+    }
+
+    /// The held envelope drag follows the pointer: a key moves in time and dB within its
+    /// neighbours and the clip's source range, a segment moves both keys by one dB amount.
+    pub(crate) fn gain_move(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(edit) = self.gain_edit.as_mut() else {
+            return;
+        };
+        let local_y = f32::from(position.y - edit.origin.y);
+        let height = f32::from(edit.size.height);
+        let (lo_db, hi_db) = (engine::project::MIN_CLIP_GAIN_DB, engine::project::MAX_CLIP_GAIN_DB);
+        let dx = f32::from(position.x - edit.press.x);
+        let mut shown = edit.keys.clone();
+        match edit.grab {
+            GainGrab::Key(i) => {
+                let k = edit.keys[i];
+                let prev = i.checked_sub(1).map(|j| edit.keys[j].at + 1).unwrap_or(edit.in_frame);
+                let next = edit.keys.get(i + 1).map(|n| n.at.saturating_sub(1)).unwrap_or(edit.out_frame);
+                let (lo, hi) = (prev.max(edit.in_frame), next.min(edit.out_frame));
+                let src = f64::from(k.at) + f64::from(dx) / f64::from(edit.px_per_frame) * edit.speed;
+                let at = if lo <= hi { (src.round().max(0.) as u32).clamp(lo, hi) } else { k.at };
+                let disp = clip_envelope::db_of_y(local_y, height) + edit.grab_db;
+                let db = (disp - edit.clip_gain).clamp(lo_db, hi_db);
+                shown[i] = engine::GainKey { at, db, ..k };
+            }
+            GainGrab::Segment(i) => {
+                let delta = clip_envelope::db_of_y(local_y, height) - edit.grab_db;
+                let pair = [edit.keys[i], edit.keys[i + 1]];
+                let most_up = pair.iter().map(|k| hi_db - k.db).fold(f32::INFINITY, f32::min);
+                let most_down = pair.iter().map(|k| lo_db - k.db).fold(f32::NEG_INFINITY, f32::max);
+                let delta = if most_down <= most_up { delta.clamp(most_down, most_up) } else { 0. };
+                for j in [i, i + 1] {
+                    shown[j] = engine::GainKey { db: edit.keys[j].db + delta, ..edit.keys[j] };
+                }
+            }
+        }
+        edit.shown = shown;
+        cx.notify();
+    }
+
+    /// The release of an envelope drag: one edit, one undo step, and nothing at all when the
+    /// hand came back to where it was.
+    pub(crate) fn gain_release(&mut self, cx: &mut Context<Self>) {
+        let Some(edit) = self.gain_edit.take() else {
+            return;
+        };
+        let moved = edit.shown.iter().zip(&edit.keys).any(|(a, b)| a.at != b.at || a.db != b.db);
+        if moved && self.session.as_mut().is_some_and(|s| s.set_gain_keys(edit.lane, edit.idx, edit.shown)) {
+            self.mark_dirty();
+        }
+        cx.notify();
+    }
+
+    /// Delete with a key picked takes that key out, one undo step. `false` when no key is picked.
+    pub(crate) fn gain_delete_pick(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some((lane, idx, at)) = self.gain_pick.take() else {
+            return false;
+        };
+        if self.session.as_mut().is_some_and(|s| s.remove_gain_key(lane, idx, at)) {
+            self.mark_dirty();
+        }
+        cx.notify();
+        true
     }
 }

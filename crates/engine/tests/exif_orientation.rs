@@ -72,41 +72,19 @@ fn corners(width: u32, height: u32, bgra: &[u8]) -> [&'static str; 4] {
 /// own shape and says the rest in the tag.
 const STORED: [&str; 4] = ["red", "green", "blue", "yellow"];
 
-/// A 64x32 RGB picture of four coloured quadrants, encoded as a JPEG and given
-/// an APP1/EXIF segment stating `exif` as the orientation.
+/// The stored picture, as a JPEG with no orientation tag: 64x32, four coloured
+/// quadrants (`tests/data/quadrants_64x32.jpg`, written once with a JPEG
+/// encoder and checked in, so this suite needs no encoder at run time).
+const BASE_JPEG: &[u8] = include_bytes!("data/quadrants_64x32.jpg");
+
+/// The fixture with an APP1/EXIF segment stating `exif` as the orientation.
 ///
 /// The EXIF is written by hand rather than through a crate: the segment is six
 /// bytes of `Exif\0\0` followed by a little-endian TIFF header and one IFD
 /// entry, which is the whole of what tag `0x0112` is, and writing it out is what
 /// makes this a fixture rather than a dependency.
 fn build(exif: u8) -> Vec<u8> {
-    let (width, height) = (64u32, 32u32);
-    let (red, green, blue, yellow) = (
-        [220u8, 30, 30],
-        [30, 200, 40],
-        [40, 60, 220],
-        [230, 210, 40],
-    );
-    let (qx, qy) = (width / 4, height / 4);
-    let mut rgb = image::RgbImage::new(width, height);
-    for y in 0..height {
-        for x in 0..width {
-            let colour = match (x >= 2 * qx, y >= 2 * qy) {
-                (false, false) => red,
-                (true, false) => green,
-                (true, true) => blue,
-                (false, true) => yellow,
-            };
-            rgb.put_pixel(x, y, image::Rgb(colour));
-        }
-    }
-    let mut jpeg = Vec::new();
-    image::DynamicImage::ImageRgb8(rgb)
-        .write_to(
-            &mut std::io::Cursor::new(&mut jpeg),
-            image::ImageFormat::Jpeg,
-        )
-        .expect("encode the JPEG");
+    let jpeg = BASE_JPEG;
     // Inserted straight after SOI, which is where a camera's APP1 sits and
     // where a decoder's marker walk finds it first.
     let app1 = exif_app1(exif);
@@ -154,9 +132,9 @@ fn first_frame(path: &std::path::Path) -> (u32, u32, Vec<u8>) {
 /// Software everywhere, so the suite proves the path every machine has.
 fn pin_software() {
     static PIN: std::sync::Once = std::sync::Once::new();
-    PIN.call_once(|| unsafe {
-        std::env::set_var("VE_SW", "1");
-        std::env::set_var("VE_SW_ENC", "1");
+    PIN.call_once(|| {
+        engine::envcfg::set("VE_SW", "1");
+        engine::envcfg::set("VE_SW_ENC", "1");
     });
 }
 

@@ -54,6 +54,7 @@ pub(crate) fn eq_y(gain_db: f32) -> f32 {
 /// zeroes trimmed, so "1 kHz" stays "1 kHz" and a band nudged off it reads as
 /// 1.12 kHz rather than as the same "1 kHz" it was before the keystroke -- a
 /// number that does not move under an edit is worse than no number.
+#[cfg_attr(not(test), allow(dead_code, reason = "see band_label"))]
 pub(crate) fn eq_freq_label(freq_hz: f32) -> String {
     if freq_hz < 1000. {
         return format!("{freq_hz:.0} Hz");
@@ -66,13 +67,56 @@ pub(crate) fn eq_freq_label(freq_hz: f32) -> String {
 /// What a band row calls itself: the corner or centre frequency, and for a
 /// shelf the fact that it tilts everything past it -- which is the difference
 /// between "12 kHz" moving the last octave and moving one band inside it.
+#[cfg_attr(not(test), allow(dead_code, reason = "the band row now shows a number field; kept for the tests and the spoken name"))]
 pub(crate) fn band_label(band: &Band) -> String {
     let freq = eq_freq_label(band.freq_hz);
     match band.kind {
         BandKind::LowShelf => format!("{freq} low shelf"),
         BandKind::HighShelf => format!("{freq} high shelf"),
+        BandKind::LowCut => format!("{freq} low cut"),
+        BandKind::HighCut => format!("{freq} high cut"),
         BandKind::Peak => freq,
     }
+}
+
+/// The five kinds a band can be, in the order their chips lay out: the cuts at
+/// the ends and the shelves beside the bells. Each carries the sentence its
+/// chip's tooltip says, so a name like "shelf" is explained where it is picked.
+pub(crate) const EQ_KINDS: [(BandKind, &str, &str); 5] = [
+    (BandKind::LowCut, "Low cut", "Removes what is below the corner"),
+    (
+        BandKind::LowShelf,
+        "Low shelf",
+        "Lifts or cuts everything below the frequency",
+    ),
+    (BandKind::Peak, "Peak", "A bell around the frequency"),
+    (
+        BandKind::HighShelf,
+        "High shelf",
+        "Lifts or cuts everything above the frequency",
+    ),
+    (BandKind::HighCut, "High cut", "Removes what is above the corner"),
+];
+
+/// Whether a band's gain takes part in its response. A cut ignores it -- it has
+/// a corner to put and no level to set -- so the card does not draw its field.
+pub(crate) fn eq_takes_gain(kind: BandKind) -> bool {
+    !matches!(kind, BandKind::LowCut | BandKind::HighCut)
+}
+
+/// Which of a band's numbers have left the layout the clip opens on, as
+/// (frequency, gain, Q): what makes a number read ink1 rather than ink3. A band
+/// has no name but its place, so it is compared with the layout's band at the
+/// same index; one past the layout's end has no default to have left, so its
+/// frequency and Q count as moved. Every band's gain rests at flat.
+#[cfg_attr(not(test), allow(dead_code, reason = "see band_label"))]
+pub(crate) fn eq_band_changes(band: &Band, index: usize) -> (bool, bool, bool) {
+    const SAME: f32 = 1e-4;
+    let default = EqParams::default_layout().bands.get(index).copied();
+    let freq = default.is_none_or(|d| (band.freq_hz / d.freq_hz - 1.).abs() > SAME);
+    let gain = band.gain_db.abs() > SAME;
+    let q = default.is_none_or(|d| (band.q - d.q).abs() > SAME);
+    (freq, gain, q)
 }
 
 /// In-place radix-2 FFT of `re`/`im`, whose length must be a power of two.

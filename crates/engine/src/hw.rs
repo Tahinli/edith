@@ -1,193 +1,108 @@
-//! Runtime-optional hardware decode/encode plugin (`libengine_hw.so`).
+//! Hardware decode and encode, held by a child process.
 //!
-//! The plugin links libva/gbm/drm; this crate and the app binary must not, so
-//! the only coupling is this C ABI plus a `dlopen`. Anything that goes wrong --
-//! plugin missing, no VA-API runtime, no render node, unsupported stream --
-//! leaves us with `None` and the caller falls back to the software codec.
+//! The VA-API drivers live in `hw-child`, a binary of the `engine-hw` package
+//! that is started next to the editor's own executable the same way the editor
+//! finds its other helpers ([`crate::hwproc`]). This module is the parent side:
+//! a session is a child plus a socket, and every call is one request and one
+//! reply. Nothing here links a driver and nothing here is `unsafe`.
 //!
-//! Decode and encode resolve their symbols into *separate* tables on purpose: a
-//! plugin built before the encode entry points existed must still decode, so a
-//! missing `vh_enc_*` may only cost us [`HwEncoder`], never [`HwSession`].
+//! Anything that goes wrong -- child missing, no VA-API runtime, no render node,
+//! unsupported stream, a child that stops answering or dies -- leaves us with
+//! `None` or an `Err`, and the caller falls back to the software codec exactly
+//! as it always did. A dead child is reaped at once and the next open starts a
+//! fresh one.
 //!
-//! The codec is *not* part of this ABI and adding VP9 and HEVC did not change
-//! it: the plugin demuxes the file it is given and picks its decoder from the
-//! container, so a plugin older than that support simply returns null for such a
-//! path -- the same "no" it gives for an unsupported profile, and the caller's
-//! honest [`crate::demux::Codec::needs_plugin`] refusal covers both.
+//! Pictures in memory cross in a shared memfd, read out with one `pread`.
+//! Pictures still on the GPU cross as DRM-PRIME descriptors over `SCM_RIGHTS`
+//! and are never copied through the socket.
 
-use std::ffi::{c_char, c_void, CString};
-use std::os::fd::FromRawFd;
-use std::path::{Path, PathBuf};
+use std::ffi::OsString;
+use std::os::fd::OwnedFd;
+use std::path::Path;
+use std::process::Child;
 use std::sync::OnceLock;
 
-use libloading::Library;
-
 use crate::colorspace::ColorDescription;
+use crate::hwproc::{
+    DMA_BODY, HW_LOST, K_DMA, K_PIXELS, Lost, Open, R_AU, R_ERR, R_NONE, Remote, Seat, Shm, T_NEXT,
+    T_NEXT_DMA, T_SEEK, recv_reply, send_msg, spawn_child,
+};
 
-const LIB_NAME: &str = "libengine_hw.so";
+#[cfg(test)]
+thread_local! {
+    /// How many times this thread asked for a decoder. The seam the tests read
+    /// to show a file was never offered to the GPU, which stderr cannot show
+    /// in-process.
+    pub(crate) static OPEN_ATTEMPTS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
 
-/// Stream metadata, C layout. Mirrors [`crate::VideoMeta`]'s picture half --
-/// the four fields a session was opened with, plus the coded pair and the
-/// sample aspect a display size can now differ from the coded one by.
+/// One picture as the caller reads it: the Y, U and V planes, then the width
+/// and height they are laid out at.
+type Planes<'a> = (&'a [u8], &'a [u8], &'a [u8], u32, u32);
+
+/// Stream metadata. The picture half of [`crate::VideoMeta`]: the four fields a
+/// session was opened with, plus the coded pair and the sample aspect a display
+/// size can differ from the coded one by.
 ///
 /// `width`/`height` are the *displayed* shape, exactly as [`crate::VideoMeta`]
-/// promises: a plugin opened on a rotated file has always been handed a
-/// swapped pair here, and the pictures it hands back are sized by its own
-/// decoder's output, which is the coded pair. `coded_width`/`coded_height`
-/// name that pair explicitly, and `pixel_aspect_h`/`_v` carry the ratio one
-/// coded pixel is drawn at, so a caller that needs the stored shape (a copy
-/// declaring a track, an encoder agreeing on a surface) asks the coded one and
-/// a caller that draws asks the display one -- both answered, neither derived.
-#[repr(C)]
-#[derive(Default)]
+/// promises. `coded_width`/`coded_height` name the stored pair explicitly, and
+/// `pixel_aspect_h`/`_v` carry the ratio one coded pixel is drawn at; zero and
+/// zero reads square.
+#[derive(Default, Clone, Copy, Debug, PartialEq)]
 pub struct VhMeta {
     pub width: u32,
     pub height: u32,
     pub frame_rate: f64,
     pub frame_count: u32,
-    /// What the samples are stored at, before any turn or stretch.
     pub coded_width: u32,
     pub coded_height: u32,
-    /// The sample aspect ratio, h over v, square as 1 and 1 -- or 0 and 0,
-    /// which is `Default` and reads square ([`crate::demux::PixelAspect`]).
     pub pixel_aspect_h: u32,
     pub pixel_aspect_v: u32,
 }
 
-/// One decoded picture as planar I420. Pointers belong to the plugin and stay
-/// valid only until the next `vh_next_frame`/`vh_close` on the same session.
-#[repr(C)]
-pub struct VhFrame {
-    pub y: *const u8,
-    pub u: *const u8,
-    pub v: *const u8,
-    pub y_stride: usize,
-    pub u_stride: usize,
-    pub v_stride: usize,
-    pub width: u32,
-    pub height: u32,
+/// Bytes of [`VhMeta`] on the wire: eight 4-byte fields, the frame rate as its
+/// bit pattern in 8 bytes.
+pub const META_WIRE: usize = 36;
+
+/// [`VhMeta`] as the child sends it at open.
+pub fn meta_to_wire(meta: &VhMeta) -> [u8; META_WIRE] {
+    let mut out = [0u8; META_WIRE];
+    out[0..4].copy_from_slice(&meta.width.to_le_bytes());
+    out[4..8].copy_from_slice(&meta.height.to_le_bytes());
+    out[8..16].copy_from_slice(&meta.frame_rate.to_bits().to_le_bytes());
+    out[16..20].copy_from_slice(&meta.frame_count.to_le_bytes());
+    out[20..24].copy_from_slice(&meta.coded_width.to_le_bytes());
+    out[24..28].copy_from_slice(&meta.coded_height.to_le_bytes());
+    out[28..32].copy_from_slice(&meta.pixel_aspect_h.to_le_bytes());
+    out[32..36].copy_from_slice(&meta.pixel_aspect_v.to_le_bytes());
+    out
 }
 
-impl Default for VhFrame {
-    fn default() -> Self {
-        Self {
-            y: std::ptr::null(),
-            u: std::ptr::null(),
-            v: std::ptr::null(),
-            y_stride: 0,
-            u_stride: 0,
-            v_stride: 0,
-            width: 0,
-            height: 0,
-        }
+/// The other half of [`meta_to_wire`]; `None` for anything of the wrong size.
+pub fn meta_from_wire(bytes: &[u8]) -> Option<VhMeta> {
+    if bytes.len() != META_WIRE {
+        return None;
     }
+    let u32_at = |at: usize| Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?));
+    Some(VhMeta {
+        width: u32_at(0)?,
+        height: u32_at(4)?,
+        frame_rate: f64::from_bits(u64::from_le_bytes(bytes.get(8..16)?.try_into().ok()?)),
+        frame_count: u32_at(16)?,
+        coded_width: u32_at(20)?,
+        coded_height: u32_at(24)?,
+        pixel_aspect_h: u32_at(28)?,
+        pixel_aspect_v: u32_at(32)?,
+    })
 }
 
-/// One decoded picture *left on the GPU*: a DRM-PRIME buffer the encoder
-/// imports instead of the caller reading the pixels back and writing them out
-/// again. All integers, so it crosses a channel to the encoding thread the way
-/// a picture's bytes used to.
-///
-/// The `fd` belongs to whoever holds this: the plugin hands ownership over with
-/// the descriptor and [`DmaFrame`] closes it. What it does *not* own is the
-/// buffer's contents -- the decode session keeps the picture from being decoded
-/// over for a few frames only (see `vh_next_frame_dma`), which is why nothing
-/// but the export's two-deep decode channel may sit between the two calls.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct VhDma {
-    /// One DRM-PRIME handle per plane, luma then chroma -- which is how the
-    /// driver hands its own surfaces out (radeonsi exports an NV12 surface as
-    /// *two* objects into one allocation, measured 2026-08-13), and describing
-    /// it any other way is guessing at what the second one means. `fd[0]` below
-    /// zero says this picture is not on the GPU at all; `fd[1]` below zero says
-    /// both planes live in the first object.
-    pub fd: [i32; 2],
-    /// `NV12` and nothing else, today.
-    pub fourcc: u32,
-    /// DRM format modifier of the buffer, passed through to the import.
-    pub modifier: u64,
-    /// The surface's own size, which is the picture's rounded up to whatever
-    /// the codec codes in -- what an encoder has to agree with, sample for
-    /// sample, before it can read this buffer at all.
-    pub coded_width: u32,
-    pub coded_height: u32,
-    /// The picture inside it.
-    pub width: u32,
-    pub height: u32,
-    /// Luma then chroma, each inside its own object above.
-    pub offset: [u32; 2],
-    pub stride: [u32; 2],
-}
-
-impl Default for VhDma {
-    fn default() -> Self {
-        Self {
-            fd: [-1, -1],
-            fourcc: 0,
-            modifier: 0,
-            coded_width: 0,
-            coded_height: 0,
-            width: 0,
-            height: 0,
-            offset: [0; 2],
-            stride: [0; 2],
-        }
-    }
-}
-
-/// A [`VhDma`] with its file descriptor owned: dropping it closes the handle,
-/// which is the only thing this side of the ABI has to get right.
-pub struct DmaFrame(VhDma);
-
-impl DmaFrame {
-    /// Takes ownership of descriptors that arrived from somewhere other than a
-    /// decode session -- which is the `hw-encode-child` helper, receiving over
-    /// `SCM_RIGHTS` the very buffer the parent's decoder wrote into.
-    #[doc(hidden)]
-    pub fn from_desc(desc: VhDma) -> Self {
-        Self(desc)
-    }
-
-    pub fn width(&self) -> u32 {
-        self.0.width
-    }
-
-    pub fn height(&self) -> u32 {
-        self.0.height
-    }
-}
-
-impl Drop for DmaFrame {
-    fn drop(&mut self) {
-        for fd in self.0.fd {
-            if fd >= 0 {
-                // SAFETY: the plugin transferred these descriptors to us with
-                // the frame and nothing else owns them; `DmaFrame` is not
-                // `Clone`, and the two are distinct handles even where they
-                // name one allocation.
-                drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) });
-            }
-        }
-    }
-}
-
-/// What *this machine* takes, as far as the plugin implements it: one bit per
-/// codec ([`CAP_H264`] and its four neighbours) in each mask, so a caller reads
-/// "H.264 decodes and encodes here, HEVC only decodes" off three `u32`s.
-///
-/// The intersection is the plugin's to compute, never the driver's alone: a GPU
-/// with an HEVC *encode* entrypoint is still not an HEVC encoder here -- the
-/// plugin has no such entry point -- and a capability nothing can reach would be
-/// a lie in whatever the front-end draws from this.
-#[repr(C)]
+/// What the driver says this machine decodes and encodes: one bit per codec
+/// ([`CAP_H264`] and its neighbours) in each mask.
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VhCaps {
     pub decode: u32,
     pub encode: u32,
-    /// Codecs whose 10-bit profiles decode: the driver has the profile *and* a
-    /// P010 image format for the read-back, which is the pair the plugin's
-    /// 10-bit path needs.
+    /// Codecs whose 10-bit profiles decode.
     pub decode_10bit: u32,
 }
 
@@ -196,255 +111,357 @@ pub const CAP_HEVC: u32 = 1 << 1;
 pub const CAP_VP9: u32 = 1 << 2;
 pub const CAP_AV1: u32 = 1 << 3;
 
-/// VP8 decodes on `ec-vp8` inside the plugin -- software, linked into the
-/// plugin itself, no GPU and no VA-API profile anywhere in it -- so this bit
-/// is the *plugin's* seat, never the driver's, and it lights up
-/// [`VhCaps::decode`] unconditionally: there is no library whose presence the
-/// bit depends on any more. The hardware line in [`crate::caps`] deliberately
-/// keeps it off, being a line about what the GPU takes.
+/// VP8 decodes on `ec-vp8` inside the child -- software, no GPU and no VA-API
+/// profile anywhere in it -- so this bit is the child's seat, never the
+/// driver's, and it lights up [`VhCaps::decode`] unconditionally. The hardware
+/// line in [`crate::caps`] deliberately keeps it off.
 pub const CAP_VP8: u32 = 1 << 4;
 
-struct Plugin {
-    open_at: unsafe extern "C" fn(*const c_char, u32) -> *mut c_void,
-    meta: unsafe extern "C" fn(*mut c_void, *mut VhMeta) -> i32,
-    next_frame: unsafe extern "C" fn(*mut c_void, *mut VhFrame) -> i32,
-    /// The zero-copy door, and optional for the same reason [`Plugin::caps`] is:
-    /// a plugin built before it decodes exactly as it did, through the read-back
-    /// above.
-    next_frame_dma: Option<
-        unsafe extern "C" fn(*mut c_void, *mut VhFrame, *mut VhDma, u32, u32, u32, u32) -> i32,
-    >,
-    close: unsafe extern "C" fn(*mut c_void),
-    /// The capability query, and the one symbol of this table that may be
-    /// missing: a plugin built before it exports the four above and not this,
-    /// which costs a front-end the listing and never a decode.
-    caps: Option<unsafe extern "C" fn(*mut VhCaps) -> i32>,
-    /// Repositioning an open session, and optional for the reason `caps` is: a
-    /// plugin built before it decodes exactly as it did, and a caller that
-    /// cannot reposition closes the session and opens another -- which is what
-    /// every seek did before this symbol existed.
-    seek: Option<unsafe extern "C" fn(*mut c_void, u32) -> i32>,
-    // Never dropped (lives in a static), so the fn pointers above stay valid.
-    _lib: Library,
+/// A picture's DRM-PRIME description, without its file descriptors (those
+/// travel beside it in a [`DmaFrame`]): one object per plane, luma first, or one
+/// object for both.
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VhDma {
+    /// `NV12` and nothing else, today.
+    pub fourcc: u32,
+    /// DRM format modifier of the buffer, passed through to the import.
+    pub modifier: u64,
+    /// The surface's own size, rounded up to what the codec codes in.
+    pub coded_width: u32,
+    pub coded_height: u32,
+    /// The picture inside it.
+    pub width: u32,
+    pub height: u32,
+    /// Luma then chroma, each inside its own object.
+    pub offset: [u32; 2],
+    pub stride: [u32; 2],
 }
 
-fn plugin() -> Option<&'static Plugin> {
-    static PLUGIN: OnceLock<Option<Plugin>> = OnceLock::new();
-    PLUGIN.get_or_init(load).as_ref()
+/// One decoded picture left on the GPU, with the descriptors owned: dropping it
+/// closes them. The decode child keeps the buffer out of its pool for a few
+/// pictures only (see `DMA_HOLD` in engine-hw), so encode it before asking for
+/// several more.
+#[derive(Debug)]
+pub struct DmaFrame {
+    pub desc: VhDma,
+    /// One per plane object, luma first.
+    pub fds: Vec<OwnedFd>,
 }
 
-/// Where the plugin may live: next to the executable first (cargo puts both in
-/// target/<profile>), then whatever the dynamic linker's search path turns up.
-fn candidates() -> impl Iterator<Item = PathBuf> {
-    std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(|dir| dir.join(LIB_NAME)))
-        .into_iter()
-        .chain(std::iter::once(PathBuf::from(LIB_NAME)))
-}
-
-fn load() -> Option<Plugin> {
-    for candidate in candidates() {
-        // SAFETY: loading a shared object runs its initialisers; we only ever
-        // name our own plugin, and every symbol below is type-checked against
-        // the definitions this crate shares with it.
-        let lib = match unsafe { Library::new(candidate) } {
-            Ok(lib) => lib,
-            Err(_) => continue,
-        };
-        let plugin = unsafe {
-            (|| {
-                Some(Plugin {
-                    open_at: *lib.get(b"vh_open_at\0").ok()?,
-                    meta: *lib.get(b"vh_meta\0").ok()?,
-                    next_frame: *lib.get(b"vh_next_frame\0").ok()?,
-                    next_frame_dma: lib.get(b"vh_next_frame_dma\0").ok().map(|s| *s),
-                    close: *lib.get(b"vh_close\0").ok()?,
-                    caps: lib.get(b"vh_caps\0").ok().map(|s| *s),
-                    seek: lib.get(b"vh_seek\0").ok().map(|s| *s),
-                    _lib: lib,
-                })
-            })()
-        };
-        if plugin.is_some() {
-            return plugin;
-        }
+impl DmaFrame {
+    pub fn width(&self) -> u32 {
+        self.desc.width
     }
-    None
+
+    pub fn height(&self) -> u32 {
+        self.desc.height
+    }
 }
 
-/// What the plugin says this machine decodes and encodes, asked once per
-/// process and cached: the answer cannot change while we run.
+/// Bytes of one packed I420 picture of this size.
+fn i420_bytes(width: u32, height: u32) -> usize {
+    let (w, h) = (width as usize, height as usize);
+    w * h + 2 * (w.div_ceil(2) * h.div_ceil(2))
+}
+
+/// Reads a `u32` little-endian at `at`, or `None` past the end.
+fn le_u32(bytes: &[u8], at: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?))
+}
+
+/// The one-time capability query, asked of a child that answers and exits.
+/// `None` on every way there is no answer -- no child, no driver, a child that
+/// refuses -- and a caller says "software only" for all of them.
 ///
-/// `None` on every way there is no answer -- no plugin, a plugin older than the
-/// symbol (optional exactly as `vh_enc_av1_open` is: such a plugin still
-/// decodes), no driver, a driver that refuses the query -- and a caller says
-/// "software only" for all of them, which is what they mean.
-///
-/// VP8 sits outside that reading on a driverless machine: its decoder is
-/// `ec-vp8` inside the plugin, so the plugin may open a VP8 file where this
-/// table answers `None`. Nothing here promises otherwise -- the decode path
-/// asks the plugin, not this table -- and the one display-dependent half the
-/// front-end draws from this stays exactly as truthful as it was.
+/// VP8 sits outside that reading on a driverless machine: its decoder is inside
+/// the child, so a VP8 file may open where this answers `None`.
 ///
 /// Costs one VA-API init (~90 ms) the first time: ask it off a render thread.
 pub fn caps() -> Option<VhCaps> {
     static CAPS: OnceLock<Option<VhCaps>> = OnceLock::new();
-    *CAPS.get_or_init(|| {
-        let query = plugin()?.caps?;
-        let mut caps = VhCaps::default();
-        // SAFETY: the plugin writes the struct it is handed and reports "no
-        // answer" as a negative code; nothing is borrowed across the call.
-        match unsafe { query(&mut caps) } {
-            0 => Some(caps),
-            _ => None,
-        }
-    })
+    *CAPS.get_or_init(query_caps)
 }
 
-/// An open hardware decode session. Dropping it closes the plugin session.
+fn query_caps() -> Option<VhCaps> {
+    let (mut child, mut sock) = spawn_child(&[OsString::from("caps")])?;
+    let mut body = Vec::new();
+    let answer = match recv_reply(&mut sock, &mut body) {
+        Ok((R_AU, _)) => Some(VhCaps {
+            decode: le_u32(&body, 0)?,
+            encode: le_u32(&body, 4)?,
+            decode_10bit: le_u32(&body, 8)?,
+        }),
+        _ => None,
+    };
+    reap(&mut child);
+    answer
+}
+
+/// Kills and reaps a child. Kills first: a child may be stuck in a driver
+/// rather than dead, and a stuck child is never waited for.
+fn reap(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Picture count at which new sessions inject a hardware error; negative for
+/// none. Read once per [`HwSession::open_at`].
+static FAIL_AFTER: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
+
+/// Test hook: sessions opened from now on report a hardware error after
+/// `pictures` pictures (counted from the open, or the last seek), as a hung or
+/// reset GPU context would. `None` switches it off. `EC_HW_FAIL_AT=N` does the
+/// same for a whole process.
+#[doc(hidden)]
+pub fn inject_failure_after(pictures: Option<u64>) {
+    let value = pictures.map_or(-1, |n| i64::try_from(n).unwrap_or(i64::MAX));
+    FAIL_AFTER.store(value, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn injected_failure() -> Option<u64> {
+    match FAIL_AFTER.load(std::sync::atomic::Ordering::SeqCst) {
+        n if n >= 0 => Some(n as u64),
+        _ => crate::envcfg::var("EC_HW_FAIL_AT")?.parse().ok(),
+    }
+}
+
+/// What one decode request handed back.
+enum Fetched {
+    /// The picture is in the session's pixel buffer.
+    Pixels,
+    /// The picture is still on the GPU.
+    Dma(DmaFrame),
+}
+
+/// An open hardware decode session, in a child process of its own. Dropping it
+/// kills the child.
 pub struct HwSession {
-    plugin: &'static Plugin,
-    handle: *mut c_void,
+    child: Child,
+    sock: std::os::unix::net::UnixStream,
+    /// The staging buffer pictures in memory are read out of. Its capacity is
+    /// the child's own, so a frame that does not fit comes with a new one.
+    shm: Shm,
+    meta: VhMeta,
+    /// The last reply's body.
+    body: Vec<u8>,
+    /// The last picture read out of `shm`, packed I420.
+    pixels: Vec<u8>,
+    /// Set the moment the child is known gone, so every later call refuses in
+    /// the same words instead of waiting on a socket nobody holds.
+    lost: Option<String>,
+    /// Test hook: the number of pictures after which `next_frame*` reports a
+    /// hardware error. Set by [`inject_failure_after`] or `EC_HW_FAIL_AT`.
+    fail_after: Option<u64>,
+    delivered: u64,
 }
 
 impl HwSession {
-    /// Probes the plugin against this very file: success means the driver,
-    /// the render node and the stream's profile are all usable.
+    /// Probes the child against this very file: success means the driver, the
+    /// render node and the stream's profile are all usable.
     pub fn open(path: &Path) -> Option<Self> {
         Self::open_at(path, 0)
     }
 
     /// As [`HwSession::open`], but the first [`HwSession::next_frame`] returns
     /// display index `start_frame`; earlier pictures are decoded and dropped
-    /// inside the plugin, without the read-back copy.
+    /// inside the child, without the read-back copy.
     pub fn open_at(path: &Path, start_frame: u32) -> Option<Self> {
-        let plugin = plugin()?;
-        let c_path = CString::new(path.as_os_str().as_encoded_bytes()).ok()?;
+        #[cfg(test)]
+        OPEN_ATTEMPTS.with(|n| n.set(n.get() + 1));
         // Sample ids are 1-based, frame indices 0-based.
         let target_sample = start_frame.saturating_add(1);
-        // SAFETY: `c_path` is a valid NUL-terminated string alive for the call.
-        let handle = unsafe { (plugin.open_at)(c_path.as_ptr(), target_sample) };
-        if handle.is_null() {
+        let args = [
+            OsString::from("decode"),
+            path.as_os_str().to_owned(),
+            OsString::from(target_sample.to_string()),
+        ];
+        let (mut child, mut sock) = spawn_child(&args)?;
+        let mut body = Vec::new();
+        let opened = match recv_reply(&mut sock, &mut body) {
+            Ok((R_AU, mut fds)) if fds.len() == 1 => {
+                meta_from_wire(&body).map(|meta| (meta, fds.remove(0)))
+            }
+            // A child that said no, or died opening the driver, is no session.
+            _ => None,
+        };
+        let Some((meta, fd)) = opened else {
+            reap(&mut child);
             return None;
-        }
-        Some(Self { plugin, handle })
+        };
+        Some(Self {
+            child,
+            sock,
+            shm: Shm::from_fd(fd, i420_bytes(meta.width, meta.height)),
+            meta,
+            body,
+            pixels: Vec::new(),
+            lost: None,
+            fail_after: injected_failure(),
+            delivered: 0,
+        })
     }
 
     /// Repositions this very session so the next [`HwSession::next_frame`]
-    /// returns display index `start_frame` -- the same landing
-    /// [`HwSession::open_at`] gives, without the VA-API initialisation (~90 ms),
-    /// the render node probe and the container parse that opening one again
-    /// costs. What lets a decode worker outlive the seeks its caller makes.
-    ///
-    /// `false` when the plugin cannot do it -- too old to export the symbol, or
-    /// a decoder that would not flush -- and the caller then opens a new session
-    /// exactly as it always did. The session is left untouched either way, so a
-    /// `false` is never a half-moved decoder.
+    /// returns display index `start_frame`, without a new child and its driver
+    /// initialisation. `false` when the child cannot do it, and the caller then
+    /// opens a new session as it always did. The session is left usable either
+    /// way.
     pub fn seek(&mut self, start_frame: u32) -> bool {
-        let Some(seek) = self.plugin.seek else {
-            return false;
-        };
         // Sample ids are 1-based, frame indices 0-based -- as in `open_at`.
         let target_sample = start_frame.saturating_add(1);
-        // SAFETY: `handle` came from `vh_open_at` and is still open; the plugin
-        // writes nothing through it and the call cannot unwind (it catches).
-        unsafe { seek(self.handle, target_sample) == 0 }
+        let moved = matches!(self.call(T_SEEK, &target_sample.to_le_bytes()), Ok((R_AU, _)));
+        if moved {
+            self.delivered = 0;
+        }
+        moved
+    }
+
+    /// The injected error, once `fail_after` pictures have been delivered.
+    fn inject(&mut self) -> crate::Result<()> {
+        if let Some(limit) = self.fail_after {
+            if self.delivered >= limit {
+                return Err(format!("injected hardware error after {limit} pictures").into());
+            }
+            self.delivered += 1;
+        }
+        Ok(())
     }
 
     pub fn meta(&self) -> Option<VhMeta> {
-        let mut meta = VhMeta::default();
-        // SAFETY: `handle` came from `vh_open_at` and is still open.
-        if unsafe { (self.plugin.meta)(self.handle, &mut meta) } < 0 {
-            return None;
-        }
-        Some(meta)
+        Some(self.meta)
     }
 
     /// Next picture in display order as tightly packed I420 `(y, u, v)`.
     /// `Ok(None)` is clean end of stream.
-    pub fn next_frame(&mut self) -> crate::Result<Option<(&[u8], &[u8], &[u8], u32, u32)>> {
-        let mut frame = VhFrame::default();
-        // SAFETY: `handle` is live; the plugin fills `frame` with pointers that
-        // stay valid until the next call, which `&mut self` prevents overlapping.
-        match unsafe { (self.plugin.next_frame)(self.handle, &mut frame) } {
-            0 => return Ok(None),
-            1 => {}
-            code => return Err(format!("hardware decode failed (code {code})").into()),
+    pub fn next_frame(&mut self) -> crate::Result<Option<Planes<'_>>> {
+        self.inject()?;
+        match self.fetch(T_NEXT, &[])? {
+            None => Ok(None),
+            Some(Fetched::Pixels) => Ok(Some(self.planes())),
+            Some(Fetched::Dma(_)) => Err("the decoder handed over a GPU buffer nobody asked for".into()),
         }
-        self.pixels(&frame).map(Some)
     }
 
     /// The next picture *without reading it back* where the caller's encoder can
-    /// take the buffer the decoder wrote into -- which is what `want` describes,
-    /// down to the coded size, because an encoder reads a surface of its own
-    /// shape or none at all.
-    ///
-    /// Anything the plugin cannot hand over that way comes back as pixels
+    /// take the buffer the decoder wrote into -- which is what `want` describes.
+    /// Anything the child cannot hand over that way comes back as pixels
     /// instead ([`HwPicture::Pixels`]), so a mismatch costs the read-back it
-    /// always cost and never a frame. A plugin too old to know the door exists
-    /// is the same answer.
+    /// always cost and never a frame.
     ///
     /// The buffer behind a [`DmaFrame`] is the decoder's, held out of its pool
     /// for a few pictures only: encode it before asking this for a few more.
     pub fn next_frame_dma(&mut self, want: DmaWant) -> crate::Result<Option<HwPicture<'_>>> {
-        let Some(next_dma) = self.plugin.next_frame_dma else {
-            return Ok(self
-                .next_frame()?
-                .map(|(y, u, v, w, h)| HwPicture::Pixels(y, u, v, w, h)));
-        };
-        let mut frame = VhFrame::default();
-        let mut dma = VhDma::default();
-        // SAFETY: as `next_frame`, plus a writable descriptor whose `fd` the
-        // plugin either hands us ownership of or leaves at -1.
-        let code = unsafe {
-            next_dma(
-                self.handle,
-                &mut frame,
-                &mut dma,
-                want.coded_width,
-                want.coded_height,
-                want.width,
-                want.height,
-            )
-        };
-        match code {
-            0 => return Ok(None),
-            1 => {}
-            code => return Err(format!("hardware decode failed (code {code})").into()),
+        self.inject()?;
+        let mut body = Vec::with_capacity(16);
+        for value in [want.coded_width, want.coded_height, want.width, want.height] {
+            body.extend_from_slice(&value.to_le_bytes());
         }
-        if dma.fd[0] >= 0 {
-            return Ok(Some(HwPicture::Dma(DmaFrame(dma))));
+        match self.fetch(T_NEXT_DMA, &body)? {
+            None => Ok(None),
+            Some(Fetched::Dma(frame)) => Ok(Some(HwPicture::Dma(frame))),
+            Some(Fetched::Pixels) => {
+                let (y, u, v, width, height) = self.planes();
+                Ok(Some(HwPicture::Pixels(y, u, v, width, height)))
+            }
         }
-        let (y, u, v, w, h) = self.pixels(&frame)?;
-        Ok(Some(HwPicture::Pixels(y, u, v, w, h)))
     }
 
-    /// The plugin's plane pointers as slices, checked against the strides it
-    /// declares -- the one shape this side takes.
-    fn pixels(&self, frame: &VhFrame) -> crate::Result<(&[u8], &[u8], &[u8], u32, u32)> {
-        let (w, h) = (frame.width as usize, frame.height as usize);
+    /// One decode request and its reply: `None` at end of stream, otherwise
+    /// where the picture is.
+    fn fetch(&mut self, request: u8, body: &[u8]) -> crate::Result<Option<Fetched>> {
+        let (tag, mut fds) = self.call(request, body)?;
+        if tag == R_NONE {
+            return Ok(None);
+        }
+        let reply = self.body.clone();
+        match reply.first().copied() {
+            Some(K_PIXELS) if tag == R_AU => {
+                let bad = || -> crate::Error { "the decoder sent a short picture header".into() };
+                let width = le_u32(&reply, 1).ok_or_else(bad)?;
+                let height = le_u32(&reply, 5).ok_or_else(bad)?;
+                let needed = i420_bytes(width, height);
+                if let Some(fd) = fds.pop() {
+                    // The child made a bigger staging buffer for this frame.
+                    self.shm = Shm::from_fd(fd, needed);
+                }
+                if needed > self.shm.capacity() {
+                    return Err(format!("a {width}x{height} picture does not fit the staging buffer").into());
+                }
+                self.shm
+                    .read_into(&mut self.pixels, needed)
+                    .map_err(|e| format!("cannot read the staging buffer: {e}"))?;
+                self.meta.width = width;
+                self.meta.height = height;
+                Ok(Some(Fetched::Pixels))
+            }
+            Some(K_DMA) if tag == R_AU => {
+                let desc = dma_from_wire(&reply).ok_or("the decoder sent a short GPU buffer header")?;
+                let count = usize::from(reply[DMA_BODY - 1]);
+                if fds.len() != count || !(1..=2).contains(&count) {
+                    return Err("the decoder's GPU buffer came without its descriptors".into());
+                }
+                self.meta.width = desc.width;
+                self.meta.height = desc.height;
+                Ok(Some(Fetched::Dma(DmaFrame { desc, fds })))
+            }
+            _ => Err(format!("unexpected reply {tag} from the decoder").into()),
+        }
+    }
+
+    /// The picture last read into `pixels`, as planes of the current size.
+    fn planes(&self) -> Planes<'_> {
+        let (w, h) = (self.meta.width as usize, self.meta.height as usize);
         let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
-        if frame.y.is_null()
-            || frame.u.is_null()
-            || frame.v.is_null()
-            || frame.y_stride != w
-            || frame.u_stride != cw
-            || frame.v_stride != cw
-        {
-            return Err("hardware plugin returned a non-packed I420 frame".into());
+        let (y, rest) = self.pixels.split_at(w * h);
+        let (u, rest) = rest.split_at(cw * ch);
+        (y, u, &rest[..cw * ch], self.meta.width, self.meta.height)
+    }
+
+    /// One request and its reply on this session's socket. A child that does
+    /// not answer, or is gone, is reaped here and every later call refuses.
+    fn call(&mut self, tag: u8, body: &[u8]) -> crate::Result<(u8, Vec<OwnedFd>)> {
+        if let Some(gone) = &self.lost {
+            return Err(Lost(gone.clone()).into());
         }
-        // SAFETY: plane pointers are non-null and the strides just checked above
-        // pin each plane's length; the borrow ends before the next call.
-        unsafe {
-            Ok((
-                std::slice::from_raw_parts(frame.y, w * h),
-                std::slice::from_raw_parts(frame.u, cw * ch),
-                std::slice::from_raw_parts(frame.v, cw * ch),
-                frame.width,
-                frame.height,
-            ))
+        let mut msg = Vec::with_capacity(1 + body.len());
+        msg.push(tag);
+        msg.extend_from_slice(body);
+        if let Err(e) = send_msg(&self.sock, &msg, &[]) {
+            return Err(self.bury(&e.to_string()));
         }
+        match recv_reply(&mut self.sock, &mut self.body) {
+            Ok((R_ERR, _)) => Err(String::from_utf8_lossy(&self.body).into_owned().into()),
+            Ok(answer) => Ok(answer),
+            Err(e) => Err(self.bury(&e.to_string())),
+        }
+    }
+
+    fn bury(&mut self, why: &str) -> crate::Error {
+        reap(&mut self.child);
+        let message = format!("{HW_LOST} stopped answering ({why}) and was killed; the driver took it down and not the editor");
+        self.lost = Some(message.clone());
+        Lost(message).into()
+    }
+}
+
+/// The `K_DMA` header after its kind byte.
+fn dma_from_wire(body: &[u8]) -> Option<VhDma> {
+    let at = 1;
+    Some(VhDma {
+        fourcc: le_u32(body, at)?,
+        modifier: u64::from_le_bytes(body.get(at + 4..at + 12)?.try_into().ok()?),
+        coded_width: le_u32(body, at + 12)?,
+        coded_height: le_u32(body, at + 16)?,
+        width: le_u32(body, at + 20)?,
+        height: le_u32(body, at + 24)?,
+        offset: [le_u32(body, at + 28)?, le_u32(body, at + 32)?],
+        stride: [le_u32(body, at + 36)?, le_u32(body, at + 40)?],
+    })
+}
+
+impl Drop for HwSession {
+    fn drop(&mut self) {
+        reap(&mut self.child);
     }
 }
 
@@ -465,374 +482,22 @@ pub enum HwPicture<'a> {
     Dma(DmaFrame),
 }
 
-impl Drop for HwSession {
-    fn drop(&mut self) {
-        // SAFETY: `handle` came from `vh_open_at` and is closed exactly once.
-        unsafe { (self.plugin.close)(self.handle) }
-    }
-}
-
-// The plugin session is used from one thread at a time (the decode worker) and
-// never shared; VA-API state inside it is not `Sync`.
-unsafe impl Send for HwSession {}
-
-struct EncPlugin {
-    open: extern "C" fn(u32, u32, u32, u32, u64) -> *mut c_void,
-    /// The AV1 seat, and the one symbol that may be missing: a plugin built
-    /// before AV1 encode existed exports the four below and not this, which
-    /// costs an AV1 export its hardware path and nothing else. Every session it
-    /// opens is fed and closed through the very same three entry points -- the
-    /// plugin keeps one session type for both codecs, so the codec is decided
-    /// once, at the open, exactly as the H.264 seat's parameters are.
-    open_av1: Option<extern "C" fn(u32, u32, u32, u32, u64) -> *mut c_void>,
-    /// The HEVC seat, missing from an older plugin for the same reason and at
-    /// the same cost: an HEVC export then runs on the software intra encoder.
-    /// Four arguments more than the others: what the SPS says the samples mean
-    /// ([`HwEncoder::open_hevc`]), which is why the symbol is named apart from
-    /// the colourless `vh_enc_hevc_open` it replaced rather than sharing its
-    /// name with another signature.
-    open_hevc: Option<extern "C" fn(u32, u32, u32, u32, u64, u32, u32, u32, i32) -> *mut c_void>,
-    /// The **intra-only** H.264 seat, missing from an older plugin for the same
-    /// reason and at the same cost: a proxy then runs on the software encoder,
-    /// which codes one frame a GOP and so writes the same kind of file.
-    open_intra: Option<extern "C" fn(u32, u32, u32, u32, u64) -> *mut c_void>,
-    frame:
-        unsafe extern "C" fn(*mut c_void, *const VhFrame, i32, *mut *const u8, *mut usize) -> i32,
-    /// The zero-copy pair, both optional together: an older plugin exports
-    /// neither and every picture reaches it as bytes, which is what it always
-    /// did.
-    dma_geometry: Option<unsafe extern "C" fn(*mut c_void, *mut u32, *mut u32) -> i32>,
-    frame_dma: Option<
-        unsafe extern "C" fn(*mut c_void, *const VhDma, i32, *mut *const u8, *mut usize) -> i32,
-    >,
-    drain: unsafe extern "C" fn(*mut c_void, *mut *const u8, *mut usize) -> i32,
-    close: unsafe extern "C" fn(*mut c_void),
-    // Never dropped (lives in a static), so the fn pointers above stay valid.
-    _lib: Library,
-}
-
-fn enc_plugin() -> Option<&'static EncPlugin> {
-    static PLUGIN: OnceLock<Option<EncPlugin>> = OnceLock::new();
-    PLUGIN.get_or_init(load_enc).as_ref()
-}
-
-fn load_enc() -> Option<EncPlugin> {
-    for candidate in candidates() {
-        // SAFETY: as in `load` -- our own plugin, symbols type-checked against
-        // the definitions this crate shares with it.
-        let lib = match unsafe { Library::new(candidate) } {
-            Ok(lib) => lib,
-            Err(_) => continue,
-        };
-        let plugin = unsafe {
-            (|| {
-                Some(EncPlugin {
-                    open: *lib.get(b"vh_enc_open\0").ok()?,
-                    open_av1: lib.get(b"vh_enc_av1_open\0").ok().map(|s| *s),
-                    open_hevc: lib.get(b"vh_enc_hevc_open_colour\0").ok().map(|s| *s),
-                    open_intra: lib.get(b"vh_enc_open_intra\0").ok().map(|s| *s),
-                    frame: *lib.get(b"vh_enc_frame\0").ok()?,
-                    dma_geometry: lib.get(b"vh_enc_dma_geometry\0").ok().map(|s| *s),
-                    frame_dma: lib.get(b"vh_enc_frame_dma\0").ok().map(|s| *s),
-                    drain: *lib.get(b"vh_enc_drain\0").ok()?,
-                    close: *lib.get(b"vh_enc_close\0").ok()?,
-                    _lib: lib,
-                })
-            })()
-        };
-        if plugin.is_some() {
-            return plugin;
-        }
-    }
-    None
-}
-
-/// An open hardware encode session **in this process**, which is the one thing
-/// an editor must not have: the driver's own C threads `abort()` the process
-/// they are in when the video ring resets ([`crate::hwproc`]). Public only so
-/// that the `hw-encode-child` helper -- the process whose whole job is to be the
-/// one that dies -- can open it; every other caller goes through [`HwEncoder`],
-/// which is this seat held at arm's length.
+/// An open hardware encode session, in a child process of its own. See
+/// [`crate::hwproc`] for why the driver is never in the editor's address space.
 ///
-/// Dropping it closes the plugin session.
-#[doc(hidden)]
-pub struct LocalEncoder {
-    plugin: &'static EncPlugin,
-    handle: *mut c_void,
-}
-
-impl LocalEncoder {
-    /// The four seats behind one argument, which is how the helper is told
-    /// which of them to open.
-    pub fn open_seat(open: crate::hwproc::Open) -> Option<Self> {
-        let (w, h, n, d, b) = (
-            open.width,
-            open.height,
-            open.fps_num,
-            open.fps_den,
-            open.bitrate,
-        );
-        match open.seat {
-            crate::hwproc::Seat::H264 => Self::open(w, h, n, d, b),
-            crate::hwproc::Seat::Intra => Self::open_intra(w, h, n, d, b),
-            crate::hwproc::Seat::Av1 => Self::open_av1(w, h, n, d, b),
-            crate::hwproc::Seat::Hevc => Self::open_hevc(w, h, n, d, b, open.colour),
-        }
-    }
-
-    /// H.264 at `width`x`height`, `fps_num / fps_den` frames per second, coded
-    /// at a constant `bitrate` bits per second. `None` whenever hardware encode
-    /// is unavailable -- plugin missing, plugin too old to export the encode
-    /// entry points, no driver, dimensions the driver refuses -- and the caller
-    /// falls back to the software encoder.
-    pub fn open(width: u32, height: u32, fps_num: u32, fps_den: u32, bitrate: u64) -> Option<Self> {
-        let plugin = enc_plugin()?;
-        Self::opened(
-            plugin,
-            plugin.open,
-            width,
-            height,
-            fps_num,
-            fps_den,
-            bitrate,
-        )
-    }
-
-    /// The same H.264 seat, **intra-only**: every picture comes back an IDR
-    /// with its own parameter sets, so every frame of the file is one a decoder
-    /// may be started from. What [`crate::proxy`] codes a stand-in with.
-    ///
-    /// `None` on everything [`HwEncoder::open`] answers `None` to *and* on a
-    /// plugin built before this seat existed -- and that `None` matters more
-    /// than the others: the caller must then take the software encoder, which
-    /// codes one frame a GOP, rather than the ordinary hardware seat, which
-    /// would write a long-GOP file under a name that promises otherwise.
-    pub fn open_intra(
-        width: u32,
-        height: u32,
-        fps_num: u32,
-        fps_den: u32,
-        bitrate: u64,
-    ) -> Option<Self> {
-        let plugin = enc_plugin()?;
-        let open = plugin.open_intra?;
-        Self::opened(plugin, open, width, height, fps_num, fps_den, bitrate)
-    }
-
-    /// The same, coding AV1 instead. `None` on everything [`HwEncoder::open`]
-    /// answers `None` to *and* on a plugin or a GPU with no AV1 encoder -- an
-    /// AV1 encode entrypoint is recent hardware, so this is the fallback that
-    /// really fires, and the caller's software AV1 encoder takes the export
-    /// without saying anything about it.
-    ///
-    /// The caller only reaches this when a person picked
-    /// [`crate::export::EncoderSeat::Hardware`] for an AV1 export: the vendored
-    /// encoder reset this project's own GPU, which
-    /// [`crate::export::Enc::open_av1`] states in full.
-    pub fn open_av1(
-        width: u32,
-        height: u32,
-        fps_num: u32,
-        fps_den: u32,
-        bitrate: u64,
-    ) -> Option<Self> {
-        let plugin = enc_plugin()?;
-        let open = plugin.open_av1?;
-        Self::opened(plugin, open, width, height, fps_num, fps_den, bitrate)
-    }
-
-    /// The same, coding HEVC. Unlike the AV1 seat this is **not** behind an
-    /// opt-in: it is the default for an HEVC export, and what makes that safe is
-    /// that the pictures it codes are intra-only, which is the same file the
-    /// software seat writes ([`crate::export::Enc::open_hevc`]) and not the
-    /// GPU-resetting inter path AV1's opt-in exists for.
-    ///
-    /// `None` on everything [`HwEncoder::open`] answers `None` to, on a plugin
-    /// too old to export the symbol, on a GPU with no HEVC encode entrypoint,
-    /// and below 384x384 -- the driver's own floor, stated in the plugin. The
-    /// caller then takes the software intra encoder without a word about it.
-    ///
-    /// `colour` is what the SPS will say the samples mean, and it is taken at
-    /// the open because the parameter sets are written when the sequence starts.
-    /// libavcodec's HEVC decoder overwrites a container's colour with the
-    /// bitstream's, so a seat that signalled nothing hands a player
-    /// "unspecified" -- BT.601 -- however the file is tagged.
-    pub fn open_hevc(
-        width: u32,
-        height: u32,
-        fps_num: u32,
-        fps_den: u32,
-        bitrate: u64,
-        colour: ColorDescription,
-    ) -> Option<Self> {
-        let plugin = enc_plugin()?;
-        let open = plugin.open_hevc?;
-        let (primaries, transfer, matrix) = colour.codes();
-        let handle = open(
-            width,
-            height,
-            fps_num,
-            fps_den,
-            bitrate,
-            u32::from(primaries),
-            u32::from(transfer),
-            u32::from(matrix),
-            i32::from(colour.full_range),
-        );
-        if handle.is_null() {
-            return None;
-        }
-        Some(Self { plugin, handle })
-    }
-
-    /// The null check both opens share, which is the plugin's whole way of
-    /// saying "no".
-    fn opened(
-        plugin: &'static EncPlugin,
-        open: extern "C" fn(u32, u32, u32, u32, u64) -> *mut c_void,
-        width: u32,
-        height: u32,
-        fps_num: u32,
-        fps_den: u32,
-        bitrate: u64,
-    ) -> Option<Self> {
-        let handle = open(width, height, fps_num, fps_den, bitrate);
-        if handle.is_null() {
-            return None;
-        }
-        Some(Self { plugin, handle })
-    }
-
-    /// Feeds one tightly packed I420 picture. `Ok(None)` means the encoder has
-    /// not finished an access unit yet; the returned bytes are Annex-B and stay
-    /// valid until the next call on this session.
-    pub fn encode(
-        &mut self,
-        y: &[u8],
-        u: &[u8],
-        v: &[u8],
-        width: u32,
-        height: u32,
-        force_key: bool,
-    ) -> crate::Result<Option<&[u8]>> {
-        let (w, h) = (width as usize, height as usize);
-        let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
-        if y.len() < w * h || u.len() < cw * ch || v.len() < cw * ch {
-            return Err("encode input is not a packed I420 frame".into());
-        }
-        let frame = VhFrame {
-            y: y.as_ptr(),
-            u: u.as_ptr(),
-            v: v.as_ptr(),
-            y_stride: w,
-            u_stride: cw,
-            v_stride: cw,
-            width,
-            height,
-        };
-        // SAFETY: `handle` is live, the planes outlive the call and their sizes
-        // were just checked against the strides we declare.
-        self.take(|plugin, handle, out, out_len| unsafe {
-            (plugin.frame)(handle, &frame, force_key as i32, out, out_len)
-        })
-    }
-
-    /// The surface size this seat codes in, or `None` where the plugin has no
-    /// zero-copy door at all. What [`HwEncoder::dma_want`] turns into the whole
-    /// description a decoder is asked for.
-    pub fn dma_geometry(&self) -> Option<(u32, u32)> {
-        let geometry = self.plugin.dma_geometry?;
-        self.plugin.frame_dma?;
-        let (mut coded_width, mut coded_height) = (0u32, 0u32);
-        // SAFETY: `handle` is live and both destinations are writable.
-        if unsafe { geometry(self.handle, &mut coded_width, &mut coded_height) } != 1 {
-            return None;
-        }
-        Some((coded_width, coded_height))
-    }
-
-    /// Feeds one picture the decoder left on the GPU. Same answer and same
-    /// lifetime rule as [`HwEncoder::encode`]; an error here is a real one, the
-    /// caller having asked [`HwEncoder::dma_want`] what this seat takes before
-    /// the decoder handed the buffer over.
-    pub fn encode_dma(&mut self, dma: &DmaFrame, force_key: bool) -> crate::Result<Option<&[u8]>> {
-        let Some(frame_dma) = self.plugin.frame_dma else {
-            return Err("hardware encoder has no zero-copy path".into());
-        };
-        let desc = dma.0;
-        // SAFETY: `handle` is live and `desc` outlives the call; the buffer it
-        // names is the decode session's, held for the caller by contract.
-        self.take(|_, handle, out, out_len| unsafe {
-            frame_dma(handle, &desc, force_key as i32, out, out_len)
-        })
-    }
-
-    /// Flushes the encoder; call until it returns `Ok(None)`. Same lifetime rule
-    /// as [`HwEncoder::encode`].
-    pub fn drain(&mut self) -> crate::Result<Option<&[u8]>> {
-        // SAFETY: `handle` is live.
-        self.take(|plugin, handle, out, out_len| unsafe { (plugin.drain)(handle, out, out_len) })
-    }
-
-    /// Shared tail of `encode`/`drain`: run the call, then turn the plugin's
-    /// (pointer, length) pair into a slice borrowed for as long as `&mut self`,
-    /// which is exactly the "valid until the next call" contract.
-    fn take(
-        &mut self,
-        call: impl FnOnce(&EncPlugin, *mut c_void, *mut *const u8, *mut usize) -> i32,
-    ) -> crate::Result<Option<&[u8]>> {
-        let mut ptr: *const u8 = std::ptr::null();
-        let mut len: usize = 0;
-        match call(self.plugin, self.handle, &mut ptr, &mut len) {
-            0 => return Ok(None),
-            1 => {}
-            code => return Err(format!("hardware encode failed (code {code})").into()),
-        }
-        if ptr.is_null() || len == 0 {
-            return Err("hardware encoder returned an empty access unit".into());
-        }
-        // SAFETY: the plugin promises `len` readable bytes at `ptr` until its
-        // next call on this session, which `&mut self` prevents overlapping.
-        Ok(Some(unsafe { std::slice::from_raw_parts(ptr, len) }))
-    }
-}
-
-impl Drop for LocalEncoder {
-    fn drop(&mut self) {
-        // SAFETY: `handle` came from `vh_enc_open` and is closed exactly once.
-        unsafe { (self.plugin.close)(self.handle) }
-    }
-}
-
-// As `HwSession`: used from one thread at a time (the export worker).
-unsafe impl Send for LocalEncoder {}
-
-/// An open hardware encode session, **in a child process** wherever there is a
-/// helper to run it in -- which is what keeps a driver's `abort()` off the
-/// editor. See [`crate::hwproc`] for the whole of why.
-///
-/// The API is the in-process one it replaced, call for call, so nothing in the
-/// export loop knows which side of a process boundary the encoder is on.
-pub enum HwEncoder {
-    /// The isolated seat, and the one every ordinary build takes.
-    Remote(crate::hwproc::Remote),
-    /// The seat as it was: taken only where there is no helper binary to run
-    /// (a build that produced the plugin and not the editor's own directory) or
-    /// where `VE_HW_INPROCESS` pins it, which is how the isolated path's cost is
-    /// measured against the path it replaced.
-    Local(LocalEncoder),
-}
+/// The API is the one it always was, call for call, so nothing in the export
+/// loop knows which side of a process boundary the encoder is on.
+pub struct HwEncoder(Remote);
 
 impl HwEncoder {
     /// H.264 at `width`x`height`, `fps_num / fps_den` frames per second, coded
     /// at a constant `bitrate` bits per second. `None` whenever hardware encode
-    /// is unavailable -- plugin missing, plugin too old to export the encode
-    /// entry points, no driver, dimensions the driver refuses, *or a helper that
-    /// died opening any of it* -- and the caller falls back to the software
-    /// encoder.
+    /// is unavailable -- no child binary, no driver, dimensions the driver
+    /// refuses, *or a child that died opening any of it* -- and the caller falls
+    /// back to the software encoder.
     pub fn open(width: u32, height: u32, fps_num: u32, fps_den: u32, bitrate: u64) -> Option<Self> {
         Self::seated(
-            crate::hwproc::Seat::H264,
+            Seat::H264,
             width,
             height,
             fps_num,
@@ -842,24 +507,14 @@ impl HwEncoder {
         )
     }
 
-    /// The same H.264 seat, **intra-only**: every picture comes back an IDR
-    /// with its own parameter sets, so every frame of the file is one a decoder
-    /// may be started from. What [`crate::proxy`] codes a stand-in with.
-    ///
-    /// `None` on everything [`HwEncoder::open`] answers `None` to *and* on a
-    /// plugin built before this seat existed -- and that `None` matters more
-    /// than the others: the caller must then take the software encoder, which
-    /// codes one frame a GOP, rather than the ordinary hardware seat, which
-    /// would write a long-GOP file under a name that promises otherwise.
-    pub fn open_intra(
-        width: u32,
-        height: u32,
-        fps_num: u32,
-        fps_den: u32,
-        bitrate: u64,
-    ) -> Option<Self> {
+    /// The same H.264 seat, **intra-only**: every picture comes back an IDR, so
+    /// every frame of the file is one a decoder may be started from. What
+    /// [`crate::proxy`] codes a stand-in with. `None` on a child that cannot
+    /// make that seat, and the caller must then take the software encoder rather
+    /// than the ordinary hardware seat.
+    pub fn open_intra(width: u32, height: u32, fps_num: u32, fps_den: u32, bitrate: u64) -> Option<Self> {
         Self::seated(
-            crate::hwproc::Seat::Intra,
+            Seat::Intra,
             width,
             height,
             fps_num,
@@ -869,25 +524,12 @@ impl HwEncoder {
         )
     }
 
-    /// The same, coding AV1 instead. `None` on everything [`HwEncoder::open`]
-    /// answers `None` to *and* on a plugin or a GPU with no AV1 encoder -- an
-    /// AV1 encode entrypoint is recent hardware, so this is the fallback that
-    /// really fires, and the caller's software AV1 encoder takes the export
-    /// without saying anything about it.
-    ///
-    /// The caller only reaches this when a person picked
-    /// [`crate::export::EncoderSeat::Hardware`] for an AV1 export: this is the
-    /// seat whose ring hang killed the editor on 2026-08-13, and it is now the
-    /// seat that kills a child instead.
-    pub fn open_av1(
-        width: u32,
-        height: u32,
-        fps_num: u32,
-        fps_den: u32,
-        bitrate: u64,
-    ) -> Option<Self> {
+    /// The same, coding AV1 instead. `None` on a child or a GPU with no AV1
+    /// encoder, and the caller's software AV1 encoder takes the export without
+    /// saying anything about it.
+    pub fn open_av1(width: u32, height: u32, fps_num: u32, fps_den: u32, bitrate: u64) -> Option<Self> {
         Self::seated(
-            crate::hwproc::Seat::Av1,
+            Seat::Av1,
             width,
             height,
             fps_num,
@@ -897,17 +539,9 @@ impl HwEncoder {
         )
     }
 
-    /// The same, coding HEVC. Unlike the AV1 seat this is **not** behind an
-    /// opt-in: it is the default for an HEVC export, and what makes that safe is
-    /// that the pictures it codes are intra-only, which is the same file the
-    /// software seat writes ([`crate::export::Enc::open_hevc`]) and not the
-    /// GPU-resetting inter path AV1's opt-in exists for.
-    ///
-    /// `colour` is what the SPS will say the samples mean, and it is taken at
-    /// the open because the parameter sets are written when the sequence starts.
-    /// libavcodec's HEVC decoder overwrites a container's colour with the
-    /// bitstream's, so a seat that signalled nothing hands a player
-    /// "unspecified" -- BT.601 -- however the file is tagged.
+    /// The same, coding HEVC. `colour` is what the SPS will say the samples
+    /// mean, and it is taken at the open because the parameter sets are written
+    /// when the sequence starts.
     pub fn open_hevc(
         width: u32,
         height: u32,
@@ -916,25 +550,11 @@ impl HwEncoder {
         bitrate: u64,
         colour: ColorDescription,
     ) -> Option<Self> {
-        Self::seated(
-            crate::hwproc::Seat::Hevc,
-            width,
-            height,
-            fps_num,
-            fps_den,
-            bitrate,
-            colour,
-        )
+        Self::seated(Seat::Hevc, width, height, fps_num, fps_den, bitrate, colour)
     }
 
-    /// Where the choice between the two seats is made, and the only place it is.
-    ///
-    /// A child is not started where there is nothing for it to open: with no
-    /// plugin on this machine the answer is `None` before a process is forked,
-    /// which is exactly what a plugin-less machine has always answered and at
-    /// the same cost.
     fn seated(
-        seat: crate::hwproc::Seat,
+        seat: Seat,
         width: u32,
         height: u32,
         fps_num: u32,
@@ -942,7 +562,7 @@ impl HwEncoder {
         bitrate: u64,
         colour: ColorDescription,
     ) -> Option<Self> {
-        let open = crate::hwproc::Open {
+        let open = Open {
             seat,
             width,
             height,
@@ -951,18 +571,9 @@ impl HwEncoder {
             bitrate,
             colour,
         };
-        if enc_plugin().is_none() && !crate::hwproc::faked() {
-            return None;
-        }
-        // corner-cut: a build with no helper beside the executable keeps the
-        // in-process seat rather than losing hardware encode outright, so a
-        // driver crash there is still fatal. The ceiling is packaging: ship
-        // `hw-encode-child` next to `edith` (cargo already does) and this arm is
-        // never taken.
-        if !crate::hwproc::available() || std::env::var_os("VE_HW_INPROCESS").is_some() {
-            return LocalEncoder::open_seat(open).map(Self::Local);
-        }
-        crate::hwproc::Remote::spawn(open).map(Self::Remote)
+        // No child binary beside the executable means no hardware seat at all:
+        // `Remote::spawn` answers `None` before a process is forked.
+        Remote::spawn(open).map(Self)
     }
 
     /// Feeds one tightly packed I420 picture. `Ok(None)` means the encoder has
@@ -977,28 +588,21 @@ impl HwEncoder {
         height: u32,
         force_key: bool,
     ) -> crate::Result<Option<&[u8]>> {
-        // Checked on this side of the boundary whichever seat has the picture:
-        // a caller's mistake is a caller's mistake, and the isolated seat must
-        // not turn one into a message about a dead child.
+        // Checked on this side of the boundary: a caller's mistake is a caller's
+        // mistake, and the child must not turn one into a message about a dead
+        // child.
         let (w, h) = (width as usize, height as usize);
         let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
         if y.len() < w * h || u.len() < cw * ch || v.len() < cw * ch {
             return Err("encode input is not a packed I420 frame".into());
         }
-        match self {
-            Self::Remote(remote) => remote.encode(y, u, v, width, height, force_key),
-            Self::Local(local) => local.encode(y, u, v, width, height, force_key),
-        }
+        self.0.encode(y, u, v, width, height, force_key)
     }
 
     /// What a decoded buffer must look like to reach this encoder without a
-    /// copy -- the surface size it codes in, plus the picture it was opened for
-    /// -- or `None` where the plugin has no zero-copy door at all.
+    /// copy, or `None` where the child has no zero-copy door at all.
     pub fn dma_want(&mut self, width: u32, height: u32) -> Option<DmaWant> {
-        let (coded_width, coded_height) = match self {
-            Self::Remote(remote) => remote.dma_geometry()?,
-            Self::Local(local) => local.dma_geometry()?,
-        };
+        let (coded_width, coded_height) = self.0.dma_geometry()?;
         Some(DmaWant {
             coded_width,
             coded_height,
@@ -1007,27 +611,42 @@ impl HwEncoder {
         })
     }
 
-    /// Feeds one picture the decoder left on the GPU. Same answer and same
-    /// lifetime rule as [`HwEncoder::encode`]; an error here is a real one, the
-    /// caller having asked [`HwEncoder::dma_want`] what this seat takes before
-    /// the decoder handed the buffer over.
-    ///
-    /// The buffer does not move for the isolated seat either: its descriptors
-    /// go to the child over `SCM_RIGHTS` and the pixels stay where the decoder
-    /// wrote them.
+    /// Feeds one picture the decoder left on the GPU. The descriptors go over
+    /// with the message, so the buffer itself never moves.
     pub fn encode_dma(&mut self, dma: &DmaFrame, force_key: bool) -> crate::Result<Option<&[u8]>> {
-        match self {
-            Self::Remote(remote) => remote.encode_dma(&dma.0, force_key),
-            Self::Local(local) => local.encode_dma(dma, force_key),
-        }
+        self.0.encode_dma(dma, force_key)
     }
 
-    /// Flushes the encoder; call until it returns `Ok(None)`. Same lifetime rule
-    /// as [`HwEncoder::encode`].
+    /// Flushes the encoder; call until it returns `Ok(None)`.
     pub fn drain(&mut self) -> crate::Result<Option<&[u8]>> {
-        match self {
-            Self::Remote(remote) => remote.drain(),
-            Self::Local(local) => local.drain(),
-        }
+        self.0.drain()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The meta block survives the wire, frame rate's bit pattern included.
+    #[test]
+    fn meta_round_trips_through_the_wire() {
+        let meta = VhMeta {
+            width: 1920,
+            height: 1080,
+            frame_rate: 30000.0 / 1001.0,
+            frame_count: 4321,
+            coded_width: 1920,
+            coded_height: 1088,
+            pixel_aspect_h: 4,
+            pixel_aspect_v: 3,
+        };
+        assert_eq!(meta_from_wire(&meta_to_wire(&meta)), Some(meta));
+        assert_eq!(meta_from_wire(&[0u8; 35]), None);
+    }
+
+    #[test]
+    fn i420_size_rounds_chroma_up() {
+        assert_eq!(i420_bytes(3, 3), 9 + 2 * 4);
+        assert_eq!(i420_bytes(1920, 1080), 1920 * 1080 * 3 / 2);
     }
 }

@@ -70,17 +70,24 @@ impl Coeffs {
 /// row ranges on separate threads -- each row is independent (chroma only
 /// ever reads `row / 2`, never a neighbouring output row), so splitting the
 /// row loop changes nothing about what a pixel comes out as.
+/// The three I420 planes of one frame and the strides they are read at.
+#[derive(Clone, Copy)]
+struct Planes<'a> {
+    y: &'a [u8],
+    u: &'a [u8],
+    v: &'a [u8],
+    width: usize,
+    cw: usize,
+}
+
 fn convert_rows(
     k: &Coeffs,
     lut: Option<&crate::color::Lut>,
-    y: &[u8],
-    u: &[u8],
-    v: &[u8],
-    width: usize,
-    cw: usize,
+    planes: Planes<'_>,
     rows: std::ops::Range<usize>,
     out: &mut [u8],
 ) {
+    let Planes { y, u, v, width, cw } = planes;
     for (i, row) in rows.enumerate() {
         let y_row = row * width;
         let c_row = (row / 2) * cw;
@@ -129,12 +136,13 @@ fn convert_parallel(
     height: usize,
 ) -> Vec<u8> {
     let cw = width.div_ceil(2);
+    let planes = Planes { y, u, v, width, cw };
     let mut out = vec![0u8; width * height * 4];
     let lanes = std::thread::available_parallelism()
         .map_or(1, |n| n.get())
         .min(height);
     if lanes <= 1 {
-        convert_rows(k, lut, y, u, v, width, cw, 0..height, &mut out);
+        convert_rows(k, lut, planes, 0..height, &mut out);
         return out;
     }
     let rows_per_lane = height.div_ceil(lanes);
@@ -145,7 +153,7 @@ fn convert_parallel(
             let end = (start + rows_per_lane).min(height);
             let (chunk, remainder) = rest.split_at_mut((end - start) * width * 4);
             rest = remainder;
-            scope.spawn(move || convert_rows(k, lut, y, u, v, width, cw, start..end, chunk));
+            scope.spawn(move || convert_rows(k, lut, planes, start..end, chunk));
             start = end;
         }
     });
@@ -186,8 +194,17 @@ pub fn i420_to_bgra_with(
         return i420_to_bgra(color, y, u, v, width, height);
     }
     let k = Coeffs::new(color);
-    let lut = crate::color::Lut::new(params);
-    convert_parallel(&k, Some(&lut), y, u, v, width, height)
+    let lut = (!params.sliders_identity()).then(|| crate::color::Lut::new(params, color.full_range));
+    if params.look.is_identity() {
+        return convert_parallel(&k, lut.as_ref(), y, u, v, width, height);
+    }
+    // The look's RGB stage pairs every luma sample with its chroma, which this
+    // loop's table lookups cannot: it runs on a copy first, the sliders still
+    // fold into the conversion.
+    let looked = crate::color::ColorParams { look: params.look, ..Default::default() };
+    let (mut gy, mut gu, mut gv) = (y.to_vec(), u.to_vec(), v.to_vec());
+    crate::color::apply_yuv(&looked, &mut gy, &mut gu, &mut gv, width, false);
+    convert_parallel(&k, lut.as_ref(), &gy, &gu, &gv, width, height)
 }
 
 #[cfg(test)]
@@ -239,18 +256,20 @@ mod tests {
             contrast: 1.3,
             saturation: 0.4,
             tint: 0.25,
+            ..Default::default()
         };
         let mut y: Vec<u8> = (0..64 * 48).map(|i| (i % 256) as u8).collect();
         let mut u: Vec<u8> = (0..32 * 24).map(|i| (i % 256) as u8).collect();
         let mut v: Vec<u8> = (0..32 * 24).map(|i| (255 - i % 256) as u8).collect();
         let fused = i420_to_bgra_with(&SD, &params, &y, &u, &v, 64, 48);
-        crate::color::apply_yuv(&params, &mut y, &mut u, &mut v);
+        crate::color::apply_yuv(&params, &mut y, &mut u, &mut v, 64, false);
         assert_eq!(fused, i420_to_bgra(&SD, &y, &u, &v, 64, 48));
     }
 
     /// Not asserted, printed: the numbers in `i420_to_bgra_with`'s docs come
     /// from here. `cargo test -p engine --release convert:: -- --nocapture`.
     #[test]
+    #[ignore = "perf: run with --ignored"]
     fn perf_1080p() {
         let (w, h) = (1920usize, 1080usize);
         let y: Vec<u8> = (0..w * h).map(|i| (i % 256) as u8).collect();
@@ -261,6 +280,7 @@ mod tests {
             contrast: 1.2,
             saturation: 1.3,
             tint: 0.2,
+            ..Default::default()
         };
         let runs = 20;
         let bench = |name: &str, mut f: Box<dyn FnMut()>| {
@@ -289,7 +309,7 @@ mod tests {
             "copy + apply_yuv   ",
             Box::new(|| {
                 let (mut y, mut u, mut v) = (y.clone(), u.clone(), v.clone());
-                crate::color::apply_yuv(&params, &mut y, &mut u, &mut v);
+                crate::color::apply_yuv(&params, &mut y, &mut u, &mut v, 64, false);
                 std::hint::black_box((y, u, v));
             }),
         );
@@ -328,7 +348,7 @@ mod tests {
         for (color, [yv, uv, vv], [r, g, b]) in cases {
             let out = i420_to_bgra(&color, &[yv; 4], &[uv], &[vv], 2, 2);
             assert_eq!(out.len(), 2 * 2 * 4);
-            for px in out.chunks_exact(4) {
+            for px in out.as_chunks::<4>().0 {
                 assert!(px[0].abs_diff(b) <= 2, "B {} vs {}", px[0], b);
                 assert!(px[1].abs_diff(g) <= 2, "G {} vs {}", px[1], g);
                 assert!(px[2].abs_diff(r) <= 2, "R {} vs {}", px[2], r);

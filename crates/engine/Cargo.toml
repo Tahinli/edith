@@ -3,37 +3,58 @@ name = "engine"
 version.workspace = true
 edition.workspace = true
 
+[lib]
+# No runnable doc examples; skip the rustdoc test pass.
+doctest = false
+
 # No UI dependency here, ever: the engine must stay reusable across front-ends.
 [dependencies]
-# The two audio-only export formats. Pure Rust, both of them, which is the whole
-# reason they are the two: `hound` writes the RIFF header and the PCM, `flacenc`
-# encodes FLAC. No default features on flacenc -- its `par` (rayon), `log` and
-# `serde` are for its own command-line front-end, and this needs none of them.
-hound = "3.5.1"
-flacenc = { version = "0.5.1", default-features = false }
-libloading = "0.8"
-# `memfd_create`, `mmap` and `SCM_RIGHTS` -- the three things std has no door to
-# and the whole of what puts the video driver in another process
-# (`crate::hwproc`). Not a new crate tree: it was already in this workspace's
-# lock file, pulled in by half the dependencies here, so this line compiles
-# nothing that was not compiled before.
+# The WAV writer and reader, the family's own (`ec-riff`): RIFF for the usual
+# sizes and RF64 past 4 GiB, WAVE_FORMAT_EXTENSIBLE for the layouts that need it.
+# `ec-flac` encodes FLAC (RFC 9639), the family's own encoder.
+ec-riff = { path = "../../../edith_codecs/crates/ec-riff" }
+ec-flac = { path = "../../../edith_codecs/crates/ec-flac" }
+# The noise reduction's STFT (`crate::voice`). Already in the lock file via ec-opus.
+rustfft = "6.4"
+# edith-stt speaks JSON lines ([`crate::speech`]); the server already builds this crate.
+serde_json = "1"
+# `libc` for the constants the hardware-encode child's parent reads (`SIGKILL`,
+# `ExitStatus` signals) and for the tests and examples that use it directly.
+# Not a new crate tree: it was already in this workspace's lock file.
 libc = "0.2"
-# Still images, decoded once per placed clip (`decode::Still`). Pure Rust like
-# everything else here, and already in the app's tree (gpui pulls it), so this
-# costs the build nothing new. Exactly the formats `crate::is_image` admits: no
-# default features, which would drag in a dozen decoders nothing opens.
-image = { version = "0.25", default-features = false, features = [
-    "png",
-    "jpeg",
-    "webp",
-] }
-mp4 = "0.14"
+# `memfd_create` and `recvmsg` with `SCM_RIGHTS` for the hardware-encode child
+# (`crate::hwproc`), through rustix's safe APIs: the shared staging buffer and the
+# descriptors the child hands back. "fs" and "net" are the two features those take.
+rustix = { version = "1", features = ["fs", "net", "process"] }
+# `sendmsg` with `SCM_RIGHTS` for the hardware-encode child. rustix's send side
+# takes `BorrowedFd`s, and the DMA-BUF descriptors the parent forwards are the
+# raw ints a decoder frame owns, which no safe code can borrow; nix takes raw
+# descriptors in a safe API. Already in the lock file (0.29.0), pulled in by
+# the rest of the tree, so this line compiles nothing new.
+nix = { version = "0.29", features = ["socket", "uio"] }
+# Still images: `ec-image`, the family's own decoder (PNG, JPEG, WebP, GIF, BMP,
+# TIFF), decodes every picture `decode::Still` places, reads the header-only
+# EXIF orientation and size (`probe_reader`), and makes the quarter turn of a
+# turned still (`transform`). The `image` crate is no longer a dependency.
+ec-image = { path = "../../../edith_codecs/crates/ec-image" }
+# The MP4/MOV demuxer and muxer.
+ec-mp4 = { path = "../../../edith_codecs/crates/ec-mp4" }
+# The MPEG transport stream demuxer (`.ts`, `.mts`, `.m2ts`): H.264, HEVC, MPEG-2, AAC, AC-3, MP2, MP3, LPCM, PGS.
+ec-mpegts = { path = "../../../edith_codecs/crates/ec-mpegts" }
+# The MPEG-1/2 video decoder (a software seat, always).
+ec-mpeg2 = { path = "../../../edith_codecs/crates/ec-mpeg2" }
+# (ec-prores, below, is also the decoder.) The intra-only professional picture codecs, each a software seat (`decode::prores`,
+# `decode::dnxhd`, `decode::mjpeg`): Apple ProRes, Avid DNxHD/DNxHR, Motion JPEG.
+ec-dnxhd = { path = "../../../edith_codecs/crates/ec-dnxhd" }
+ec-mjpeg = { path = "../../../edith_codecs/crates/ec-mjpeg" }
+# DV video (DV25, DVCPRO50, DVCPRO HD) with its audio and raw `.dv` files, and MPEG-4 Part 2
+# (Simple / Advanced Simple) with H.263: software seats (`decode::dv`, `decode::mpeg4`).
+ec-dv = { path = "../../../edith_codecs/crates/ec-dv" }
+ec-mpeg4 = { path = "../../../edith_codecs/crates/ec-mpeg4" }
 # zlib, for the one Matroska `ContentEncodings` scheme that is not a byte off
 # the front of every block: mkvmerge compressed subtitle tracks with it for
-# years. No new crate tree and nothing new to compile -- `image` above already
-# pulls this exact version in through `png`, and it is the pure-Rust inflate the
-# rest of the ecosystem is built on.
-miniz_oxide = "0.8"
+# years. `ec-inflate`, the family's own decoder, with a ceiling on the output.
+ec-inflate = { path = "../../../edith_codecs/crates/ec-inflate" }
 # The software H.264 seats, both of them the project's own: `ec-h264` (I/P/B
 # encode, CAVLC and CABAC, full DPB decode, weighted prediction, in-loop
 # deblocking), bit-exact against the JVT conformance suite. The decode seat
@@ -58,14 +79,13 @@ ec-h264 = { path = "../../../edith_codecs/crates/ec-h264" }
 # Its shared IR (packets, frames, the registry decoder contract the seat is
 # written against), direct because decode.rs names those types itself.
 ec-core = { path = "../../../edith_codecs/crates/ec-core" }
-# The multichannel AAC decode seat: symphonia's own refuses anything wider than
-# stereo outright (`aac/mod.rs:93`, "aac: aac too complex"), and a 5.1 or 7.1
-# film soundtrack is exactly that. `ec-aac`, the family's own decoder, took the
-# multichannel seat from `rusty_aac` -- it hands 5.1 back already reordered
-# into FL, FR, FC, LFE, BL, BR, the order the downmix in `audio` folds, the
-# same one the seat always delivered. It took the *encode* seat too (the swap
-# that removed `rusty_aac` from the tree): every re-encoded track's sound now
-# leaves through `export.rs`'s `encode_audio` on this encoder.
+# The AAC seat, both ways: every AAC stream edith decodes -- mono to 7.1, LC and
+# HE-AAC, from mp4, Matroska or ADTS -- goes through this decoder. symphonia's
+# refuses HE-AAC outright ("aac: aac too complex", `aac/mod.rs:91-96`), so its
+# AAC decoder is not in the tree at all. 5.1 and 7.1 come back already reordered
+# into FL, FR, FC, LFE, BL, BR, the order the downmix in `audio` folds. It is
+# also the *encode* seat: every re-encoded track's sound leaves through
+# `export.rs`'s `encode_audio` on this encoder.
 ec-aac = { path = "../../../edith_codecs/crates/ec-aac" }
 # The software AV1 decode seat, the project's own: a whole AV1 decoder
 # (entropy, prediction, transforms, loop filters, film grain) with no
@@ -74,6 +94,14 @@ ec-aac = { path = "../../../edith_codecs/crates/ec-aac" }
 # stream (`decode::run_av1`), so peak memory is one output picture plus the
 # reference bank, and seeks stay the demuxer's job.
 ec-av1 = { path = "../../../edith_codecs/crates/ec-av1" }
+# The software VP9 decode seat, the project's own: `ec-vp9`, every frame of a
+# profile 0 or 2 stream decoded in this process (`decode::vp9`). It is handed one
+# block or superframe at a time, the way the demuxer already delivers them, so the
+# span needs no reassembly and seeks stay the demuxer's job.
+ec-vp9 = { path = "../../../edith_codecs/crates/ec-vp9" }
+# The software VP8 decode seat, the project's own: `ec-vp8` (RFC 6386), every
+# frame of a stream, the same role `ec-vp9` plays for VP9.
+ec-vp8 = { path = "../../../edith_codecs/crates/ec-vp8" }
 # The MP3 encode seat, the family's own: MPEG-1/2/2.5 Layer III, CBR and true
 # VBR (a quality in [0, 1] whose mean tracks its own bitrate ladder), with a
 # Xing/Info gapless header whose delay/padding fields are *measured* correct.
@@ -96,7 +124,7 @@ ec-mp3 = { path = "../../../edith_codecs/crates/ec-mp3" }
 # sample count fed, which let the workaround go. See [`crate::export::write_ogg`]
 # for the measurement that decided it.
 ec-vorbis = { path = "../../../edith_codecs/crates/ec-vorbis" }
-# Symphonia has no Opus at any version -- its feature list stops at vorbis and
+# Symphonia has no Opus at any version -- its codec features stop at ALAC, FLAC and MP3 and
 # there is no `symphonia-codec-opus` crate -- while both of its containers *read*
 # the format already: `A_OPUS` and `OpusHead` have always mapped to
 # `CODEC_ID_OPUS`. The decoder was the one missing half, and the reason a 5.1
@@ -137,15 +165,26 @@ ec-opus = { path = "../../../edith_codecs/crates/ec-opus" }
 # name where `oxideav-ac3` walked them; every single-substream AC-3 and E-AC-3
 # track decodes.
 ec-ac3 = { path = "../../../edith_codecs/crates/ec-ac3" }
-# The Ogg container, and the only new *name* here that is not a new crate tree:
-# its one dependency is `oxideav-core`, a direct line below. MIT. Vorbis-aware
-# where it counts -- `xiph_lace` builds the
+# The Dolby TrueHD and MLP decode seat, the family's own: `ec-truehd`, the
+# lossless substream decode bit-exact against ffmpeg. Every access unit is one
+# Matroska block and comes back as S32 at the rate and layout of its major sync.
+# It hands out the highest presentation the unit carries (7.1 where the stream
+# has it, else 5.1, else stereo); the audio worker folds that to the pair the
+# timeline carries, as it does for every multichannel source. An Atmos track's
+# 4th (object) substream is refused by name by the decoder, and so is the open.
+ec-truehd = { path = "../../../edith_codecs/crates/ec-truehd" }
+# DTS core / XCH / X96 decode (`ec-dts`) and the family's audio reader and codec
+# registry (`ec-probe`: IMA/MS ADPCM, ima4, A-law, mu-law, AMR-NB/WB, and the
+# mp4 / Matroska / WAVE / raw readers that carry them), seated in `extaudio`.
+ec-dts = { path = "../../../edith_codecs/crates/ec-dts" }
+ec-probe = { path = "../../../edith_codecs/crates/ec-probe" }
+# The Ogg container, the family's own: `ec-ogg`, the RFC 3533 demuxer and muxer
+# with the Vorbis, Opus (RFC 7845) and FLAC mappings. `xiph_lace` builds the
 # three-header blob and the muxer pages those ahead of the audio, which is the
 # encapsulation order a Vorbis decoder needs and the part that is easy to get
 # wrong by hand.
-oxideav-ogg = "0.1.8"
+ec-ogg = { path = "../../../edith_codecs/crates/ec-ogg" }
 symphonia-core = "0.6"
-symphonia-codec-aac = "0.6"
 # The umbrella crate for the standalone audio files: one dependency instead of
 # seven, and its `default::get_probe`/`get_codecs` are the registries this would
 # otherwise hand-build. Explicit feature list rather than the default one -- no
@@ -156,7 +195,6 @@ symphonia-codec-aac = "0.6"
 # `ec-ac3` and Opus from `ec-opus` above, both plugged into this crate's
 # own readers, and DTS is the one that really is refused.
 symphonia = { version = "0.6", default-features = false, features = [
-    "aac",
     "alac",
     "flac",
     "id3v1",
@@ -166,28 +204,27 @@ symphonia = { version = "0.6", default-features = false, features = [
     "mp3",
     "ogg",
     "pcm",
-    "vorbis",
     "wav",
 ] }
-oxideav-core = "0.1.34"
-# The subtitle parsers: SRT and WebVTT here, ASS/SSA in the sibling crate --
-# `oxideav-subtitle` hosts the shared IR and hands ASS to `oxideav-ass`, which
-# is why both names are needed for the three formats. MIT, pure Rust, and both
-# asked for without their default features: nothing here *draws* a cue yet (see
-# `crate::subtitle`), so the rendering stacks are dead weight. Only `oxideav-ass`
-# actually loses one -- it depends on `oxideav-subtitle` with defaults on, so
-# that crate's `text` feature (the bitmap font and rasterizer) is unified back
-# in whatever this line says. Nothing here calls into it.
-oxideav-subtitle = { version = "0.1.2", default-features = false }
-oxideav-ass = { version = "0.0.9", default-features = false }
+# The family's own subtitle parsers: SRT and WebVTT in `ec-subs`, ASS/SSA in
+# `ec-ass` (which shares its cue IR), and the PGS picture decoder in `ec-pgs`.
+# Pure Rust, and nothing here draws a cue yet (see `crate::subtitle`), so no
+# rendering stack comes in with them.
+ec-subs = { path = "../../../edith_codecs/crates/ec-subs" }
+# Closed captions (CEA-608/708) out of the picture track's SEI / user data: the embedded caption tracks
+# `demux::captions` lists and imports beside the container's own subtitle tracks.
+ec-cc = { path = "../../../edith_codecs/crates/ec-cc" }
+ec-ass = { path = "../../../edith_codecs/crates/ec-ass" }
+ec-pgs = { path = "../../../edith_codecs/crates/ec-pgs" }
+ec-dvdsub = { path = "../../../edith_codecs/crates/ec-dvdsub" }
+ec-dvbsub = { path = "../../../edith_codecs/crates/ec-dvbsub" }
 # The software AV1 encoder, and the only new name in this list that was already
 # in the lock file: `ravif` pulls the very same rav1e 0.8.1 in through the image
 # crate, so this links what the build already compiled. BSD-2 with the AOM
-# patent grant, and pure Rust with `asm` *off*: that feature wants `nasm`, which
-# this project's build does not have and will not require. `threading` is rayon
-# inside rav1e itself and is what keeps an export minutes rather than tens of
-# minutes; the cost of no assembly is measured in `export::Enc::open_av1`.
-rav1e = { version = "0.8.1", default-features = false, features = ["threading"] }
+# patent grant. `asm` wants `nasm` at build time (this machine has nasm 3.x); it
+# is what makes the software export near realtime at 1080p (see `export::Enc::open_av1`).
+# `threading` is rayon inside rav1e itself.
+rav1e = { version = "0.8.1", default-features = false, features = ["threading", "asm"] }
 # The software HEVC encoder, intra-only: the project's own `ec-h265`, the seat
 # that replaces OxideAV's vendored intra encoder. Every picture is an IDR
 # carrying its own VPS/SPS/PPS -- an intraframe master, ProRes-shaped, large
@@ -201,11 +238,30 @@ ec-h265 = { path = "../../../edith_codecs/crates/ec-h265" }
 # The HEVC bitstream syntax the encoder's config speaks -- the VUI types the
 # seat builds the SPS's colour description from. Same family, same workspace.
 ec-h265-syntax = { path = "../../../edith_codecs/crates/ec-h265-syntax" }
-oxideav-sub-image = "0.0.7"
-
-[dev-dependencies]
-# The still-image suite compares what the timeline shows against the file's own
-# pixels rather than against a constant, and the EXIF suite has to *write* one:
-# no fixture in `assets/` carries an orientation tag, so the turned-still test
-# builds its own JPEG here. Already built for the engine itself.
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# The ProRes encoder (`Format::ProRes`, [`crate::export`]): all six profiles, 10-bit, software.
+ec-prores = { path = "../../../edith_codecs/crates/ec-prores" }
+# The H.264 SPS parser, for the profile a stream states (`video_profile`).
+ec-h264-syntax = { path = "../../../edith_codecs/crates/ec-h264-syntax" }
+# Text in the picture (`crate::text`): the glyph rasteriser behind burned-in
+# captions and title cards. Pure Rust; default features stay on, because without
+# `std` (or `libm`) its rasteriser does not build. It reads the bundled TTF
+# straight out of `assets/fonts`. Its only dependencies are `ab_glyph_rasterizer` and
+# `owned_ttf_parser`, both small and pure Rust.
+ab_glyph = "0.2.29"
+# The system font database a caption's family name is looked up in (`crate::text::family_face`).
+# Already in the lock file through the GUI's text stack, so no new crate is compiled.
+fontdb = "0.23"
+# Script shaping for `crate::text`: Arabic joins, Devanagari reorders and forms
+# conjuncts, and the Thai and Hebrew faces need their own GSUB/GPOS. `rustybuzz`
+# is the HarfBuzz port ab_glyph has no door to. Pinned exactly: 0.20.1 is from
+# 2024-11-12, well past any two-week rule, and it is the version the lock file
+# already holds.
+rustybuzz = "=0.20.1"
+# The Unicode bidi algorithm (UAX #9), for the right-to-left runs of a line. 0.3.18
+# (2024-12-16), already in the lock file.
+unicode-bidi = "=0.3.18"
+# Colour emoji: the system colour font's COLR layers are read straight off its
+# tables, and each layer's outline is rasterised here. Both are the versions
+# ab_glyph already pulls in, so no new crate is compiled.
+ttf-parser = "=0.25.1"
+ab_glyph_rasterizer = "=0.1.10"

@@ -60,7 +60,7 @@ fn graded() -> PlaybackSession {
 /// which is 0 for a greyscale picture and ~250 for these colour bars.
 fn spread(bgra: &[u8]) -> f64 {
     let total: u64 = bgra
-        .chunks_exact(4)
+        .as_chunks::<4>().0.iter()
         .map(|px| u64::from(px[..3].iter().max().unwrap() - px[..3].iter().min().unwrap()))
         .sum();
     total as f64 / (bgra.len() / 4) as f64
@@ -149,10 +149,8 @@ fn wait(handle: &ExportHandle, limit: Duration) -> engine::Result<()> {
 /// installed -- the same pin `tests/export.rs`'s default suite uses.
 #[test]
 fn an_exported_grade_is_the_one_that_was_watched() {
-    unsafe {
-        std::env::set_var("VE_SW", "1");
-        std::env::set_var("VE_SW_ENC", "1");
-    }
+    engine::envcfg::set("VE_SW", "1");
+    engine::envcfg::set("VE_SW_ENC", "1");
     let mut session = graded();
     session.pause();
     let out = Scratch::file("ve_color", "mp4");

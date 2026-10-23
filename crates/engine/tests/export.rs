@@ -21,7 +21,7 @@
 use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, Once};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// The two proxy tests below share one film, and a proxy job is one per film:
@@ -30,6 +30,7 @@ use std::time::{Duration, Instant};
 static PROXY_FILM: Mutex<()> = Mutex::new(());
 
 use ec_core::registry::{CodecId, CodecParameters, Decoder as _};
+use ec_core::Demuxer as _;
 use ec_core::{Packet, TimeBase};
 use ec_h264::H264Decoder;
 use engine::export::ExportSettings;
@@ -41,6 +42,24 @@ use engine::scratch::Scratch;
 use engine::{DecodeSession, ExportHandle, PlaybackSession, Project, Rotation};
 
 const FPS: f64 = 30.0;
+
+/// `path` opened as an mp4 with `ec-mp4`'s demuxer.
+fn open_mp4(path: &Path) -> ec_mp4::Mp4Demuxer<BufReader<File>> {
+    let file = File::open(path).expect("open the mp4");
+    ec_mp4::Mp4Demuxer::new(BufReader::new(file)).expect("mp4 header")
+}
+
+/// How many samples track `track_id` of the mp4 at `path` has.
+fn packets_of(path: &Path, track_id: u32) -> u32 {
+    let reader = open_mp4(path);
+    let stream = reader
+        .tracks()
+        .iter()
+        .find(|t| t.track_id == track_id)
+        .and_then(|t| t.stream)
+        .expect("the track");
+    u32::try_from(reader.samples(stream).len()).expect("a packet count")
+}
 
 fn asset(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -76,33 +95,41 @@ static SEAT: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
 type Shared = std::sync::RwLockReadGuard<'static, ()>;
 
-/// Pins both paths to software for the whole test binary, so the default suite
-/// proves the fallback that every machine has. Bind the guard: it is the borrow
-/// above, and dropping it early puts the export back in the race this exists to
-/// end.
+/// Serialises the writes to `VE_SW` and `VE_SW_ENC` between readers, which share
+/// [`SEAT`] and so may all reach for the pin at once. The pin is checked and set
+/// under it, so a reader never sees the variable half-way through another's
+/// write, and a value already in place is left alone.
+static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Pins both paths to software for as long as the guard lives, so the default
+/// suite proves the fallback that every machine has. Bind the guard: it is the
+/// borrow above, and dropping it early puts the export back in the race this
+/// exists to end. Set on every call rather than once per binary, so a
+/// hardware test that ran in between cannot leave the seat on the wrong side.
 #[must_use = "the seat pin holds only while its guard is alive"]
 fn pin_software() -> Shared {
     let borrowed = SEAT.read().unwrap_or_else(|poisoned| poisoned.into_inner());
-    static PIN: Once = Once::new();
-    PIN.call_once(|| unsafe {
-        std::env::set_var("VE_SW", "1");
-        std::env::set_var("VE_SW_ENC", "1");
-    });
+    let _env = ENV.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    for (var, value) in [("VE_SW", "1"), ("VE_SW_ENC", "1")] {
+        if engine::envcfg::var_os(var).as_deref() != Some(std::ffi::OsStr::new(value)) {
+            engine::envcfg::set(var, value);
+        }
+    }
     borrowed
 }
 
-/// Removes both pins, for the hardware twins -- which run in their own
-/// `--ignored --test-threads=1` pass, so they never share this binary with the
-/// software ones.
+/// Removes both pins, for the hardware twins. Takes [`SEAT`] exclusively, so no
+/// software export is in flight while the seat is cleared, and every software
+/// test pins again when it next starts.
 #[must_use = "the seat pin holds only while its guard is alive"]
-fn pin_hardware() -> Shared {
-    let borrowed = SEAT.read().unwrap_or_else(|poisoned| poisoned.into_inner());
-    static PIN: Once = Once::new();
-    PIN.call_once(|| unsafe {
-        std::env::remove_var("VE_SW");
-        std::env::remove_var("VE_SW_ENC");
-    });
-    borrowed
+fn pin_hardware() -> std::sync::RwLockWriteGuard<'static, ()> {
+    let exclusive = SEAT
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _env = ENV.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    engine::envcfg::unset("VE_SW");
+    engine::envcfg::unset("VE_SW_ENC");
+    exclusive
 }
 
 /// `[0,30) + [60,150)` of the source: two cuts and a delete, so the export has
@@ -187,10 +214,8 @@ fn round_trip(name: &str, limit: Duration) {
     assert_eq!((meta.width, meta.height), (1280, 720));
     assert_eq!(meta.frame_rate.round(), FPS);
 
-    let file = File::open(&out).unwrap();
-    let size = file.metadata().unwrap().len();
-    let reader = mp4::Mp4Reader::read_header(BufReader::new(file), size).unwrap();
-    let duration = reader.duration().as_secs_f64();
+    let reader = open_mp4(&out);
+    let duration = reader.duration_secs().unwrap_or(0.0);
     assert!(
         (duration - 120.0 / FPS).abs() <= 1.0 / FPS,
         "duration {duration} s is more than a frame off 4.0 s"
@@ -237,11 +262,24 @@ fn exports_an_edited_timeline_in_hardware() {
 fn exports_at_the_project_resolution_with_the_watched_geometry() {
     let _seat = pin_software();
     let clip = |source: usize, start: u32| engine::Clip {
+        speed_keys: Vec::new(),
+        reversed: false,
+        stabilise: None, deinterlace: Default::default(), mark: Default::default(),
+        angle: Default::default(),
         fade_in: 0,
         fade_out: 0,
         transition_out: 0,
+        transition_kind: Default::default(),
         visualizer: 0,
         viz_paint: 0,
+        gain_db: 0.0,
+        gain_keys: Vec::new(),
+        pan: 0,
+        pitch: 0,
+        transform_keys: Vec::new(),
+        opacity_keys: Vec::new(),
+        color_keys: Vec::new(),
+        effects: Vec::new(),
         start,
         in_frame: 0,
         out_frame: 10,
@@ -277,6 +315,7 @@ fn exports_at_the_project_resolution_with_the_watched_geometry() {
         frame_count: 20,
         codec: engine::Codec::H264,
         color: Default::default(),
+        matrix_assumed: false,
         rotation: Rotation::None,
         // Square pixels, coded where they are declared: a meta no container
         // wrote, so nothing was read to disagree with it.
@@ -303,7 +342,7 @@ fn exports_at_the_project_resolution_with_the_watched_geometry() {
     // as neither.
     let mean = |frame: &[u8], y: usize| {
         frame[y * 960 * 4..][..960 * 4]
-            .chunks_exact(4)
+            .as_chunks::<4>().0.iter()
             .flat_map(|px| [px[0], px[1], px[2]])
             .map(f64::from)
             .sum::<f64>()
@@ -332,11 +371,24 @@ fn exports_the_audio_stream_the_timeline_plays() {
     let multi = asset("test_multiaudio.mp4");
     let (meta, _) = engine::demux::Demuxer::open(&multi).expect("open the fixture");
     let whole = engine::Clip {
+        speed_keys: Vec::new(),
+        reversed: false,
+        stabilise: None, deinterlace: Default::default(), mark: Default::default(),
+        angle: Default::default(),
         fade_in: 0,
         fade_out: 0,
         transition_out: 0,
+        transition_kind: Default::default(),
         visualizer: 0,
         viz_paint: 0,
+        gain_db: 0.0,
+        gain_keys: Vec::new(),
+        pan: 0,
+        pitch: 0,
+        transform_keys: Vec::new(),
+        opacity_keys: Vec::new(),
+        color_keys: Vec::new(),
+        effects: Vec::new(),
         start: 0,
         in_frame: 0,
         out_frame: meta.frame_count,
@@ -354,11 +406,11 @@ fn exports_the_audio_stream_the_timeline_plays() {
     let project = Project::from_parts(
         vec![Source {
             path: multi.clone(),
-            audio_stream: 1,
+            audio_stream: 1, ..Default::default()
         }],
         vec![
-            (engine::project::LaneKind::Video, vec![whole]),
-            (engine::project::LaneKind::Audio, vec![whole]),
+            (engine::project::LaneKind::Video, vec![whole.clone()]),
+            (engine::project::LaneKind::Audio, vec![whole.clone()]),
         ],
         Vec::new(),
         Vec::new(),
@@ -374,7 +426,7 @@ fn exports_the_audio_stream_the_timeline_plays() {
         .expect("the export has audio");
     assert_eq!(
         (audio.sample_rate, audio.channels),
-        (22_050, 1),
+        (48_000, 1),
         "the export carries stream 0's parameters, not the stream that played"
     );
 
@@ -394,23 +446,13 @@ fn exports_the_audio_stream_the_timeline_plays() {
     let (one, zero) = (copy(1), copy(0));
     assert_ne!(one, zero, "the two streams are not the same bytes");
 
-    let file = File::open(&out).unwrap();
-    let size = file.metadata().unwrap().len();
-    let mut reader = mp4::Mp4Reader::read_header(BufReader::new(file), size).unwrap();
-    let track = *reader
-        .tracks()
-        .keys()
-        .find(|id| reader.sample_count(**id).unwrap_or(0) as usize == one.len())
-        .unwrap_or(&2);
-    let written: Vec<Vec<u8>> = (1..=reader.sample_count(track).expect("audio track"))
-        .map(|id| {
-            reader
-                .read_sample(track, id)
-                .expect("sample")
-                .expect("present")
-                .bytes
-                .to_vec()
-        })
+    let mut reader = open_mp4(&out);
+    let stream = (0..reader.streams().len() as u32)
+        .find(|s| reader.samples(*s).len() == one.len())
+        .unwrap_or(1);
+    let count = reader.samples(stream).len();
+    let written: Vec<Vec<u8>> = (0..count)
+        .map(|i| reader.read_sample(stream, i).expect("sample").data.to_vec())
         .collect();
     assert_eq!(written, one, "the exported packets are stream 1's");
     std::fs::remove_file(&out).unwrap();
@@ -495,10 +537,7 @@ fn multi_source_round_trip(name: &str, limit: Duration) {
     // copies 172 and owes 272 samples, and it is that *carried* debt that makes
     // the second copy 173: rounding each source on its own would give 345, so
     // this number is the proof the accumulator survives a source change.
-    let file = File::open(&out).unwrap();
-    let size = file.metadata().unwrap().len();
-    let reader = mp4::Mp4Reader::read_header(BufReader::new(file), size).unwrap();
-    let packets = reader.sample_count(2).expect("audio track");
+    let packets = packets_of(&out, 2);
     assert_eq!(packets, 346, "packet total across the source join");
     let wanted = f64::from(total) / FPS * 44_100.0;
     assert!(
@@ -691,10 +730,7 @@ fn exports_audio_alongside_the_video() {
     let handle = session.export_to(&out);
     wait(&handle, Duration::from_secs(600)).expect("export");
 
-    let file = File::open(&out).unwrap();
-    let size = file.metadata().unwrap().len();
-    let reader = mp4::Mp4Reader::read_header(BufReader::new(file), size).unwrap();
-    let packets = reader.sample_count(2).expect("audio track");
+    let packets = packets_of(&out, 2);
     let expected = engine::AudioSession::copy_segments(&source, &[(0.0, 2.0), (2.0, 5.0)])
         .unwrap()
         .expect("source has audio")
@@ -859,10 +895,11 @@ fn mp4_interleaves_a_mix_that_lands_early_under_the_rest_of_the_picture() {
     }
     muxer
         .add_audio_track(&AudioParams {
-            freq_index: 3, // mp4::SampleFreqIndex::Freq48000
+            freq_index: 3, // 48 kHz in the AAC table
             chan_conf: 2,  // ChannelConfig::Stereo
             sample_rate: 48_000,
             opus_pre_skip: None,
+            language: None,
         })
         .expect("declare audio");
     // The whole mix, handed over in one tight loop exactly as
@@ -948,11 +985,11 @@ fn assert_no_single_stream_span_over(path: &Path, seconds: f64) {
     }
 }
 
-/// The first `pts_time` ffprobe reports for stream kind `select` ("v" or
-/// "a") in `path` -- just enough of [`assert_no_single_stream_span_over`]'s
-/// ffprobe call, restricted to one stream, to check A/V sync independently of
-/// the interleave order.
-fn first_pts(path: &Path, select: &str) -> f64 {
+/// The value of stream `entry` (`start_time`, `duration`) ffprobe reports for
+/// the first stream of kind `select` ("v" or "a") in `path`, in seconds. Read
+/// on its own, not against the packets, so the answer is the track's
+/// presentation time and not the interleave order.
+fn stream_seconds(path: &Path, select: &str, entry: &str) -> f64 {
     let output = std::process::Command::new("ffprobe")
         .args([
             "-v",
@@ -960,7 +997,7 @@ fn first_pts(path: &Path, select: &str) -> f64 {
             "-select_streams",
             select,
             "-show_entries",
-            "packet=pts_time",
+            entry,
             "-of",
             "csv=p=0",
         ])
@@ -975,9 +1012,10 @@ fn first_pts(path: &Path, select: &str) -> f64 {
     String::from_utf8_lossy(&output.stdout)
         .lines()
         .find(|line| !line.is_empty())
-        .expect("stream has at least one packet")
+        .expect("stream has that entry")
+        .trim()
         .parse()
-        .expect("pts_time")
+        .expect("seconds")
 }
 
 /// An mp4 export used to write every video sample and only then the whole
@@ -1007,10 +1045,13 @@ fn mp4_audio_interleaves_with_the_picture() {
     // A/V sync: the first audio sample starts at movie time zero either way --
     // interleaving moves *where in the file* a packet sits, never what `stts`
     // says it plays at.
-    assert_eq!(
-        first_pts(&out, "a"),
-        0.0,
-        "first audio pts is media time zero"
+    // The presentation start, not the first packet's pts: an AAC track written
+    // with its priming edit list starts its first packet one priming's worth
+    // before zero, by design, and the sound still plays from zero.
+    let audio_start = stream_seconds(&out, "a", "stream=start_time");
+    assert!(
+        audio_start.abs() < 0.001,
+        "audio presentation starts at {audio_start} s, not media time zero"
     );
 
     assert_no_single_stream_span_over(&out, 2.0);
@@ -1136,10 +1177,7 @@ fn exports_a_gapped_timeline_as_black_and_silence() {
     // The audio track spans the whole timeline in packets: the hole is real
     // silent access units, so the bresenham bound the copier promises -- half a
     // packet per join, carried through the gap -- covers the gap too.
-    let file = File::open(&out).unwrap();
-    let size = file.metadata().unwrap().len();
-    let reader = mp4::Mp4Reader::read_header(BufReader::new(file), size).unwrap();
-    let count = reader.sample_count(2).expect("audio track");
+    let count = packets_of(&out, 2);
     let samples = f64::from(count * 1024);
     let wanted = timeline * 44_100.0;
     println!("gapped export: {count} packets = {samples} samples for {wanted}");
@@ -1183,7 +1221,12 @@ fn exports_a_gapped_timeline_as_black_and_silence() {
 fn a_proxy_is_picture_only_every_frame_a_starting_point_and_cached() {
     let _film = PROXY_FILM.lock().unwrap_or_else(|e| e.into_inner());
     let _seat = pin_software();
-    let source = asset("test_av.mp4");
+    // The proxy cache is keyed by the file's path, size and mtime, so the shared
+    // fixture would put every concurrent run on one cache file. A copy in a
+    // scratch directory of its own keys a stand-in no other run touches.
+    let scratch = Scratch::dir("proxy_cache_key");
+    let source = scratch.join("test_av.mp4");
+    std::fs::copy(asset("test_av.mp4"), &source).expect("copy the fixture");
     let out = engine::proxy::path_for(&source).expect("a cache directory");
     // A proxy left by an earlier run would make this test assert about a file
     // it did not write -- and the cache-hit half below would be the only half
@@ -1280,7 +1323,7 @@ fn a_proxy_is_picture_only_every_frame_a_starting_point_and_cached() {
     session.set_proxies(true);
     session.save_project(&project).expect("save");
     let text = std::fs::read_to_string(&project).expect("read the project back");
-    assert!(text.starts_with("edith 23\n"), "{text}");
+    assert!(text.starts_with("edith 30\n"), "{text}");
     assert!(text.contains("\nproxy on\n"), "{text}");
     let reopened = PlaybackSession::open_project(&project).expect("load");
     assert!(reopened.proxies(), "the switch came back on");
@@ -1363,8 +1406,7 @@ fn a_stopped_proxy_leaves_neither_a_stand_in_nor_half_of_one() {
     let refusal = job
         .outcome()
         .expect("a settled job has an outcome")
-        .err()
-        .expect("a stopped proxy is not a proxy");
+        .expect_err("a stopped proxy is not a proxy");
     assert!(
         refusal.to_string().contains("cancelled"),
         "not the cancellation: {refusal}"
@@ -1621,42 +1663,46 @@ fn injected_with<T>(
     let _exclusive = SEAT
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let restore = std::env::var_os("VE_SW_ENC");
-    unsafe {
-        std::env::set_var("VE_SW", "1");
-        std::env::remove_var("VE_SW_ENC");
-        std::env::set_var("VE_HW_TEST_FAKE", "1");
-        std::env::set_var("VE_HW_CHILD_BIN", env!("CARGO_BIN_EXE_hw-encode-child"));
-        match timeout_ms {
-            Some(ms) => std::env::set_var("VE_HW_TIMEOUT_MS", ms),
-            None => std::env::remove_var("VE_HW_TIMEOUT_MS"),
-        }
-        match abort {
-            Some(at) => std::env::set_var("VE_HW_TEST_ABORT", at),
-            None => std::env::remove_var("VE_HW_TEST_ABORT"),
-        }
-        match hang {
-            Some(at) => std::env::set_var("VE_HW_TEST_HANG", at),
-            None => std::env::remove_var("VE_HW_TEST_HANG"),
-        }
+    let restore = engine::envcfg::var_os("VE_SW_ENC");
+    engine::envcfg::set("VE_SW", "1");
+    engine::envcfg::unset("VE_SW_ENC");
+    engine::envcfg::set("VE_HW_TEST_FAKE", "1");
+    // The child is a binary of `engine-hw`, so cargo names it for no test of
+    // this package; it sits beside the test binary's own `target/<profile>/`.
+    let child = std::env::current_exe()
+        .expect("the test binary's path")
+        .parent()
+        .and_then(|deps| deps.parent())
+        .expect("target/<profile>")
+        .join("hw-child");
+    engine::envcfg::set("VE_HW_CHILD_BIN", child.to_str().expect("a UTF-8 path"));
+    match timeout_ms {
+        Some(ms) => engine::envcfg::set("VE_HW_TIMEOUT_MS", ms),
+        None => engine::envcfg::unset("VE_HW_TIMEOUT_MS"),
+    }
+    match abort {
+        Some(at) => engine::envcfg::set("VE_HW_TEST_ABORT", at),
+        None => engine::envcfg::unset("VE_HW_TEST_ABORT"),
+    }
+    match hang {
+        Some(at) => engine::envcfg::set("VE_HW_TEST_HANG", at),
+        None => engine::envcfg::unset("VE_HW_TEST_HANG"),
     }
     let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
-    unsafe {
-        for var in [
-            "VE_HW_TEST_FAKE",
-            "VE_HW_CHILD_BIN",
-            "VE_HW_TIMEOUT_MS",
-            "VE_HW_TEST_ABORT",
-            "VE_HW_TEST_HANG",
-        ] {
-            std::env::remove_var(var);
-        }
-        // Put the software suite's pin back exactly as it was found -- it is
-        // set once for the whole binary and this is the only thing that ever
-        // takes it away.
-        if let Some(pinned) = restore {
-            std::env::set_var("VE_SW_ENC", pinned);
-        }
+    for var in [
+        "VE_HW_TEST_FAKE",
+        "VE_HW_CHILD_BIN",
+        "VE_HW_TIMEOUT_MS",
+        "VE_HW_TEST_ABORT",
+        "VE_HW_TEST_HANG",
+    ] {
+        engine::envcfg::unset(var);
+    }
+    // Put the software suite's pin back exactly as it was found -- it is
+    // set once for the whole binary and this is the only thing that ever
+    // takes it away.
+    if let Some(pinned) = restore {
+        engine::envcfg::set("VE_SW_ENC", pinned);
     }
     match out {
         Ok(value) => value,
@@ -2010,11 +2056,24 @@ fn a_dead_encoder_answers_every_later_call_the_same_way() {
 fn one_source_clip(source: &Path, fade_in: u32, out_frame: u32) -> (Project, engine::VideoMeta) {
     let (meta, _) = engine::demux::Demuxer::open(source).expect("open the fixture");
     let whole = engine::Clip {
+        speed_keys: Vec::new(),
+        reversed: false,
+        stabilise: None, deinterlace: Default::default(), mark: Default::default(),
+        angle: Default::default(),
         fade_in,
         fade_out: 0,
         transition_out: 0,
+        transition_kind: Default::default(),
         visualizer: 0,
         viz_paint: 0,
+        gain_db: 0.0,
+        gain_keys: Vec::new(),
+        pan: 0,
+        pitch: 0,
+        transform_keys: Vec::new(),
+        opacity_keys: Vec::new(),
+        color_keys: Vec::new(),
+        effects: Vec::new(),
         start: 0,
         in_frame: 0,
         out_frame,
@@ -2029,11 +2088,11 @@ fn one_source_clip(source: &Path, fade_in: u32, out_frame: u32) -> (Project, eng
     let project = Project::from_parts(
         vec![Source {
             path: source.to_path_buf(),
-            audio_stream: 0,
+            audio_stream: 0, ..Default::default()
         }],
         vec![
             (engine::project::LaneKind::Video, vec![whole.clone()]),
-            (engine::project::LaneKind::Audio, vec![whole]),
+            (engine::project::LaneKind::Audio, vec![whole.clone()]),
         ],
         Vec::new(),
         Vec::new(),
@@ -2046,7 +2105,7 @@ fn one_source_clip(source: &Path, fade_in: u32, out_frame: u32) -> (Project, eng
 /// Interleaved-stereo RMS of `samples`.
 fn rms(samples: &[f32]) -> f64 {
     let sum: f64 = samples
-        .chunks_exact(2)
+        .as_chunks::<2>().0.iter()
         .map(|c| f64::from(c[0]) * f64::from(c[0]) + f64::from(c[1]) * f64::from(c[1]))
         .sum();
     (sum / samples.len().max(1) as f64).sqrt()
@@ -2143,11 +2202,24 @@ fn a_clip_that_outlives_its_source_says_so_on_the_card() {
 fn two_clip_edit(source: &Path, first: u32, second: u32) -> (Project, engine::VideoMeta) {
     let (meta, _) = engine::demux::Demuxer::open(source).expect("open the fixture");
     let clip = |start: u32, out_frame: u32| engine::Clip {
+        speed_keys: Vec::new(),
+        reversed: false,
+        stabilise: None, deinterlace: Default::default(), mark: Default::default(),
+        angle: Default::default(),
         fade_in: 0,
         fade_out: 0,
         transition_out: 0,
+        transition_kind: Default::default(),
         visualizer: 0,
         viz_paint: 0,
+        gain_db: 0.0,
+        gain_keys: Vec::new(),
+        pan: 0,
+        pitch: 0,
+        transform_keys: Vec::new(),
+        opacity_keys: Vec::new(),
+        color_keys: Vec::new(),
+        effects: Vec::new(),
         start,
         in_frame: 0,
         out_frame,
@@ -2163,7 +2235,7 @@ fn two_clip_edit(source: &Path, first: u32, second: u32) -> (Project, engine::Vi
     let project = Project::from_parts(
         vec![Source {
             path: source.to_path_buf(),
-            audio_stream: 0,
+            audio_stream: 0, ..Default::default()
         }],
         vec![
             (engine::project::LaneKind::Video, clips.clone()),
@@ -2221,8 +2293,8 @@ fn a_healthy_two_clip_timeline_carries_no_truncation_notice() {
     wait(&handle, Duration::from_secs(900)).expect("export");
     let line = handle.encoders().expect("the seats were published");
     let notice = line.contains("past the last picture");
-    assert_eq!(
-        notice, false,
+    assert!(
+        !notice,
         "a whole export says it was truncated: {line}"
     );
     assert_eq!(
@@ -2244,14 +2316,10 @@ fn a_panicking_worker_deletes_the_part_file() {
     let (project, meta) = short_edit(&source, 20);
     let out = out_path("panic");
     let part = part_path(&out);
-    unsafe {
-        std::env::set_var("VE_EXPORT_TEST_PANIC", part.as_os_str().to_owned());
-    }
+    engine::envcfg::set("VE_EXPORT_TEST_PANIC", part.as_os_str());
     let handle = engine::export::start(project, meta, &out, &ExportSettings::default(), None);
     let result = wait(&handle, Duration::from_secs(120));
-    unsafe {
-        std::env::remove_var("VE_EXPORT_TEST_PANIC");
-    }
+    engine::envcfg::unset("VE_EXPORT_TEST_PANIC");
     let error = result.expect_err("the injected panic is the outcome");
     assert!(
         error.to_string().contains("export worker panicked"),
@@ -2259,4 +2327,36 @@ fn a_panicking_worker_deletes_the_part_file() {
     );
     assert!(!out.exists(), "a panicked export wrote {}", out.display());
     assert!(!part.exists(), "the .part outlived the panic");
+}
+
+/// An untouched timeline copies its sound packet for packet, and the copy must
+/// run as long as the picture it plays under: `test_sync.mp4` is 4.0 s of
+/// picture over 174 AAC packets, and the copy used to stop six milliseconds
+/// short of the picture because the last packet was rounded away.
+#[test]
+fn a_copied_sound_runs_as_long_as_its_picture() {
+    let _seat = pin_software();
+    let source = asset("test_sync.mp4");
+    let session = PlaybackSession::open(&source).expect("open source");
+    let out = out_path("copy-length");
+    let handle = session.export_to(&out);
+    wait(&handle, Duration::from_secs(600)).expect("export");
+
+    let picture = stream_seconds(&out, "v", "stream=duration");
+    let sound = stream_seconds(&out, "a", "stream=duration");
+    // One AAC frame is 1024 samples of the sound's own rate.
+    let rate = stream_seconds(&out, "a", "stream=sample_rate");
+    let aac_frame = 1024.0 / rate;
+    eprintln!("copy length: picture {picture:.6} s, sound {sound:.6} s");
+    // Not short of the picture, and not longer than it by more than an AAC frame.
+    assert!(
+        sound >= picture - 0.001,
+        "the sound stops {:.4} s short of the picture",
+        picture - sound
+    );
+    assert!(
+        sound <= picture + aac_frame,
+        "the sound runs {:.4} s past the picture",
+        sound - picture
+    );
 }

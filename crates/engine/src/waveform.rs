@@ -565,7 +565,7 @@ pub(crate) fn viz_envelope_capped(
         // The stated length is the container's, which is a lower bound on what
         // the decode finds (a tail past it is still drawn), so a file near the
         // ceiling can turn out larger. The windowed route below catches that.
-        Some(samples) => (samples as f64 / per_bucket) as usize + 1 <= cap,
+        Some(samples) => ((samples as f64 / per_bucket) as usize) < cap,
         // A length the container does not state cannot be windowed -- neither
         // by this ask nor by the split inside it. Read exactly as it always
         // was, and held when it fits.
@@ -882,10 +882,7 @@ fn jobs_for(secs: f64) -> usize {
         return 1;
     }
     let cores = thread::available_parallelism().map_or(1, |n| n.get());
-    ((secs / PER_JOB_SECS) as usize)
-        .min(cores)
-        .min(CEILING)
-        .max(1)
+    ((secs / PER_JOB_SECS) as usize).clamp(1, cores.min(CEILING))
 }
 
 /// `part` folded into `peaks` bucket for bucket. Both are indexed absolutely,
@@ -909,7 +906,21 @@ fn open_window(
     end_secs: f64,
 ) -> crate::Result<Option<(crate::AudioMeta, Receiver<AudioChunk>)>> {
     let sources = [(PathBuf::from(path), stream)];
-    AudioSession::open_multi_streams(&sources, &[(Some(0), start_secs, end_secs)])
+    // A waveform draws the file, so it is read at the file's own rate: the
+    // mix rule would read an 8 kHz source at 48 kHz, which is the wrong
+    // number of buckets per second for the picture it is drawn beside.
+    let file_rate = AudioSession::probe_streams(path)?
+        .into_iter()
+        .find(|s| s.index == stream)
+        .map(|s| s.sample_rate)
+        .filter(|rate| *rate > 0);
+    AudioSession::open_multi_streams_speed_at(
+        &sources,
+        &[(Some(0), start_secs, end_secs)],
+        &[],
+        &[],
+        file_rate,
+    )
 }
 
 /// Min/max per bucket of everything `rx` carries, at absolute bucket positions:
@@ -974,9 +985,8 @@ mod tests {
 
     /// A private copy of a fixture, so the memo key a test drives is not one
     /// another test in this binary may already hold.
-    fn copy_of(name: &str, tag: &str) -> PathBuf {
-        let path =
-            std::env::temp_dir().join(format!("edith-peaks-{tag}-{}.mp4", std::process::id()));
+    fn copy_of(name: &str, tag: &str) -> crate::scratch::Scratch {
+        let path = crate::scratch::Scratch::file(&format!("ve_peaks_{tag}"), "mp4");
         std::fs::write(&path, std::fs::read(asset(name)).expect("read the fixture"))
             .expect("write the copy");
         path
@@ -1211,8 +1221,7 @@ mod tests {
     #[test]
     fn a_replaced_source_is_read_again() {
         let _serial = counters_serial();
-        let path =
-            std::env::temp_dir().join(format!("edith-peaks-memo-{}.mp4", std::process::id()));
+        let path = crate::scratch::Scratch::file("ve_peaks_memo", "mp4");
         let short = std::fs::read(asset("test_multiaudio.mp4")).expect("read the fixture");
         let long = std::fs::read(asset("test_av.mp4")).expect("read the fixture");
         // The two halves below are the length half and the clock half of the
@@ -1254,8 +1263,6 @@ mod tests {
             !std::sync::Arc::ptr_eq(&replaced, &touched),
             "the mtime is not part of the key"
         );
-
-        let _ = std::fs::remove_file(&path);
     }
 
     /// A trackless source is an answer too, and the memo keeps it: without that
@@ -1281,8 +1288,6 @@ mod tests {
             after_first,
             "the second ask re-opened a trackless source"
         );
-
-        let _ = std::fs::remove_file(&path);
     }
 
     /// A trackless answer holds no buckets, so the ceiling counts only
@@ -1337,8 +1342,6 @@ mod tests {
             1,
             "an envelope over the ceiling was held"
         );
-
-        let _ = std::fs::remove_file(&file);
     }
 
     /// An insert that replaces an entry the counter already includes subtracts
@@ -1393,8 +1396,7 @@ mod tests {
     #[test]
     fn a_window_of_a_non_periodic_file_is_where_it_says_it_is() {
         let _serial = counters_serial();
-        let path =
-            std::env::temp_dir().join(format!("edith-peaks-noise-{}.flac", std::process::id()));
+        let path = crate::scratch::Scratch::file("ve_peaks_noise", "flac");
         let generated = std::process::Command::new("ffmpeg")
             .args(["-y", "-v", "error", "-f", "lavfi", "-i"])
             .arg("anoisesrc=color=white:amplitude=0.5:sample_rate=8000:duration=120")
@@ -1471,7 +1473,6 @@ mod tests {
                 "t={secs}: the window painted a frame the whole envelope does not"
             );
         }
-        let _ = std::fs::remove_file(&path);
     }
 
     /// The summary pass reads the file *once*. Its windows partition it -- the
@@ -1482,8 +1483,7 @@ mod tests {
     #[test]
     fn a_summary_pass_folds_the_file_once() {
         let _serial = counters_serial();
-        let path =
-            std::env::temp_dir().join(format!("edith-peaks-once-{}.flac", std::process::id()));
+        let path = crate::scratch::Scratch::file("ve_peaks_once", "flac");
         let generated = std::process::Command::new("ffmpeg")
             .args(["-y", "-v", "error", "-f", "lavfi", "-i"])
             .arg("anoisesrc=color=white:amplitude=0.5:sample_rate=8000:duration=120")
@@ -1512,7 +1512,6 @@ mod tests {
             "the summary pass folded {folded} frames of a {frames}-frame file, {:.2}x over",
             folded as f64 / frames as f64
         );
-        let _ = std::fs::remove_file(&path);
     }
 
     /// A container that states no sample rate (or a zero one) must not make the
@@ -1592,7 +1591,6 @@ mod tests {
                 ask + 2
             );
         }
-        let _ = std::fs::remove_file(&file);
     }
 
     /// A window paints the frame the whole envelope paints: the picture of a
@@ -1667,8 +1665,7 @@ mod tests {
     #[test]
     fn a_film_length_source_paints_the_same_frame_in_windows() {
         let _serial = counters_serial();
-        let path =
-            std::env::temp_dir().join(format!("edith-peaks-long-{}.flac", std::process::id()));
+        let path = crate::scratch::Scratch::file("ve_peaks_long", "flac");
         let generated = std::process::Command::new("ffmpeg")
             .args(["-y", "-v", "error", "-f", "lavfi", "-i"])
             .arg("sine=frequency=440:duration=2400")
@@ -1747,6 +1744,17 @@ mod tests {
                 ask + 2
             );
         }
-        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The copies these tests write leave nothing in the temporary directory
+    /// once the test is over, and that holds on a panic too: the guard is what
+    /// removes them, not the last line of each test.
+    #[test]
+    fn a_copy_leaves_no_file_behind_when_its_test_is_over() {
+        let path = copy_of("test_av.mp4", "gone");
+        let dir = path.parent().expect("a copy has a directory").to_path_buf();
+        assert!(path.exists(), "the copy was not written");
+        drop(path);
+        assert!(!dir.exists(), "the copy's directory outlived its guard");
     }
 }

@@ -2,6 +2,7 @@
 //! interface hangs off, root to overlays.
 
 use crate::*;
+use crate::ui::type_scale::Typeset;
 
 /// The frame `image`, letterboxed/pillarboxed into whatever box it is given,
 /// filling that box on its own axis and leaving the other bare -- the bare
@@ -68,6 +69,8 @@ impl Player {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        // The compare view's picture as shot is read for the frame on screen, if it is not in hand.
+        self.refresh_before(window, cx);
         div()
             .flex_1()
             .min_h(px(0.))
@@ -84,20 +87,74 @@ impl Player {
             .items_center()
             .bg(rgb(BG_CANVAS()))
             .children(
+                // A clip whose file is off the disk shows black, not the last frame it had:
+                // the banner says what is wrong, and a frame of another clip would read as this one.
                 self.image
                     .clone()
-                    .map(|i| letterboxed_image(i).into_any_element())
+                    .filter(|_| !self.picture_is_missing())
+                    .map(|i| {
+                        let native = self.viewer_native_or(&i);
+                        // The compare view draws the graded frame with the picture as shot beside it.
+                        // A source preview has no grade to compare, so it keeps the plain picture.
+                        if self.compare != crate::viewer_view::Compare::Off && self.preview_session.is_none() {
+                            return crate::viewer_view::compare_picture(
+                                self.compare,
+                                self.before.clone(),
+                                i,
+                                native,
+                                self.viewer.zoom,
+                                self.viewer_pan,
+                                window.scale_factor(),
+                            )
+                            .into_any_element();
+                        }
+                        crate::viewer_view::viewer_picture(i, native, self.viewer, self.viewer_pan, window.scale_factor())
+                            .into_any_element()
+                    })
                     // With no file open the letterbox is the whole region,
                     // and a black rectangle says only that something is
                     // broken -- so it says what it wants instead. The window
                     // is already the drop target.
                     .or_else(|| {
-                        (self.active_session().is_none()).then(|| empty_hint().into_any_element())
+                        (self.active_session().is_none()).then(|| self.empty_viewer(cx).into_any_element())
                     }),
             )
+            // The empty project frame's edge, so a near-black canvas still reads as a frame.
+            .children(self.empty_canvas_outline())
+            // The clip under the playhead reads a file that is gone: say so over the picture.
+            .children(self.missing_clip_note(cx))
             // After the picture, so the plate is drawn over it rather than
             // under.
-            .children(self.subtitle_overlay(position, window))
+            // Titles first, so the captions over them draw on top.
+            // Placed against the picture as drawn: the fitted frame, or the zoomed and panned one.
+            .children(self.title_overlay(position, window.scale_factor(), window, cx))
+            .children(self.subtitle_overlay(position, window).map(|overlay| {
+                // Zoomed, the caption's box is the picture's rectangle, not the region.
+                match (self.viewer.zoom, self.viewer_frame_local(window.scale_factor())) {
+                    (crate::viewer_view::Zoom::Fit, _) | (_, None) => overlay.into_any_element(),
+                    (_, Some((x, y, w, h))) => div()
+                        .absolute()
+                        .left(px(x))
+                        .top(px(y))
+                        .w(px(w))
+                        .h(px(h))
+                        .child(overlay)
+                        .into_any_element(),
+                }
+            }))
+            .children(self.viewer_reduced().then(|| {
+                div()
+                    .absolute()
+                    .top(px(8.))
+                    .left(px(8.))
+                    .px(px(6.))
+                    .py(px(2.))
+                    .rounded(px(4.))
+                    .bg(rgba(crate::ui::theme::with_alpha(crate::ui::theme::tokens().e0, 0x99)))
+                    .type_style(crate::ui::type_scale::caption())
+                    .text_color(rgb(crate::ui::theme::tokens().ink1))
+                    .child(format!("{} res", self.viewer.quality.label()))
+            }))
             // The three transient lines hang off the bottom of the picture
             // rather than taking a row of the column: a notice that arrives
             // must not push the transport, the toolbar and the timeline down
@@ -121,10 +178,6 @@ impl Player {
                     // this box is then empty.
                     .child(height_probe(self.notice_h.clone())),
             )
-            // The preview's scrub bar, drawn LAST: the notice box above shares
-            // its bottom edge, and a bar under the "PREVIEWING ..." plate was
-            // invisible for exactly the moment it matters.
-            .children(self.preview_scrub_bar(cx))
     }
 }
 
@@ -153,11 +206,13 @@ impl Player {
             return;
         }
         let scale = window.scale_factor();
-        let Some(session) = self.active_session_mut() else {
+        let Some(session) = self.active_session() else {
             return;
         };
+        let playing = session.is_playing();
         // Device pixels, the unit `Contain` measures its fitting size in.
         let meta = session.meta();
+        let native = (meta.width, meta.height);
         let fitted = gpui::ObjectFit::Contain.get_bounds(
             region,
             size(
@@ -167,9 +222,42 @@ impl Player {
         );
         let w = (f32::from(fitted.size.width) * scale).round() as u32;
         let h = (f32::from(fitted.size.height) * scale).round() as u32;
+        let (w, h) = self.viewer_target((w, h), native, playing);
+        let Some(session) = self.active_session_mut() else {
+            return;
+        };
         if session.set_view_size(w, h) {
             session.resync_picture();
         }
+    }
+}
+
+impl Player {
+    /// The focus invariant: keyboard focus is always somewhere inside the
+    /// room, so the root's key handler and every ring handler under it hear
+    /// the keys. A card, sheet or tab that unmounts while it (or a button in
+    /// it) holds focus leaves the window focused on a handle that is no longer
+    /// in the tree, and gpui then dispatches keys to nothing -- Space, Ctrl+Z
+    /// and Esc all go dead until a click lands on a focusable box. The tree a
+    /// render produces is only known once drawn, so a short check after it
+    /// puts focus back on the root if the focused handle is gone. One door for
+    /// every way a surface can close, rather than a refocus at each of them.
+    fn guard_focus(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if self.focus_guard_pending {
+            return;
+        }
+        self.focus_guard_pending = true;
+        cx.spawn_in(window, async move |this, cx| {
+            gpui::Timer::after(std::time::Duration::from_millis(60)).await;
+            this.update_in(cx, |p, window, cx| {
+                p.focus_guard_pending = false;
+                if !p.focus.contains_focused(window, cx) {
+                    window.focus(&p.focus);
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 }
 
@@ -181,7 +269,28 @@ impl Render for Player {
         if let Some(session) = self.active_session_mut() {
             session.tick();
         }
-        self.pump(window);
+        self.pump();
+        // The dropped-frames words linger after a stop, timed from it, so the window is drawn
+        // again until the linger has run out and the words can go.
+        if self.drop_lingers() {
+            window.refresh();
+        }
+        // The frames the pump replaced leave every window's sprite atlas here, where the
+        // video output window's copy of them can be reached too.
+        for old in std::mem::take(&mut self.retired_images) {
+            cx.drop_image(old, Some(window));
+        }
+        self.sync_output(cx);
+        self.sync_dock_tab();
+        self.sync_sections(cx);
+        // Every press is noted for the tooltips: one still waiting to show must not show after it.
+        window.on_mouse_event(|e: &MouseDownEvent, phase, _, _| {
+            if phase.capture() {
+                crate::ui::widgets::note_press(e.position);
+            }
+        });
+        self.sync_transcript();
+        self.guard_focus(window, cx);
         // A screenshot waiting for its project-sized frame is written on the
         // repaint that lands it -- and before the size push below, which is
         // what gives the preview its own size back.
@@ -194,24 +303,39 @@ impl Render for Player {
         // What every hover label asks before it paints: a card or a menu is
         // drawn over whatever the pointer is resting on.
         OVERLAID.store(self.overlaid(), Ordering::Relaxed);
+        let vs = window.viewport_size();
+        let dock_left = f32::from(vs.width) - self.split_px(Split::Dock, vs);
+        crate::ui::widgets::DOCK_W_BITS.store((f32::from(vs.width) - dock_left).to_bits(), Ordering::Relaxed);
+        let timeline_top =
+            crate::ui::stance::below_picture_floor(f32::from(vs.height), self.split_px(Split::Bench, vs));
+        crate::ui::widgets::TIMELINE_TOP_BITS.store(timeline_top.to_bits(), Ordering::Relaxed);
         // A cleared seek is a frame delivered, which is the one readiness signal
         // there is: whatever a slider drag held back is written here.
         if self.seek_since.is_none() {
             self.flush_drag(cx);
         }
         self.poll_export();
+        self.poll_queue();
         self.poll_import(cx);
+        self.poll_collect(cx);
         self.poll_silence();
         self.poll_proxies(cx);
+        self.poll_render(cx);
+        self.poll_stabilise();
+        self.poll_tracks();
+        self.poll_reframe();
+        self.poll_multicam();
         // Every way a source can arrive -- argv, an import, a project load --
         // has been through a repaint by the time its clips are drawn, so this
         // is the one place that has to notice a new one.
         self.cache_media(cx);
         self.cache_export_seat(cx);
+        // The export sheet's one-second trial write, which prices its time.
+        self.cache_export_pace();
         self.cache_hw_caps(cx);
         // What the compositor calls this window. Pushed only when it changes:
         // it is a protocol round trip and this runs at vsync.
-        let title = window_title(&self.name);
+        let title = shown_title(&self.name, &self.project_path, self.new_project.as_deref(), self.autosave_armed);
         if title != self.titled {
             window.set_window_title(&title);
             self.titled = title;
@@ -242,6 +366,10 @@ impl Render for Player {
         if state.is_playing()
             || self.seek_since.is_some()
             || self.export.is_some()
+            // ...and the queue, whose rows carry a percent.
+            || self.queue.is_going()
+            // ...and the sheet's trial write, whose answer is the time line.
+            || self.export_sheet.bench.is_some()
             || self.importing.is_some()
             // A silence scan too: its progress and its two clocks only reach
             // the screen on a repaint, and a still line is the very thing this
@@ -251,6 +379,19 @@ impl Render for Player {
             // only reaches the screen on a repaint, and a bar that never moves
             // is exactly what a person reads as a hung encode.
             || self.making_proxies()
+            // ...and a stabilisation analysis: its percent on the transform
+            // card, and the corrected picture once it lands.
+            || !self.stab_waiting.is_empty()
+            // ...and a mask track: its percent on the effects card.
+            || !self.track_jobs.is_empty()
+            // ...and an auto reframe: its percent in the status bar.
+            || self.reframe_run.is_some()
+            // ...and angles being synced: the percent in the status bar.
+            || self.mcam_run.is_some()
+            // ...and a media collect: its bar and byte count only reach the screen on a repaint.
+            || self.collect_running()
+            // ...and a render preview: its bar fills, and its finish is seen, on a repaint.
+            || self.render.as_ref().is_some_and(|(job, _)| !job.is_finished())
         {
             window.request_animation_frame();
         }
@@ -274,6 +415,28 @@ impl Render for Player {
         // while playing. It is given straight back below, the moment the head
         // is on the bed a person chose to look at -- so the scroll wins now and
         // the follow resumes by itself, with nothing to press.
+        // A fit asked for before the bed was painted ([`Player::zoom_fit`]) is
+        // taken here, on the first frame that measured one; until then the
+        // loop is kept alive so that frame comes.
+        if self.fit_pending {
+            match self.view().bed > 0. {
+                true => {
+                    self.fit_to_bed();
+                    self.fit_pending = false;
+                }
+                false => window.request_animation_frame(),
+            }
+        }
+        // A fit still in force follows the bed: the first frame measures the
+        // window's initial size, and a compositor resize to the tiled size
+        // after it changes the bed, so the fit is taken again for the new width
+        // ([`Player::fit_to_bed`]). A hand's zoom or scroll has cleared it.
+        if let Some(fitted) = self.fitted_bed {
+            let bed = self.view().bed;
+            if bed > 0. && bed != fitted {
+                self.fit_to_bed();
+            }
+        }
         self.scale = match (state.is_playing() || self.seek_since.is_some()) && !self.panned {
             true => self.view().following(position),
             false => self.view().settled(),

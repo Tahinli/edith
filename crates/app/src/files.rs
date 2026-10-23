@@ -4,7 +4,7 @@ use crate::*;
 
 /// How a finished export announces itself. Written by `poll_export` and read
 /// by the notice bar, which is what makes that one line clickable.
-pub(crate) const EXPORT_DONE: &str = "EXPORT DONE → ";
+pub(crate) const EXPORT_DONE: &str = "Export done → ";
 
 /// The path as a URI the bus will take: percent-encoded, because an export
 /// lands wherever its source lives and those directories have spaces in them.
@@ -70,6 +70,13 @@ pub(crate) fn run_picker(pickers: [(&str, Vec<String>); 2]) -> Option<Option<Pat
         let Ok(out) = std::process::Command::new(bin).args(args).output() else {
             continue;
         };
+        // A chooser that could not open at all (no display to draw on, a broken toolkit) says
+        // so on stderr and is not a cancel: the next one is tried, and with none left the
+        // caller says no dialog could open.
+        let cancelled = out.status.code() == Some(1) && out.stderr.iter().all(u8::is_ascii_whitespace);
+        if !out.status.success() && !cancelled {
+            continue;
+        }
         let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
         return Some((!path.is_empty()).then(|| PathBuf::from(path)));
     }
@@ -91,9 +98,25 @@ pub(crate) fn pick_file(title: &str) -> Result<Option<PathBuf>, &'static str> {
         ),
         ("kdialog", vec!["--getopenfilename".into()]),
     ])
-    .ok_or(
-        "NO FILE CHOOSER — install zenity or kdialog",
-    )
+    .ok_or(NO_DIALOG)
+}
+
+/// What is said when no file dialog could open (none installed, or none that can draw here). The callers
+/// that can take a typed path open the path sheet instead of saying this.
+pub(crate) const NO_DIALOG: &str = "No file chooser opened here.";
+
+/// A folder chooser, opened on `start`. `Err` is a machine with no chooser at all.
+pub(crate) fn pick_folder(title: &str, start: &std::path::Path) -> Result<Option<PathBuf>, &'static str> {
+    // A trailing slash makes the dialog open inside the folder, not on it.
+    let start = format!("{}/", start.to_string_lossy().trim_end_matches('/'));
+    run_picker([
+        (
+            "zenity",
+            vec!["--file-selection".into(), "--directory".into(), format!("--title={title}"), format!("--filename={start}")],
+        ),
+        ("kdialog", vec!["--getexistingdirectory".into(), start]),
+    ])
+    .ok_or("No folder dialog could open here. Type the path instead.")
 }
 
 /// The save-side dialog, opened on where the export would land anyway: with no
@@ -115,17 +138,7 @@ pub(crate) fn pick_save(default: &std::path::Path) -> Result<Option<PathBuf>, &'
         ),
         ("kdialog", vec!["--getsavefilename".into(), default]),
     ])
-    .ok_or(
-        "NO FILE CHOOSER — exporting beside the source",
-    )
-}
-
-/// Where an export goes: the source path with `.export.mp4` for an extension,
-/// so it lands beside the original and can never be the original.
-pub(crate) fn export_path(source: impl Into<PathBuf>) -> PathBuf {
-    let mut path = source.into();
-    path.set_extension("export.mp4");
-    path
+    .ok_or("No file chooser: exporting beside the source")
 }
 
 /// Where a save goes when the timeline did not come from a project file: the
@@ -150,15 +163,25 @@ pub(crate) fn is_project(path: &std::path::Path) -> bool {
 /// name plates and the ledger's project identity). One place, so the two can
 /// never come to disagree about the same file's name.
 pub(crate) fn stem(path: &std::path::Path) -> String {
-    path.file_stem().map_or_else(
-        || file_name(path),
-        |n| n.to_string_lossy().into(),
-    )
+    if let Some(title) = engine::generate::title(path) {
+        return title.into();
+    }
+    if let Some(title) = engine::generate::tone_title(path) {
+        return title;
+    }
+    path.file_stem()
+        .map_or_else(|| file_name(path), |n| n.to_string_lossy().into())
 }
 
 /// The tail of a path, for showing. A path that is all root has none, and reads
 /// as itself.
 pub(crate) fn file_name(path: &std::path::Path) -> String {
+    if let Some(title) = engine::generate::title(path) {
+        return title.into();
+    }
+    if let Some(title) = engine::generate::tone_title(path) {
+        return title;
+    }
     path.file_name().map_or_else(
         || path.display().to_string(),
         |n| n.to_string_lossy().into(),

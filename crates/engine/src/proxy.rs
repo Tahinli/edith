@@ -150,7 +150,7 @@ pub fn path_for(source: &Path) -> Option<PathBuf> {
     bytes.extend_from_slice(&mtime.0.to_le_bytes());
     bytes.extend_from_slice(&mtime.1.to_le_bytes());
     let dir = crate::demux::cache_dir(
-        std::env::var_os("XDG_CACHE_HOME"),
+        crate::envcfg::var_os("XDG_CACHE_HOME"),
         std::env::var_os("HOME"),
         "proxies",
     )?;
@@ -261,7 +261,7 @@ fn sweep_parts(dir: &Path) {
 /// running. A no-op where the machine has no cache directory at all.
 pub fn sweep_stale_parts() {
     if let Some(dir) = crate::demux::cache_dir(
-        std::env::var_os("XDG_CACHE_HOME"),
+        crate::envcfg::var_os("XDG_CACHE_HOME"),
         std::env::var_os("HOME"),
         "proxies",
     ) {
@@ -522,6 +522,11 @@ fn started(
     only_if: fn(&VideoMeta) -> bool,
     cancel: &Arc<AtomicBool>,
 ) -> crate::Result<Option<Job>> {
+    // A film that is not on the disk (moved, drive unplugged) has nothing to
+    // make a stand-in of: that is the media list's "missing" badge, not a failure here.
+    if std::fs::metadata(source).is_err() {
+        return Ok(None);
+    }
     let out = path_for(source).ok_or("no cache directory to keep a proxy in")?;
     if out.is_file() {
         return Ok(Some(Job {
@@ -574,11 +579,23 @@ fn started(
     // what makes the proxy picture-only: the export walk codes the lanes it is
     // given and there is no sound among them.
     let clip = Clip {
+        speed_keys: Vec::new(),
+        reversed: false,
+        stabilise: None, deinterlace: Default::default(), mark: Default::default(),
+        angle: Default::default(),
         fade_in: 0,
         fade_out: 0,
         transition_out: 0,
+        transition_kind: Default::default(),
         visualizer: 0,
         viz_paint: 0,
+        gain_db: 0.0,
+        gain_keys: Vec::new(),
+        pan: 0,
+        transform_keys: Vec::new(),
+        opacity_keys: Vec::new(),
+        color_keys: Vec::new(),
+        effects: Vec::new(),
         start: 0,
         in_frame: 0,
         out_frame: meta.frame_count.max(1),
@@ -589,6 +606,7 @@ fn started(
         transform: None,
         fit: FitPolicy::default(),
         speed: Speed::NORMAL,
+        pitch: 0,
     };
     let project = Project::from_parts(
         vec![Source::new(source, 0)],
@@ -668,6 +686,7 @@ mod tests {
             frame_count: 240,
             codec,
             color: ColorDescription::default(),
+            matrix_assumed: false,
             rotation,
             coded_width,
             coded_height,
@@ -896,37 +915,34 @@ mod tests {
 
     /// A well-formed mp4 carrying one AAC track and no video track: what an
     /// `ffmpeg -vn` or a music file in the wrong box looks like. Written with
-    /// the same crate the exporter's muxer uses, so it is the file that reader
-    /// really parses and not a hand-made approximation.
+    /// the same muxer the exporter uses, so it is the file that reader really
+    /// parses and not a hand-made approximation.
     fn write_audio_only_mp4(path: &Path) {
-        use mp4::{
-            AacConfig, AudioObjectType, ChannelConfig, FourCC, MediaConfig, Mp4Config, Mp4Writer,
-            SampleFreqIndex, TrackConfig, TrackType,
+        use ec_core::{
+            AudioParameters, Buf, ChannelLayout, CodecId, CodecParameters, MediaParameters,
+            Muxer as _, Packet, StreamInfo, TimeBase,
         };
-        let mut writer = Mp4Writer::write_start(
-            std::io::BufWriter::new(std::fs::File::create(path).expect("create")),
-            &Mp4Config {
-                major_brand: FourCC::from(*b"isom"),
-                minor_version: 512,
-                compatible_brands: vec![FourCC::from(*b"isom"), FourCC::from(*b"mp41")],
-                timescale: 44_100,
-            },
-        )
+        // AAC-LC at 44.1 kHz, stereo: the `AudioSpecificConfig` says so.
+        let mut params = CodecParameters::new(CodecId::Aac);
+        params.extradata = Some(Buf::from(vec![0x12, 0x10]));
+        params.media = MediaParameters::Audio(AudioParameters {
+            sample_rate: 44_100,
+            layout: ChannelLayout::from_count(2),
+            ..Default::default()
+        });
+        let mut writer = ec_mp4::Mp4Muxer::new(std::io::BufWriter::new(
+            std::fs::File::create(path).expect("create"),
+        ))
         .expect("start an mp4");
         writer
-            .add_track(&TrackConfig {
-                track_type: TrackType::Audio,
-                timescale: 44_100,
-                language: "und".to_string(),
-                media_conf: MediaConfig::AacConfig(AacConfig {
-                    bitrate: 0,
-                    profile: AudioObjectType::AacLowComplexity,
-                    freq_index: SampleFreqIndex::Freq44100,
-                    chan_conf: ChannelConfig::Stereo,
-                }),
-            })
+            .add_stream(StreamInfo::new(0, TimeBase::from_rate(44_100), params))
             .expect("an audio track");
-        writer.write_end().expect("finish the mp4");
+        let mut packet = Packet::new(0, TimeBase::from_rate(44_100), vec![0x21, 0x10]);
+        packet.dts = Some(0);
+        packet.duration = Some(1024);
+        packet.flags.keyframe = true;
+        writer.write_packet(&packet).expect("an audio packet");
+        ec_core::Muxer::finish(&mut writer).expect("finish the mp4");
     }
 
     /// The staleness rule *is* the name: touch the source and the old proxy is

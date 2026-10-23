@@ -30,7 +30,7 @@ fn main() {
         .and_then(|s| s.to_str().and_then(|s| s.parse().ok()))
         .unwrap_or(5.0);
     let out = args.next().map_or_else(
-        || PathBuf::from(std::env::temp_dir()).join("ve_export_audio_cost.mkv"),
+        || std::env::temp_dir().join("ve_export_audio_cost.mkv"),
         PathBuf::from,
     );
 

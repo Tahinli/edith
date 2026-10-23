@@ -55,7 +55,7 @@ fn main() -> engine::Result<()> {
 fn write_ppm(out: &str, width: u32, height: u32, bgra: &[u8]) -> engine::Result<()> {
     let mut w = BufWriter::new(File::create(out)?);
     writeln!(w, "P6\n{width} {height}\n255")?;
-    for px in bgra.chunks_exact(4) {
+    for px in bgra.as_chunks::<4>().0 {
         w.write_all(&[px[2], px[1], px[0]])?; // BGRA -> RGB
     }
     Ok(())

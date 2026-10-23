@@ -1,6 +1,7 @@
 //! What a pointer is doing: the drags, the ghosts, the trims and the key repeat.
 
 use crate::*;
+use engine::project::TrimWalls;
 
 /// A library row being dragged: the file and which of its audio streams that
 /// row is, which is the whole of what a row names. Where it lands does not
@@ -12,7 +13,7 @@ pub(crate) struct AssetDrag(pub(crate) PathBuf, pub(crate) usize);
 /// nothing is inserted -- the same clip changes lane and keeps the frames it
 /// plays -- but where along the bed it is let go is exactly where it lands, less
 /// the offset the hand grabbed it at ([`Player::grab`]).
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct ClipDrag {
     pub(crate) lane: Lane,
     pub(crate) idx: usize,
@@ -110,11 +111,133 @@ pub(crate) struct Trim {
     pub(crate) link: Option<u32>,
 }
 
-/// How wide a clip's edge is as a *target*: the strip at each end where a press
-/// means "make this longer or shorter" instead of "move this to another lane".
-/// Wide enough to hit, narrow enough that the middle of even a small box is
-/// still the body.
+/// A box select in flight: pressed on empty bed at `from`, pulled to `to`
+/// (window coordinates). Under [`MARQUEE_SLOP`] it is still a click.
+#[derive(Clone, Copy)]
+pub(crate) struct Marquee {
+    pub(crate) from: Point<Pixels>,
+    pub(crate) to: Point<Pixels>,
+}
+
+/// How far the pointer must travel before a press on empty bed becomes a box.
+pub(crate) const MARQUEE_SLOP: f32 = 4.;
+
+impl Marquee {
+    /// Whether the pointer has travelled far enough for this to be a box.
+    pub(crate) fn live(&self) -> bool {
+        let (dx, dy) = (f32::from(self.to.x - self.from.x), f32::from(self.to.y - self.from.y));
+        dx.abs() >= MARQUEE_SLOP || dy.abs() >= MARQUEE_SLOP
+    }
+
+    /// Left, top, right, bottom of the box.
+    pub(crate) fn edges(&self) -> (Pixels, Pixels, Pixels, Pixels) {
+        (
+            self.from.x.min(self.to.x),
+            self.from.y.min(self.to.y),
+            self.from.x.max(self.to.x),
+            self.from.y.max(self.to.y),
+        )
+    }
+}
+
+/// Which of the three pro trims a gesture or key makes (roll, slip, slide).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ProKind {
+    /// The cut after `idx` moves; both clips at it change, the length does not.
+    Roll,
+    /// The clip shows another part of its file, in the same slot.
+    Slip,
+    /// The clip moves between its neighbours, which give and take the frames.
+    Slide,
+}
+
+/// A shift-drag in flight on a clip edge (roll) or body (slip, slide). Like
+/// [`Trim`] it is tracked on the root and the engine hears about it once, at
+/// the release -- one edit, one undo step.
+#[derive(Clone, Copy)]
+pub(crate) struct ProDrag {
+    pub(crate) lane: Lane,
+    /// The clip the engine call is made on: for a roll, the clip *before* the
+    /// cut being dragged (the edge strip's own clip, or the one ahead of it).
+    pub(crate) idx: usize,
+    pub(crate) kind: ProKind,
+    /// The timeline frame under the pointer at the press.
+    pub(crate) from: u32,
+    /// Timeline frames moved so far, already clamped to the room the engine
+    /// answers (slip is clamped by the engine itself at the release).
+    pub(crate) by: i64,
+}
+
+/// How long a trim edge's handle flashes warn when the pointer runs past a
+/// media wall (the source has no more frames that way).
+pub(crate) const TRIM_FLASH: std::time::Duration = std::time::Duration::from_millis(120);
+
+/// The media-wall stop an edge is pinned against, live: the edge is kept at a
+/// bound while it is pulled through it, and the warn flash is for that stop
+/// alone. `since` is when it began, `wall` the frame it is pinned to, so a
+/// pointer that stays past the same wall is one stop, not a flash per sample.
+#[derive(Clone, Copy)]
+pub(crate) struct TrimFlash {
+    pub(crate) lane: Lane,
+    pub(crate) idx: usize,
+    pub(crate) edge: Edge,
+    pub(crate) wall: u32,
+    pub(crate) since: Instant,
+}
+
+impl TrimFlash {
+    /// Whether this edge's handle is still flashing.
+    pub(crate) fn lit(&self, lane: Lane, idx: usize, edge: Edge) -> bool {
+        (self.lane, self.idx, self.edge) == (lane, idx, edge) && self.since.elapsed() < TRIM_FLASH
+    }
+}
+
+/// The media wall a trim stopped against, if the pointer wanted past it: `at`
+/// is where the pointer asked the edge to be, `to` where the engine let it
+/// stand, `walls` the room the edge has. `None` when nothing was refused, or
+/// when the bound that held is a neighbour or the timeline's own start, which
+/// carry no flash -- only the source's end does.
+pub(crate) fn media_wall_stop(at: u32, to: u32, walls: TrimWalls) -> Option<u32> {
+    if at < walls.lo && to == walls.lo && walls.lo_media {
+        return Some(walls.lo);
+    }
+    if at > walls.hi && to == walls.hi && walls.hi_media {
+        return Some(walls.hi);
+    }
+    None
+}
+
+/// The handle width [`trims`] is built on: a box below three of these has no
+/// trim zones at all. The zones themselves are [`TRIM_REACH`] either side of
+/// each edge, which is wider than this strip, so this is the floor, not the
+/// hit size.
 pub(crate) const EDGE_W: f32 = 6.;
+
+/// How far a trim's hit zone reaches on *each* side of a clip edge: 24 px
+/// centred on the edge, so the hand finds it by aim alone (WCAG 2.5.8,
+/// [`HIT_MIN`]). The visible handle of a selected clip is [`TRIM_HANDLE`]
+/// wide; the rest of the zone is a target, not a drawing.
+pub(crate) const TRIM_REACH: f32 = HIT_MIN / 2.;
+
+/// The drawn trim handle a selected clip shows inside each edge.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const TRIM_HANDLE: f32 = 12.;
+
+/// How far one edge's trim zone reaches, as `(inside, outside)` px from the
+/// edge. `room` is the gap to the neighbour on that side (`f32::INFINITY`
+/// where there is none): the outside reach stops at the middle of that gap, so
+/// where two clips meet the clip under the pointer wins its own half of the
+/// join.
+///
+/// The inside reach shrinks on a clip under 48 px to a quarter of its width,
+/// which keeps the middle half of it a move target -- the middle third is
+/// what the rule guarantees, and a quarter leaves it room to breathe.
+pub(crate) fn trim_zone(width: f32, room: f32) -> (f32, f32) {
+    (
+        TRIM_REACH.min(width / 4.),
+        TRIM_REACH.min(room.max(0.) / 2.),
+    )
+}
 
 /// A fade handle's own hit zone, at each *top* corner of an audio clip's box --
 /// never the trim strip's height, which is [`EDGE_W`] wide down the whole box
@@ -145,6 +268,40 @@ pub(crate) struct FadeDrag {
     pub(crate) start: u32,
     pub(crate) to: u32,
     pub(crate) cap: u32,
+}
+
+/// What a volume-envelope drag holds: one key, or the line between key `i` and key `i + 1`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GainGrab {
+    Key(usize),
+    Segment(usize),
+}
+
+/// A volume-envelope drag on one audio clip, tracked on the root like a fade is. A key moves in
+/// time (between its neighbours and the clip's own source range) and in dB; a segment moves both
+/// of its keys up or down by the same dB. `keys` is the envelope at the press, which the release
+/// compares against; `shown` is what the drag is showing and what the release commits, in one
+/// undo step. Positions are window pixels, and `origin` and `size` are the clip's own box.
+#[derive(Clone, Debug)]
+pub(crate) struct GainEdit {
+    pub(crate) lane: Lane,
+    pub(crate) idx: usize,
+    pub(crate) grab: GainGrab,
+    pub(crate) press: Point<Pixels>,
+    pub(crate) origin: Point<Pixels>,
+    pub(crate) size: Size<Pixels>,
+    pub(crate) keys: Vec<engine::GainKey>,
+    pub(crate) shown: Vec<engine::GainKey>,
+    /// The clip's own gain, the source range a key may move in, its speed and the timeline's
+    /// pixels per frame, read at the press.
+    pub(crate) clip_gain: f32,
+    pub(crate) in_frame: u32,
+    pub(crate) out_frame: u32,
+    pub(crate) speed: f64,
+    pub(crate) px_per_frame: f32,
+    /// For a key: the display dB the press was over, less the key's own. For a segment: the dB
+    /// under the press. A move adds the pointer's change to it.
+    pub(crate) grab_db: f32,
 }
 
 /// Whether a clip box this wide gets its two trim strips at all. Below three
@@ -195,7 +352,8 @@ pub(crate) fn scrim() -> Div {
 /// (DESIGN §2/§4); the legacy tree keeps its own raised sheet. One function,
 /// so the next change reaches all three or none.
 pub(crate) fn menu_plate(id: &'static str, x: f32, y: f32) -> Stateful<Div> {
-    div()
+    // The one popup look (REDESIGN §1.6): every menu starts from `kit::plate`.
+    crate::ui::kit::plate(6.)
         .id(id)
         .absolute()
         .left(px(x))
@@ -204,10 +362,6 @@ pub(crate) fn menu_plate(id: &'static str, x: f32, y: f32) -> Stateful<Div> {
         .flex()
         .flex_col()
         .p(px(crate::layout::MENU_PAD))
-        .rounded(px(6.))
-        .bg(rgb(crate::ui::theme::DARK_PANEL()))
-        .border_1()
-        .border_color(rgba(crate::ui::theme::DARK_SEAM()))
 }
 
 /// The sheet a card with a *slider* in it takes instead: the same scrim, with
@@ -223,7 +377,7 @@ pub(crate) fn menu_plate(id: &'static str, x: f32, y: f32) -> Stateful<Div> {
 /// The scrim is the one surface above the occluder that covers the whole card,
 /// so the same two listeners go here, and a drag that leaves the card is picked
 /// up by the root's copy of them without a seam.
-pub(crate) fn drag_scrim(cx: &mut Context<Player>) -> Div {
+pub(crate) fn drag_scrim(cx: &Context<Player>) -> Div {
     scrim()
         .on_mouse_move(cx.listener(Player::drag_move))
         .on_mouse_up(MouseButton::Left, cx.listener(Player::drag_release))
@@ -314,7 +468,10 @@ pub(crate) fn divider(split: Split, held: bool, cx: &mut Context<Player>) -> Div
                                 this.splits.clear(split);
                                 crate::layout::save_stance_splits(&this.splits);
                             }
-                            false => this.split_drag = Some(split),
+                            false => {
+                                this.split_drag = Some(split);
+                                this.split_press = Some((event.position, false));
+                            }
                         }
                         cx.notify();
                         cx.stop_propagation();
@@ -348,6 +505,63 @@ pub(crate) fn divider(split: Split, held: bool, cx: &mut Context<Player>) -> Div
         )
 }
 
+/// The grab on a lane's bottom edge (DESIGN §5 "Lane heights"): 2px inside the
+/// lane's edge and 12px past it -- the 2px [`ROW_GAP`] plus 10px of the lane
+/// below. It starts at the head's right edge, so the bed carries it and a head
+/// keeps its own bottom pixels for its reorder grab and switches. It stays out
+/// of the lane's bottom 2px and so does not cover the key marks drawn on a
+/// clip's foot (`ui/bench_stance/lane.rs`), which must take their own presses.
+/// A press starts the drag (`Player::lane_resize`, read by `drag_move`); a
+/// double-click puts the lane back to its kind's default.
+pub(crate) fn lane_resize_band(
+    lane: Lane,
+    h: f32,
+    left: f32,
+    cx: &mut Context<Player>,
+) -> impl IntoElement + use<> {
+    const ABOVE_H: f32 = 2.;
+    const BELOW_H: f32 = 12.;
+    let key = crate::ui::bench_stance::lane_key(lane);
+    // Named per lane: `group_hover` resolves by name through one global map.
+    let group = format!("lane-resize-{key}");
+    div()
+        .id(SharedString::from(format!("bench-lane-resize-{key}")))
+        .absolute()
+        .group(group.clone())
+        .left(px(left))
+        .right_0()
+        .top(px(h - ABOVE_H))
+        .h(px(ABOVE_H + BELOW_H))
+        .cursor_row_resize()
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                match event.click_count >= 2 {
+                    true => this.reset_lane_h(lane, cx),
+                    // The grab is the pointer's y less the height the lane
+                    // has now, so a drag sets the height from the pointer
+                    // alone (`Player::drag_lane_resize`) and never jumps.
+                    false => {
+                        this.lane_resize = Some((lane, f32::from(event.position.y) - h));
+                        cx.notify();
+                    }
+                }
+                cx.stop_propagation();
+            }),
+        )
+        // The hairline at the lane's edge, lit under the pointer -- the same
+        // "this can be dragged" cue a seam gives (`divider`).
+        .child(
+            div()
+                .absolute()
+                .left_0()
+                .right_0()
+                .top(px(ABOVE_H - 1.))
+                .h(px(1.))
+                .group_hover(group, |s| s.bg(rgb(STROKE_DIVIDER()))),
+        )
+}
+
 /// A press that stops here. What every card's body hands its scrim: the scrim
 /// closes the card on a press, and the card is painted after it, so this listener
 /// runs first (gpui dispatches topmost-first, window.rs:3705) and a press meant
@@ -376,12 +590,17 @@ pub(crate) const DROP_SNAP_PX: f64 = 10.;
 /// own seek strip, which is the idiom it sits under.
 pub(crate) const SCROLL_THUMB_MIN: f32 = 24.;
 
-/// The thickness of a scrollbar strip's hit area, in the one dimension the
-/// strip spans: the height of the horizontal one under the lanes, the width
-/// of the vertical one on the beds' right edge. The bar inside it looks 6 px,
-/// and the strip that takes the press is thicker for the ruler strip's
-/// reason -- a hand must be able to find it without aiming (WCAG 2.5.8).
-pub(crate) const SCROLL_HIT: f32 = 14.;
+/// The thickness of a scrollbar bar as drawn, in the one dimension the strip
+/// spans: the height of the horizontal one under the lanes, the width of the
+/// vertical one on the beds' right edge. This is what the layout spends.
+pub(crate) const SCROLL_BAR_H: f32 = 6.;
+
+/// The hit area of a scrollbar strip, in the same dimension: a hand must be
+/// able to find it without aiming (WCAG 2.5.8, [`HIT_MIN`]). The strip's row
+/// is [`SCROLL_ROW_H`] tall; the band reaches [`SCROLL_HIT_UP`] above it into
+/// the bottom of the lanes and [`SCROLL_HIT_DOWN`] below it, so the band is
+/// at least [`HIT_MIN`] and the lanes give up no more than 8px for it.
+pub(crate) const SCROLL_HIT: f32 = HIT_MIN;
 
 /// Where a held key would land, which is the whole of what auto-repeat has to
 /// know. [`Player::repeat_scope`] answers it from the same state the handler
@@ -424,5 +643,52 @@ pub(crate) fn repeats(scope: Repeat, key: &str, action: Option<ActionId>) -> boo
             )
         ),
         Repeat::Nothing => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn walls(lo_media: bool, hi_media: bool) -> TrimWalls {
+        TrimWalls {
+            lo: 1,
+            hi: 9,
+            lo_media,
+            hi_media,
+        }
+    }
+
+    #[test]
+    fn a_stop_flashes_only_at_a_media_wall_the_pointer_wanted_past() {
+        // Past the source's end: flash. Past a neighbour, or inside the room:
+        // nothing to say.
+        assert_eq!(media_wall_stop(12, 9, walls(false, true)), Some(9));
+        assert_eq!(media_wall_stop(12, 9, walls(false, false)), None);
+        assert_eq!(media_wall_stop(0, 1, walls(true, false)), Some(1));
+        assert_eq!(media_wall_stop(0, 1, walls(false, true)), None);
+        assert_eq!(media_wall_stop(5, 5, walls(true, true)), None);
+        // A clamp that did not clamp the pointer's ask is not a stop.
+        assert_eq!(media_wall_stop(9, 9, walls(true, true)), None);
+    }
+
+    #[test]
+    fn a_flash_lights_its_own_edge_for_its_window_only() {
+        let lane = Lane::V1;
+        let fresh = TrimFlash {
+            lane,
+            idx: 2,
+            edge: Edge::End,
+            wall: 9,
+            since: Instant::now(),
+        };
+        assert!(fresh.lit(lane, 2, Edge::End));
+        assert!(!fresh.lit(lane, 2, Edge::Start));
+        assert!(!fresh.lit(lane, 3, Edge::End));
+        let spent = TrimFlash {
+            since: Instant::now() - TRIM_FLASH - Duration::from_millis(1),
+            ..fresh
+        };
+        assert!(!spent.lit(lane, 2, Edge::End));
     }
 }

@@ -22,7 +22,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 
 use crate::AudioSession;
-use crate::project::{Clip, Speed};
+use crate::project::Clip;
 
 /// Loudness windows per second: 50, i.e. 20 ms each -- short enough to place a
 /// cut inside one frame at any sane rate, long enough that one glottal pulse is
@@ -288,19 +288,11 @@ pub fn timeline_regions(clip: &Clip, fps: f64, regions: &[(f64, f64)]) -> Vec<(u
             if last <= first {
                 return None;
             }
-            let start = clip.start + clip.speed.timeline_at(first - clip.in_frame);
-            let end = clip.start + floor_timeline(clip.speed, last - clip.in_frame);
+            let start = clip.start + clip.timeline_offset(first - clip.in_frame);
+            let end = clip.start + clip.timeline_offset_floor(last - clip.in_frame);
             (end > start).then_some((start, end - start))
         })
         .collect()
-}
-
-/// [`Speed::timeline_at`] floored instead of ceiled: which timeline frame of a
-/// clip a source frame lands on, rounded the way an *end* has to be so a
-/// region never eats the frame speech starts on. The ceil is the right rounding
-/// for a start and for playback's stamps, and this is its partner.
-fn floor_timeline(speed: Speed, offset: u32) -> u32 {
-    (u64::from(offset) * 1000 / u64::from(speed.permille())).min(u64::from(u32::MAX)) as u32
 }
 
 #[cfg(test)]
@@ -308,7 +300,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{Settings, invert, levels, regions, timeline_regions};
-    use crate::project::{Clip, Speed};
+    use crate::project::{Clip, Speed, SpeedKey};
     use crate::scale::FitPolicy;
 
     fn asset(name: &str) -> PathBuf {
@@ -319,11 +311,23 @@ mod tests {
 
     fn clip(start: u32, in_frame: u32, out_frame: u32, speed: Speed) -> Clip {
         Clip {
+            speed_keys: Vec::new(),
+            reversed: false,
+            stabilise: None, deinterlace: Default::default(), mark: Default::default(),
+            angle: Default::default(),
             fade_in: 0,
             fade_out: 0,
             transition_out: 0,
+            transition_kind: Default::default(),
             visualizer: 0,
             viz_paint: 0,
+            gain_db: 0.0,
+            gain_keys: Vec::new(),
+            pan: 0,
+            transform_keys: Vec::new(),
+            opacity_keys: Vec::new(),
+            color_keys: Vec::new(),
+            effects: Vec::new(),
             start,
             in_frame,
             out_frame,
@@ -334,6 +338,7 @@ mod tests {
             transform: None,
             fit: FitPolicy::default(),
             speed,
+            pitch: 0,
         }
     }
 
@@ -554,6 +559,26 @@ mod tests {
         let short = clip(0, 0, 45, Speed::NORMAL);
         assert_eq!(timeline_regions(&short, 30., &[(1., 2.)]), vec![(30, 15)]);
         assert!(timeline_regions(&short, 30., &[(2., 3.)]).is_empty());
+    }
+
+    /// A ramped clip maps a region through the ramp's integral, not one rate: 1x to 2x
+    /// over 60 frames reads source frame `t + t^2/120` at timeline frame `t`, so the
+    /// second of source from frame 30 to 60 starts at timeline 25 (the first frame
+    /// whose source frame is 30 or more) and its end rounds down to 43.
+    #[test]
+    fn regions_map_through_a_ramp_not_a_single_rate() {
+        let ramped = Clip {
+            speed_keys: vec![
+                SpeedKey { at: 0, speed: Speed::NORMAL },
+                SpeedKey { at: 60, speed: Speed::from_permille(2000) },
+            ],
+            ..clip(0, 0, 300, Speed::NORMAL)
+        };
+        assert_eq!(timeline_regions(&ramped, 30., &[(1., 2.)]), vec![(25, 18)]);
+        // Placed at 100 and read from source frame 30: the region is the same 30 source
+        // frames in, so it lands the same 25 frames in.
+        let placed = Clip { start: 100, in_frame: 30, ..ramped };
+        assert_eq!(timeline_regions(&placed, 30., &[(1., 2.)]), vec![(125, 18)]);
     }
 
     /// Rounded inward at both ends: a region whose seconds fall between frames

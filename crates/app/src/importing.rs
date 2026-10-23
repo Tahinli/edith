@@ -106,7 +106,7 @@ pub(crate) struct Import {
     /// -- the header index and the subtitle pass, the twenty seconds of a cold
     /// 24 GB remux -- gives up at the next element.
     ///
-    /// corner-cut: an mp4's header is one read inside `mp4::Mp4Reader`, which
+    /// corner-cut: an mp4's header is one read inside `ec_mp4::Mp4Demuxer`, which
     /// has no flag to poll, so a cancelled mp4 import still finishes its own
     /// header before the worker returns. Ceiling: the disk stays busy for that
     /// read, though nothing waits on it. Upgrade path is our own `moov` parse,
@@ -239,6 +239,11 @@ pub(crate) enum Landing {
     Import,
 }
 
+/// Whether `path` is an OpenTimelineIO file: a timeline to make a sequence of, never media.
+pub(crate) fn is_timeline(path: &std::path::Path) -> bool {
+    path.extension().is_some_and(|e| e.eq_ignore_ascii_case("otio"))
+}
+
 /// Which of the three a queued file is (`landing` above is the drag's).
 /// `opening` is the one path argv named and is cleared as it lands, so a second
 /// arrival of the same *media* path -- a drop of the film that is already open
@@ -283,8 +288,8 @@ pub(crate) fn import_line(
     };
     let what = stage.what();
     let verb = match opening {
-        true => "OPENING",
-        false => "IMPORTING",
+        true => "Opening",
+        false => "Importing",
     };
     match since >= IMPORT_STALL {
         true => format!(
@@ -395,11 +400,11 @@ pub(crate) fn silence_line(scanned: f32, total: f32, elapsed: f32, since: f32) -
     };
     match since >= IMPORT_STALL {
         true => format!(
-            "SCANNING · still reading the sound — a big film is minutes of decoding, and the \
+            "Scanning · still reading the sound — a big video is minutes of decoding, and the \
              window is not frozen · {far} · {} elapsed",
             clock(elapsed)
         ),
-        false => format!("SCANNING · {far} · {} elapsed", clock(elapsed)),
+        false => format!("Scanning · {far} · {} elapsed", clock(elapsed)),
     }
 }
 

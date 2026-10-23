@@ -36,19 +36,21 @@ fn asset(name: &str) -> PathBuf {
 /// Software everywhere, so the suite proves the path every machine has.
 fn pin_software() {
     static PIN: Once = Once::new();
-    PIN.call_once(|| unsafe {
-        std::env::set_var("VE_SW", "1");
-        std::env::set_var("VE_SW_ENC", "1");
+    PIN.call_once(|| {
+        engine::envcfg::set("VE_SW", "1");
+        engine::envcfg::set("VE_SW_ENC", "1");
     });
 }
 
 /// The fixture's own pixel at `(x, y)` as RGB -- what the timeline has to show
 /// there, whatever it scaled the picture to on the way.
 fn source_rgb(x: u32, y: u32) -> [u8; 3] {
-    let img = image::open(asset("test_still.png"))
-        .expect("the still fixture (scripts/gen_fixtures.sh)")
-        .to_rgb8();
-    img.get_pixel(x, y).0
+    let img = ec_image::open(asset("test_still.png"))
+        .expect("the still fixture (scripts/gen_fixtures.sh)");
+    let (width, _) = img.dimensions();
+    let rgb = img.to_rgb8();
+    let at = ((y * width + x) * 3) as usize;
+    [rgb[at], rgb[at + 1], rgb[at + 2]]
 }
 
 /// One BGRA pixel of a frame as RGB, so both sides of a comparison read alike.
@@ -146,7 +148,7 @@ fn a_placed_still_shows_its_own_pixels_on_the_canvas() {
 
     // Placed for five seconds on the video lane, and on no other: a still is
     // silent, so nothing of it belongs on an audio lane.
-    let placed = *session.lane_clips(Lane::V1).last().expect("the still clip");
+    let placed = session.lane_clips(Lane::V1).last().expect("the still clip").clone();
     assert_eq!(placed.len(), PLACED, "five seconds at 30 fps");
     assert_eq!(
         session.lane_clips(Lane::A1).len(),
@@ -193,7 +195,7 @@ fn a_still_trims_out_to_its_cap_and_no_further() {
     assert_eq!(session.lane_clips(Lane::V1)[0].len(), PLACED);
     assert!(session.lane_clips(Lane::A1).is_empty(), "silent");
 
-    let clip = session.lane_clips(Lane::V1)[0];
+    let clip = session.lane_clips(Lane::V1)[0].clone();
     assert_eq!(
         session.trim_room(Lane::V1, 0, Edge::End),
         Some((clip.start + 1, clip.start + CAP)),
@@ -213,7 +215,7 @@ fn a_still_trims_out_to_its_cap_and_no_further() {
     // frame to walk an in-point back to, so its left edge stretches out to the
     // same cap. Pulled in first, since a clip at frame 0 has nowhere to go.
     assert!(session.trim_clip(Lane::V1, 0, Edge::Start, 20));
-    let clip = session.lane_clips(Lane::V1)[0];
+    let clip = session.lane_clips(Lane::V1)[0].clone();
     assert_eq!((clip.start, clip.len()), (20, 40));
     assert_eq!(
         session.trim_room(Lane::V1, 0, Edge::Start),
@@ -221,7 +223,7 @@ fn a_still_trims_out_to_its_cap_and_no_further() {
         "out to frame 0: the cap is further off than the timeline reaches"
     );
     assert!(session.trim_clip(Lane::V1, 0, Edge::Start, 0), "dragged out");
-    let clip = session.lane_clips(Lane::V1)[0];
+    let clip = session.lane_clips(Lane::V1)[0].clone();
     assert_eq!(
         (clip.start, clip.in_frame, clip.len()),
         (0, 0, 60),
@@ -327,7 +329,7 @@ fn a_still_survives_the_project_round_trip() {
     );
     // Trimmed well past the five seconds it went down as, so the reload's own
     // length check has something to be wrong about.
-    let clip = *session.lane_clips(Lane::V1).last().expect("the still clip");
+    let clip = session.lane_clips(Lane::V1).last().expect("the still clip").clone();
     let idx = session.lane_clips(Lane::V1).len() - 1;
     assert!(session.trim_clip(Lane::V1, idx, Edge::End, clip.start + 900));
     let before: Vec<_> = session.lane_clips(Lane::V1).to_vec();
@@ -373,21 +375,34 @@ fn a_still_at_saved_source_zero_keeps_the_rate_and_the_sound() {
     std::fs::copy(asset("test_25fps.mp4"), &media).expect("copy the video");
     std::fs::copy(asset("test_still.png"), &still).expect("copy the still");
 
-    // 25 fps, which no still is ever given: the rate alone says which source
-    // the reload scaffolded from.
-    let mut session = PlaybackSession::open(&media).expect("open the fixture");
+    // Source indexes are session order now (`Project::without_orphan_sources`
+    // keeps every import, in the order it arrived), so a still is at saved
+    // source 0 only if it was imported first. Open the timeline on the still:
+    // a still-scaffolded timeline runs at the still's made-up 30 fps, and the
+    // footage then joins it at its own 25 (read at `Rate` against 30).
+    let mut session = PlaybackSession::open(&still).expect("a picture opens a timeline");
     session.set_gain(0.0);
-    assert!((session.meta().frame_rate - 25.0).abs() < 0.01);
-    session.import(&still).expect("a picture");
-    // Over the head of V1, where it takes the whole take's picture: the sound
-    // stays on A1, so the still is the first clip in save order and the video
-    // is a source only the audio lane names.
+    assert!((session.meta().frame_rate - 30.0).abs() < 0.01);
+    session.import(&media).expect("the footage joins it");
+    // Placing the footage puts its picture on V1 as well, over the head of the
+    // still, and the still is then placed back over that head. The still is
+    // the first source in the session, so it is source 0 in the save; the
+    // footage's sound is what the reload must find on A1.
+    assert!(
+        session
+            .place_stream_at(0.0, &media, 0, Some(Lane::A1))
+            .expect("the footage joins the timeline")
+    );
     assert!(
         session
             .place_stream_at(0.0, &still, 0, Some(Lane::V1))
             .expect("a still joins any timeline")
     );
-    assert!(session.lane_clips(Lane::V1).len() == 1 && session.lane_clips(Lane::A1).len() == 1);
+    assert_eq!(session.lane_clips(Lane::A1).len(), 1, "the footage's sound");
+    assert!(
+        session.lane_clips(Lane::V1).iter().any(|c| c.source == 0),
+        "the still is on V1 under source 0"
+    );
 
     let project = dir.join("still_first.edith");
     session.save_project(&project).expect("save");
@@ -402,16 +417,18 @@ fn a_still_at_saved_source_zero_keeps_the_rate_and_the_sound() {
     );
 
     let reopened = PlaybackSession::open_project(&project).expect("a saved project always reopens");
+    // The saved rate comes back as the session had it: a v9 file says what it
+    // was cut at, and that beats the scaffold's own made-up rate for a still.
     assert!(
-        (reopened.meta().frame_rate - 25.0).abs() < 0.01,
-        "the footage's rate, not the still's 30: {}",
+        (reopened.meta().frame_rate - session.meta().frame_rate).abs() < 0.01,
+        "the saved rate, not the scaffold's: {}",
         reopened.meta().frame_rate
     );
-    // The same sound, at the same place, playing the same file -- by a *new*
-    // index, which is the renumbering this whole test is about.
+    // The same sound, at the same place, playing the same file -- read from the
+    // index the save gave it, which is the still-first order this test builds.
     let (sound, was) = (
-        reopened.lane_clips(Lane::A1)[0],
-        session.lane_clips(Lane::A1)[0],
+        reopened.lane_clips(Lane::A1)[0].clone(),
+        session.lane_clips(Lane::A1)[0].clone(),
     );
     assert_eq!(
         (sound.start, sound.in_frame, sound.out_frame),
@@ -516,4 +533,34 @@ fn a_still_asked_for_on_an_audio_lane_lands_on_the_video_one() {
         2,
         "on the video lane instead"
     );
+}
+
+/// The project's still length: a still placed after it is set takes that length, one placed
+/// before keeps its own, and the length a project was saved with is the one a still takes
+/// after a reopen.
+#[test]
+fn the_still_length_is_the_projects_and_sets_the_next_placement() {
+    pin_software();
+    let still = asset("test_still.png");
+    let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+    session.set_gain(0.0);
+    session.import(&still).expect("a picture");
+    assert_eq!(session.still_secs(), 5.0, "the default");
+    let end = session.timeline_duration();
+    assert!(session.place_stream_at(end, &still, 0, Some(Lane::V1)).expect("a still joins"));
+    assert_eq!(session.lane_clips(Lane::V1).last().expect("the still").len(), PLACED);
+
+    assert!(session.set_still_secs(2.0));
+    assert!(!session.set_still_secs(2.0), "the same length changes nothing");
+    let end = session.timeline_duration();
+    assert!(session.place_stream_at(end, &still, 0, Some(Lane::V1)).expect("a still joins"));
+    let clips = session.lane_clips(Lane::V1);
+    assert_eq!(clips.last().expect("the new still").len(), 60, "two seconds at 30 fps");
+    assert_eq!(clips[clips.len() - 2].len(), PLACED, "the still already placed keeps five seconds");
+
+    // Too short or too long is held to the range the editor allows.
+    assert!(session.set_still_secs(0.01));
+    assert_eq!(session.still_secs(), 0.5);
+    session.set_still_secs(f64::NAN);
+    assert_eq!(session.still_secs(), 5.0, "not a number is the default");
 }

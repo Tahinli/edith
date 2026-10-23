@@ -1,0 +1,16 @@
+# cargo-nextest: how the workspace's test suite runs.
+
+[profile.default]
+# A test is flagged slow after 60s. Slow tests are flagged only and none are killed,
+# because the heavy export tests take minutes.
+slow-timeout = "60s"
+# One failure must not hide the others.
+fail-fast = false
+
+# Full decode, export and render runs are the heavy ones: at most two at once.
+[test-groups.heavy]
+max-threads = 2
+
+[[profile.default.overrides]]
+filter = 'package(engine) and test(/export|decode|render/)'
+test-group = "heavy"

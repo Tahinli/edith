@@ -8,7 +8,7 @@ pub(crate) const NO_FILE: &str = "no file open";
 
 /// What a press of play says when there is nothing to play: no timeline at all
 /// and an emptied one are the same answer to the user, so they are one line.
-pub(crate) const NOTHING_TO_PLAY: &str = "NOTHING TO PLAY — the timeline is empty";
+pub(crate) const NOTHING_TO_PLAY: &str = "Nothing to play: the timeline is empty";
 
 /// Whether a press of play would have anything to play. No timeline at all and
 /// one every clip has been taken off are the same state to a transport, and the
@@ -293,18 +293,30 @@ pub(crate) fn viz_held_paint(paint: u64, held: Option<(VizSlot, u8, u8)>) -> u64
 /// cold read of a big film takes, which is the only case worth a line.
 pub(crate) const SEEK_STALL: Duration = Duration::from_secs(2);
 
+/// How long before the line counts the seconds.
+pub(crate) const SEEK_COUNT: Duration = Duration::from_secs(3);
+
+/// How long a picture may stand unopened before the line stops saying it is opening and says
+/// why it cannot be shown. A slow read still lands inside this; a compound or a missing file
+/// never does, and a running timer over it would be a lie.
+pub(crate) const SEEK_GIVE_UP: Duration = Duration::from_secs(8);
+
 /// What a seek that has stood past [`SEEK_STALL`] says, and nothing at all
 /// before that: a line on every click of the ruler would be a flicker, and the
 /// picture holding still for a tenth of a second is not something to explain.
-/// The import bar's words, for the import bar's reason -- a window that cannot
-/// move and a window that has hung look identical, so this one says which.
+/// Short and plain; the seconds only once they say something (a window that
+/// cannot move and a window that has hung look identical, so this one counts).
+/// A picture whose file is off the disk is the banner's to say (`missing_clip_note`), so this
+/// line is only for a read that failed.
 pub(crate) fn seek_line(standing: Option<Duration>) -> Option<String> {
     let since = standing.filter(|d| *d >= SEEK_STALL)?;
-    Some(format!(
-        "still opening the picture — a cold read of a big file is seconds of it, and the window \
-         is not frozen · {} elapsed",
-        clock(since.as_secs_f32())
-    ))
+    if since >= SEEK_GIVE_UP {
+        return Some("Can't show this frame: nothing could be read at the playhead.".to_string());
+    }
+    Some(match since >= SEEK_COUNT {
+        true => format!("Opening the picture\u{2026} {} s", since.as_secs()),
+        false => "Opening the picture\u{2026}".to_string(),
+    })
 }
 
 /// Where along the preview's own seek bar a click landed, in seconds from

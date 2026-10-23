@@ -29,6 +29,146 @@ pub(crate) fn speed_at(permille: i32) -> Speed {
     Speed::from_permille(permille.clamp(0, i32::from(u16::MAX)) as u16)
 }
 
+/// How far a ramp key's speed moves per press of its stepper: a quarter of real
+/// time, the same quarter the bar's lowest rate is.
+pub(crate) const RAMP_KEY_STEP: i32 = 250;
+
+/// The ramp shapes the speed card and the palette offer, each laid across the clip's
+/// own length on the timeline.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RampPreset {
+    /// Real time easing up to double.
+    Up,
+    /// Double easing down to real time.
+    Down,
+    /// Slow, then fast through the middle, then slow: the classic speed ramp.
+    SlowFastSlow,
+    /// Fast, then slow through the middle, then fast: the hero shot.
+    FastSlowFast,
+}
+
+impl RampPreset {
+    pub(crate) const ALL: [RampPreset; 4] = [
+        RampPreset::Up,
+        RampPreset::Down,
+        RampPreset::SlowFastSlow,
+        RampPreset::FastSlowFast,
+    ];
+
+    /// The chip's face on the card.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            RampPreset::Up => "Speed up",
+            RampPreset::Down => "Slow down",
+            RampPreset::SlowFastSlow => "Fast in the middle",
+            RampPreset::FastSlowFast => "Slow in the middle",
+        }
+    }
+
+    /// The keys of the shape over a clip `frames` timeline frames long. `None` when the
+    /// clip is too short to hold the shape's keys one frame apart.
+    pub(crate) fn keys(self, frames: u32) -> Option<Vec<engine::project::SpeedKey>> {
+        let key = |at: u32, permille: u16| engine::project::SpeedKey {
+            at,
+            speed: Speed::from_permille(permille),
+        };
+        match self {
+            RampPreset::Up => (frames >= 1).then(|| vec![key(0, 1000), key(frames, 2000)]),
+            RampPreset::Down => (frames >= 1).then(|| vec![key(0, 2000), key(frames, 1000)]),
+            RampPreset::SlowFastSlow => (frames >= 2)
+                .then(|| vec![key(0, 500), key(frames / 2, 2000), key(frames, 500)]),
+            RampPreset::FastSlowFast => (frames >= 2)
+                .then(|| vec![key(0, 2000), key(frames / 2, 500), key(frames, 2000)]),
+        }
+    }
+}
+
+/// `keys` with a key of `speed` at clip frame `at`: one already there is replaced,
+/// else the new one is slotted in order. `None` when the ramp is full
+/// ([`engine::project::MAX_SPEED_KEYS`]) and `at` is a new frame.
+pub(crate) fn ramp_with_key(
+    keys: &[engine::project::SpeedKey],
+    at: u32,
+    speed: Speed,
+) -> Option<Vec<engine::project::SpeedKey>> {
+    let mut out = keys.to_vec();
+    match out.iter().position(|k| k.at >= at) {
+        Some(i) if out[i].at == at => out[i].speed = speed,
+        _ if out.len() >= engine::project::MAX_SPEED_KEYS => return None,
+        Some(i) => out.insert(i, engine::project::SpeedKey { at, speed }),
+        None => out.push(engine::project::SpeedKey { at, speed }),
+    }
+    Some(out)
+}
+
+/// `keys` without the `i`th; the last key out leaves no ramp at all.
+pub(crate) fn ramp_without_key(
+    keys: &[engine::project::SpeedKey],
+    i: usize,
+) -> Vec<engine::project::SpeedKey> {
+    let mut out = keys.to_vec();
+    if i < out.len() {
+        out.remove(i);
+    }
+    out
+}
+
+/// `keys` with the `i`th key's speed moved by `steps` of [`RAMP_KEY_STEP`], clamped to
+/// what a [`Speed`] holds.
+pub(crate) fn ramp_key_stepped(
+    keys: &[engine::project::SpeedKey],
+    i: usize,
+    steps: i32,
+) -> Vec<engine::project::SpeedKey> {
+    let mut out = keys.to_vec();
+    if let Some(k) = out.get_mut(i) {
+        k.speed = speed_at(i32::from(k.speed.permille()) + steps * RAMP_KEY_STEP);
+    }
+    out
+}
+
+/// The speed curve of a ramp as the card draws it: `n + 1` points across the clip's
+/// `frames`, x the fraction of the way along and y the speed's place on the speed bar
+/// (log scale, real time mid-height), so the card's curve and its bar read alike. A
+/// clip without a ramp draws its constant speed as a level line.
+pub(crate) fn ramp_curve(
+    keys: &[engine::project::SpeedKey],
+    constant: Speed,
+    frames: u32,
+    n: usize,
+) -> Vec<(f32, f32)> {
+    let n = n.max(1);
+    (0..=n)
+        .map(|i| {
+            let x = i as f32 / n as f32;
+            let at = (x * frames as f32).round() as u32;
+            let speed = match keys.is_empty() {
+                true => constant,
+                false => engine::project::ramp_speed_at(keys, at),
+            };
+            (x, crate::player::cards::speed_fraction(f32::from(speed.permille())))
+        })
+        .collect()
+}
+
+/// A clip's speed as its box wears it: `2×` for a constant one, the ramp's keys joined
+/// by arrows (`1×→2×→1×`) for a ramp, and only its two ends and a count once it has more
+/// than three keys. `None` for a clip at real time with no ramp.
+pub(crate) fn speed_chip_text(clip: &Clip) -> Option<String> {
+    if clip.speed_keys.is_empty() {
+        return (!clip.speed.is_normal()).then(|| crate::ui::cards::speed_text(clip.speed));
+    }
+    let at = |k: &engine::project::SpeedKey| crate::ui::cards::speed_text(k.speed);
+    let keys = &clip.speed_keys;
+    Some(match keys.as_slice() {
+        [only] => at(only),
+        [a, b] => format!("{}→{}", at(a), at(b)),
+        [a, b, c] => format!("{}→{}→{}", at(a), at(b), at(c)),
+        [first, .., last] => format!("{}→{} ({} keys)", at(first), at(last), keys.len()),
+        [] => return None,
+    })
+}
+
 /// The silence card's rows, in the order it lists them: how wide the apply
 /// reaches, the threshold and the unit it is read in, the three durations a
 /// scan is told, and the rate the speed-up plays at. What `silence_field`
@@ -67,9 +207,9 @@ impl Scope {
             .collect::<Vec<_>>()
             .join("+");
         match self {
-            Scope::Take => format!("this take ({named})"),
+            Scope::Take => format!("this clip ({named})"),
             Scope::Track => format!("this track ({named})"),
-            Scope::Everything => "every track".to_string(),
+            Scope::Everything => "the whole timeline".to_string(),
         }
     }
 }
@@ -115,9 +255,11 @@ pub(crate) fn silence_rate(permille: i32) -> Speed {
 pub(crate) const EQ_FREQ_LOW: f32 = 20.;
 pub(crate) const EQ_FREQ_HIGH: f32 = 20_000.;
 
-/// The curve box. Tall enough that 1 dB is a visible move at the ±12 dB axis,
-/// and short enough that the card still fits a 360 px window.
-pub(crate) const EQ_GRAPH_H: f32 = 132.;
+/// The curve box, docked: a 140 px plot with the knob room above and below it
+/// (the strip for "Play to see sound" over the plot, the frequency labels under).
+/// Tall enough that 1 dB is a visible move at the ±12 dB axis, and the card scrolls
+/// in a 360 px window.
+pub(crate) const EQ_GRAPH_H: f32 = 182.;
 
 /// The curve box maximized: 1 dB and a semitone-ish band of frequency both
 /// read as more pixels than the docked floor spends on them -- the same
@@ -175,6 +317,11 @@ pub(crate) const EQ_CURVE_STEPS: usize = 96;
 /// A band's handle on the curve. Only the dot -- what is *grabbed* is the whole
 /// graph (the nearest band along the frequency axis), so the target is the box.
 pub(crate) const EQ_HANDLE: f32 = 10.;
+
+/// A band's hit area on the curve: 24 px ([`crate::layout::HIT_MIN`], WCAG
+/// 2.5.8) centred on the dot, so the point is found by aim alone. The dot is
+/// drawn [`EQ_HANDLE`] wide inside it; the rest is a target, not a drawing.
+pub(crate) const EQ_HIT: f32 = crate::layout::HIT_MIN;
 
 /// The frequencies the graph names, so the curve can be read as a curve *of
 /// something*. The two ends label themselves at the edges.
@@ -234,7 +381,7 @@ mod eq_graph_maximize_tests {
             EQ_GRAPH_H,
             "docked height must be the floor maximized also uses"
         );
-        assert!(EQ_GRAPH_H <= EQ_GRAPH_MAX_H);
+        const { assert!(EQ_GRAPH_H <= EQ_GRAPH_MAX_H) };
     }
 }
 

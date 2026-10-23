@@ -1,48 +1,27 @@
-//! The time band's own content (MOCK-SPEC.md "Time band", DESIGN.md §5):
-//! hero timecode, one three-glyph transport, the cut odometer, the contact
-//! strip (whole-film minimap, carrying the export range's two mark grips)
-//! and the boxed Export chip. `stance.rs::time_band()`'s frame draws
-//! the strip; this module owns what fills it, the same split
-//! `dock_stance.rs`/`bench_stance.rs` already make for their regions.
-//!
-//! Type note: DESIGN.md §3's approved scale gives the hero timecode 18px,
-//! close to the mock's ~20px reading. Every size in this module comes from
-//! `ui::type_scale` (role, not a bare `px()` literal).
+//! The transport band's own content (REDESIGN §3.3, DESIGN.md §6.3): the
+//! timecode on the left, icon-only transport controls centred (go to start,
+//! frame back, play, frame forward, go to end, loop), then mute, the volume
+//! slider and the level meter on the right. Words and keys live in the
+//! tooltips only. The trim deltas show only while a loop-trim roll is armed.
+//! The band is 44px tall. The overview strip sits above the ruler
+//! (`ui/bench_stance/overview.rs`); Export lives on the menu bar
+//! (`ui/menubar.rs`). `stance.rs::time_band()`'s frame draws the band; this
+//! module owns what fills it, the same split `dock_stance.rs`/`bench_stance.rs`
+//! already make for their regions.
 
+use crate::player::text_field::TextField;
 use crate::ui::hitmap;
-use crate::ui::type_scale::{self, label, mono};
+use crate::ui::type_scale::{self, Typeset};
 use crate::*;
-use gpui::FontWeight;
 
 thread_local! {
-    // corner-cut: every other drag surface in this codebase (the bench
-    // scrollbar's `scroll_drag`, the volume slider's `volume_dragging`) keeps
-    // its anchor and its measured bounds as `Player` fields (`main.rs`). That
-    // file belongs to a concurrent builder this session, so the contact
-    // strip's own transient gesture state lives here instead, in the same
-    // `Rc<Cell<Bounds<Pixels>>>` shape `bounds_probe` already takes. Ceiling:
-    // fold both into `Player` once `main.rs` is free again.
-    static STRIP_BOUNDS: Rc<Cell<Bounds<Pixels>>> = Rc::new(Cell::new(Bounds::default()));
-    static PAN_ANCHOR: Cell<Option<f32>> = Cell::new(None);
-    /// Which export mark a live drag on the strip is moving (the grips of
-    /// `mark_grip` below), `None` when no mark drag is up. Same transient
-    /// shape as `PAN_ANCHOR` above, and the same ceiling.
-    static MARK_DRAG: Cell<Option<ActionId>> = const { Cell::new(None) };
     /// The band row's own measured width, read by the frame after the one
     /// that took it (`width_probe` asks for that frame whenever it changes).
     /// This is what the degradation ladder below keys off: the band cannot
     /// know its column's width any other way without a `Window` this
     /// module's `render` is not handed.
     static BAND_W: Rc<Cell<Pixels>> = Rc::new(Cell::new(px(0.)));
-    /// Set once per `render` from the ladder, read by `ghost` (which the
-    /// band's own helpers call three levels down) -- a render-scoped
-    /// constant rather than a parameter threaded through every call site.
-    static SHOW_CHORDS: Cell<bool> = const { Cell::new(true) };
 }
-
-/// The contact strip's floor: the flex_1 element absorbs the band's slack,
-/// but a minimap narrower than this is not a map.
-pub(crate) const STRIP_MIN_W: f32 = 120.;
 
 /// The band's own width probe, `timeline_math::height_probe`'s shape on the
 /// other axis: a measurement is read by the frame after the one that took it,
@@ -62,11 +41,24 @@ fn width_probe(into: Rc<Cell<Pixels>>) -> impl IntoElement {
     .size_full()
 }
 
+/// The centre column's width as the time band last measured it (0 before the
+/// first frame). The toolbar shares the column, so it reads this instead of
+/// owning a second probe.
+pub(crate) fn column_w() -> f32 {
+    BAND_W.with(|w| f32::from(w.get()))
+}
+
 /// Which layers of the band are still drawn at a given column width
-/// (DESIGN §7's ladder). Cleanse round 2 (2026-09-10) left the band five
-/// things -- timecode, the three transport glyphs, the odometer, the strip
-/// and the Export chip -- and only one of them has anything left to shed.
+/// (DESIGN §7's ladder). The band's groups are the timecode, the transport,
+/// Loop, the volume and Mute, and only the chord row under the glyphs is
+/// sheddable. The thresholds below were measured before the §6.3 right-end
+/// controls landed, so they still need re-measuring with `$EDITH_HITMAP`.
+///
+/// Keys are no longer a rung: DESIGN §4.5 has every command wear its key, so
+/// the chord badges under the glyphs are always drawn. The ladder's one rung
+/// is kept only for the test that pins its thresholds.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct BandLayers {
     /// Chord badges under the transport glyphs.
     pub(crate) chords: bool,
@@ -78,8 +70,9 @@ pub(crate) struct BandLayers {
 /// side) holds 454px of fixed groups beside the strip that absorbs the rest,
 /// and the same band with the chords dropped holds 419px (each glyph's door
 /// falls back to its `HIT_MIN` floor, so the chord row costs 35px of width
-/// and 22px of height). Fixed width + `STRIP_MIN_W`, rounded up to the next
-/// 10px, is what each rung costs:
+/// and 22px of height). Fixed width + the strip's old 120px floor, rounded up
+/// to the next 10px, is what each rung costs (the strip has left the band, but
+/// these are the numbers the rung was measured at, and the test pins them):
 ///
 /// | drawn                                        | fixed | needs  |
 /// |----------------------------------------------|-------|--------|
@@ -92,156 +85,30 @@ pub(crate) struct BandLayers {
 /// used to drop -- the monitoring cluster, the sync pair and loop, the
 /// `I O ×` marks -- left the band entirely in cleanse round 2, so the rungs
 /// that shed them went with them.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn band_layers(band_w: f32) -> BandLayers {
     BandLayers {
         chords: band_w >= 580.,
     }
 }
 
-/// The odometer's cut (DESIGN §6, "the cut readout is the odometer"): the cut
-/// the playhead rests on, or -- when it rests in a gap -- the next one ahead
-/// of it. `None` only when there is no cut at or after the playhead, which is
-/// when the caller falls back to the selection.
-pub(crate) fn odometer_cut(clips: &[Clip], frame: u32) -> Option<usize> {
-    clips
-        .iter()
-        .position(|c| frame >= c.start && frame < c.end())
-        .or_else(|| clips.iter().position(|c| c.start > frame))
-}
-
-/// A stacked ghost command (DESIGN §4, MOCK-SPEC "Ghost transport"/"spine"):
-/// glyph 18px `ink2` over its chord 13px `ink3`, read live off the keymap
-/// so a rebind can never leave the band showing a stroke that no longer
-/// fires it -- the same shape `stance::ghost` draws for the spine, kept local
-/// here so this module owns its own region end to end.
-///
-/// FAULT 2 fix: this used to read [`Keymap::display`], the full-sentence
-/// form (`ctrl+left`) meant for the keys overlay's own list -- MOCK-SPEC's
-/// band wants the compact badge (`J`, `spc`, `L`) the spine already reads
-/// via [`Keymap::chord`] (`stance::ghost`). Switched to `chord` here so every
-/// badge in the band matches that same compact grammar.
-///
-/// Also FAULT 2: this glyph drew no `on_click` at all -- a badge that names
-/// a stroke but does not fire it on a click is the same "glyph, badge and
-/// what fires must agree" defect the chord text was, so it now dispatches
-/// `action` through [`Player::act`] the same way `stance::ghost` (spine) and
-/// `spine_stance`'s own ghost already do, `id` making the three transport
-/// ghosts distinct elements gpui can track.
-/// `active` (added alongside the volume/loop cluster this task adds) tints
-/// the glyph `ink1` instead of `ink2` -- the same on/off convention
-/// `spine_stance::glyph` already uses for loop-trim -- so a toggle sitting
-/// in this band (`Loop`, `ToggleMute`) can show its own state without a
-/// second widget shape.
-fn ghost(
-    id: &'static str,
-    player: &Player,
-    glyph: impl Into<SharedString>,
-    action: ActionId,
-    active: bool,
-    cx: &mut Context<Player>,
-) -> impl IntoElement {
-    let glyph_style = label(type_scale::HERO_TIMECODE_PX, FontWeight::MEDIUM);
-    // The chord names a key, so DESIGN §3's mono rule ("if a string is about
-    // ... a key, it is mono") applies here same as everywhere else in the band.
-    let chord_style = mono(type_scale::CHORD_METADATA_MIN_PX, FontWeight::MEDIUM);
-    div()
-        .id(id)
-        .flex_none()
-        .flex()
-        .flex_col()
-        .items_center()
-        .justify_center()
-        // WCAG 2.5.8, the same `HIT_MIN` floor `interact.rs` holds clip edges
-        // to: a glyph may be 8px wide, its door may not. Padding only --
-        // glyph sizes and the groups' own gaps are untouched.
-        .min_w(px(HIT_MIN))
-        .min_h(px(HIT_MIN))
-        .px(px(2.))
-        .gap(px(1.))
-        .cursor_pointer()
-        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-            this.act(action, window, cx);
-        }))
-        .children(hitmap::action(action, player.enable(action, None).yes()))
-        // The glyphs nobody could name (`|◂`, `∞`, `‹|`): the hover line is built
-        // where the ghost is, so a glyph added to this band tomorrow cannot
-        // ship without one.
-        .tooltip(crate::ui::widgets::action_hover(player, action))
-        .font(glyph_style.font)
-        .text_size(glyph_style.size)
-        .text_color(rgb(if active { INK1() } else { INK2() }))
-        .child(glyph.into())
-        .when(SHOW_CHORDS.with(Cell::get), |el| {
-            el.child(
-                div()
-                    .flex_none()
-                    .font(chord_style.font)
-                    .text_size(chord_style.size)
-                    .text_color(rgb(INK3()))
-                    .child(player.keymap.chord(action)),
-            )
-        })
-}
-
-/// The hero timecode, digits `ink1` and colons `ink3` (DESIGN §3, MOCK-SPEC
-/// "Hero timecode"): the one place in the band the string is split apart
-/// rather than painted whole, so the colons can read a shade quieter than
-/// the numbers either side of them.
-fn hero_timecode(tc: &str) -> impl IntoElement {
-    let style = mono(type_scale::HERO_TIMECODE_PX, FontWeight::BOLD);
-    div()
-        .flex_none()
-        .flex()
-        .font(style.font)
-        .text_size(style.size)
-        .children(tc.chars().map(|c| {
-            let ink = if c == ':' { INK3() } else { INK1() };
-            div().text_color(rgb(ink)).child(c.to_string())
-        }))
-}
-
-/// A signed `±M:SS` delta, the shape MOCK-SPEC's cut readout writes trim
-/// deltas in (`−02:10`, `+01:04`) -- the sign says which way the edge moved
-/// since roll armed, [`clock`] says how far.
+/// A signed delta in seconds to one decimal (`−0.5 s`, `+1.0 s`): the sign says which way the
+/// edge moved since the trim-both-sides mode armed, the number how far.
 fn signed_delta(frames: i64, fps: f64) -> String {
-    let secs = (frames.unsigned_abs() as f32) / (fps as f32).max(1.);
-    format!("{}{}", if frames < 0 { "−" } else { "+" }, clock(secs))
+    let secs = frames as f64 / fps.max(1.);
+    format!("{}{:.1} s", if frames < 0 { "−" } else { "+" }, secs.abs())
 }
 
-/// The cut readout (MOCK-SPEC "Cut readout"): the odometer (`cut 14/37`),
-/// the subject cut's own trim deltas against where roll armed it (only real
-/// once [`Player::loop_trim`] has a baseline to measure against), and the
-/// roll word itself, on or dim. `·` separators in `ink3`, values in `ink2`.
-fn cut_readout(player: &Player, position: f64) -> impl IntoElement {
-    let sep = || div().text_color(rgb(INK3())).child(" · ");
-    let val = |s: String| div().text_color(rgb(INK2())).child(s);
-    let anchor = player.selected.anchor();
-    // The odometer reads the PLAYHEAD, not the selection (DESIGN 6): right
-    // after a split the two halves are on the bench and nothing is picked,
-    // and a readout saying `cut -/-` while the playhead sits on the new cut
-    // is an odometer that stopped turning. The selection only answers when
-    // the playhead is off every cut on its lane.
-    let frame = (position * player.active_fps()).max(0.).round() as u32;
-    let at_playhead = player.session.as_ref().and_then(|s| {
-        let lane = anchor
-            .map(|(lane, _)| lane)
-            .or_else(|| s.lanes().into_iter().find(|l| l.kind == LaneKind::Video))?;
-        Some((lane, odometer_cut(s.lane_clips(lane), frame)?))
-    });
-    let odometer = at_playhead
-        .or(anchor)
-        .and_then(|(lane, idx)| {
-            player
-                .session
-                .as_ref()
-                .map(|s| format!("cut {}/{}", idx + 1, s.lane_clips(lane).len()))
-        })
-        .unwrap_or_else(|| "cut —/—".to_string());
+/// The loop-trim line (DESIGN §6.3), while a roll is armed: the mode in plain words and the
+/// subject cut's own trim deltas against where the roll armed it. The deltas need a selected cut
+/// to measure; the mode name does not. Read by the status line (`ui::stance`), not the band: a
+/// line of it in the transport band moved the transport's own controls.
+pub(crate) fn trim_text(player: &Player) -> Option<String> {
+    let (lo, hi) = player.loop_trim?;
     // The baseline a roll session captured at arm time (`toggle_loop_trim`)
     // doubles as the trim deltas' zero point: the same span it loops is the
     // span its own edges are measured from.
-    let deltas = anchor.and_then(|(lane, idx)| {
-        let (lo, hi) = player.loop_trim?;
+    let deltas = player.selected.anchor().and_then(|(lane, idx)| {
         let clip = player.session.as_ref()?.lane_clips(lane).get(idx)?;
         let fps = player.active_fps();
         Some((
@@ -249,545 +116,494 @@ fn cut_readout(player: &Player, position: f64) -> impl IntoElement {
             signed_delta(i64::from(clip.end()) - i64::from(hi), fps),
         ))
     });
-    let roll_on = player.loop_trim.is_some();
-    let style = mono(type_scale::CHORD_METADATA_MAX_PX, FontWeight::MEDIUM);
-    div()
-        .id("stance-cut-readout")
-        .flex_none()
-        .flex()
-        .items_center()
-        // FAULT 1a: this used to fill+round a `DARK_CANVAS` rectangle over
-        // the band's own `DARK_PANEL` ground -- a second hard-edged plate
-        // that read as a chip beside Export, the room's one bordered
-        // commitment (DESIGN §4). A readout is still a plate in the
-        // language's own words, but this band already has one (Export); the
-        // fix is to drop the competing fill, not add a second box the
-        // Export chip has to compete with. Values stay in `ink2`, the
-        // separators in `ink3` -- the readout is still legible sitting
-        // straight on the band ground.
-        .px(px(4.))
-        .font(style.font)
-        .text_size(style.size)
-        .child(val(odometer))
-        .when_some(deltas, |el, (in_d, out_d)| {
-            el.child(sep())
-                .child(val(format!("out {out_d}")))
-                .child(sep())
-                .child(val(format!("in {in_d}")))
-        })
-        // Cleanse round 2: the word `roll` sat in the band dim at all times,
-        // naming a mode that is off. The STATE stays -- when roll is armed
-        // the word is there in `ink1` -- but at rest the odometer reads
-        // `cut 14/37` and nothing else.
-        .when(roll_on, |el| {
-            el.child(sep())
-                .child(div().text_color(rgb(INK1())).child("roll"))
-        })
+    Some(match deltas {
+        Some((start_d, end_d)) => format!("Trimming both sides \u{00b7} Start {start_d} \u{00b7} End {end_d}"),
+        None => "Trimming both sides".to_string(),
+    })
 }
-/// The contact strip (MOCK-SPEC "Contact strip"): the whole-film minimap
-/// filling the band's remaining width, with a 1px viewport bracket marking
-/// where the bench's own window sits. Click jumps the playhead; drag pans
-/// the bench window.
-///
-/// The trace is real audio, not a placeholder: [`Player::waves`] already
-/// caches each source's peaks for the bench's own waveform clips
-/// ([`bench_stance`]'s `clip_box`), so every audio-lane clip draws its own
-/// stretch of that same envelope here, positioned by its timeline fraction
-/// instead of `bench_stance`'s per-lane pixel scale -- the cheapest honest
-/// whole-film trace this app can draw without a new decode pass. Splice
-/// ticks (video-lane clip boundaries) still mark cut points on top of it.
-fn contact_strip(player: &Player, position: f64, cx: &mut Context<Player>) -> impl IntoElement {
-    let duration = player.drawn_duration();
-    let view = player.view();
-    let (left_frac, width_frac) = if duration > 0. {
-        (
-            (view.scale.start / duration).clamp(0., 1.) as f32,
-            (view.span() / duration).clamp(0., 1.) as f32,
-        )
-    } else {
-        (0., 1.)
-    };
-    let fps = player.active_fps();
-    let frac = |f: u32| ((f64::from(f) / fps) / duration).clamp(0., 1.) as f32;
-    let ticks: Vec<f32> = player
-        .session
-        .as_ref()
-        .map(|s| {
-            s.lanes()
-                .into_iter()
-                .filter(|l| l.kind == LaneKind::Video)
-                .flat_map(|l| s.lane_clips(l).iter().map(Clip::end).collect::<Vec<_>>())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|_| duration > 0.)
-        .map(frac)
-        .collect();
-    let traces: Vec<(f32, f32, Arc<Vec<(f32, f32)>>, f64, f64, u32)> = player
-        .session
-        .as_ref()
-        .filter(|_| duration > 0.)
-        .map(|s| {
-            s.lanes()
-                .into_iter()
-                .filter(|l| l.kind == LaneKind::Audio)
-                .flat_map(|l| s.lane_clips(l).to_vec())
-                .filter_map(|clip| {
-                    let source = player.sources().get(clip.source)?;
-                    let Wave::Peaks(peaks) = player
-                        .waves
-                        .get(&(source.path.clone(), source.audio_stream))?
-                        .clone()
-                    else {
-                        return None;
-                    };
-                    let (in_f, out_f) = (
-                        f64::from(clip.in_frame) / fps,
-                        f64::from(clip.out_frame) / fps,
-                    );
-                    Some((
-                        frac(clip.start),
-                        frac(clip.end()),
-                        peaks,
-                        in_f,
-                        out_f,
-                        source_tint(clip.source),
-                    ))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    let strip_bounds = STRIP_BOUNDS.with(Rc::clone);
+
+/// The slider's length on the band (REDESIGN §3.3).
+const VOLUME_TRACK_W: f32 = 96.;
+/// The slider's thumb, round.
+const VOLUME_THUMB: f32 = 12.;
+
+/// The master volume (REDESIGN §3.3): a 3px track in `e3`, an `accent` fill and a
+/// 12px `ink1` thumb, 24px tall to hit (WCAG 2.5.8). A press and every drag
+/// sample after it write the level live through [`Player::drag_volume`]: a
+/// monitoring level has nothing to undo. It never touches mute, so a muted
+/// slider still shows what unmuting comes back to, drawn dim. No number is
+/// printed beside it; the level reads in the tooltip.
+fn volume_slider(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
+    let t = crate::ui::theme::tokens();
+    let fill = if player.volume.muted { t.ink3 } else { t.accent };
+    let half = VOLUME_THUMB / 2.;
     div()
-        .id("stance-contact-strip")
-        .relative()
-        .flex_1()
-        // The strip is what absorbs the band's slack, and it measured w=0 at
-        // 1280 before this: it holds a floor now and the ladder sheds groups
-        // above it instead of squeezing the map to nothing.
-        .min_w(px(STRIP_MIN_W))
-        .h(px(28.))
+        .id("stance-volume")
+        .flex_none()
+        .w(px(VOLUME_TRACK_W))
+        .h(px(HIT_MIN))
+        .px(px(half))
         .cursor_pointer()
-        // Division of the plain drag (MOCK-SPEC "Contact strip", task's own
-        // instruction to decide honestly): a person reaches for this strip to
-        // move through the FILM far more often than to slide the bench's own
-        // viewport window, so the strip's own drag now scrubs the playhead
-        // continuously -- press-and-move is not just a jump on release. The
-        // bracket keeps panning, but only from its own grip notches
-        // (`viewport_bracket` below), which `stop_propagation` on their own
-        // press so a pan-start never also fires a scrub-jump underneath it.
+        .tooltip(crate::ui::widgets::tip_hover(
+            "Volume",
+            "",
+            Some(&format!("{}%", player.volume.percent())),
+        ))
         .on_mouse_down(
             MouseButton::Left,
-            cx.listener({
-                let bounds = strip_bounds.clone();
-                move |this, event: &MouseDownEvent, _, cx| {
-                    let duration = this.drawn_duration();
-                    if duration > 0. {
-                        let frac = frac_along(event.position.x, bounds.get());
-                        this.seek(f64::from(frac) * duration, cx);
-                    }
-                }
+            cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                this.volume_dragging = true;
+                this.drag_volume(event.position.x, cx);
             }),
         )
-        .on_mouse_move(cx.listener({
-            let bounds = strip_bounds.clone();
-            move |this, event: &MouseMoveEvent, _, cx| {
-                if event.pressed_button != Some(MouseButton::Left) {
-                    PAN_ANCHOR.with(|a| a.set(None));
-                    MARK_DRAG.with(|m| m.set(None));
-                    return;
-                }
-                // A mark grip is under the hand: the drag sets that mark
-                // instead of scrubbing or panning (the grip's own press
-                // armed this and stopped propagation, so this branch is the
-                // only thing a mark drag does).
-                if let Some(action) = MARK_DRAG.with(Cell::get) {
-                    let duration = this.drawn_duration();
-                    if duration > 0. {
-                        let frac = frac_along(event.position.x, bounds.get());
-                        let at = (f64::from(frac) * duration * this.active_fps()).max(0.).round()
-                            as u32;
-                        let (lo, hi) = this.range.unwrap_or((at, at));
-                        let (a, b) = if action == ActionId::SetIn {
-                            (at, hi)
-                        } else {
-                            (lo, at)
-                        };
-                        // Dragged past its partner, the mark under the hand
-                        // becomes the OTHER mark (`ordered_range` is what
-                        // keeps the pair legal, and `i`/`o` swap the same
-                        // way). Without this flip a live drag re-orders on
-                        // every move event and both ticks walk along with
-                        // the pointer, which is what the first harness run
-                        // caught.
-                        if crate::player::actions::ordered_range(a, b) != (a, b) {
-                            MARK_DRAG.with(|m| {
-                                m.set(Some(if action == ActionId::SetIn {
-                                    ActionId::SetOut
-                                } else {
-                                    ActionId::SetIn
-                                }))
-                            });
-                        }
-                        this.range = Some(crate::player::actions::ordered_range(a, b));
-                    }
-                    cx.notify();
-                    return;
-                }
-                match PAN_ANCHOR.with(Cell::get) {
-                    // A pan is live (started on the bracket's own grips): slide
-                    // the bench viewport instead of the playhead.
-                    Some(last_x) => {
-                        let b = STRIP_BOUNDS.with(Rc::clone).get();
-                        let w = f32::from(b.size.width).max(1.);
-                        let dx = f32::from(event.position.x) - last_x;
-                        let duration = this.drawn_duration();
-                        if duration > 0. {
-                            let delta = f64::from(dx / w) * duration;
-                            let span = this.view().span();
-                            let max_start = (duration - span).max(0.);
-                            this.scale.start = (this.scale.start + delta).clamp(0., max_start);
-                        }
-                        PAN_ANCHOR.with(|a| a.set(Some(f32::from(event.position.x))));
-                    }
-                    // No pan armed: the plain drag scrubs, continuously
-                    // reseeking to wherever the hand is along the strip.
-                    None => {
-                        let duration = this.drawn_duration();
-                        if duration > 0. {
-                            let frac = frac_along(event.position.x, bounds.get());
-                            this.seek(f64::from(frac) * duration, cx);
-                        }
-                    }
-                }
-                cx.notify();
-            }
-        }))
-        .on_mouse_up(
-            MouseButton::Left,
-            cx.listener(|_, _, _, _| {
-                PAN_ANCHOR.with(|a| a.set(None));
-                MARK_DRAG.with(|m| m.set(None));
-            }),
-        )
-        // The plate sits beside the id it names: the mark-drag branch above
-        // pushed the two more than `every_hitmap_control_wears_a_hover_line`
-        // reaches when this hung at the top of the chain.
-        .tooltip(|_, cx| {
-            cx.new(|_| Tip("Contact strip — drag scrubs the playhead, click jumps; drag the bracket's grips to pan the bench".into()))
-                .into()
-        })
-        .children(hitmap::control("timeline.contact-strip", "Timeline contact strip", true))
-        .child(bounds_probe(strip_bounds))
-        // Baseline: a quiet hairline under the real traces below it, so an
-        // audio-free stretch of film still reads as film rather than gap.
         .child(
+            // The probe box is the track itself (the thumb's centre travels it), so a
+            // press maps to the share the thumb will sit at.
             div()
-                .absolute()
-                .left_0()
-                .right_0()
-                .top(px(13.))
-                .h(px(2.))
-                .bg(rgb(DARK_HAIRLINE())),
+                .relative()
+                .size_full()
+                .child(bounds_probe(player.volume_bar.clone()))
+                .child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .right_0()
+                        .top(px((HIT_MIN - 3.) / 2.))
+                        .h(px(3.))
+                        .rounded(px(2.))
+                        .bg(rgb(t.e3))
+                        .child(
+                            div()
+                                .h_full()
+                                .w(relative(player.volume.along()))
+                                .rounded(px(2.))
+                                .bg(rgb(fill)),
+                        ),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .top(px((HIT_MIN - VOLUME_THUMB) / 2.))
+                        .left(relative(player.volume.along()))
+                        .ml(px(-half))
+                        .size(px(VOLUME_THUMB))
+                        .rounded(px(half))
+                        .bg(rgb(if player.volume.muted { t.ink3 } else { t.ink1 })),
+                ),
         )
-        // The real trace: each audio-lane clip's own envelope, in the
-        // source's ink, positioned by timeline fraction (see the fn doc
-        // above) -- the whole-film minimap MOCK-SPEC asks for, not a
-        // placeholder line.
-        .children(traces.into_iter().map(|(from, to, peaks, in_f, out_f, ink)| {
-            div()
-                .absolute()
-                .left(relative(from))
-                .top(px(4.))
-                .bottom(px(4.))
-                .w(relative((to - from).max(0.002)))
-                .child(waveform_ink(peaks, in_f, out_f, ink))
-        }))
-        .children(ticks.into_iter().map(|frac| {
-            div()
-                .absolute()
-                .left(relative(frac))
-                .top(px(2.))
-                .w(px(1.))
-                .h(px(24.))
-                .bg(rgb(LAMP_WHITE()))
-        }))
-        // The viewport bracket (MOCK-SPEC: "1px viewport bracket (with grip
-        // notches)"): FAULT 1's box fix -- DESIGN §4 reserves the full
-        // bordered rectangle for the room's one commit chip (Export), so this
-        // draws only the two edges (left/right verticals + corner notches),
-        // never a closed box, and stays visually distinct from the trace it
-        // sits over (ink1 lines/notches vs the trace's film ink fills).
-        .child(
-            div()
-                .absolute()
-                .left(relative(left_frac))
-                .top_0()
-                .h_full()
-                .w(relative(width_frac.max(0.01)))
-                .border_l_1()
-                .border_r_1()
-                .border_color(rgb(INK1()))
-                .child(grip("stance-strip-grip-lt", true, true))
-                .child(grip("stance-strip-grip-lb", true, false))
-                .child(grip("stance-strip-grip-rt", false, true))
-                .child(grip("stance-strip-grip-rb", false, false)),
-        )
-        // The export range's own two grips (DESIGN §5 as amended
-        // 2026-09-10): the `I O ×` trio left the band, so the marks live on
-        // the film itself. Nothing is drawn until a mark exists.
-        .when_some(
-            player.range.filter(|_| duration > 0.),
-            |el, (in_f, out_f)| {
-                el.child(mark_grip(
-                    player,
-                    "stance-strip-mark-in",
-                    frac(in_f),
-                    "Mark in",
-                    ActionId::SetIn,
-                ))
-                .child(mark_grip(
-                    player,
-                    "stance-strip-mark-out",
-                    frac(out_f),
-                    "Mark out",
-                    ActionId::SetOut,
-                ))
-            },
-        )
-        // The lamp-white playhead marker: this is what turns the strip from
-        // a trace into a slider with a handle (task's own wording) -- the
-        // one 1px line on the whole band that names *this* film moment,
-        // drawn last so it always sits above the trace and the bracket.
-        .when(duration > 0., |el| {
-            let frac = ((position / duration).clamp(0., 1.)) as f32;
-            el.child(
-                div()
-                    .id("stance-strip-playhead")
-                    .absolute()
-                    .left(relative(frac))
-                    .top_0()
-                    .h_full()
-                    .w(px(1.))
-                    .bg(rgb(LAMP_WHITE())),
-            )
-        })
+}
+/// The Loop hover's name: the same whether or not a range is set; what it loops is the second line
+/// ([`loop_tip_hint`]).
+pub(crate) fn loop_tip_name(_range: Option<(u32, u32)>) -> &'static str {
+    "Loop playback"
 }
 
-/// One export-range mark, drawn on the contact strip at its own film
-/// position: an `ink1` tick beside the bracket's lamp-white playhead, with a
-/// ±6px door around it that takes precedence over the strip's own
-/// click-jump/drag-scrub (`stop_propagation` on its press, the same split
-/// [`grip`] below makes for the bench-window pan). Dragging it sets that
-/// mark; `i`, `o` and `^u` are unchanged.
-fn mark_grip(
-    player: &Player,
-    id: &'static str,
-    frac: f32,
-    name: &'static str,
-    action: ActionId,
-) -> impl IntoElement {
-    let chord = player.keymap.chord(action);
-    div()
-        .id(id)
-        .absolute()
-        .left(relative(frac))
-        .top_0()
-        .h_full()
-        .ml(px(-MARK_GRAB))
-        .w(px(MARK_GRAB * 2. + 1.))
-        .flex()
-        .justify_center()
-        .cursor_col_resize()
-        .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, _, cx| {
-            MARK_DRAG.with(|m| m.set(Some(action)));
-            cx.stop_propagation();
-        })
-        .tooltip(crate::ui::widgets::tip_hover(name, &chord, None))
-        .children(hitmap::action(action, player.enable(action, None).yes()))
-        .child(div().w(px(1.)).h_full().bg(rgb(INK1())))
+/// The Loop hover's second line: what a loop would loop -- between the In and Out marks when both
+/// are set, the whole timeline otherwise.
+pub(crate) fn loop_tip_hint(range: Option<(u32, u32)>) -> &'static str {
+    match range {
+        Some(_) => "Between In and Out",
+        None => "Set In and Out to loop a range",
+    }
 }
 
-/// How far either side of a mark tick the hand still grabs it.
-const MARK_GRAB: f32 = 6.;
+/// The hover of an icon control: the action's own, except Loop, which names its range.
+type TipFn = Box<dyn Fn(&mut Window, &mut App) -> gpui::AnyView>;
 
-/// One grip notch on the viewport bracket (MOCK-SPEC "grip notches"): the
-/// only part of the contact strip that pans the bench window rather than
-/// scrubbing the playhead (see [`contact_strip`]'s own doc on that split).
-/// `stop_propagation` on its own press so starting a pan here never also
-/// fires the strip's scrub-jump underneath it.
-fn grip(id: &'static str, left: bool, top: bool) -> impl IntoElement {
-    div()
-        .id(id)
-        .absolute()
-        .when(left, |d| d.left(px(-3.)))
-        .when(!left, |d| d.right(px(-3.)))
-        .when(top, |d| d.top_0())
-        .when(!top, |d| d.bottom_0())
-        .w(px(8.))
-        .h(px(10.))
-        .cursor_col_resize()
-        .child(
-            div()
-                .absolute()
-                .when(left, |d| d.left(px(3.)))
-                .when(!left, |d| d.right(px(3.)))
-                .when(top, |d| d.top_0())
-                .when(!top, |d| d.bottom_0())
-                .w(px(2.))
-                .h(px(6.))
-                .bg(rgb(INK1())),
-        )
-        .on_mouse_down(MouseButton::Left, move |event: &MouseDownEvent, _, cx| {
-            PAN_ANCHOR.with(|a| a.set(Some(f32::from(event.position.x))));
-            cx.stop_propagation();
-        })
-        .tooltip(crate::ui::widgets::tip_hover("Pan the timeline window", "drag", None))
-        .children(hitmap::control(id, "Timeline viewport grip", true))
+fn icon_tip(player: &Player, action: ActionId) -> TipFn {
+    if action == ActionId::Loop {
+        let enable = player.enable(action, None);
+        Box::new(crate::ui::widgets::tip_hover(
+            loop_tip_name(player.range),
+            &player.keymap.display(action),
+            enable.why().or(Some(loop_tip_hint(player.range))),
+        ))
+    } else {
+        Box::new(crate::ui::widgets::action_hover(player, action))
+    }
 }
 
-/// The Export chip (MOCK-SPEC "Export chip", DESIGN §4): the room's single
-/// bordered control. Opens the export card exactly the way the legacy room's
-/// own Export button does ([`Player::open_export`], `ui/toolbar.rs`'s
-/// `action_control` click) -- this is the fix for the shipped defect: the
-/// darkroom used to suppress `ActionId::Export` outright because it drew no
-/// surface for the card to land on; `stance.rs::render` now dispatches it
-/// like every other action, and the card itself
-/// ([`Player::export_card`]/`export_progress_card`) is mounted over the room
-/// by [`super::stance::render`] the same way the keys overlay is.
-fn export_chip(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
-    let exporting = player.exporting().is_some();
-    let label_style = label(type_scale::LABEL_ROW_PX, FontWeight::MEDIUM);
-    let chord_style = mono(type_scale::CHORD_METADATA_MIN_PX, FontWeight::MEDIUM);
+/// The master level meter's length on the band, in px.
+const METER_W: f32 = 32.;
+
+/// The stereo master level meter before the volume: two 4px bars (left over right), each to its
+/// level with a 1px marker at its held peak, warning-coloured within 1 dB of full scale, and a
+/// clip lamp at the right end that stays lit for a few seconds after a peak reached 0 dBFS. The
+/// lamp's slot is always there, so a clip moves nothing. Read through [`Player::master_reading`]
+/// (at most 30 times a second, from the engine's own stereo peaks, so the mix card's meters do not
+/// compete with it).
+fn level_meter(player: &Player) -> impl IntoElement {
+    use crate::player::cards::METER_FLOOR_DB;
+    let now = std::time::Instant::now();
+    let (meters, clipped) = player.master_reading(now);
+    let frac = |db: f32| ((db - METER_FLOOR_DB) / -METER_FLOOR_DB).clamp(0., 1.);
+    let bar = |side: usize| {
+        let meter = Some(meters[side]);
+        let level = meter.map_or(0., |m| frac(m.level_db));
+        let hold = meter.map_or(0., |m| frac(m.hold_db));
+        let hot = meter.is_some_and(|m| m.level_db >= -1.);
+        div()
+            .flex_none()
+            .relative()
+            .w_full()
+            .h(px(4.))
+            .rounded(px(2.))
+            // The raised plate, not the panel: the band is panel-coloured, and a
+            // bed the band's own colour would vanish at rest.
+            .bg(rgb(DARK_RAISED()))
+            .child(div().h_full().w(relative(level)).rounded(px(2.)).bg(rgb(
+                if hot { STATUS_WARNING() } else { ACCENT_PRIMARY() },
+            )))
+            .when(hold > 0., |d| {
+                d.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .h_full()
+                        .w(px(1.))
+                        .left(relative(hold))
+                        .bg(rgb(INK1())),
+                )
+            })
+    };
     div()
-        .id("stance-export")
+        .id("stance-tb-meter")
         .flex_none()
         .flex()
         .items_center()
-        .gap(px(6.))
-        .px(px(10.))
-        .py(px(6.))
-        .rounded(px(3.))
-        .border_1()
-        .border_color(rgb(DARK_HAIRLINE()))
-        .bg(rgb(DARK_RAISED()))
-        .text_color(rgb(INK1()))
-        .cursor_pointer()
-        .hover(|s| s.bg(rgb(DARK_PANEL())))
-        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-            if this.exporting().is_some() {
-                this.cancel_export();
-            } else {
-                this.open_export(cx);
-            }
-            cx.notify();
-        }))
-        .tooltip(crate::ui::widgets::action_hover(player, if exporting { ActionId::CancelExport } else { ActionId::Export }))
-        .children(hitmap::action(
-            if exporting {
-                ActionId::CancelExport
-            } else {
-                ActionId::Export
-            },
-            true,
+        .gap(px(3.))
+        .w(px(METER_W))
+        .tooltip(crate::ui::widgets::tip_hover(
+            "Master level, left over right. The lamp lights on a clipped peak.",
+            "",
+            None,
         ))
+        .child(div().flex_1().flex().flex_col().gap(px(1.)).child(bar(0)).child(bar(1)))
         .child(
             div()
-                .font(label_style.font)
-                .text_size(label_style.size)
-                .child(if exporting { "Exporting" } else { "Export" }),
-        )
-        .child(
-            div()
-                .font(chord_style.font)
-                .text_size(chord_style.size)
-                .text_color(rgb(INK3()))
-                // FAULT 2: compact badge everywhere in the band, same fix as
-                // `ghost` above (`Export  ^e`, not `Export  ctrl+e`).
-                .child(player.keymap.chord(ActionId::Export)),
+                .flex_none()
+                .w(px(3.))
+                .h(px(9.))
+                .rounded(px(1.5))
+                .bg(rgb(if clipped { STATUS_ERROR() } else { DARK_RAISED() })),
         )
 }
 
-/// The whole band, left to right per MOCK-SPEC: hero timecode, ghost
-/// transport, cut readout, the contact strip filling the rest, the Export
-/// chip at the end.
+/// The timecode on the transport (REDESIGN §3.3): the `timecode` role, digits in
+/// `ink1`, the colons and the frames in `ink2`. The one mono string in the room.
+fn hero_timecode(tc: &str) -> impl IntoElement {
+    let t = crate::ui::theme::tokens();
+    let frames_from = tc.len().saturating_sub(2);
+    div()
+        .flex_none()
+        .flex()
+        .type_style(type_scale::timecode())
+        .children(tc.char_indices().map(|(i, c)| {
+            let ink = if c == ':' || i >= frames_from { t.ink2 } else { t.ink1 };
+            div().text_color(rgb(ink)).child(c.to_string())
+        }))
+}
+
+/// The timecode while it is being retyped (Go to time): the same mono role and size, so the
+/// band does not move. The text is what was typed, all selected until a key replaces it, with
+/// a caret after it otherwise.
+fn timecode_field(field: &TextField) -> impl IntoElement {
+    let t = crate::ui::theme::tokens();
+    let typed = !field.text.is_empty();
+    let shown: AnyElement = match field.all && typed {
+        true => div().bg(rgba(t.accent_wash)).child(field.text.clone()).into_any_element(),
+        false => SharedString::from(format!("{}\u{258f}", field.text)).into_any_element(),
+    };
+    div()
+        .id("stance-timecode-field")
+        .flex_none()
+        .flex()
+        .type_style(type_scale::timecode())
+        .text_color(rgb(t.ink1))
+        .child(shown)
+}
+
+/// One icon-only transport control: a 32px hit with a 20px icon and a tooltip
+/// (name and key). It always dispatches through [`Player::act`] so a refused
+/// press still says why, but draws dim when the oracle refuses it.
+fn icon_button(
+    id: &'static str,
+    player: &Player,
+    icon: crate::ui::icons::Icon,
+    action: ActionId,
+    on: bool,
+    cx: &mut Context<Player>,
+) -> impl IntoElement {
+    use crate::ui::kit::{Button, ButtonSize, ButtonStyle};
+    let yes = player.enable(action, None).yes();
+    let tip = icon_tip(player, action);
+    Button::new(id)
+        .style(ButtonStyle::Ghost)
+        .size(ButtonSize::Large)
+        .icon(icon)
+        .on(on)
+        .enabled(yes)
+        .build()
+        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+            this.act(action, window, cx);
+        }))
+        .children(hitmap::action(action, yes))
+        .tooltip(tip)
+}
+
+/// The play / pause button: 36px, `e2`, the glyph in `accent` while playing.
+fn play_button(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
+    use crate::ui::icons::{Icon, IconSize};
+    let t = crate::ui::theme::tokens();
+    let playing = player.transport().is_playing();
+    let yes = player.enable(ActionId::Play, None).yes();
+    let name = if playing { "Pause" } else { "Play" };
+    let key = player.keymap.primary(ActionId::Play);
+    crate::ui::kit::states(
+        div().id("stance-tb-play"),
+        crate::ui::kit::Fills::solid(),
+        yes,
+        None,
+    )
+    .flex_none()
+    .flex()
+    .items_center()
+    .justify_center()
+    .size(px(36.))
+    .rounded(px(18.))
+    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+        this.act(ActionId::Play, window, cx);
+    }))
+    .children(hitmap::action(ActionId::Play, yes))
+    .tooltip(crate::ui::widgets::tip_hover(name, &key, Some("Shuttle: J K L")))
+    .child(
+        (if playing { Icon::Pause } else { Icon::Play })
+            .el(IconSize::Toolbar, if playing { t.accent } else { t.ink1 }),
+    )
+}
+
+/// The width of the timecode cluster and of the volume cluster: equal, so the
+/// transport between them sits on the column's centre.
+const SIDE_W: f32 = 184.;
+
+/// The whole band, left to right: the timecode, the transport centred in the
+/// rest of the row, then mute, the volume and the level meter (REDESIGN §3.3).
+/// Icons and a tooltip each; no words, no keys, no `J K L`.
 pub(crate) fn render(
     player: &mut Player,
     position: f64,
     cx: &mut Context<Player>,
 ) -> impl IntoElement {
-    let tc = timecode(position, player.active_fps());
+    use crate::ui::icons::Icon;
+    let tc = timecode(player.hero_position(position), player.active_fps());
     let band_w = BAND_W.with(Rc::clone);
-    // Layer decision for THIS frame, off the width the last frame measured
-    // (`width_probe` asks for a frame whenever that width changes, so a
-    // resize settles in one).
-    let layers = band_layers(f32::from(band_w.get()));
-    SHOW_CHORDS.with(|c| c.set(layers.chords));
+    let wide = column_w() >= 900.;
+    // Go to time retypes the timecode in place; a click on it opens that.
+    let timecode_cell = match player.time_edit.clone() {
+        Some(field) => timecode_field(&field).into_any_element(),
+        None => hero_timecode(&tc).into_any_element(),
+    };
+    let go_to = player.keymap.primary(ActionId::GoToTime);
     div()
         .id("stance-time-band-row")
-        // FAULT 1 fix: this div used to be `flex_none`, which sized it to its
-        // own content inside `stance.rs::time_band()`'s row -- leaving the
-        // contact strip's `flex_1` nothing to grow into (its "free space" was
-        // zero, since the parent itself never claimed the band's full width).
-        // `flex_1` here is what actually lets the strip fill the band.
+        .relative()
+        // This div must claim the band's full width: `flex_1` here is what lets
+        // the transport group inside it take the slack and centre the icons.
         .flex_1()
         .min_w(px(0.))
         .h_full()
         .flex()
         .items_center()
-        // Nothing in this band may ever paint (or be clicked) outside its own
-        // column again: the Export chip used to land at x=1113 under the
-        // dock, where a click on blank dock space opened the export card.
+        // Nothing in this band may ever paint (or be clicked) outside its own column.
         .overflow_hidden()
-        .gap(px(12.))
-        .px(px(12.))
+        .gap(px(8.))
+        .px(px(16.))
         .child(width_probe(band_w))
-        // The most-read element anchors its region (DESIGN §5): the
-        // timecode leads.
-        .child(hero_timecode(&tc))
-        // Cleanse round 2 (2026-09-10): one transport, three glyphs. The
-        // shuttle pair (`◀◀ ▶▶`), the home/end pair, the sync points, the
-        // loop toggle, the monitoring cluster, the `I O ×` marks and Save
-        // all left the band -- each keeps its chord, its KEYS-tab row and
-        // (where it has one) its right-click home, and the marks became the
-        // contact strip's own two grips.
         .child(
             div()
+                .id("stance-timecode")
                 .flex_none()
+                .w(px(SIDE_W))
+                .overflow_hidden()
+                .cursor_pointer()
+                .tooltip(crate::ui::widgets::tip_hover("Go to time", &go_to, None))
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.open_time_entry(cx)))
+                .child(timecode_cell),
+        )
+        .child(
+            div()
+                .id("stance-transport")
+                .flex_1()
+                .min_w(px(0.))
                 .flex()
                 .items_center()
-                .gap(px(10.))
-                .child(ghost(
-                    "stance-tb-step-back",
-                    player,
-                    "|◂",
-                    ActionId::StepBack,
-                    false,
-                    cx,
-                ))
-                .child(ghost(
-                    "stance-tb-play",
-                    player,
-                    if player.transport().is_playing() {
-                        "❚❚"
-                    } else {
-                        "▶"
-                    },
-                    ActionId::Play,
-                    false,
-                    cx,
-                ))
-                .child(ghost(
-                    "stance-tb-step-forward",
-                    player,
-                    "▸|",
-                    ActionId::StepForward,
-                    false,
-                    cx,
-                )),
+                .justify_center()
+                .gap(px(4.))
+                .child(icon_button("stance-tb-go-start", player, Icon::SkipBack, ActionId::GoStart, false, cx))
+                .child(icon_button("stance-tb-step-back", player, Icon::StepBack, ActionId::StepBack, false, cx))
+                .child(play_button(player, cx))
+                .child(icon_button("stance-tb-step-forward", player, Icon::StepForward, ActionId::StepForward, false, cx))
+                .child(icon_button("stance-tb-go-end", player, Icon::SkipForward, ActionId::GoEnd, false, cx))
+                .child(div().flex_none().w(px(8.)))
+                .child(icon_button("stance-tb-loop", player, Icon::Repeat, ActionId::Loop, player.loop_on, cx)),
         )
-        .child(cut_readout(player, position))
-        .child(contact_strip(player, position, cx))
-        .child(export_chip(player, cx))
+        .child(
+            div()
+                .id("stance-tail")
+                .flex_none()
+                .w(px(SIDE_W))
+                .flex()
+                .items_center()
+                .justify_end()
+                .gap(px(4.))
+                .child(icon_button(
+                    "stance-tb-mute",
+                    player,
+                    if player.volume.muted { Icon::VolumeX } else { Icon::Volume2 },
+                    ActionId::ToggleMute,
+                    player.volume.muted,
+                    cx,
+                ))
+                .child(volume_slider(player, cx))
+                // The meter is the first thing to go when the column narrows.
+                .when(wide, |d| d.child(level_meter(player))),
+        )
+}
+
+/// Where a typed time sends the playhead: to a frame of the timeline, or by a number of frames
+/// from where it is now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Jump {
+    At(i64),
+    By(i64),
+}
+
+/// The note a time that does not read gets.
+const NOT_A_TIME: &str = "Not a time. Type 1:23, 83, 83.5, 00:01:23:12, +2s or -10f";
+
+/// Reads a typed time at `fps`, in the forms the MCP help lists under TIMES: `450f` (frames),
+/// `15s` or `15` (seconds, a fraction allowed), `1:23` or `1:23.5` (minutes and seconds),
+/// `1:02:03` (hours) and `00:01:23:12` (timecode, frames last). A leading `+` or `-` makes it a
+/// move from the playhead: `+2s`, `-10f`.
+pub(crate) fn parse_jump(text: &str, fps: f64) -> Result<Jump, String> {
+    if !(fps.is_finite() && fps > 0.) {
+        return Err(format!("the project has no usable frame rate ({fps})"));
+    }
+    let t = text.trim();
+    let (sign, body) = match t.chars().next() {
+        Some('+') => (1, &t[1..]),
+        Some('-') => (-1, &t[1..]),
+        _ => (0, t),
+    };
+    let frames = absolute(body.trim(), fps).ok_or_else(|| NOT_A_TIME.to_string())?;
+    Ok(match sign {
+        0 => Jump::At(frames),
+        s => Jump::By(s * frames),
+    })
+}
+
+/// One time without its sign, as a frame count (or a distance in frames).
+fn absolute(body: &str, fps: f64) -> Option<i64> {
+    if body.is_empty() {
+        return None;
+    }
+    let lower = body.to_ascii_lowercase();
+    if let Some(n) = lower.strip_suffix('f') {
+        return whole(n).map(|v| v as i64);
+    }
+    if let Some(n) = lower.strip_suffix('s') {
+        return secs(n).map(|v| (v * fps).round() as i64);
+    }
+    if !body.contains(':') {
+        return secs(body).map(|v| (v * fps).round() as i64);
+    }
+    let parts: Vec<&str> = body.split(':').collect();
+    match parts.len() {
+        4 => {
+            let (h, m, s, f) = (whole(parts[0])?, whole(parts[1])?, whole(parts[2])?, whole(parts[3])?);
+            if m >= 60 || s >= 60 || f >= fps.ceil() as u64 {
+                return None;
+            }
+            let base = ((h * 3600 + m * 60 + s) as f64 * fps).round() as i64;
+            Some(base + f as i64)
+        }
+        2 | 3 => {
+            let (h, m, sec) = match parts.len() {
+                3 => (whole(parts[0])?, whole(parts[1])?, secs(parts[2])?),
+                _ => (0, whole(parts[0])?, secs(parts[1])?),
+            };
+            if (parts.len() == 3 && m >= 60) || sec >= 60. {
+                return None;
+            }
+            let total = h as f64 * 3600. + m as f64 * 60. + sec;
+            Some((total * fps).round() as i64)
+        }
+        _ => None,
+    }
+}
+
+/// A whole, unsigned number, digits only.
+fn whole(p: &str) -> Option<u64> {
+    let t = p.trim();
+    if t.is_empty() || !t.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    t.parse().ok()
+}
+
+/// A non-negative number of seconds, a fraction allowed.
+fn secs(p: &str) -> Option<f64> {
+    let v: f64 = p.trim().parse().ok()?;
+    (v.is_finite() && v >= 0.).then_some(v)
+}
+
+#[cfg(test)]
+mod time_entry_tests {
+    use super::*;
+
+    const F25: f64 = 25.;
+
+    #[test]
+    fn seconds_and_minutes_read_at_the_project_rate() {
+        assert_eq!(parse_jump("83", F25), Ok(Jump::At(2075)));
+        // 83.5 s is frame 2087.5, which rounds up like the MCP reader does.
+        assert_eq!(parse_jump("83.5", F25), Ok(Jump::At(2088)));
+        assert_eq!(parse_jump("1:23", F25), Ok(Jump::At(2075)));
+        assert_eq!(parse_jump("1:23.5", F25), Ok(Jump::At(2088)));
+        assert_eq!(parse_jump("1:02:03", F25), Ok(Jump::At(93075)));
+        assert_eq!(parse_jump("15s", F25), Ok(Jump::At(375)));
+        assert_eq!(parse_jump(" 15.0s ", F25), Ok(Jump::At(375)));
+    }
+
+    #[test]
+    fn frames_and_timecode_are_whole_frames() {
+        assert_eq!(parse_jump("450f", F25), Ok(Jump::At(450)));
+        assert_eq!(parse_jump("450F", F25), Ok(Jump::At(450)));
+        assert_eq!(parse_jump("00:01:23:12", F25), Ok(Jump::At(2087)));
+        assert_eq!(parse_jump("00:00:01:00", F25), Ok(Jump::At(25)));
+        assert_eq!(parse_jump("00:00:00:24", F25), Ok(Jump::At(24)));
+    }
+
+    #[test]
+    fn a_sign_moves_from_the_playhead() {
+        assert_eq!(parse_jump("+2s", F25), Ok(Jump::By(50)));
+        assert_eq!(parse_jump("-10f", F25), Ok(Jump::By(-10)));
+        assert_eq!(parse_jump("+0.5s", F25), Ok(Jump::By(13)));
+        assert_eq!(parse_jump("-1:00", F25), Ok(Jump::By(-1500)));
+        assert_eq!(parse_jump("-1:2:3", F25), Ok(Jump::By(-93075)));
+        assert_eq!(parse_jump("+00:00:01:00", F25), Ok(Jump::By(25)));
+    }
+
+    #[test]
+    fn garbage_is_refused_with_the_note() {
+        for bad in ["", "   ", "abc", "1.2.3", "1:75", "1:23:45:25", "1:2:3:4:5", "--5", "-", "+", "15 s x"] {
+            assert_eq!(parse_jump(bad, F25), Err(NOT_A_TIME.to_string()), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_project_with_no_frame_rate_refuses_every_time() {
+        assert!(parse_jump("1", 0.).is_err());
+        assert!(parse_jump("1", f64::NAN).is_err());
+    }
 }

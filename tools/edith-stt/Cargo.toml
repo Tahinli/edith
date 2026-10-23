@@ -1,0 +1,27 @@
+[package]
+name = "edith-stt"
+version = "0.1.0"
+edition = "2021"
+description = "Offline speech-to-text helper for edith: Whisper on CPU via candle, JSON-lines output"
+
+[[bin]]
+name = "edith-stt"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+candle-core = "=0.11.0"
+candle-nn = "=0.11.0"
+candle-transformers = "=0.11.0"
+flate2 = "1"
+hound = "3.5"
+tracing = "0.1"
+serde_json = "1"
+ureq = { version = "2", default-features = false, features = ["tls"] }
+
+[workspace]
+
+# zip 8.6.0 was yanked from crates.io, but candle-core 0.11 requires exactly that line.
+# Vendored verbatim from the registry tarball (unmodified) so the lock stays reproducible.
+[patch.crates-io]
+zip = { path = "vendor/zip-8.6.0" }

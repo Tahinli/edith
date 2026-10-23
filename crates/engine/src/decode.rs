@@ -14,10 +14,9 @@ use ec_core::registry::Decoder as _;
 use ec_core::registry::{CodecId, CodecParameters};
 use ec_core::{Error as Av1Error, Packet, TimeBase};
 use ec_h264::H264Decoder;
-use image::ImageDecoder as _;
 
 use crate::color::ColorParams;
-use crate::colorspace::{ColorDescription, Matrix, Transfer};
+use crate::colorspace::{Chroma, ColorDescription, Matrix, Transfer};
 use crate::convert::{i420_to_bgra, i420_to_bgra_with};
 use crate::demux::{Codec, Demuxer, PixelAspect, Rotation, VideoMeta};
 use crate::hw::HwSession;
@@ -25,6 +24,219 @@ use crate::project::Speed;
 use crate::scale::Composer;
 use crate::tonemap::{self, ToneMapper};
 use crate::transform::TransformParams;
+
+mod dnxhd;
+mod dv;
+mod hevc;
+pub(crate) mod intra;
+mod mjpeg;
+mod raw;
+mod prores;
+use hevc::run_hevc;
+mod mpeg2;
+use mpeg2::run_mpeg2;
+mod mpeg4;
+use mpeg4::run_mpeg4;
+mod vp8;
+use vp8::run_vp8;
+mod vp9;
+use vp9::run_vp9;
+
+/// One software picture as the tightly packed 8-bit I420 every converter takes:
+/// the buffers a pulled decoder fills, reused for every picture of a stream.
+#[derive(Default)]
+pub(crate) struct I420 {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) y: Vec<u8>,
+    pub(crate) u: Vec<u8>,
+    pub(crate) v: Vec<u8>,
+}
+
+/// The 10-bit planes of a picture an export's 10-bit seat encodes: the same
+/// shape as [`I420`], at 16 bits a sample and 10 bits of depth.
+#[derive(Default)]
+pub(crate) struct Wide {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) y: Vec<u16>,
+    pub(crate) u: Vec<u16>,
+    pub(crate) v: Vec<u16>,
+}
+
+/// What `ec-h264` hands over for a High 10 stream (`I010`: 16-bit little-endian
+/// samples, 10 bits of depth, a 9-bit stream left-aligned), taken into the two
+/// shapes the engine reads: [`Wide`] for a 10-bit export, and the truncated
+/// 8-bit [`I420`] playback and an 8-bit export use (`>> 2`, the same
+/// truncation `ec-h265`'s narrowing and the P010 read-back make). Buffers are
+/// reused for every picture of a stream.
+#[derive(Default)]
+pub(crate) struct Deep {
+    pub(crate) wide: Wide,
+    pub(crate) narrow: I420,
+    /// Whether the last picture loaded was `I010`.
+    pub(crate) on: bool,
+    /// Whether it went into `wide` (else into `narrow`).
+    pub(crate) in_wide: bool,
+}
+
+impl Deep {
+    /// Takes `pic` when it is anything but plain 8-bit 4:2:0: `I010` (High 10),
+    /// the 4:2:2 shapes `I422` and `I210`, whose chroma is full height and is
+    /// averaged down a pair of rows to 4:2:0 as HEVC 4:2:2 is
+    /// (`(a + b + 1) >> 1`), and the 4:4:4 shapes `I444` and `I410`, averaged
+    /// down over 2x2 the same way. Into `wide` when `want_wide` and the picture is
+    /// above 8 bits, into `narrow` otherwise (`>> 2` for 10-bit); a plain
+    /// picture just clears [`Deep::on`].
+    pub(crate) fn load(&mut self, pic: &VideoFrame, want_wide: bool) {
+        use ec_core::frame::PixelFormat as F;
+        // (bytes per sample, chroma is full height, chroma is full width)
+        let (bytes, full_height, full_width) = match pic.format {
+            F::I010 => (2usize, false, false),
+            F::I210 => (2, true, false),
+            F::I422 => (1, true, false),
+            F::I410 => (2, true, true),
+            F::I444 => (1, true, true),
+            _ => {
+                self.on = false;
+                self.in_wide = false;
+                return;
+            }
+        };
+        self.on = true;
+        self.in_wide = want_wide && bytes == 2;
+        let (w, h) = (pic.width as usize, pic.height as usize);
+        let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+        let src_ch = if full_height { h } else { ch };
+        let src_cw = if full_width { w } else { cw };
+        let dims = [(w, h, h, w), (cw, ch, src_ch, src_cw), (cw, ch, src_ch, src_cw)];
+        let sample = |line: &[u8], x: usize| -> u32 {
+            if bytes == 2 { u32::from(u16::from_le_bytes([line[2 * x], line[2 * x + 1]])) } else { u32::from(line[x]) }
+        };
+        // One output sample (r, x): the sample itself, or the rounded average of
+        // the 2x1 / 1x2 / 2x2 source samples under it for chroma stored at full
+        // height and/or width (`(a + b + 1) >> 1`, applied per axis).
+        let row_value = |plane: &ec_core::Plane, r: usize, rows_in: usize, cols_in: usize, x: usize, avg_v: bool, avg_h: bool| -> u32 {
+            let line = |row: usize| &plane.data[row * plane.stride..row * plane.stride + cols_in * bytes];
+            let at = |row: usize| -> u32 {
+                if avg_h {
+                    let (a, b) = (2 * x, (2 * x + 1).min(cols_in - 1));
+                    (sample(line(row), a) + sample(line(row), b) + 1) >> 1
+                } else {
+                    sample(line(row), x)
+                }
+            };
+            if avg_v {
+                let (a, b) = (2 * r, (2 * r + 1).min(rows_in - 1));
+                (at(a) + at(b) + 1) >> 1
+            } else {
+                at(r)
+            }
+        };
+        if self.in_wide {
+            self.wide.width = pic.width;
+            self.wide.height = pic.height;
+            let out = [&mut self.wide.y, &mut self.wide.u, &mut self.wide.v];
+            for (i, ((plane, (pw, ph, rows_in, cols_in)), out)) in pic.planes.iter().zip(dims).zip(out).enumerate() {
+                out.clear();
+                for r in 0..ph {
+                    out.extend((0..pw).map(|x| row_value(plane, r, rows_in, cols_in, x, full_height && i > 0, full_width && i > 0) as u16));
+                }
+            }
+        } else {
+            self.narrow.width = pic.width;
+            self.narrow.height = pic.height;
+            let shift = if bytes == 2 { 2 } else { 0 };
+            let out = [&mut self.narrow.y, &mut self.narrow.u, &mut self.narrow.v];
+            for (i, ((plane, (pw, ph, rows_in, cols_in)), out)) in pic.planes.iter().zip(dims).zip(out).enumerate() {
+                out.clear();
+                for r in 0..ph {
+                    out.extend((0..pw).map(|x| (row_value(plane, r, rows_in, cols_in, x, full_height && i > 0, full_width && i > 0) >> shift) as u8));
+                }
+            }
+        }
+    }
+}
+
+/// The software seats whose pictures come one at a time: `ec-h265`, `ec-vp9`,
+/// `ec-vp8`, `ec-mpeg2`, `ec-mpeg4` and the intra-only `ec-prores`, `ec-dnxhd`, `ec-mjpeg` and `ec-dv`. Export decodes its sources through here, and playback's span
+/// loops read the same streams, so each codec's decode is written once.
+pub(crate) enum Pulled {
+    Hevc(Box<hevc::Stream>),
+    Vp9(Box<vp9::Stream>),
+    Vp8(Box<vp8::Stream>),
+    Mpeg2(Box<mpeg2::Stream>),
+    ProRes(Box<prores::Stream>),
+    Dnxhd(Box<dnxhd::Stream>),
+    Mjpeg(Box<mjpeg::Stream>),
+    Dv(Box<dv::Stream>),
+    Mpeg4(Box<mpeg4::Stream>),
+    Raw(Box<raw::Stream>),
+}
+
+impl Pulled {
+    /// A stream positioned at the sync sample at or before `start_frame`. `None`
+    /// for a codec with no pulled seat: H.264 and AV1 keep their own loops.
+    pub(crate) fn open(
+        codec: Codec,
+        demuxer: &mut Demuxer,
+        start_frame: u32,
+        deint: crate::project::Deinterlace,
+    ) -> Option<Self> {
+        Some(match codec {
+            Codec::Hevc => Self::Hevc(Box::new(hevc::Stream::open(demuxer, start_frame))),
+            Codec::Vp9 => Self::Vp9(Box::new(vp9::Stream::open(demuxer, start_frame))),
+            Codec::Vp8 => Self::Vp8(Box::new(vp8::Stream::open(demuxer, start_frame))),
+            Codec::Mpeg2 => Self::Mpeg2(Box::new(mpeg2::Stream::open(demuxer, start_frame, deint))),
+            Codec::ProRes => Self::ProRes(Box::new(prores::Stream::open(demuxer, start_frame))),
+            Codec::Dnxhd => Self::Dnxhd(Box::new(dnxhd::Stream::open(demuxer, start_frame))),
+            Codec::Mjpeg => Self::Mjpeg(Box::new(mjpeg::Stream::open(demuxer, start_frame))),
+            Codec::Dv => Self::Dv(Box::new(dv::Stream::open(demuxer, start_frame))),
+            Codec::Mpeg4 | Codec::MsMpeg4 => Self::Mpeg4(Box::new(mpeg4::Stream::open(demuxer, start_frame))),
+            Codec::Raw => Self::Raw(Box::new(raw::Stream::open(demuxer, start_frame))),
+            Codec::H264 | Codec::Av1 => return None,
+        })
+    }
+
+    /// The next picture in display order at 10-bit scale, into `out`, with its
+    /// display index. HEVC and the intra-only seats (ProRes, DNxHD, MJPEG) have such
+    /// a seat; the others are an error here, and the export asks for it only of those.
+    pub(crate) fn next_wide(
+        &mut self,
+        demuxer: &mut Demuxer,
+        out: &mut Wide,
+    ) -> Result<Option<i64>, String> {
+        match self {
+            Self::Hevc(stream) => stream.next_wide(demuxer, out),
+            Self::ProRes(stream) => stream.next_wide(demuxer, out),
+            Self::Dnxhd(stream) => stream.next_wide(demuxer, out),
+            Self::Mjpeg(stream) => stream.next_wide(demuxer, out),
+            Self::Raw(stream) => stream.next_wide(demuxer, out),
+            Self::Vp9(_) | Self::Vp8(_) | Self::Mpeg2(_) | Self::Dv(_) | Self::Mpeg4(_) => Err("no 10-bit seat for this codec".into()),
+        }
+    }
+
+    /// The next picture in display order, narrowed into `out`, with its display
+    /// index. `None` at end of stream; `Err` names a refusal.
+    pub(crate) fn next(
+        &mut self,
+        demuxer: &mut Demuxer,
+        out: &mut I420,
+    ) -> Result<Option<i64>, String> {
+        match self {
+            Self::Hevc(stream) => stream.next(demuxer, out),
+            Self::Vp9(stream) => stream.next(demuxer, out),
+            Self::Vp8(stream) => stream.next(demuxer, out),
+            Self::Mpeg2(stream) => stream.next(demuxer, out),
+            Self::ProRes(stream) => stream.next(demuxer, out),
+            Self::Dnxhd(stream) => stream.next(demuxer, out),
+            Self::Mjpeg(stream) => stream.next(demuxer, out),
+            Self::Dv(stream) => stream.next(demuxer, out),
+            Self::Mpeg4(stream) => stream.next(demuxer, out),
+            Self::Raw(stream) => stream.next(demuxer, out),
+        }
+    }
+}
 
 /// One decoded picture, ready to hand to a renderer.
 pub struct Frame {
@@ -34,6 +246,31 @@ pub struct Frame {
     pub height: u32,
     /// BGRA8, straight alpha, tightly packed.
     pub bgra: Vec<u8>,
+}
+
+/// `frame` as a PNG file at `path` (RGBA, colours swizzled from BGRA).
+pub fn to_png(frame: &Frame, path: &Path) -> crate::Result<()> {
+    std::fs::write(path, to_png_bytes(frame)?)?;
+    Ok(())
+}
+
+/// `frame` as PNG-encoded bytes (RGBA, colours swizzled from BGRA).
+pub fn to_png_bytes(frame: &Frame) -> crate::Result<Vec<u8>> {
+    let pixels = frame.width as usize * frame.height as usize;
+    if frame.bgra.len() != pixels * 4 {
+        return Err(format!(
+            "frame is {}x{} but carries {} bytes",
+            frame.width,
+            frame.height,
+            frame.bgra.len()
+        )
+        .into());
+    }
+    let mut rgba = Vec::with_capacity(pixels * 4);
+    for px in frame.bgra.as_chunks::<4>().0 {
+        rgba.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+    }
+    Ok(ec_image::png_encode::encode_rgba8(frame.width, frame.height, &rgba)?)
 }
 
 /// Which decoder a source is really running on. Read-only introspection: it
@@ -49,8 +286,8 @@ pub enum Backend {
     Opening,
     /// The VA-API plugin (`libengine_hw.so`).
     Hardware,
-    /// This project's own software seat: `ec-h264` or `ec-av1`, in this
-    /// process.
+    /// This project's own software seat: `ec-h264`, `ec-h265`, `ec-av1`, `ec-vp9`
+    /// or `ec-vp8`, in this process.
     Software,
     /// A still image: one `image` decode, no stream and no decoder to pick.
     Still,
@@ -122,22 +359,25 @@ impl BackendCell {
 /// decides it: the same `VE_SW` pin and the same plugin probe against this very
 /// file. What lets a front-end name the decoder *before* anything plays.
 ///
-/// The codec is `None` for a still image, which has no coded stream. A stream
-/// no decoder here can take is an `Err` naming the plugin, exactly as opening
-/// it would be -- the same refusal, one VA-API init earlier.
+/// The codec is `None` for a still image and for a sound-only file, which have no
+/// coded stream (both answer [`Backend::Still`]). Every codec
+/// here has a software seat, so a plugin that will not take the file is not a
+/// refusal: the file plays in software, and the only `Err` is the container's.
 ///
 /// Costs that one init (~90 ms) for a stream the plugin takes: ask it once per
 /// file, off a render thread, and keep the answer.
 pub fn probe(path: &Path) -> crate::Result<(Option<Codec>, Backend)> {
-    if crate::is_image(path) {
+    // A still, and a sound-only file ([`crate::is_audio`]): neither has a picture
+    // stream, so there is no coded stream to open and no container to read as a
+    // movie. Asking the mp4 reader of a wav would refuse it with the mp4 reader's
+    // words, which the media panel would show beside a file that plays.
+    if crate::is_image(path) || crate::is_audio(path) {
         return Ok((None, Backend::Still));
     }
     let path = path.to_path_buf();
     let (meta, _demuxer) = Demuxer::open(&path)?;
-    match hw_decodes(&path, 0, meta.codec) {
-        Ok(()) => return Ok((Some(meta.codec), Backend::Hardware)),
-        Err(e) if !matches!(meta.codec, Codec::H264 | Codec::Av1) => return Err(e.into()),
-        Err(_) => {}
+    if hw_decodes(&path, 0, meta.codec).is_ok() {
+        return Ok((Some(meta.codec), Backend::Hardware));
     }
     Ok((Some(meta.codec), Backend::Software))
 }
@@ -200,6 +440,10 @@ struct SpanCmd {
     /// shown. [`Speed::NORMAL`] for a file-level open ([`DecodeSession::open`]
     /// and friends), which has no clip and skips nothing.
     speed: Speed,
+    /// The clip's deinterlace setting ([`crate::project::Clip::deinterlace`]). With
+    /// `Field` on an interlaced source the file's frame numbers in `start`, `end`
+    /// and every [`Frame::index`] are **field** numbers, `2 * frame + 0 or 1`.
+    deint: crate::project::Deinterlace,
     tx: SyncSender<Frame>,
 }
 
@@ -317,7 +561,7 @@ impl Worker {
     /// in `send`, and only then does it reach the command below. So the order at
     /// the call site is unchanged -- install the new receiver, and the old
     /// worker finds out by losing its consumer.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, dead_code, reason = "the playback session calls reseek_with once the lane's playback.rs hunk is in")]
     pub(crate) fn reseek(
         &mut self,
         path: &Path,
@@ -328,6 +572,24 @@ impl Worker {
         canvas: Composer,
         tone: tonemap::Preset,
         speed: Speed,
+    ) -> Option<(Receiver<Frame>, BackendCell)> {
+        self.reseek_with(path, start, end, color, transform, canvas, tone, speed, Default::default())
+    }
+
+    /// [`reseek`](Self::reseek) for a clip with a deinterlace setting: `start` and
+    /// `end` are field numbers when `deint` is `Field` and the file is interlaced.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn reseek_with(
+        &mut self,
+        path: &Path,
+        start: u32,
+        end: u32,
+        color: ColorParams,
+        transform: TransformParams,
+        canvas: Composer,
+        tone: tonemap::Preset,
+        speed: Speed,
+        deint: crate::project::Deinterlace,
     ) -> Option<(Receiver<Frame>, BackendCell)> {
         let reuse = self.reuse.as_ref()?;
         if reuse.path != path || self.is_finished() {
@@ -352,6 +614,7 @@ impl Worker {
                 canvas,
                 tone,
                 speed,
+                deint,
                 tx,
             })
             .ok()?;
@@ -571,6 +834,167 @@ impl DecodeSession {
         }
     }
 
+    /// A stream whose frames `body` produces on a thread of its own, sent down
+    /// the same bounded channel, with the same cancel and the same retire path,
+    /// as a decoder's. What a layered picture's composed frames come down.
+    pub(crate) fn spawn_stream(
+        name: &'static str,
+        backend: Backend,
+        body: impl FnOnce(&std::sync::mpsc::SyncSender<Frame>, &AtomicBool) + Send + 'static,
+    ) -> FrameStream {
+        let (tx, rx) = sync_channel(2);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let handle = thread::Builder::new()
+            .name(name.into())
+            .spawn(move || body(&tx, &worker_cancel))
+            .ok();
+        FrameStream {
+            frames: rx,
+            worker: Worker {
+                cancel,
+                handle,
+                reuse: None,
+            },
+            backend: BackendCell::new(backend),
+            failure: DecodeFailure::default(),
+        }
+    }
+
+    /// A worker that plays `count` frames of `path` **backwards**, from file frame
+    /// `top` down: the picture of a reversed clip. Frame `d` of the stream is file
+    /// frame `top - d`, numbered `top + d` -- the clip's *own* frame numbers, counted
+    /// as if the file ran backwards from `top`, so everything downstream that stamps,
+    /// skips and drops by a frame's number (and every span mapping in
+    /// [`crate::project::Span`]) treats it as the forward stream it looks like.
+    ///
+    /// The frames are decoded by a forward worker a block at a time and served last
+    /// to first ([`crate::reverse`]), which is what bounds the memory: one block of
+    /// finished canvases, never the clip. The picture is graded and placed exactly as
+    /// a forward span's is -- the same inner worker does it -- so a reversed frame is
+    /// a forward frame, bit for bit, in another order. A block that ends early (a file
+    /// shorter than the window) ends the stream there.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code, reason = "the playback session calls open_reversed_with once the lane's playback.rs hunk is in")]
+    pub(crate) fn open_reversed(
+        path: &Path,
+        top: u32,
+        count: u32,
+        color: ColorParams,
+        transform: TransformParams,
+        canvas: Composer,
+        tone: tonemap::Preset,
+    ) -> FrameStream {
+        Self::open_reversed_with(path, top, count, color, transform, canvas, tone, Default::default())
+    }
+
+    /// [`open_reversed`](Self::open_reversed) for a clip with a deinterlace
+    /// setting. In field mode `top` and `count` are field numbers: the fields of
+    /// an interlaced file play last to first, so each frame's second field comes
+    /// before its first.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn open_reversed_with(
+        path: &Path,
+        top: u32,
+        count: u32,
+        color: ColorParams,
+        transform: TransformParams,
+        canvas: Composer,
+        tone: tonemap::Preset,
+        deint: crate::project::Deinterlace,
+    ) -> FrameStream {
+        let path = path.to_path_buf();
+        let deint = crate::deinterlace::effective(deint, &path);
+        let (cw, ch) = canvas.dims();
+        // A pass-through canvas has no size of its own: plan for the biggest picture
+        // the engine decodes so that the block stays inside its budget whatever it is.
+        let (cw, ch) = if cw == 0 || ch == 0 { (3840, 2160) } else { (cw, ch) };
+        Self::spawn_stream("decode-reverse", Backend::Software, move |tx, cancel| {
+            let lo = (top + 1).saturating_sub(count);
+            let mut sync = crate::reverse::sync_frames(&path);
+            if deint == crate::project::Deinterlace::Field {
+                // Sync frames are frame numbers; a field-mode block starts at a
+                // frame's first field.
+                sync.iter_mut().for_each(|f| *f *= 2);
+            }
+            if deint == crate::project::Deinterlace::Ivtc {
+                // ...and a film-frame block at the first film frame that starts at or
+                // after the sync frame.
+                sync.iter_mut().for_each(|f| *f = crate::deinterlace::counted_frames(deint, &path, *f));
+            }
+            let cap = crate::reverse::block_cap(cw as usize * ch as usize * 4);
+            let mut walk = crate::reverse::Walk::new(sync, lo, top + 1, cap);
+            let mut inner: Option<FrameStream> = None;
+            let mut rx: Option<Receiver<Frame>> = None;
+            while let Some((start, end)) = walk.next() {
+                if cancel.load(Ordering::Relaxed) {
+                    return;
+                }
+                match inner.as_mut() {
+                    None => {
+                        let stream = span_worker(
+                            path.clone(),
+                            None,
+                            start,
+                            end,
+                            color,
+                            transform,
+                            canvas.fresh(),
+                            tone,
+                            Speed::NORMAL,
+                            deint,
+                        );
+                        inner = Some(stream);
+                    }
+                    Some(stream) => {
+                        match stream.worker.reseek_with(
+                            &path,
+                            start,
+                            end,
+                            color,
+                            transform,
+                            canvas.fresh(),
+                            tone,
+                            Speed::NORMAL,
+                            deint,
+                        ) {
+                            Some((next, _)) => rx = Some(next),
+                            // The worker is gone (the file would not open, or it died):
+                            // nothing more to serve.
+                            None => return,
+                        }
+                    }
+                }
+                let stream = inner.as_ref().expect("opened above");
+                let frames = rx.as_ref().unwrap_or(&stream.frames);
+                let mut block: Vec<Frame> = Vec::with_capacity((end - start) as usize);
+                loop {
+                    match frames.recv_timeout(std::time::Duration::from_millis(50)) {
+                        Ok(frame) => block.push(frame),
+                        Err(RecvTimeoutError::Timeout) => {
+                            if cancel.load(Ordering::Relaxed) {
+                                return;
+                            }
+                        }
+                        Err(RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+                if block.is_empty() {
+                    return; // the inner worker found nothing: the file ended or failed
+                }
+                for mut frame in block.into_iter().rev() {
+                    if cancel.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    frame.index = 2 * top - frame.index;
+                    if tx.send(frame).is_err() {
+                        return; // caller moved on
+                    }
+                }
+            }
+        })
+    }
+
     /// A worker for a still image ([`crate::is_image`]): the file is decoded
     /// *once* and the same picture goes down the channel `len` times, indexed
     /// from `start_frame` exactly as a decoder's pictures are -- so a placed
@@ -588,7 +1012,14 @@ impl DecodeSession {
         transform: TransformParams,
         canvas: Composer,
     ) -> crate::Result<FrameStream> {
-        let still = Still::open(path)?;
+        // A numbered run opens on the frame the stream starts at; a file opens as it always did.
+        let still = match crate::sequence::Run::parse(path) {
+            Some(_) => Still::open_at(path, start_frame)?,
+            None => Still::open(path)?,
+        };
+        if still.seq.is_some() {
+            return Self::open_run(still, start_frame, len, color, transform, canvas);
+        }
         let (tx, rx) = sync_channel(2);
         let cancel = Arc::new(AtomicBool::new(false));
         if len == 0 {
@@ -671,6 +1102,59 @@ impl DecodeSession {
         })
     }
 
+    /// A numbered run ([`crate::sequence`]) as a stream: one picture per frame of the clip, each
+    /// frame of the run read on the worker when its turn comes, so a long run never sits decoded
+    /// in memory. The same stream shape [`open_still`](Self::open_still) gives a single picture.
+    fn open_run(
+        mut still: Still,
+        start_frame: u32,
+        len: u32,
+        color: ColorParams,
+        transform: TransformParams,
+        canvas: Composer,
+    ) -> crate::Result<FrameStream> {
+        let (tx, rx) = sync_channel(2);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut render = Render::new(
+            color,
+            transform,
+            // A frame's own turn is already in its planes, made by `Still::open_at`.
+            Rotation::None,
+            PixelAspect::SQUARE,
+            ColorDescription::default(),
+            canvas,
+            tonemap::Preset::default(),
+            None,
+        );
+        let worker_cancel = Arc::clone(&cancel);
+        let handle = thread::Builder::new()
+            .name("still-run".into())
+            .spawn(move || {
+                for index in 0..len {
+                    if worker_cancel.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    // The first call hands out the frame the stream opened on; each later one reads the next.
+                    let (y, u, v, width, height) = still.picture();
+                    let frame = render.frame(start_frame + index, y, u, v, width, height);
+                    if tx.send(frame).is_err() {
+                        return; // caller moved on
+                    }
+                }
+            })
+            .ok();
+        Ok(FrameStream {
+            frames: rx,
+            worker: Worker {
+                cancel,
+                handle,
+                reuse: None,
+            },
+            backend: BackendCell::new(Backend::Still),
+            failure: DecodeFailure::default(),
+        })
+    }
+
     /// A worker for an audio file played as a *picture* ([`crate::is_audio`]):
     /// the file's peaks are decoded **once** on the worker, and every picture
     /// after that is painted -- a sliding visualizer
@@ -683,6 +1167,10 @@ impl DecodeSession {
     /// ([`crate::project::Rate::REAL_TIME`]) -- so `Frame::index` runs
     /// `start_frame ..` like a decoder's output and a speed reaches it through
     /// the same rewrite as any other clip.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "playback.rs calls this seat positionally; bundling its arguments is a change to that caller too"
+    )]
     pub(crate) fn open_visualizer(
         path: &Path,
         stream: usize,
@@ -830,6 +1318,23 @@ impl DecodeSession {
         canvas: Composer,
         tone: tonemap::Preset,
     ) -> crate::Result<(VideoMeta, FrameStream)> {
+        Self::open_worker_with(path, start_frame, end_frame, color, transform, canvas, tone, Default::default())
+    }
+
+    /// [`open_worker`](Self::open_worker) for a clip with a deinterlace setting:
+    /// with `Field` over an interlaced file `start_frame` and `end_frame` are field
+    /// numbers, and the range is capped at twice the file's frame count.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn open_worker_with(
+        path: impl AsRef<Path>,
+        start_frame: u32,
+        end_frame: u32,
+        color: ColorParams,
+        transform: TransformParams,
+        canvas: Composer,
+        tone: tonemap::Preset,
+        deint: crate::project::Deinterlace,
+    ) -> crate::Result<(VideoMeta, FrameStream)> {
         let path = path.as_ref().to_path_buf();
         // A still is not a stream: handing one to the mp4 demuxer answers "a
         // box with a larger size than it", which is a true sentence about a
@@ -849,6 +1354,7 @@ impl DecodeSession {
                 frame_count: 1,
                 codec: Codec::H264,
                 color: ColorDescription::default(),
+                matrix_assumed: false,
                 // A still's own turn was made in `Still::open`, before these
                 // planes were written, so there is nothing left to state here.
                 rotation: Rotation::None,
@@ -859,19 +1365,15 @@ impl DecodeSession {
             return Self::open_still(&path, start_frame, 1, color, transform, canvas)
                 .map(|stream| (meta, stream));
         }
-        let (meta, demuxer) = Demuxer::open(&path)?;
-        // No software HEVC, VP9 or VP8 decoder exists, so such a file the plugin will
-        // not take is refused *here*, where the caller still has somewhere to
-        // show it -- a worker that opened and then produced nothing is a black
-        // screen with no explanation. The probe session is opened, made to
-        // decode one picture and dropped: it costs one extra VA-API init
-        // (~90 ms) plus that frame, and only off the two codecs with a software
-        // seat of their own -- H.264 through `ec-h264`, AV1 through `ec-av1` --
-        // which fall back to it exactly where this probe would have refused.
-        if !matches!(meta.codec, Codec::H264 | Codec::Av1) {
-            hw_decodes(&path, start_frame, meta.codec)?;
+        let (meta, mut demuxer) = Demuxer::open(&path)?;
+        // Before any decoder is chosen: a stream whose parameter sets the parser
+        // refuses is refused here, for hardware and software alike, because the
+        // driver would otherwise open it and hand back no picture.
+        if meta.codec == Codec::Hevc && !demuxer.hevc_parameter_sets_parse() {
+            return Err(Codec::Hevc.undecodable().into());
         }
-        let end_frame = end_frame.min(meta.frame_count);
+        let deint = effective_deint(deint, &meta, &demuxer);
+        let end_frame = end_frame.min(crate::deinterlace::counted_frames(deint, &path, meta.frame_count));
         if end_frame <= start_frame {
             // Nothing to decode: a disconnected receiver and no thread at all,
             // so the caller sees an immediate end of stream rather than an error.
@@ -894,7 +1396,7 @@ impl DecodeSession {
             meta,
             span_worker(
                 path,
-                Some(Source::demuxed(demuxer, meta)),
+                Some((demuxer, meta)),
                 start_frame,
                 end_frame,
                 color,
@@ -904,6 +1406,7 @@ impl DecodeSession {
                 // A file-level open has no clip and no speed to skip frames
                 // for: every picture in range is delivered, as it always was.
                 Speed::NORMAL,
+                deint,
             ),
         ))
     }
@@ -921,6 +1424,7 @@ impl DecodeSession {
     /// open did on this path before. Callers that must *tell* the user why --
     /// an import at the door -- keep the sync opener.
     #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code, reason = "the playback session calls open_worker_deferred_with once the lane's playback.rs hunk is in")]
     pub(crate) fn open_worker_deferred(
         path: impl AsRef<Path>,
         start_frame: u32,
@@ -930,6 +1434,23 @@ impl DecodeSession {
         canvas: Composer,
         tone: tonemap::Preset,
         speed: Speed,
+    ) -> FrameStream {
+        Self::open_worker_deferred_with(path, start_frame, end_frame, color, transform, canvas, tone, speed, Default::default())
+    }
+
+    /// [`open_worker_deferred`](Self::open_worker_deferred) for a clip with a
+    /// deinterlace setting (see [`open_worker_with`](Self::open_worker_with)).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn open_worker_deferred_with(
+        path: impl AsRef<Path>,
+        start_frame: u32,
+        end_frame: u32,
+        color: ColorParams,
+        transform: TransformParams,
+        canvas: Composer,
+        tone: tonemap::Preset,
+        speed: Speed,
+        deint: crate::project::Deinterlace,
     ) -> FrameStream {
         span_worker(
             path.as_ref().to_path_buf(),
@@ -941,6 +1462,7 @@ impl DecodeSession {
             canvas,
             tone,
             speed,
+            deint,
         )
     }
 }
@@ -951,13 +1473,15 @@ impl DecodeSession {
 /// a demuxer seek and a decoder flush instead of a thread, a container parse and
 /// a VA-API initialisation (98 ms measured worst case).
 ///
-/// `opened` is the file when the caller already read it (the sync opener, which
-/// demuxes on the caller's thread to have metadata to return); `None` is the
+/// `opened` is the demuxer when the caller already read the file (the sync opener,
+/// which demuxes on the caller's thread to have metadata to return); `None` is the
 /// deferred one, where the worker opens it and nothing here touches the disk.
+/// The [`Source`] itself is built on the worker, so the hardware session it may
+/// hold never crosses a thread boundary.
 #[allow(clippy::too_many_arguments)]
 fn span_worker(
     path: PathBuf,
-    opened: Option<Source>,
+    opened: Option<(Demuxer, VideoMeta)>,
     start_frame: u32,
     end_frame: u32,
     color: ColorParams,
@@ -965,6 +1489,7 @@ fn span_worker(
     canvas: Composer,
     tone: tonemap::Preset,
     speed: Speed,
+    deint: crate::project::Deinterlace,
 ) -> FrameStream {
     // The depth is the size of the pictures this worker will *emit*, which for a
     // pass-through canvas is the stream's own -- and the sync opener has already
@@ -974,7 +1499,7 @@ fn span_worker(
     // decode-ahead this engine had before there was one, until the first seek
     // built a real canvas.
     let depth = match (&opened, canvas.places_nothing()) {
-        (Some(source), true) => crate::scale::queue_depth(source.meta.width, source.meta.height),
+        (Some((_, meta)), true) => crate::scale::queue_depth(meta.width, meta.height),
         _ => canvas.queue_depth(),
     };
     let (tx, rx) = sync_channel(depth);
@@ -1001,6 +1526,7 @@ fn span_worker(
         canvas,
         tone,
         speed,
+        deint,
         tx,
     };
     let worker_cancel = Arc::clone(&cancel);
@@ -1012,7 +1538,7 @@ fn span_worker(
     let handle = thread::Builder::new()
         .name("decode".into())
         .spawn(move || {
-            let mut source = opened;
+            let mut source = opened.map(|(demuxer, meta)| Source::demuxed(demuxer, meta));
             let mut cmd = first;
             loop {
                 let abort = Abort {
@@ -1057,6 +1583,7 @@ fn span_worker(
                     Err(RecvTimeoutError::Timeout) => {
                         if let Some(source) = &mut source
                             && source.hw.take().is_some()
+                            && std::env::var_os("EDITH_DEBUG").is_some()
                         {
                             eprintln!("decode worker idle: hardware session closed");
                         }
@@ -1161,9 +1688,9 @@ impl Source {
     fn position_hw(&mut self, path: &Path, start: u32) -> Option<bool> {
         if let Some(hw) = &mut self.hw {
             if hw.seek(start) {
-                eprintln!(
-                    "decode backend: hardware (VA-API plugin, session kept, seek to {start})"
-                );
+                if std::env::var_os("EDITH_DEBUG").is_some() {
+                    eprintln!("decode backend: hardware (VA-API plugin, session kept, seek to {start})");
+                }
                 return Some(true);
             }
             // A plugin too old to reposition, or a decoder that would not
@@ -1172,7 +1699,7 @@ impl Source {
         }
         self.hw = open_hw(path, start);
         self.hw.as_ref().map(|_| {
-            eprintln!("decode backend: hardware (VA-API plugin)");
+            if std::env::var_os("EDITH_DEBUG").is_some() { eprintln!("decode backend: hardware (VA-API plugin)"); }
             false
         })
     }
@@ -1199,9 +1726,13 @@ fn run_span(
         canvas,
         tone,
         speed,
+        deint,
         tx,
         ..
     } = cmd;
+    // Where the software seat starts: `start`, unless hardware dies mid-span and
+    // hands the rest over from the picture it failed on.
+    let mut start = start;
     // A span is a fresh question, so it starts from a clean answer: the
     // failure that stopped the span before this one was already reported, and
     // carrying it would keep saying a fault that this range may not have. Only
@@ -1224,7 +1755,11 @@ fn run_span(
     };
     // The clamp the sync opener does with the metadata it read on the caller's
     // thread; here the metadata arrives first.
-    let end = end.min(opened.meta.frame_count);
+    let deint = effective_deint(deint, &opened.meta, &opened.demuxer);
+    let end = match opened.demuxer.path() {
+        Some(path) => end.min(crate::deinterlace::counted_frames(deint, path, opened.meta.frame_count)),
+        None => end.min(opened.meta.frame_count * deint_units(deint)),
+    };
     // An empty range decodes nothing and must send nothing: `run_hw` counts a
     // frame *out* before it compares, so without this a zero-length span would
     // emit one picture.
@@ -1250,70 +1785,107 @@ fn run_span(
             return;
         }
         backend.set(Backend::Hardware);
-        let mut decoded = run_hw(
+        let mut ended = run_hw(
             opened.hw.as_mut().expect("positioned above"),
-            &tx,
-            start,
-            end,
-            &mut render,
-            abort,
-            speed,
-            worker_failure,
+            Pass {
+                tx: &tx,
+                start_frame: start,
+                end_frame: end,
+                render: &mut render,
+                abort,
+                speed,
+                failure: worker_failure,
+                deint,
+            },
         );
         // A *reused* session that produced nothing may simply be one this
         // reseek left where the driver would not follow; a session opened fresh
         // at the same frame is the honest second question, and only its silence
         // is a software fallback. Without this a single unfollowed seek would
         // collapse the rest of the file to software.
-        if !decoded && reused {
+        if ended == HwEnd::Refused && reused {
             eprintln!(
                 "hardware decode produced nothing after a reseek; reopening at frame {start}"
             );
             opened.hw = open_hw(path, start);
             if let Some(hw) = opened.hw.as_mut() {
-                decoded = run_hw(
+                ended = run_hw(
                     hw,
-                    &tx,
-                    start,
-                    end,
-                    &mut render,
-                    abort,
-                    speed,
-                    worker_failure,
+                    Pass {
+                        tx: &tx,
+                        start_frame: start,
+                        end_frame: end,
+                        render: &mut render,
+                        abort,
+                        speed,
+                        failure: worker_failure,
+                        deint,
+                    },
                 );
             }
         }
-        if decoded {
-            return;
+        match ended {
+            HwEnd::Done => return,
+            // A driver that opens but cannot decode a single frame is still a
+            // fallback case, not a dead session.
+            HwEnd::Refused => {
+                opened.hw = None;
+                if std::env::var_os("EDITH_DEBUG").is_some() {
+                    eprintln!("hardware decode failed before any frame, falling back to software");
+                }
+            }
+            // The GPU failed part-way (a hung ring, a reset context): the
+            // pictures before `index` are out, and the software seat is put at
+            // `index` below, so the span carries on as a software decode would
+            // have. The session is dropped -- its context is gone.
+            HwEnd::FellBackAt(index) => {
+                opened.hw = None;
+                start = index;
+            }
         }
-        // A driver that opens but cannot decode a single frame is still a
-        // fallback case, not a dead session.
-        opened.hw = None;
-        eprintln!("hardware decode failed before any frame, falling back to software");
     }
-    // ...except where there is nothing to fall back to. Feeding HEVC, VP9 or
-    // VP8 bytes to either software seat would be garbage, not a fallback --
-    // VP8's decoder is `ec-vp8`, inside the plugin. H.264 and AV1 each
-    // have one of this project's own here: `ec-h264`, `ec-av1`.
+    // ...and every codec has one to fall back to: H.264, HEVC, AV1, VP9 and VP8
+    // each have one of this project's own here (`ec-h264`, `ec-h265`, `ec-av1`,
+    // `ec-vp9`, `ec-vp8`), so no stream reaches a seat it cannot decode.
     match opened.meta.codec {
         Codec::H264 => {
-            eprintln!("decode backend: software (ec-h264)");
+            if std::env::var_os("EDITH_DEBUG").is_some() { eprintln!("decode backend: software (ec-h264)"); }
             backend.set(Backend::Software);
             run(
                 &mut opened.demuxer,
-                &tx,
-                start,
-                end,
-                &mut render,
-                abort,
-                speed,
-                worker_failure,
+                Pass {
+                    tx: &tx,
+                    start_frame: start,
+                    end_frame: end,
+                    render: &mut render,
+                    abort,
+                    speed,
+                    failure: worker_failure,
+                    deint,
+                },
             );
         }
         Codec::Av1 => {
-            eprintln!("decode backend: software (ec-av1)");
+            if std::env::var_os("EDITH_DEBUG").is_some() { eprintln!("decode backend: software (ec-av1)"); }
             backend.set(Backend::Software);
             run_av1(
+                &mut opened.demuxer,
+                Pass {
+                    tx: &tx,
+                    start_frame: start,
+                    end_frame: end,
+                    render: &mut render,
+                    abort,
+                    speed,
+                    failure: worker_failure,
+                    deint,
+                },
+            );
+        }
+        Codec::Vp9 => {
+            eprintln!("decode backend: software (ec-vp9)");
+            backend.set(Backend::Software);
+            run_vp9(
                 &mut opened.demuxer,
                 &tx,
                 start,
@@ -1324,13 +1896,90 @@ fn run_span(
                 worker_failure,
             );
         }
-        // Nothing decodes from here -- no software seat exists for this codec.
-        // Say so: the cell was left claiming the hardware session that opened
-        // and then produced nothing, and it reports what happened, not what
-        // was hoped for.
-        other => {
-            backend.set(Backend::Gap);
-            worker_failure.set(format!("{}: {}", path.display(), other.needs_plugin()));
+        Codec::Vp8 => {
+            eprintln!("decode backend: software (ec-vp8)");
+            backend.set(Backend::Software);
+            run_vp8(
+                &mut opened.demuxer,
+                &tx,
+                start,
+                end,
+                &mut render,
+                abort,
+                speed,
+                worker_failure,
+            );
+        }
+        Codec::ProRes => {
+            eprintln!("decode backend: software (ec-prores)");
+            backend.set(Backend::Software);
+            intra::run::<prores::ProResSeat>(
+                &mut opened.demuxer, &tx, start, end, &mut render, abort, speed, worker_failure,
+            );
+        }
+        Codec::Dnxhd => {
+            eprintln!("decode backend: software (ec-dnxhd)");
+            backend.set(Backend::Software);
+            intra::run::<dnxhd::DnxhdSeat>(
+                &mut opened.demuxer, &tx, start, end, &mut render, abort, speed, worker_failure,
+            );
+        }
+        Codec::Mjpeg => {
+            eprintln!("decode backend: software (ec-mjpeg)");
+            backend.set(Backend::Software);
+            intra::run::<mjpeg::MjpegSeat>(
+                &mut opened.demuxer, &tx, start, end, &mut render, abort, speed, worker_failure,
+            );
+        }
+        Codec::Dv => {
+            eprintln!("decode backend: software (ec-dv)");
+            backend.set(Backend::Software);
+            intra::run::<dv::DvSeat>(
+                &mut opened.demuxer, &tx, start, end, &mut render, abort, speed, worker_failure,
+            );
+        }
+        Codec::Raw => {
+            eprintln!("decode backend: software (raw video)");
+            backend.set(Backend::Software);
+            intra::run::<raw::RawSeat>(
+                &mut opened.demuxer, &tx, start, end, &mut render, abort, speed, worker_failure,
+            );
+        }
+        Codec::Mpeg4 | Codec::MsMpeg4 => {
+            eprintln!("decode backend: software (ec-mpeg4)");
+            backend.set(Backend::Software);
+            run_mpeg4(
+                &mut opened.demuxer, &tx, start, end, &mut render, abort, speed, worker_failure,
+            );
+        }
+        Codec::Mpeg2 => {
+            eprintln!("decode backend: software (ec-mpeg2)");
+            backend.set(Backend::Software);
+            run_mpeg2(
+                &mut opened.demuxer,
+                &tx,
+                start,
+                end,
+                &mut render,
+                abort,
+                speed,
+                worker_failure,
+                deint,
+            );
+        }
+        Codec::Hevc => {
+            eprintln!("decode backend: software (ec-h265)");
+            backend.set(Backend::Software);
+            run_hevc(
+                &mut opened.demuxer,
+                &tx,
+                start,
+                end,
+                &mut render,
+                abort,
+                speed,
+                worker_failure,
+            );
         }
     }
 }
@@ -1346,7 +1995,7 @@ fn run_span(
 /// A project at the media's own resolution never reaches any of that: it takes
 /// the fused graded conversion, the one path this engine had before there was a
 /// project resolution, byte for byte and allocation for allocation.
-struct Render {
+pub(crate) struct Render {
     color: ColorParams,
     /// This clip's placement, on top of whatever the canvas's own fit policy
     /// already does ([`crate::scale::Composer::place_transformed`]).
@@ -1405,6 +2054,10 @@ impl Render {
     /// `peak` is what the file declared about its own brightness
     /// ([`Demuxer::light`]), which only an HDR stream has and only the
     /// reference rendition reads (see [`tonemap::Preset`]).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one argument per field, passed straight through at its three construction sites"
+    )]
     fn new(
         color: ColorParams,
         transform: TransformParams,
@@ -1439,7 +2092,7 @@ impl Render {
         }
     }
 
-    fn frame(
+    pub(crate) fn frame(
         &mut self,
         index: u32,
         y: &[u8],
@@ -1561,7 +2214,7 @@ impl Render {
                 // including the passthrough-sized clip a transform moves, whose
                 // grade used to be dropped on the floor between these two guards.
                 if !skip_placement && !self.color.is_identity() {
-                    crate::color::apply_yuv(&self.color, gy, gu, gv);
+                    crate::color::apply_yuv(&self.color, gy, gu, gv, width as usize, self.tone.is_none() && self.desc.full_range);
                 }
                 let desc = if self.tone.is_some() {
                     TONE_MAPPED
@@ -1632,6 +2285,21 @@ pub(crate) struct Still {
     /// the displayed one ([`crate::demux::Rotation`]'s own contract).
     pub(crate) width: u32,
     pub(crate) height: u32,
+    /// An animated generator ([`crate::generate`]) and the source frame its next picture is.
+    /// `None` for a file and for a generator that is the same on every frame.
+    anim: Option<(crate::generate::Gen, u32)>,
+    /// A numbered run ([`crate::sequence`]): the frame the planes hold, read again for each
+    /// picture that follows. `None` for a file and for a generator.
+    seq: Option<SeqCursor>,
+}
+
+/// Where a [`Still`] read from a numbered run is: the run, and which of its frames the planes
+/// hold. `handed` is set once the planes have been handed out, so the next call moves on.
+#[derive(Debug, Clone)]
+pub(crate) struct SeqCursor {
+    run: crate::sequence::Run,
+    at: u32,
+    handed: bool,
 }
 
 /// A still whose EXIF orientation is not a quarter turn: values 2, 4, 5 and 7
@@ -1678,26 +2346,31 @@ impl UnsupportedStillOrientation {
 ///
 /// EXIF 1, 6, 8 and 3 are the four quarter turns; **2, 4, 5 and 7 are
 /// mirrorings** and are refused ([`UnsupportedStillOrientation`]) rather than
-/// approximated by the nearest rotation. A value the standard does not define
-/// (0, or above 8) states no orientation this can read, and is likewise
-/// refused rather than guessed at.
-fn rotation_of_exif(orientation: image::metadata::Orientation) -> crate::Result<Rotation> {
-    use image::metadata::Orientation as O;
+/// approximated by the nearest rotation. Any other value (0, or above 8) is
+/// not a legal orientation and reads as upright, as `ec_image` reports it.
+fn rotation_of_exif(orientation: u8) -> crate::Result<Rotation> {
     Ok(match orientation {
-        O::NoTransforms => Rotation::None,
-        O::Rotate90 => Rotation::Cw90,
-        O::Rotate180 => Rotation::Cw180,
-        O::Rotate270 => Rotation::Cw270,
-        // The `image` crate keeps the raw number alongside: an orientation it
-        // could not read is `NoTransforms`, and saying "0" for a mirror would
-        // be a claim rather than a reading.
-        mirrored => {
-            return Err(UnsupportedStillOrientation {
-                exif: mirrored.to_exif(),
-            }
-            .into());
+        6 => Rotation::Cw90,
+        3 => Rotation::Cw180,
+        8 => Rotation::Cw270,
+        // A mirror is refused by its own EXIF number, so the sentence names
+        // what the file says rather than a guess at the nearest turn.
+        2 | 4 | 5 | 7 => {
+            return Err(UnsupportedStillOrientation { exif: orientation }.into());
         }
+        _ => Rotation::None,
     })
+}
+
+/// The header of the picture at `path`, read through the first
+/// [`ec_image::PROBE_LIMIT`] bytes and no further: no pixel is decoded, and
+/// the file is never read whole. Shared by [`image_orientation`] and
+/// [`image_size`] so a library row costs one bounded read.
+fn probe_header(path: &Path) -> crate::Result<ec_image::Info> {
+    // A numbered run's spelling is not a file: its size and turn are its first frame's.
+    let path = crate::sequence::first_frame(path);
+    let file = std::fs::File::open(&path)?;
+    ec_image::probe_reader(file).map_err(|e| format!("{}: {e}", path.display()).into())
 }
 
 /// What turn `path` asks for, read off its **header** alone -- what a library
@@ -1705,18 +2378,17 @@ fn rotation_of_exif(orientation: image::metadata::Orientation) -> crate::Result<
 /// [`image_size`] needs to report the size the picture is shown at.
 ///
 /// Header-only on purpose: the whole file is not decoded, exactly as
-/// [`image_size`] has always been. `into_decoder` parses the container and
-/// stops there; the pixels are never touched.
+/// [`image_size`] has always been. The probe reads the container's header
+/// and EXIF block and stops; the pixels are never touched.
 pub fn image_orientation(path: &Path) -> crate::Result<Rotation> {
-    let mut decoder = image::ImageReader::open(path)?
-        .with_guessed_format()?
-        .into_decoder()
-        .map_err(|e| format!("{}: {e}", path.display()))?;
+    if crate::generate::is_generated(path) {
+        return Ok(Rotation::None);
+    }
     // The refusal is handed on **unchanged**, not folded into a sentence with
     // the file's name: a `String` is not an error a caller can downcast, and
     // `is_it` is how a front-end tells this refusal from any other failure.
     // The path is not lost -- every caller that has one puts it in front.
-    rotation_of_exif(decoder.orientation()?)
+    rotation_of_exif(probe_header(path)?.orientation)
 }
 
 impl Still {
@@ -1734,6 +2406,24 @@ impl Still {
     /// lands as a rectangle. Upgrade path is keeping the alpha plane here and
     /// giving `scale::Composer` a blend over the lane below.
     pub(crate) fn open(path: &Path) -> crate::Result<Self> {
+        Self::open_at(path, 0)
+    }
+
+    /// [`Still::open`] for a span that starts at source frame `start`: only an animated
+    /// generator ([`crate::generate::Gen::animated`]) cares, and then each [`Still::picture`]
+    /// is the next frame of it.
+    pub(crate) fn open_at(path: &Path, start: u32) -> crate::Result<Self> {
+        if let Some(g) = crate::generate::Gen::parse(path) {
+            let (y, u, v) = rgb_to_i420(&g.rgb(start), g.width as usize, g.height as usize);
+            return Ok(Self { y, u, v, width: g.width, height: g.height, anim: g.animated().then_some((g, start)), seq: None });
+        }
+        // A numbered run opens at its frame `start`, and each later picture is the frame after it.
+        let run = crate::sequence::Run::parse(path);
+        let file = match &run {
+            Some(run) => run.frame(start),
+            None => path.to_path_buf(),
+        };
+        let path = file.as_path();
         // The turn is read and made **here**, once, before a single pair of
         // numbers leaves this function: `image`'s decoder keeps an EXIF
         // orientation in its own field and applies nothing, so a portrait
@@ -1743,31 +2433,26 @@ impl Still {
         // step the video doors make, at the same place in the pipeline
         // (before the grade, the canvas and the conversion all see the
         // picture), and it uses the same [`Rotation`].
-        let mut decoder = image::ImageReader::open(path)?
-            .with_guessed_format()?
-            .into_decoder()
-            .map_err(|e| format!("{}: {e}", path.display()))?;
-        // Unchanged for the reason `image_orientation` gives: a caller has to
-        // be able to downcast this refusal, and a sentence with the file's name
-        // in it is not one.
-        let rotation = rotation_of_exif(decoder.orientation()?)?;
-        let rgb = image::DynamicImage::from_decoder(decoder)
-            .map_err(|e| format!("{}: {e}", path.display()))?
-            .to_rgb8();
-        let (coded_width, coded_height) = rgb.dimensions();
+        // The turn comes from the same probe `image_size` makes, so a library
+        // row and a placed still agree on what a picture's turn is.
+        let rotation = image_orientation(path)?;
+        let decoded = ec_image::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let (coded_width, coded_height) = decoded.dimensions();
         // Turned here rather than left to each consumer, so there is exactly
         // one place the turn is made and no consumer can be forgotten: the
         // planes handed out below are the *shown* picture, so the `Render`, the
         // `VideoMeta`, an export's `place_picture` and `image_size` all agree
         // without any of them re-deriving it. A file that states no turn takes
         // the branch by a bool and not one byte is copied.
-        let (rgb, width, height) = match rotation.is_none() {
-            true => (rgb, coded_width, coded_height),
-            false => {
-                let turned = turn_rgb(&rgb, rotation.steps());
-                let (width, height) = turned.dimensions();
-                (turned, width, height)
-            }
+        let (width, height, rgb) = match rotation.is_none() {
+            true => (coded_width, coded_height, decoded.to_rgb8()),
+            false => turn_rgb(
+                &decoded.to_rgb8(),
+                coded_width,
+                coded_height,
+                rotation.steps(),
+            )
+            .map_err(|e| format!("{}: {e}", path.display()))?,
         };
         if !crate::is_resolution(width, height) {
             return Err(format!(
@@ -1783,6 +2468,8 @@ impl Still {
             v,
             width,
             height,
+            anim: None,
+            seq: run.map(|run| SeqCursor { run, at: start, handed: false }),
         })
     }
 
@@ -1791,23 +2478,51 @@ impl Still {
     /// turned still, the same value in the only sense that matters: the turn
     /// is already in them, so an export places what the preview showed without
     /// being told a second time.
-    pub(crate) fn picture(&self) -> (&[u8], &[u8], &[u8], u32, u32) {
+    pub(crate) fn picture(&mut self) -> (&[u8], &[u8], &[u8], u32, u32) {
+        // A numbered run hands out its frames in turn, each one read now: a frame that will
+        // not decode keeps the picture before it, so a run deleted under a playing clip holds
+        // its last good frame instead of tearing the timeline down.
+        if let Some(cur) = &mut self.seq {
+            if cur.handed {
+                let next = (cur.at + 1).min(cur.run.count - 1);
+                if next != cur.at && let Ok(still) = Still::open_at(&cur.run.frame(next), 0) {
+                    (self.y, self.u, self.v, self.width, self.height) = (still.y, still.u, still.v, still.width, still.height);
+                    cur.at = next;
+                }
+            }
+            cur.handed = true;
+        }
+        // An animated generator hands out its frames in turn: the one drawn at open first.
+        if let Some((g, next)) = &mut self.anim {
+            if *next > 0 || self.y.is_empty() {
+                (self.y, self.u, self.v) = rgb_to_i420(&g.rgb(*next), self.width as usize, self.height as usize);
+            }
+            *next += 1;
+        }
         (&self.y, &self.u, &self.v, self.width, self.height)
     }
 }
 
-/// `steps` quarter turns clockwise over a packed RGB8 picture -- the same
-/// direction and the same count [`crate::scale::rotate_i420_90s`] takes, on the
-/// still's own buffer rather than on its planes: a still is turned exactly once
-/// in its whole life, so there is no steady-state cost to make the allocating
-/// call the one that happens.
-fn turn_rgb(rgb: &image::RgbImage, steps: u8) -> image::RgbImage {
-    match steps % 4 {
-        1 => image::imageops::rotate90(rgb),
-        2 => image::imageops::rotate180(rgb),
-        3 => image::imageops::rotate270(rgb),
-        _ => rgb.clone(),
-    }
+/// `steps` quarter turns clockwise over a packed RGB8 picture of `width` by
+/// `height` -- the same direction and the same count
+/// [`crate::scale::rotate_i420_90s`] takes, on the still's own buffer rather
+/// than on its planes: a still is turned exactly once in its whole life, so
+/// there is no steady-state cost to make the allocating call the one that
+/// happens. Returns the turned picture's `(width, height, pixels)`.
+fn turn_rgb(
+    rgb: &[u8],
+    width: u32,
+    height: u32,
+    steps: u8,
+) -> Result<(u32, u32, Vec<u8>), ec_core::Error> {
+    use ec_image::transform::{Layout, rotate90, rotate180, rotate270};
+    let layout = Layout::Rgb8;
+    Ok(match steps % 4 {
+        1 => (height, width, rotate90(layout, width, height, rgb)?),
+        2 => (width, height, rotate180(layout, width, height, rgb)?),
+        3 => (height, width, rotate270(layout, width, height, rgb)?),
+        _ => (width, height, rgb.to_vec()),
+    })
 }
 
 /// How big the picture in `path` is as it is **shown**, from its header alone --
@@ -1821,11 +2536,12 @@ fn turn_rgb(rgb: &image::RgbImage, steps: u8) -> image::RgbImage {
 /// that exists before anything places the file. Header-only still --
 /// `into_decoder` parses the container and stops.
 pub fn image_size(path: &Path) -> crate::Result<(u32, u32)> {
-    let rotation = image_orientation(path)?;
-    let (width, height) = image::ImageReader::open(path)?
-        .with_guessed_format()?
-        .into_dimensions()
-        .map_err(|e| format!("{}: {e}", path.display()))?;
+    if let Some(g) = crate::generate::Gen::parse(path) {
+        return Ok((g.width, g.height));
+    }
+    let header = probe_header(path)?;
+    let rotation = rotation_of_exif(header.orientation)?;
+    let (width, height) = (header.width, header.height);
     Ok(match rotation.swaps_axes() {
         true => (height, width),
         false => (width, height),
@@ -2128,6 +2844,10 @@ fn rgb_yuv(r: i32, g: i32, b: i32) -> (u8, u8, u8) {
 const VIZ_WINDOW_SECS: f64 = 2.0;
 const VIZ_FAST_SECS: f64 = 0.2;
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the plane triple and its dimensions are threaded positionally through every painter's stamp calls; a planes struct would restructure all of them"
+)]
 fn viz_stamp(
     y: &mut [u8],
     u: &mut [u8],
@@ -2162,6 +2882,10 @@ fn viz_stamp(
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "forwards the same plane triple and ink as viz_stamp, positionally"
+)]
 fn viz_span(
     y: &mut [u8],
     u: &mut [u8],
@@ -2916,11 +3640,108 @@ pub(crate) fn visualizer_window_i420(
 
 /// `None` when the software path must be used: forced by `VE_SW=1`, or the
 /// plugin is absent/broken/unable to open this particular file.
-fn open_hw(path: &Path, start_frame: u32) -> Option<HwSession> {
-    if std::env::var_os("VE_SW").is_some_and(|v| v == "1") {
+pub(crate) fn open_hw(path: &Path, start_frame: u32) -> Option<HwSession> {
+    if crate::envcfg::var_os("VE_SW").is_some_and(|v| v == "1") {
+        return None;
+    }
+    // A VP9 stream the GPU cannot take goes straight to the ec-vp9 software seat.
+    if vp9_off_gpu(path).is_some() || h264_software_only(path) {
         return None;
     }
     HwSession::open_at(path, start_frame)
+}
+
+/// Whether a VP9 stream of this profile and chroma is one the VA-API plugin cannot
+/// take: the GPU decodes profiles 0 and 2 only, which are 4:2:0. Profiles 1 and 3
+/// are the 4:2:2 and 4:4:4 ones. Used by both the import probe and the decode
+/// open, through [`hw_decodes`] and [`open_hw`], so the two cannot disagree.
+fn vp9_needs_420_for_vaapi(profile: u8, chroma: Chroma) -> bool {
+    matches!(profile, 1 | 3) && chroma != Chroma::C420
+}
+
+/// The VP9 profile and chroma of `path` when it is a stream the GPU cannot take
+/// ([`vp9_needs_420_for_vaapi`]), `None` for every other file. Not a refusal: such
+/// a stream plays on the ec-vp9 software seat, which takes all four profiles.
+fn vp9_off_gpu(path: &Path) -> Option<(u8, Chroma)> {
+    let (meta, demuxer) = Demuxer::open(path).ok()?;
+    if meta.codec != Codec::Vp9 {
+        return None;
+    }
+    let chroma = demuxer.chroma()?;
+    // Profile 1 is 8-bit and profile 3 is 10-bit (12-bit is refused by the demuxer),
+    // so the depth names the profile without the header keeping a second field.
+    let profile = if demuxer.bit_depth() == 10 { 3 } else { 1 };
+    vp9_needs_420_for_vaapi(profile, chroma).then_some((profile, chroma))
+}
+
+/// A [`Render`] as a span over `demuxer`'s file builds it, for tests that need
+/// the plain conversion of a picture a decoder handed over.
+#[cfg(test)]
+pub(crate) fn test_render(meta: VideoMeta, demuxer: &Demuxer) -> Render {
+    Render::new(
+        ColorParams::default(),
+        TransformParams::default(),
+        meta.rotation,
+        meta.pixel_aspect,
+        meta.color,
+        Composer::passthrough(),
+        tonemap::Preset::default(),
+        demuxer.light().peak(),
+    )
+}
+
+/// The clip's deinterlace setting as it applies to this stream: `Frame` for
+/// anything that is not interlaced H.264, which ignores the setting.
+fn effective_deint(
+    deint: crate::project::Deinterlace,
+    meta: &VideoMeta,
+    demuxer: &Demuxer,
+) -> crate::project::Deinterlace {
+    if matches!(deint, crate::project::Deinterlace::IvtcAuto | crate::project::Deinterlace::Ivtc) {
+        // Resolved against the file: `Ivtc` when it has a cadence, else `Frame`.
+        demuxer.path().map_or(crate::project::Deinterlace::Frame, |p| crate::deinterlace::effective(deint, p))
+    } else if meta.codec == Codec::H264 && demuxer.h264_interlaced() {
+        deint
+    } else {
+        crate::project::Deinterlace::Frame
+    }
+}
+
+/// Pictures per frame of the file: 2 in field mode, where the numbers are fields.
+fn deint_units(deint: crate::project::Deinterlace) -> u32 {
+    if deint == crate::project::Deinterlace::Field { 2 } else { 1 }
+}
+
+/// Whether `path` is H.264 the GPU is never offered: above 8 bits (High 10, which
+/// VA-API has no profile for), 4:4:4 / monochrome / High 4:4:4 Predictive, or interlaced (PAFF and MBAFF, whose field order
+/// and picture order this engine reads off `ec-h264`'s own pictures and
+/// deinterlaces with their neighbours, see [`crate::deinterlace`]). Both play on
+/// the ec-h264 software seat.
+fn h264_software_only(path: &Path) -> bool {
+    Demuxer::open(path)
+        .is_ok_and(|(meta, d)| {
+            meta.codec == Codec::H264
+                && (d.bit_depth() > 8
+                    || d.h264_interlaced()
+                    // High 4:4:4 Predictive / CAVLC 4:4:4 Intra (also 4:2:0 lossless
+                    // under them), 4:4:4 and monochrome: no VA-API H.264 profile.
+                    || matches!(d.chroma(), Some(Chroma::C444 | Chroma::Gray))
+                    || d.profile().is_some_and(|p| p.contains("4:4:4")))
+        })
+}
+
+/// Why a VP9 stream [`vp9_off_gpu`] names is on the software seat: the profile, its
+/// chroma, and where it plays. Named so the probe's reason can be read off it.
+fn vp9_software_route(profile: u8, chroma: Chroma) -> String {
+    let format = match chroma {
+        Chroma::C422 => "4:2:2",
+        Chroma::C444 => "4:4:4",
+        Chroma::Gray => "grey",
+        Chroma::C420 => "4:2:0",
+    };
+    format!(
+        "VP9 profile {profile} ({format}) is not 4:2:0, which the GPU does not take: it plays on the ec-vp9 software seat"
+    )
 }
 
 /// `Ok` when the plugin really decodes this file: it opens *and* hands back a
@@ -2933,9 +3754,45 @@ fn open_hw(path: &Path, start_frame: u32) -> Option<HwSession> {
 /// The `Err` says which half failed, because "there is no decoder for this
 /// codec" and "the decoder here would not take this stream" are different
 /// refusals and a user acts on them differently.
-fn hw_decodes(path: &PathBuf, start_frame: u32, codec: Codec) -> Result<(), String> {
+fn hw_decodes(path: &Path, start_frame: u32, codec: Codec) -> Result<(), String> {
+    // The plugin's VA-API path takes Main, Main 10, Main Still and SCC (profile
+    // 1, 2, 3, 9). A range-extensions stream (profile 4 and up: 4:2:2, 4:4:4,
+    // 12-bit) reaches an `unimplemented!` in the vendored decoder, which panics.
+    // Refused by name here instead, before the plugin is asked for anything.
+    if codec == Codec::Hevc
+        && let Ok((_, demuxer)) = Demuxer::open(path)
+        && let Some(profile) = demuxer.hevc_profile().filter(|p| !matches!(p, 1 | 2 | 3 | 9))
+    {
+        // Named by the chroma the stream states, in the words `demux` uses for
+        // the same refusal at open, so probe and import say one thing.
+        let what = match demuxer.chroma() {
+            Some(Chroma::C422) => "HEVC 4:2:2".to_string(),
+            Some(Chroma::C444) => "HEVC 4:4:4".to_string(),
+            Some(Chroma::Gray) => "HEVC 4:0:0".to_string(),
+            _ => format!("HEVC profile {profile}"),
+        };
+        return Err(format!(
+            "{what} (HEVC profile {profile}) is not offered to VA-API, which takes Main and Main 10 only: it plays on the ec-h265 software seat"
+        ));
+    }
+    // VP9 profiles 1 and 3 are the 4:2:2 and 4:4:4 ones; the GPU takes 4:2:0 only, so
+    // such a stream is not the plugin's: it is routed to the ec-vp9 software seat.
+    if codec == Codec::Mpeg2 {
+        return Err("MPEG-2 video has no VA-API path here: it plays on the ec-mpeg2 software seat".into());
+    }
+    if matches!(codec, Codec::ProRes | Codec::Dnxhd | Codec::Mjpeg | Codec::Dv | Codec::Mpeg4 | Codec::MsMpeg4 | Codec::Raw) {
+        return Err(format!("{} has no VA-API path: it plays on its own software seat", codec.name()));
+    }
+    if codec == Codec::Vp9
+        && let Some((profile, chroma)) = vp9_off_gpu(path)
+    {
+        return Err(vp9_software_route(profile, chroma));
+    }
+    if codec == Codec::H264 && h264_software_only(path) {
+        return Err("H.264 High 10, 4:4:4, monochrome and interlaced H.264 are not offered to VA-API: they play on the ec-h264 software seat, deinterlaced".into());
+    }
     let Some(mut hw) = open_hw(path, start_frame) else {
-        return Err(codec.needs_plugin());
+        return Err(format!("the VA-API plugin did not open this {} stream", codec.name()));
     };
     // End of stream counts as a refusal, not as a pass: a session that hands
     // back no picture at all is exactly the black-frame-and-instant-eof this
@@ -2946,29 +3803,60 @@ fn hw_decodes(path: &PathBuf, start_frame: u32, codec: Codec) -> Result<(), Stri
     }
 }
 
-/// Returns whether the session was handled; `false` only when hardware decode
-/// failed without emitting a single frame, so software can still take over.
+/// One software or hardware pass over a span: the frames `start_frame..end_frame`
+/// go to `tx`, drawn through `render`, and the pass ends early on `abort`.
+/// `speed` and `failure` are the session's own.
+struct Pass<'a> {
+    tx: &'a SyncSender<Frame>,
+    start_frame: u32,
+    end_frame: u32,
+    render: &'a mut Render,
+    abort: &'a Abort<'a>,
+    speed: Speed,
+    failure: &'a DecodeFailure,
+    /// The clip's deinterlace setting, already narrowed to what applies to the
+    /// stream (`Frame` for anything not interlaced).
+    deint: crate::project::Deinterlace,
+}
+
+/// How a hardware pass over a span ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HwEnd {
+    /// The span was decoded to its end, or its consumer or abort stopped it.
+    Done,
+    /// Hardware gave nothing at all before the first picture, so software takes
+    /// the whole span.
+    Refused,
+    /// Hardware failed after the first picture, at this display index: software
+    /// takes the span from there.
+    FellBackAt(u32),
+}
+
+/// Reports how the pass ended: [`HwEnd::Refused`] only when hardware decode
+/// failed without emitting a single frame, [`HwEnd::FellBackAt`] when it failed
+/// after some, so software can take over either way.
 ///
 /// The plugin already positioned itself at `start_frame`, so indices are
 /// counted from there (a stream whose very first sample is not a sync sample
 /// cannot be decoded from its start at all, and is not accounted for).
-fn run_hw(
-    hw: &mut HwSession,
-    tx: &SyncSender<Frame>,
-    start_frame: u32,
-    end_frame: u32,
-    render: &mut Render,
-    abort: &Abort,
-    speed: Speed,
-    failure: &DecodeFailure,
-) -> bool {
+fn run_hw(hw: &mut HwSession, pass: Pass) -> HwEnd {
+    let Pass {
+        tx,
+        start_frame,
+        end_frame,
+        render,
+        abort,
+        speed,
+        failure: _,
+        deint: _,
+    } = pass;
     let mut index = start_frame;
     // Pictures dropped for being late since the last one handed over; see
     // [`LATE_RUN`].
     let mut skipped = 0;
     loop {
         if abort.hit() {
-            return true;
+            return HwEnd::Done;
         }
         match hw.next_frame() {
             Ok(Some((y, u, v, width, height))) => {
@@ -2981,7 +3869,7 @@ fn run_hw(
                         skipped = 0;
                         let frame = render.frame(due, y, u, v, width, height);
                         if tx.send(frame).is_err() {
-                            return true; // consumer went away
+                            return HwEnd::Done; // consumer went away
                         }
                     }
                 } else if skip_for_speed(speed, start_frame, due, end_frame) {
@@ -2991,14 +3879,20 @@ fn run_hw(
                     skipped = 0;
                     let frame = render.frame(due, y, u, v, width, height);
                     if tx.send(frame).is_err() {
-                        return true; // consumer went away
+                        return HwEnd::Done; // consumer went away
                     }
                 }
                 if index >= end_frame {
-                    return true; // end of the requested range
+                    return HwEnd::Done; // end of the requested range
                 }
             }
-            Ok(None) => return true,
+            // End of stream before the first picture is the same signal as an
+            // error there: the plugin opened and gave nothing, and software
+            // takes the span. A mid-GOP start on AV1 does exactly this -- the
+            // plugin's seek leaves the leading inter frames undecodable and the
+            // stream then ends with no picture.
+            Ok(None) if index == start_frame => return HwEnd::Refused,
+            Ok(None) => return HwEnd::Done,
             Err(e) => {
                 // Before the first picture this is not a failure to report but
                 // the signal that software should take over, and it is reported
@@ -3006,11 +3900,394 @@ fn run_hw(
                 // well would put a fault on the strip for a span that is about
                 // to decode cleanly.
                 if index == start_frame {
-                    return false;
+                    return HwEnd::Refused;
                 }
-                failure.set(format!("hardware decode error at frame {index}: {e}"));
-                return true;
+                // Mid-span: not a fault to report, because the software seat
+                // takes the rest of the span from `index`.
+                eprintln!("hardware decode error at frame {index}: {e}; continuing in software");
+                return HwEnd::FellBackAt(index);
             }
+        }
+    }
+}
+
+/// Converts one decoded picture and queues it. `true` when the consumer went
+/// away, so the span stops rather than keeps decoding into a void.
+fn send_picture(
+    pic: &VideoFrame,
+    due: u32,
+    render: &mut Render,
+    tx: &SyncSender<Frame>,
+    deep: &mut Deep,
+) -> bool {
+    // A High 10 picture is narrowed to the 8-bit planes below first.
+    deep.load(pic, false);
+    if deep.on {
+        let n = &deep.narrow;
+        let frame = render.frame(due, &n.y, &n.u, &n.v, n.width, n.height);
+        return tx.send(frame).is_err();
+    }
+    // The decoder crops each picture into tightly packed planes, the shape
+    // every converter below takes. A padded plane would render skewed rather
+    // than subtly wrong, so the assumption is pinned where it is relied on --
+    // free in a release build.
+    let (y, u, v) = (&pic.planes[0], &pic.planes[1], &pic.planes[2]);
+    debug_assert_eq!(y.stride, pic.width as usize, "padded luma plane");
+    debug_assert_eq!(
+        u.stride,
+        pic.width.div_ceil(2) as usize,
+        "padded chroma plane"
+    );
+    let frame = render.frame(due, &y.data, &u.data, &v.data, pic.width, pic.height);
+    tx.send(frame).is_err()
+}
+
+fn run(demuxer: &mut Demuxer, pass: Pass) {
+    let Pass {
+        tx,
+        start_frame,
+        end_frame,
+        render,
+        abort,
+        speed,
+        failure,
+        deint: mode,
+    } = pass;
+    // A decoder per span, and cheap: it is a parameter-set map and a picture
+    // buffer, while the *demuxer* -- whose index cost seconds to build -- is the
+    // one this worker keeps.
+    let mut decoder = H264Decoder::new(CodecParameters::new(CodecId::H264))
+        .expect("ec-h264 takes its own codec id");
+    // Decoding has to restart at a sync sample, so pictures between it and
+    // `start_frame` are decoded (the target frame references them) but never
+    // converted or sent. Signed, because the landing sync sample can sit inside
+    // what the file's edit list trims, i.e. *before* frame 0.
+    //
+    // An interlaced stream is deinterlaced against the picture before and the
+    // picture after each one ([`crate::deinterlace`]), so a seek lands one
+    // picture earlier: the target's predecessor is decoded too, and the first
+    // picture shown is filtered from the same neighbours a sequential decode
+    // gave it.
+    let interlaced = demuxer.h264_interlaced();
+    let mut deint = crate::deinterlace::Deinterlacer::with_mode(
+        mode,
+        interlaced,
+        i64::from(start_frame),
+        ec_core::frame::Interlace::Progressive,
+    )
+    .cadenced(mode, demuxer);
+    // In field mode `start_frame`, `end_frame` and every `due` below are field
+    // numbers; the demuxer lands on the frame holding the first one.
+    let mut index = demuxer.seek_to_sync_at_or_before(deint.landing(start_frame));
+    let mut pending = std::collections::VecDeque::new();
+    // Pictures leave the decoder in display order -- clause C.4.5.3 bumps the
+    // decoded picture buffer -- and the landing index above is a display index
+    // by the demuxer's own contract, so the two count one to one. The decode
+    // order this loop used to emit was a corner-cut that only held for
+    // Baseline: a stream with B pictures arrived scrambled and mislabelled,
+    // and every reader of `index` (the transport's playhead, `skip_for_speed`,
+    // the export's frame map) reads it as a timeline position.
+    let mut skipped = 0;
+    let mut deep = Deep::default();
+    // Set once the demuxer runs dry: `flush` makes the decoder release every
+    // picture its reorder delay still holds, and the drain below ends on
+    // `Error::Eof` once they are out.
+    let mut flushed = false;
+    // Every way this span ends: abort, consumer gone, end of the requested
+    // range, end of stream.
+    let mut done = false;
+    while !done {
+        if abort.hit() {
+            break;
+        }
+        // One access unit is one packet. No timestamps travel with it: the
+        // presentation order comes out of the bitstream's own POC, and `index`
+        // is counted off the pictures as the decoder releases them.
+        match demuxer.next_access_unit() {
+            Ok(Some(au)) => {
+                let packet = Packet::new(0, TimeBase::new(1, 1), au);
+                if let Err(e) = decoder.send_packet(&packet) {
+                    failure.set(format!("decode error at access unit {index}: {e}"));
+                    break;
+                }
+            }
+            Ok(None) => {
+                flushed = true;
+                if let Err(e) = decoder.flush() {
+                    failure.set(format!("decode error at end of stream: {e}"));
+                    break;
+                }
+            }
+            Err(e) => {
+                failure.set(format!("demux error: {e}"));
+                break;
+            }
+        }
+        // Take everything the packet released; `NeedMore` is the signal to go
+        // back for the next access unit.
+        loop {
+            let (due, pic) = match pending.pop_front() {
+                Some(ready) => ready,
+                None => match decoder.receive_frame() {
+                    Ok(ec_core::frame::Frame::Video(pic)) => {
+                        let tag = index;
+                        index += 1;
+                        // A disabled stage hands the picture straight back; an
+                        // interlaced stream's comes one picture late (two,
+                        // fields, in field mode), and nothing while it primes
+                        // or for a picture below the target.
+                        pending.extend(deint.push_all(tag, pic));
+                        continue;
+                    }
+                    Ok(_) => continue,
+                    Err(e) if e.is_need_more() || e.is_eof() => {
+                        // The end of the stream releases the picture the stage
+                        // was holding for a successor.
+                        if flushed {
+                            pending.extend(deint.finish_all());
+                        }
+                        if pending.is_empty() {
+                            break;
+                        }
+                        continue;
+                    }
+                    Err(e) => {
+                        failure.set(format!("decode error at access unit {index}: {e}"));
+                        break;
+                    }
+                },
+            };
+            if due < i64::from(start_frame) {
+                continue;
+            }
+            let due = due as u32;
+            if abort.late(due) {
+                if skipped < LATE_RUN {
+                    skipped += 1;
+                } else {
+                    skipped = 0;
+                    if send_picture(&pic, due, render, tx, &mut deep) {
+                        done = true; // consumer went away
+                        break;
+                    }
+                }
+            } else if skip_for_speed(speed, start_frame, due, end_frame) {
+                // Redundant by construction, not by lateness: no run limit
+                // needed (see `skip_for_speed`).
+            } else {
+                skipped = 0;
+                if send_picture(&pic, due, render, tx, &mut deep) {
+                    done = true; // consumer went away
+                    break;
+                }
+            }
+            if due + 1 >= end_frame {
+                done = true; // end of the requested range
+                break;
+            }
+        }
+        if flushed {
+            done = true;
+        }
+    }
+}
+
+/// Whether an access unit leads with a sequence header OBU, which is how both
+/// containers mark a random-access point for AV1: the demuxer prepends the
+/// `av1C`/`CodecPrivate` record (itself one sequence header OBU) ahead of every
+/// sync sample, so the marker rides on the same bytes the decoder needs. Type 1
+/// in bits 6..3 of the first OBU header byte.
+pub(crate) fn leads_with_sequence_header(au: &[u8]) -> bool {
+    matches!(au.first(), Some(&first) if first >> 3 & 0xF == 1)
+}
+
+/// One [`Av1Picture`] down to the tightly packed 8-bit I420 every converter
+/// here takes. 8-bit samples arrive as `u16` in `0..=255` and narrow losslessly;
+/// a 10-bit stream's `0..=1023` downshifts by two and a 12-bit one's by four,
+/// the same truncation the hardware seat's P010 read-back performs when it
+/// takes the high byte of each pair (`p010_to_i420`, engine-hw) -- so the two
+/// seats hand the renderer byte-identical planes off the same file.
+///
+/// `depth` is the stream's bits per luma sample. A 4:2:2 or 4:4:4 picture
+/// (profiles 1 and 2) has its chroma averaged down to 4:2:0 first, rounding to
+/// nearest, at the depth it was decoded in: a pair of rows for 4:2:2, a 2x2 box
+/// for 4:4:4 (the export's [`crate::export::chroma_420`], which the export seat
+/// has applied already when the planes arrive here at 4:2:0).
+pub(crate) fn narrow_av1(
+    picture: &Av1Picture,
+    depth: u8,
+    y: &mut Vec<u8>,
+    u: &mut Vec<u8>,
+    v: &mut Vec<u8>,
+) {
+    let shift = depth.saturating_sub(8);
+    let plane = |src: &[u16], dst: &mut Vec<u8>| {
+        dst.clear();
+        dst.extend(src.iter().map(|&sample| (sample >> shift) as u8));
+    };
+    plane(&picture.y, y);
+    let (w, h) = (picture.width, picture.height);
+    let (ow, oh) = (w.div_ceil(2), h.div_ceil(2));
+    match crate::export::chroma_shape(picture.u.len(), w, h) {
+        Some((cw, ch)) if (cw, ch) != (ow, oh) => {
+            let down = |src: &[u16], dst: &mut Vec<u8>| {
+                dst.clear();
+                dst.extend(
+                    crate::export::chroma_420(src, cw, ch, ow, oh)
+                        .into_iter()
+                        .map(|s| (s >> shift) as u8),
+                );
+            };
+            down(&picture.u, u);
+            down(&picture.v, v);
+        }
+        _ => {
+            plane(&picture.u, u);
+            plane(&picture.v, v);
+        }
+    }
+}
+
+/// Narrows one [`Av1Picture`] ([`narrow_av1`]) and queues it through the same
+/// [`Render`] every other seat's pictures go through. `true` when the consumer
+/// went away, so the span stops rather than keeps decoding into a void.
+fn send_av1(
+    picture: &Av1Picture,
+    due: u32,
+    depth: u8,
+    render: &mut Render,
+    tx: &SyncSender<Frame>,
+    (y, u, v): (&mut Vec<u8>, &mut Vec<u8>, &mut Vec<u8>),
+) -> bool {
+    narrow_av1(picture, depth, y, u, v);
+    let frame = render.frame(due, y, u, v, picture.width as u32, picture.height as u32);
+    tx.send(frame).is_err()
+}
+
+/// The AV1 software seat: one span of [`ec_av1`] through the same loop
+/// [`run`] drives `ec-h264` through. A decoder per span, and cheap -- it is the
+/// reference bank and one output picture, while the *demuxer* is the one this
+/// worker keeps. `ec-av1` has no packet-by-packet door; it takes one whole OBU
+/// stream, so the span is fed as it is built: every access unit from the landing
+/// sync sample up to (not including) the next one is one chunk, and a chunk is
+/// a legal random-access stream on its own -- it leads with the sequence header
+/// and a key frame, which is exactly what makes the chunk boundary detectable
+/// here ([`leads_with_sequence_header`]). A stream whose inter frames carried
+/// an in-band sequence header would be cut mid-GOP and refused by name below,
+/// never silently misread; container storage keeps the sequence header in the
+/// config record precisely so that does not happen.
+///
+/// Chunks decode to their end, so the reorder window of the chunk the span
+/// ends in always drains: hidden frames (`show_frame == 0`) are references
+/// and arrive at the sink with `shown == false`, and the frames they hold
+/// back in output order are the tail the sink still has to see.
+///
+/// A refusal out of `ec-av1` -- a real-world stream hitting a shape the
+/// decoder does not reconstruct -- fails the span in words, mid-film, the way
+/// the hardware seat's errors do: named on stderr, the pictures decoded so
+/// far stand, and no garbage is sent. The same sentinel ends a span that has
+/// delivered everything asked of it without decoding the rest of its last
+/// chunk.
+fn run_av1(demuxer: &mut Demuxer, pass: Pass) {
+    let Pass {
+        tx,
+        start_frame,
+        end_frame,
+        render,
+        abort,
+        speed,
+        failure,
+        deint: _,
+    } = pass;
+    // Signed, for the same reason [`run`]'s is: the landing sync sample can
+    // sit inside what an mp4's edit list trims, i.e. before frame 0.
+    let mut index = demuxer.seek_to_sync_at_or_before(start_frame);
+    // Reusable plane buffers: one allocation each for the whole span, refilled
+    // per picture by [`narrow_av1`].
+    let (mut y, mut u, mut v) = (Vec::new(), Vec::new(), Vec::new());
+    let mut skipped = 0;
+    // Every way this span ends: abort, consumer gone, the requested range
+    // delivered, the demuxer dry, or a refusal out of the decoder.
+    let mut done = false;
+    let mut demux_dry = false;
+    // An access unit read past a chunk boundary, waiting to head the next one.
+    let mut pending: Option<Vec<u8>> = None;
+    while !done && !demux_dry {
+        if abort.hit() {
+            break;
+        }
+        // One chunk: the access units from a sync sample up to the next one.
+        let mut stream = pending.take().unwrap_or_default();
+        while !demux_dry && pending.is_none() {
+            match demuxer.next_access_unit() {
+                Ok(Some(au)) => {
+                    if !stream.is_empty() && leads_with_sequence_header(&au) {
+                        pending = Some(au);
+                    } else {
+                        stream.extend_from_slice(&au);
+                    }
+                }
+                Ok(None) => demux_dry = true,
+                Err(e) => {
+                    failure.set(format!("demux error: {e}"));
+                    return;
+                }
+            }
+        }
+        let depth = demuxer.bit_depth();
+        let decode = decode_stream_with(&stream, |picture, _, shown| {
+            // Hidden frames are references: they take no display slot and
+            // are never sent, but they do hold the chunk's output order
+            // back, which is why the chunk decodes to its end.
+            if !shown {
+                return Ok(());
+            }
+            let due = index;
+            index += 1;
+            if due < i64::from(start_frame) {
+                return Ok(());
+            }
+            let due = due as u32;
+            // The three ends [`run`] reaches per picture, in its own shape:
+            // late for the playhead (one in [`LATE_RUN`] still goes through),
+            // redundant by construction at speed, or a conversion and a send.
+            let sent = if abort.late(due) {
+                if skipped < LATE_RUN {
+                    skipped += 1;
+                    false
+                } else {
+                    skipped = 0;
+                    send_av1(picture, due, depth, render, tx, (&mut y, &mut u, &mut v))
+                }
+            } else if skip_for_speed(speed, start_frame, due, end_frame) {
+                // Redundant by construction, not by lateness: no run limit
+                // needed (see `skip_for_speed`).
+                false
+            } else {
+                skipped = 0;
+                send_av1(picture, due, depth, render, tx, (&mut y, &mut u, &mut v))
+            };
+            if sent {
+                done = true; // consumer went away
+            }
+            if done || i64::from(due) + 1 >= i64::from(end_frame) {
+                done = true; // the range is out, or nobody is left to take it
+                // Stops the decode inside the chunk: everything the span
+                // asked for has been sent, and the chunk's remaining coded
+                // frames are references for pictures nobody asked for.
+                return Err(Av1Error::Eof);
+            }
+            Ok(())
+        });
+        // `done` was set by the sink itself for the `Eof` it returns -- the
+        // sentinel, not a refusal. Any other `Err` is a refusal out of the
+        // decoder, named where the hardware seat's decode errors are named;
+        // the pictures decoded so far stand and the span ends.
+        if let Err(e) = decode
+            && !done
+        {
+            failure.set(format!("software AV1 decode failed at frame {index}: {e}"));
+            done = true;
         }
     }
 }
@@ -3053,24 +4330,42 @@ mod tests {
     #[test]
     fn a_deferred_open_costs_the_caller_a_thread_and_not_a_demux() {
         let path = asset("test_baseline.mp4");
-        evict(&path);
-        let start = Instant::now();
-        let stream = DecodeSession::open_worker_deferred(
-            &path,
-            0,
-            u32::MAX,
-            ColorParams::default(),
-            TransformParams::default(),
-            Composer::passthrough(),
-            tonemap::Preset::default(),
-            Speed::NORMAL,
-        );
-        let returned = start.elapsed();
-        let frame = stream
-            .frames
-            .recv_timeout(Duration::from_secs(10))
-            .expect("first frame");
-        let first_frame = start.elapsed();
+        // One cold deferred open: how long the call took, the stream's first
+        // frame, and when that arrived.
+        let deferred = || {
+            evict(&path);
+            let start = Instant::now();
+            let stream = DecodeSession::open_worker_deferred(
+                &path,
+                0,
+                u32::MAX,
+                ColorParams::default(),
+                TransformParams::default(),
+                Composer::passthrough(),
+                tonemap::Preset::default(),
+                Speed::NORMAL,
+            );
+            let returned = start.elapsed();
+            let frame = stream
+                .frames
+                .recv_timeout(Duration::from_secs(10))
+                .expect("first frame");
+            (returned, frame, start.elapsed())
+        };
+        // The call's cost is a wall-clock sample, and a thread spawn on a
+        // machine under a parallel build can be descheduled for tens of ms --
+        // the fastest of a few tries is the cost the code itself has, as the
+        // tonemap perf gate does. A real read-before-return costs every try.
+        let (mut returned, frame, mut first_frame) = deferred();
+        for _ in 0..7 {
+            if returned < Duration::from_millis(10) {
+                break;
+            }
+            let (r, _, f) = deferred();
+            if r < returned {
+                (returned, first_frame) = (r, f);
+            }
+        }
 
         // The same file, equally cold, through the door the import path keeps:
         // that one hands back metadata, and the demux it reads to do so is on
@@ -3214,7 +4509,7 @@ mod tests {
     #[test]
     fn dropping_a_frame_stream_never_waits_for_an_undrained_channel() {
         let (_meta, stream) = DecodeSession::open_worker(
-            &asset("test_baseline.mp4"),
+            asset("test_baseline.mp4"),
             0,
             u32::MAX,
             ColorParams::default(),
@@ -3380,42 +4675,46 @@ mod tests {
         }
     }
 
-    /// The `VE_SW=1` pin, borrowed for one test and put back as it was: it is
-    /// process-wide, and this file's unit tests share one process.
-    struct SwPin(Option<std::ffi::OsString>);
+    /// Serialises the pins: `VE_SW` is process-wide and this file's unit tests
+    /// share one process, so two pinned tests must not see each other's pin
+    /// cleared under them.
+    static SW_PIN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The `VE_SW=1` pin, held for one test and put back as it was.
+    struct SwPin {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        was: Option<std::ffi::OsString>,
+    }
 
     impl SwPin {
         fn set() -> Self {
-            let had = std::env::var_os("VE_SW");
-            unsafe { std::env::set_var("VE_SW", "1") };
-            Self(had)
+            let lock = SW_PIN
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let was = crate::envcfg::var_os("VE_SW");
+            crate::envcfg::set("VE_SW", "1");
+            Self { _lock: lock, was }
         }
     }
 
     impl Drop for SwPin {
         fn drop(&mut self) {
-            match &self.0 {
-                Some(was) => unsafe { std::env::set_var("VE_SW", was) },
-                None => unsafe { std::env::remove_var("VE_SW") },
+            match &self.was {
+                Some(was) => crate::envcfg::set("VE_SW", was),
+                None => crate::envcfg::unset("VE_SW"),
             }
         }
     }
 
-    /// A span whose codec has no seat at all -- the plugin never opened one and
-    /// there is no software decoder for these bytes -- must report the *gap* it
-    /// is. The cell used to be left claiming `Hardware`: the arm below the
-    /// software fallback set it before the session that produced nothing, and
-    /// the front-end then named a decoder that had decoded no frame.
-    ///
-    /// Driven through [`run_span`] itself, which is the only door that reaches
-    /// the arm: every public one refuses a plugin-only codec at `hw_decodes`
-    /// before a span exists (VP8, VP9 and HEVC all refuse on this machine), and
-    /// the arm is for the box where the plugin was there and then was not.
-    /// `VE_SW=1` is what makes that box-independent; see [`SwPin`].
+    /// HEVC has a software seat of its own (`ec-h265`), so with the plugin off a
+    /// span on it is on that seat: it reports `Software`, and decodes what it was
+    /// asked for. Driven through [`run_span`] itself, the door the front-end's
+    /// spans come through; `VE_SW=1` is what makes the plugin's absence
+    /// box-independent; see [`SwPin`].
     #[test]
-    fn a_span_with_no_seat_at_all_reports_the_gap() {
+    fn an_hevc_span_with_no_hardware_takes_the_software_seat() {
         let _pin = SwPin::set();
-        let path = asset("test_vp8.mp4");
+        let path = asset("test_hevc.mp4");
         let mut source = None;
         let cancel = AtomicBool::new(false);
         let generation = AtomicU64::new(0);
@@ -3441,6 +4740,7 @@ mod tests {
                 canvas: Composer::passthrough(),
                 tone: tonemap::Preset::default(),
                 speed: Speed::NORMAL,
+                deint: Default::default(),
                 tx,
             },
             &abort,
@@ -3449,17 +4749,17 @@ mod tests {
         );
         assert_eq!(
             cell.get(),
-            Backend::Gap,
-            "a VP8 span with no hardware must report the gap, not a hardware seat"
+            Backend::Software,
+            "an HEVC span with no hardware is on the software seat, not a gap"
+        );
+        assert_eq!(
+            rx.try_iter().count(),
+            2,
+            "the software seat decodes the span's two pictures"
         );
         assert!(
-            rx.try_recv().is_err(),
-            "a gap decodes nothing: no picture may come down the channel"
-        );
-        assert!(
-            failure.reason().is_some(),
-            "and it says why: a span that decoded nothing is the one case where \
-             a closed channel is definitely not the end of the file"
+            failure.reason().is_none(),
+            "and a span that decoded what it was asked for says nothing went wrong"
         );
     }
 
@@ -3748,313 +5048,156 @@ mod tests {
         }
         peaks
     }
-}
 
-fn run(
-    demuxer: &mut Demuxer,
-    tx: &SyncSender<Frame>,
-    start_frame: u32,
-    end_frame: u32,
-    render: &mut Render,
-    abort: &Abort,
-    speed: Speed,
-    failure: &DecodeFailure,
-) {
-    // A decoder per span, and cheap: it is a parameter-set map and a picture
-    // buffer, while the *demuxer* -- whose index cost seconds to build -- is the
-    // one this worker keeps.
-    let mut decoder = H264Decoder::new(CodecParameters::new(CodecId::H264))
-        .expect("ec-h264 takes its own codec id");
-    // Decoding has to restart at a sync sample, so pictures between it and
-    // `start_frame` are decoded (the target frame references them) but never
-    // converted or sent. Signed, because the landing sync sample can sit inside
-    // what the file's edit list trims, i.e. *before* frame 0.
-    let mut index = demuxer.seek_to_sync_at_or_before(start_frame);
-    // Pictures leave the decoder in display order -- clause C.4.5.3 bumps the
-    // decoded picture buffer -- and the landing index above is a display index
-    // by the demuxer's own contract, so the two count one to one. The decode
-    // order this loop used to emit was a corner-cut that only held for
-    // Baseline: a stream with B pictures arrived scrambled and mislabelled,
-    // and every reader of `index` (the transport's playhead, `skip_for_speed`,
-    // the export's frame map) reads it as a timeline position.
-    let mut skipped = 0;
-    // Set once the demuxer runs dry: `flush` makes the decoder release every
-    // picture its reorder delay still holds, and the drain below ends on
-    // `Error::Eof` once they are out.
-    let mut flushed = false;
-    // Every way this span ends: abort, consumer gone, end of the requested
-    // range, end of stream.
-    let mut done = false;
-    while !done {
-        if abort.hit() {
-            break;
-        }
-        // One access unit is one packet. No timestamps travel with it: the
-        // presentation order comes out of the bitstream's own POC, and `index`
-        // is counted off the pictures as the decoder releases them.
-        match demuxer.next_access_unit() {
-            Ok(Some(au)) => {
-                let packet = Packet::new(0, TimeBase::new(1, 1), au);
-                if let Err(e) = decoder.send_packet(&packet) {
-                    failure.set(format!("decode error at access unit {index}: {e}"));
-                    break;
-                }
+    /// An AV1 clip of `pix_fmt` from ffmpeg's libaom-av1, in the temp dir.
+    fn gen_av1(name: &str, pix_fmt: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("{name}-{}.mkv", std::process::id()));
+        let out = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+            .arg("testsrc2=size=128x96:rate=30:duration=1")
+            .args(["-frames:v", "6", "-c:v", "libaom-av1", "-cpu-used", "8"])
+            .args(["-crf", "20", "-b:v", "0", "-pix_fmt", pix_fmt])
+            .arg(&path)
+            .output()
+            .expect("run ffmpeg");
+        assert!(out.status.success(), "ffmpeg: {}", String::from_utf8_lossy(&out.stderr));
+        path
+    }
+
+    /// 4:2:2 at 8 bits, 4:4:4 at 10 and 4:2:0 at 12 open, decode every frame on
+    /// the software seat's own narrowing, and land within 45 dB of ffmpeg's
+    /// `-pix_fmt yuv420p` decode of the same file.
+    #[test]
+    fn non_420_and_12_bit_av1_decodes_within_45_db_of_ffmpeg() {
+        let _pin = SwPin::set();
+        for (pix, depth) in [("yuv422p", 8u8), ("yuv444p10le", 10), ("yuv420p12le", 12), ("yuv444p12le", 12)] {
+            let clip = gen_av1(&format!("av1chroma-{pix}"), pix);
+            let (meta, mut demuxer) = Demuxer::open(&clip).unwrap_or_else(|e| panic!("{pix}: {e}"));
+            assert_eq!(demuxer.bit_depth(), depth, "{pix}");
+            let mut stream = Vec::new();
+            while let Some(au) = demuxer.next_access_unit().unwrap() {
+                stream.extend_from_slice(&au);
             }
-            Ok(None) => {
-                flushed = true;
-                if let Err(e) = decoder.flush() {
-                    failure.set(format!("decode error at end of stream: {e}"));
-                    break;
-                }
-            }
-            Err(e) => {
-                failure.set(format!("demux error: {e}"));
-                break;
-            }
-        }
-        // Take everything the packet released; `NeedMore` is the signal to go
-        // back for the next access unit.
-        loop {
-            let pic = match decoder.receive_frame() {
-                Ok(pic) => pic,
-                Err(e) if e.is_need_more() || e.is_eof() => break,
-                Err(e) => {
-                    failure.set(format!("decode error at access unit {index}: {e}"));
-                    break;
-                }
-            };
-            let ec_core::frame::Frame::Video(pic) = pic else {
-                continue;
-            };
-            if index < i64::from(start_frame) {
-                index += 1;
-                continue;
-            }
-            let due = index as u32;
-            index += 1;
-            if abort.late(due) {
-                if skipped < LATE_RUN {
-                    skipped += 1;
-                } else {
-                    skipped = 0;
-                    if send_picture(&pic, due, render, tx) {
-                        done = true; // consumer went away
-                        break;
+            let mut got = Vec::new();
+            decode_stream_with(&stream, |picture, _, shown| {
+                if shown {
+                    let (mut y, mut u, mut v) = (Vec::new(), Vec::new(), Vec::new());
+                    narrow_av1(picture, depth, &mut y, &mut u, &mut v);
+                    for p in [&y, &u, &v] {
+                        got.extend_from_slice(p);
                     }
                 }
-            } else if skip_for_speed(speed, start_frame, due, end_frame) {
-                // Redundant by construction, not by lateness: no run limit
-                // needed (see `skip_for_speed`).
-            } else {
-                skipped = 0;
-                if send_picture(&pic, due, render, tx) {
-                    done = true; // consumer went away
-                    break;
-                }
-            }
-            if index >= i64::from(end_frame) {
-                done = true; // end of the requested range
-                break;
-            }
-        }
-        if flushed {
-            done = true;
-        }
-    }
-}
-
-/// Whether an access unit leads with a sequence header OBU, which is how both
-/// containers mark a random-access point for AV1: the demuxer prepends the
-/// `av1C`/`CodecPrivate` record (itself one sequence header OBU) ahead of every
-/// sync sample, so the marker rides on the same bytes the decoder needs. Type 1
-/// in bits 6..3 of the first OBU header byte.
-fn leads_with_sequence_header(au: &[u8]) -> bool {
-    matches!(au.first(), Some(&first) if first >> 3 & 0xF == 1)
-}
-
-/// One [`Av1Picture`] down to the tightly packed 8-bit I420 every converter
-/// here takes. 8-bit samples arrive as `u16` in `0..=255` and narrow losslessly;
-/// a 10-bit stream's `0..=1023` downshifts by two, the same truncation the
-/// hardware seat's P010 read-back performs when it takes the high byte of each
-/// pair (`p010_to_i420`, engine-hw) -- so the two seats hand the renderer
-/// byte-identical planes off the same file. 12-bit never reaches a seat: the
-/// demuxer refuses it at open, where `parse_av1c` reads the depth.
-fn narrow_av1(
-    picture: &Av1Picture,
-    ten_bit: bool,
-    y: &mut Vec<u8>,
-    u: &mut Vec<u8>,
-    v: &mut Vec<u8>,
-) {
-    let shift = u8::from(ten_bit) * 2;
-    let plane = |src: &[u16], dst: &mut Vec<u8>| {
-        dst.clear();
-        dst.extend(src.iter().map(|&sample| (sample >> shift) as u8));
-    };
-    plane(&picture.y, y);
-    plane(&picture.u, u);
-    plane(&picture.v, v);
-}
-
-/// Narrows one [`Av1Picture`] ([`narrow_av1`]) and queues it through the same
-/// [`Render`] every other seat's pictures go through. `true` when the consumer
-/// went away, so the span stops rather than keeps decoding into a void.
-fn send_av1(
-    picture: &Av1Picture,
-    due: u32,
-    ten_bit: bool,
-    render: &mut Render,
-    tx: &SyncSender<Frame>,
-    y: &mut Vec<u8>,
-    u: &mut Vec<u8>,
-    v: &mut Vec<u8>,
-) -> bool {
-    narrow_av1(picture, ten_bit, y, u, v);
-    let frame = render.frame(due, y, u, v, picture.width as u32, picture.height as u32);
-    tx.send(frame).is_err()
-}
-
-/// The AV1 software seat: one span of [`ec_av1`] through the same loop
-/// [`run`] drives `ec-h264` through. A decoder per span, and cheap -- it is the
-/// reference bank and one output picture, while the *demuxer* is the one this
-/// worker keeps. `ec-av1` has no packet-by-packet door; it takes one whole OBU
-/// stream, so the span is fed as it is built: every access unit from the landing
-/// sync sample up to (not including) the next one is one chunk, and a chunk is
-/// a legal random-access stream on its own -- it leads with the sequence header
-/// and a key frame, which is exactly what makes the chunk boundary detectable
-/// here ([`leads_with_sequence_header`]). A stream whose inter frames carried
-/// an in-band sequence header would be cut mid-GOP and refused by name below,
-/// never silently misread; container storage keeps the sequence header in the
-/// config record precisely so that does not happen.
-///
-/// Chunks decode to their end, so the reorder window of the chunk the span
-/// ends in always drains: hidden frames (`show_frame == 0`) are references
-/// and arrive at the sink with `shown == false`, and the frames they hold
-/// back in output order are the tail the sink still has to see.
-///
-/// A refusal out of `ec-av1` -- a real-world stream hitting a shape the
-/// decoder does not reconstruct -- fails the span in words, mid-film, the way
-/// the hardware seat's errors do: named on stderr, the pictures decoded so
-/// far stand, and no garbage is sent. The same sentinel ends a span that has
-/// delivered everything asked of it without decoding the rest of its last
-/// chunk.
-fn run_av1(
-    demuxer: &mut Demuxer,
-    tx: &SyncSender<Frame>,
-    start_frame: u32,
-    end_frame: u32,
-    render: &mut Render,
-    abort: &Abort,
-    speed: Speed,
-    failure: &DecodeFailure,
-) {
-    // Signed, for the same reason [`run`]'s is: the landing sync sample can
-    // sit inside what an mp4's edit list trims, i.e. before frame 0.
-    let mut index = demuxer.seek_to_sync_at_or_before(start_frame);
-    // Reusable plane buffers: one allocation each for the whole span, refilled
-    // per picture by [`narrow_av1`].
-    let (mut y, mut u, mut v) = (Vec::new(), Vec::new(), Vec::new());
-    let mut skipped = 0;
-    // Every way this span ends: abort, consumer gone, the requested range
-    // delivered, the demuxer dry, or a refusal out of the decoder.
-    let mut done = false;
-    let mut demux_dry = false;
-    // An access unit read past a chunk boundary, waiting to head the next one.
-    let mut pending: Option<Vec<u8>> = None;
-    while !done && !demux_dry {
-        if abort.hit() {
-            break;
-        }
-        // One chunk: the access units from a sync sample up to the next one.
-        let mut stream = pending.take().unwrap_or_default();
-        while !demux_dry && pending.is_none() {
-            match demuxer.next_access_unit() {
-                Ok(Some(au)) => {
-                    if !stream.is_empty() && leads_with_sequence_header(&au) {
-                        pending = Some(au);
-                    } else {
-                        stream.extend_from_slice(&au);
-                    }
-                }
-                Ok(None) => demux_dry = true,
-                Err(e) => {
-                    failure.set(format!("demux error: {e}"));
-                    return;
-                }
-            }
-        }
-        let ten_bit = demuxer.bit_depth() == 10;
-        let decode = decode_stream_with(&stream, |picture, _, shown| {
-            // Hidden frames are references: they take no display slot and
-            // are never sent, but they do hold the chunk's output order
-            // back, which is why the chunk decodes to its end.
-            if !shown {
-                return Ok(());
-            }
-            let due = index;
-            index += 1;
-            if due < i64::from(start_frame) {
-                return Ok(());
-            }
-            let due = due as u32;
-            // The three ends [`run`] reaches per picture, in its own shape:
-            // late for the playhead (one in [`LATE_RUN`] still goes through),
-            // redundant by construction at speed, or a conversion and a send.
-            let sent = if abort.late(due) {
-                if skipped < LATE_RUN {
-                    skipped += 1;
-                    false
-                } else {
-                    skipped = 0;
-                    send_av1(picture, due, ten_bit, render, tx, &mut y, &mut u, &mut v)
-                }
-            } else if skip_for_speed(speed, start_frame, due, end_frame) {
-                // Redundant by construction, not by lateness: no run limit
-                // needed (see `skip_for_speed`).
-                false
-            } else {
-                skipped = 0;
-                send_av1(picture, due, ten_bit, render, tx, &mut y, &mut u, &mut v)
-            };
-            if sent {
-                done = true; // consumer went away
-            }
-            if done || i64::from(due) + 1 >= i64::from(end_frame) {
-                done = true; // the range is out, or nobody is left to take it
-                // Stops the decode inside the chunk: everything the span
-                // asked for has been sent, and the chunk's remaining coded
-                // frames are references for pictures nobody asked for.
-                return Err(Av1Error::Eof);
-            }
-            Ok(())
-        });
-        // `done` was set by the sink itself for the `Eof` it returns -- the
-        // sentinel, not a refusal. Any other `Err` is a refusal out of the
-        // decoder, named where the hardware seat's decode errors are named;
-        // the pictures decoded so far stand and the span ends.
-        if let Err(e) = decode {
-            if !done {
-                failure.set(format!("software AV1 decode failed at frame {index}: {e}"));
-                done = true;
-            }
+                Ok(())
+            })
+            .unwrap_or_else(|e| panic!("{pix}: {e}"));
+            let want = std::process::Command::new("ffmpeg")
+                .args(["-v", "error", "-i"])
+                .arg(&clip)
+                .args(["-f", "rawvideo", "-pix_fmt", "yuv420p", "-fps_mode", "passthrough", "-"])
+                .output()
+                .expect("run ffmpeg")
+                .stdout;
+            let seat_frames = DecodeSession::open(&clip).map(|(_, rx)| rx.into_iter().count());
+            let _ = std::fs::remove_file(&clip);
+            assert_eq!(got.len(), want.len(), "{pix}: picture count");
+            assert_eq!(got.len(), 128 * 96 * 3 / 2 * meta.frame_count as usize, "{pix}");
+            let squared: f64 = got
+                .iter()
+                .zip(&want)
+                .map(|(&a, &b)| (f64::from(a) - f64::from(b)).powi(2))
+                .sum();
+            let db = 10.0 * (255.0f64 * 255.0 * got.len() as f64 / squared.max(1e-9)).log10();
+            eprintln!("AV1 {pix} -> 4:2:0 against ffmpeg yuv420p: {db:.2} dB");
+            assert!(db >= 45.0, "{pix} is {db:.2} dB from ffmpeg, want 45");
+            assert_eq!(seat_frames.unwrap(), meta.frame_count as usize, "{pix}: session frames");
         }
     }
-}
 
-/// Converts one decoded picture and queues it. `true` when the consumer went
-/// away, so the span stops rather than keeps decoding into a void.
-fn send_picture(pic: &VideoFrame, due: u32, render: &mut Render, tx: &SyncSender<Frame>) -> bool {
-    // The decoder crops each picture into tightly packed planes, the shape
-    // every converter below takes. A padded plane would render skewed rather
-    // than subtly wrong, so the assumption is pinned where it is relied on --
-    // free in a release build.
-    let (y, u, v) = (&pic.planes[0], &pic.planes[1], &pic.planes[2]);
-    debug_assert_eq!(y.stride, pic.width as usize, "padded luma plane");
-    debug_assert_eq!(
-        u.stride,
-        pic.width.div_ceil(2) as usize,
-        "padded chroma plane"
-    );
-    let frame = render.frame(due, &y.data, &u.data, &v.data, pic.width, pic.height);
-    tx.send(frame).is_err()
+    /// A span whose file no seat can take -- nothing opens it and there is no
+    /// software decoder for these bytes -- must report the *gap* it is. The cell
+    /// used to be left claiming `Hardware`: the arm below the software fallback set
+    /// it before the session that produced nothing, and the front-end then named a
+    /// decoder that had decoded no frame.
+    ///
+    /// Every codec edith decodes now has a seat (VP8 included), so the gap is built
+    /// from a file no seat takes: a 45-degree display matrix, which `Demuxer::open` refuses by name,
+    /// so `Source::open` yields nothing and the span has no seat to report.
+    /// Driven through [`run_span`] itself, the only door that reaches the arm.
+    /// `VE_SW=1` keeps the test box-independent; see [`SwPin`].
+    #[test]
+    fn a_span_with_no_seat_at_all_reports_the_gap() {
+        let _pin = SwPin::set();
+        let path = asset("test_rotation45.mkv");
+        let mut source = None;
+        let cancel = AtomicBool::new(false);
+        let generation = AtomicU64::new(0);
+        let floor = AtomicU32::new(0);
+        let abort = Abort {
+            cancel: &cancel,
+            generation: &generation,
+            mine: 0,
+            floor: &floor,
+        };
+        let (tx, rx) = sync_channel(2);
+        let cell = BackendCell::new(Backend::Opening);
+        let failure = DecodeFailure::default();
+        run_span(
+            &path,
+            &mut source,
+            SpanCmd {
+                generation: 0,
+                start: 0,
+                end: 2,
+                color: ColorParams::default(),
+                transform: TransformParams::default(),
+                canvas: Composer::passthrough(),
+                tone: tonemap::Preset::default(),
+                speed: Speed::NORMAL,
+                deint: Default::default(),
+                tx,
+            },
+            &abort,
+            &cell,
+            &failure,
+        );
+        assert_eq!(
+            cell.get(),
+            Backend::Gap,
+            "a span no seat takes must report the gap, not a hardware seat"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a gap decodes nothing: no picture may come down the channel"
+        );
+        assert!(
+            failure.reason().is_some(),
+            "and it says why: a span that decoded nothing is the one case where \
+             a closed channel is definitely not the end of the file"
+        );
+    }
+
+    /// The VA-API plugin takes 4:2:0 VP9 only: profiles 0 and 2 pass, and profiles 1
+    /// and 3 pass only where the chroma is 4:2:0 (which no such profile writes).
+    #[test]
+    fn vp9_non_420_profiles_are_off_the_gpu() {
+        assert!(vp9_needs_420_for_vaapi(1, Chroma::C444));
+        assert!(vp9_needs_420_for_vaapi(1, Chroma::C422));
+        assert!(vp9_needs_420_for_vaapi(3, Chroma::C444));
+        assert!(vp9_needs_420_for_vaapi(3, Chroma::C422));
+        assert!(!vp9_needs_420_for_vaapi(0, Chroma::C420));
+        assert!(!vp9_needs_420_for_vaapi(2, Chroma::C420));
+        assert!(!vp9_needs_420_for_vaapi(1, Chroma::C420));
+    }
+
+    /// The route names the profile and its chroma, and says where the stream plays:
+    /// the ec-vp9 software seat, not a refusal.
+    #[test]
+    fn vp9_non_420_route_names_profile_chroma_and_the_seat() {
+        let text = vp9_software_route(1, Chroma::C444);
+        assert_eq!(
+            text,
+            "VP9 profile 1 (4:4:4) is not 4:2:0, which the GPU does not take: it plays on the ec-vp9 software seat"
+        );
+        assert!(vp9_software_route(3, Chroma::C422).starts_with("VP9 profile 3 (4:2:2)"));
+    }
 }

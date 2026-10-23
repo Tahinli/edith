@@ -20,21 +20,32 @@
 //!
 //! Two things cross between the processes and neither is a picture copied down a
 //! pipe. Pictures that live in memory are written into a shared anonymous file
-//! (`memfd`, mapped in both), so a frame costs one `memcpy` and a 10-byte
-//! message. Pictures still on the GPU never move at all: the DRM-PRIME
-//! descriptors travel as file descriptors over `SCM_RIGHTS`, so the zero-copy
-//! export path stays zero-copy across the process boundary.
+//! (`memfd`, which both sides read and write through their own descriptor), so a
+//! frame costs one write and a read and a 10-byte message. Pictures still on the
+//! GPU never move at all: the DRM-PRIME descriptors travel as file descriptors
+//! over `SCM_RIGHTS`, so the zero-copy export path stays zero-copy across the
+//! process boundary.
+//!
+//! Nothing here is `unsafe`: the memfd and the descriptor passing go through
+//! `rustix` and `nix`, and the staging buffer is file I/O rather than a mapping.
 
-use std::ffi::c_void;
-use std::io::Read;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::ffi::OsString;
+use std::fs::File;
+use std::io::{IoSlice, IoSliceMut, Read, Write};
+use std::mem::MaybeUninit;
+use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
+use std::os::unix::fs::FileExt;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
+use nix::sys::socket::{ControlMessage, MsgFlags, UnixAddr, sendmsg};
+use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags};
+use rustix::process::{Signal, set_parent_process_death_signal};
+
 use crate::colorspace::{ColorDescription, Matrix, Transfer};
-use crate::hw::VhDma;
+use crate::hw::{DmaFrame, VhDma};
 
 /// The words every "the child is gone" error carries, for the person reading
 /// the log; what *decides* anything is [`Lost`], never this text.
@@ -48,7 +59,7 @@ pub const HW_LOST: &str = "the hardware encoder process";
 /// mention the child -- a silent re-encode of a feature film, caused by a
 /// wording. Nothing outside this module can make one.
 #[derive(Debug)]
-pub struct Lost(String);
+pub struct Lost(pub(crate) String);
 
 impl std::fmt::Display for Lost {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -64,8 +75,10 @@ pub fn is_lost(error: &crate::Error) -> bool {
     error.downcast_ref::<Lost>().is_some()
 }
 
-/// The helper's file name; it is built into the same directory as the editor.
-const BIN: &str = "hw-encode-child";
+/// The child's file name. It is a binary of the `engine-hw` package, built into
+/// the same directory as the editor, and it is the only process that opens a
+/// video driver.
+const BIN: &str = "hw-child";
 
 /// Which encoder the child opens. Sent as argv, so the child needs no protocol
 /// before it has one.
@@ -178,94 +191,107 @@ impl Open {
     }
 }
 
-// Requests, parent to child.
+// Requests, parent to child (encode seat).
 pub const T_ENCODE: u8 = 1;
 pub const T_DMA: u8 = 2;
 pub const T_DRAIN: u8 = 3;
 pub const T_GEOM: u8 = 4;
-// Replies, child to parent.
+// Requests, parent to child (decode seat). `T_NEXT` has no body, `T_NEXT_DMA`
+// carries `coded_width, coded_height, width, height` as u32 LE, `T_SEEK` the
+// 1-based target sample as u32 LE.
+pub const T_NEXT: u8 = 5;
+pub const T_NEXT_DMA: u8 = 6;
+pub const T_SEEK: u8 = 7;
+// Replies, child to parent. `R_NONE` carries no body; `R_AU` and `R_ERR` carry
+// a u32 LE length and that many bytes. Descriptors ride on the tag byte.
 pub const R_NONE: u8 = 0;
 pub const R_AU: u8 = 1;
 pub const R_ERR: u8 = 2;
+// First byte of a decode frame's `R_AU` body: the picture is in the staging
+// buffer as packed I420 (`K_PIXELS`: then `w` and `h` as u32 LE follow), or it
+// is still on the GPU (`K_DMA`: the descriptor follows, see `DMA_BODY`, and the
+// descriptors ride on the tag byte, one per plane object).
+pub const K_PIXELS: u8 = 0;
+pub const K_DMA: u8 = 1;
+/// The `K_DMA` descriptor after its kind byte: fourcc u32, modifier u64, coded
+/// width and height, picture width and height, two offsets and two strides as
+/// u32 each, then the number of descriptors (1 or 2) as one byte.
+pub const DMA_BODY: usize = 4 + 8 + 4 * 8 + 1;
 
-/// A `memfd` mapped into this process: the staging buffer one picture is written
-/// into and read out of without either side owning the other's memory.
+/// A `memfd` this process reads and writes through its own descriptor: the
+/// staging buffer one picture is written into and read out of, shared with the
+/// other process. The protocol -- one request, one reply, never overlapping -- is
+/// what keeps only one of the two touching it at a time.
+///
+/// File I/O rather than a mapping: an `mmap` is the one thing here that needs
+/// `unsafe` at every turn, and a picture is copied in and out once either way.
 pub struct Shm {
-    ptr: *mut u8,
+    file: File,
     len: usize,
 }
 
 impl Shm {
-    /// Creates one of `len` bytes, returning it mapped plus the descriptor to
-    /// hand the other process.
+    /// Creates one of `len` bytes, returning it plus the descriptor to hand the
+    /// other process.
     pub fn create(len: usize) -> std::io::Result<(Self, OwnedFd)> {
-        // SAFETY: a NUL-terminated name and a flag word, which is the whole of
-        // this call's contract; the descriptor it returns is ours.
-        let fd = unsafe { libc::memfd_create(c"edith-hwenc".as_ptr(), libc::MFD_CLOEXEC) };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        // SAFETY: `fd` is a fresh descriptor nothing else holds.
-        let file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let fd = rustix::fs::memfd_create("edith-hwenc", rustix::fs::MemfdFlags::CLOEXEC)
+            .map_err(std::io::Error::from)?;
+        let file = File::from(fd);
         file.set_len(len as u64)?;
-        let shm = Self::map(fd, len)?;
-        Ok((shm, OwnedFd::from(file)))
+        let shared = OwnedFd::from(file.try_clone()?);
+        Ok((Self { file, len }, shared))
     }
 
-    /// Maps a descriptor the other process created.
-    pub fn map(fd: RawFd, len: usize) -> std::io::Result<Self> {
-        // SAFETY: a shared mapping of a descriptor that is open for the call;
-        // the kernel picks the address and the length is the file's own.
-        let ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                fd,
-                0,
-            )
-        };
-        if ptr == libc::MAP_FAILED {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(Self {
-            ptr: ptr.cast(),
-            len,
-        })
-    }
-
-    /// A mapping of nothing, for the moment between spawning a child and
-    /// learning which buffer it made.
-    fn empty() -> Self {
+    /// Takes the other process's descriptor of a buffer it created, `len` bytes long.
+    pub fn from_fd(fd: OwnedFd, len: usize) -> Self {
         Self {
-            ptr: std::ptr::null_mut(),
-            len: 0,
+            file: File::from(fd),
+            len,
         }
     }
 
-    /// The mapping as bytes. Both processes see the same store, and the protocol
-    /// -- one request, one reply, never overlapping -- is what keeps only one of
-    /// them looking at a time.
-    pub fn bytes(&mut self) -> &mut [u8] {
-        // SAFETY: the mapping is `len` bytes long and lives as long as `self`.
-        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    /// How many bytes the buffer holds.
+    pub fn capacity(&self) -> usize {
+        self.len
     }
-}
 
-impl Drop for Shm {
-    fn drop(&mut self) {
-        if self.len == 0 {
-            return;
+    /// Writes `parts` back to back from the start of the buffer.
+    pub fn write_picture(&self, parts: &[&[u8]]) -> std::io::Result<()> {
+        let mut at = 0u64;
+        for part in parts {
+            self.file.write_all_at(part, at)?;
+            at += part.len() as u64;
         }
-        // SAFETY: the pair of the `mmap` above, unmapped exactly once.
-        unsafe { libc::munmap(self.ptr.cast(), self.len) };
+        Ok(())
+    }
+
+    /// Reads the first `len` bytes of the buffer into `into`, reusing its
+    /// allocation.
+    pub fn read_into(&self, into: &mut Vec<u8>, len: usize) -> std::io::Result<()> {
+        if len > self.len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "a read past the end of the staging buffer",
+            ));
+        }
+        into.clear();
+        into.resize(len, 0);
+        self.file.read_exact_at(into, 0)
+    }
+
+    /// Reads the first `len` bytes of the buffer into an owned one.
+    pub fn read_bytes(&self, len: usize) -> std::io::Result<Vec<u8>> {
+        if len > self.len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "a read past the end of the staging buffer",
+            ));
+        }
+        let mut bytes = vec![0u8; len];
+        self.file.read_exact_at(&mut bytes, 0)?;
+        Ok(bytes)
     }
 }
-
-// The mapping is used from one thread at a time (the export worker), as the
-// session it belongs to is.
-unsafe impl Send for Shm {}
 
 /// Sends one message with its file descriptors attached.
 ///
@@ -275,46 +301,25 @@ unsafe impl Send for Shm {}
 /// with a signal of its own would be no containment at all.
 pub fn send_msg(sock: &UnixStream, bytes: &[u8], fds: &[RawFd]) -> std::io::Result<()> {
     debug_assert!(!bytes.is_empty(), "ancillary data rides on a real byte");
-    let mut iov = libc::iovec {
-        iov_base: bytes.as_ptr() as *mut c_void,
-        iov_len: bytes.len(),
-    };
-    // Two descriptors is the most anything here sends (a two-object NV12
-    // buffer); 64 bytes covers the header, the payload and the alignment.
-    let mut control = [0u8; 64];
-    // SAFETY: every pointer below is into a local that outlives the call, the
-    // control buffer is larger than the `CMSG_SPACE` written into
-    // `msg_controllen`, and the descriptors are open for the duration.
-    let sent = unsafe {
-        let mut msg: libc::msghdr = std::mem::zeroed();
-        msg.msg_iov = &mut iov;
-        msg.msg_iovlen = 1;
-        if !fds.is_empty() {
-            let payload = (std::mem::size_of::<RawFd>() * fds.len()) as u32;
-            msg.msg_control = control.as_mut_ptr().cast();
-            msg.msg_controllen = libc::CMSG_SPACE(payload) as _;
-            let cmsg = libc::CMSG_FIRSTHDR(&msg);
-            (*cmsg).cmsg_level = libc::SOL_SOCKET;
-            (*cmsg).cmsg_type = libc::SCM_RIGHTS;
-            (*cmsg).cmsg_len = libc::CMSG_LEN(payload) as _;
-            std::ptr::copy_nonoverlapping(
-                fds.as_ptr(),
-                libc::CMSG_DATA(cmsg).cast::<RawFd>(),
-                fds.len(),
-            );
-        }
-        libc::sendmsg(sock.as_raw_fd(), &msg, libc::MSG_NOSIGNAL)
-    };
-    match sent {
-        n if n < 0 => Err(std::io::Error::last_os_error()),
-        // Messages here are tens of bytes and a socket buffer is kilobytes, so a
-        // short send means the peer is gone rather than that we should loop.
-        n if n as usize != bytes.len() => Err(std::io::Error::new(
+    let rights = [ControlMessage::ScmRights(fds)];
+    let control: &[ControlMessage] = if fds.is_empty() { &[] } else { &rights };
+    let sent = sendmsg::<UnixAddr>(
+        sock.as_raw_fd(),
+        &[IoSlice::new(bytes)],
+        control,
+        MsgFlags::MSG_NOSIGNAL,
+        None,
+    )
+    .map_err(std::io::Error::from)?;
+    // Messages here are tens of bytes and a socket buffer is kilobytes, so a
+    // short send means the peer is gone rather than that we should loop.
+    if sent != bytes.len() {
+        return Err(std::io::Error::new(
             std::io::ErrorKind::WriteZero,
             "short send",
-        )),
-        _ => Ok(()),
+        ));
     }
+    Ok(())
 }
 
 /// Reads the one byte a message's descriptors ride on, and those descriptors.
@@ -323,45 +328,25 @@ pub fn send_msg(sock: &UnixStream, bytes: &[u8], fds: &[RawFd]) -> std::io::Resu
 /// with `recvmsg` and everything after it with an ordinary read.
 pub fn recv_tag(sock: &UnixStream) -> std::io::Result<(u8, Vec<OwnedFd>)> {
     let mut byte = [0u8; 1];
-    let mut iov = libc::iovec {
-        iov_base: byte.as_mut_ptr().cast(),
-        iov_len: 1,
-    };
-    let mut control = [0u8; 64];
-    let mut fds = Vec::new();
-    // SAFETY: as `send` -- locals that outlive the call and a control buffer
-    // whose length is what `msg_controllen` claims. Every descriptor the kernel
-    // writes there is ours, and is taken by an `OwnedFd` exactly once.
-    let got = unsafe {
-        let mut msg: libc::msghdr = std::mem::zeroed();
-        msg.msg_iov = &mut iov;
-        msg.msg_iovlen = 1;
-        msg.msg_control = control.as_mut_ptr().cast();
-        msg.msg_controllen = control.len() as _;
-        let got = libc::recvmsg(sock.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC);
-        if got > 0 {
-            let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
-            while !cmsg.is_null() {
-                if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
-                    let bytes = (*cmsg).cmsg_len as usize - libc::CMSG_LEN(0) as usize;
-                    let data = libc::CMSG_DATA(cmsg).cast::<RawFd>();
-                    for i in 0..bytes / std::mem::size_of::<RawFd>() {
-                        fds.push(OwnedFd::from_raw_fd(data.add(i).read_unaligned()));
-                    }
-                }
-                cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
-            }
-        }
-        got
-    };
-    match got {
-        n if n < 0 => Err(std::io::Error::last_os_error()),
-        0 => Err(std::io::Error::new(
+    let mut iov = [IoSliceMut::new(&mut byte)];
+    // Room for four descriptors; the most anything here sends is two.
+    let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(4))];
+    let mut control = RecvAncillaryBuffer::new(&mut space);
+    let received = rustix::net::recvmsg(sock, &mut iov, &mut control, RecvFlags::CMSG_CLOEXEC)
+        .map_err(std::io::Error::from)?;
+    if received.bytes == 0 {
+        return Err(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
             "peer closed",
-        )),
-        _ => Ok((byte[0], fds)),
+        ));
     }
+    let mut fds = Vec::new();
+    for message in control.drain() {
+        if let RecvAncillaryMessage::ScmRights(rights) = message {
+            fds.extend(rights);
+        }
+    }
+    Ok((byte[0], fds))
 }
 
 /// One access unit, or the child's own error, read off the socket.
@@ -382,12 +367,38 @@ fn read_reply(sock: &mut UnixStream, au: &mut Vec<u8>) -> std::io::Result<Option
     }))
 }
 
+/// Writes one reply: the tag with `fds` riding on it, then the body when the tag
+/// carries one (`R_AU` and `R_ERR` do; `R_NONE` is the tag alone).
+pub fn send_reply(sock: &mut UnixStream, tag: u8, body: &[u8], fds: &[RawFd]) -> std::io::Result<()> {
+    send_msg(sock, &[tag], fds)?;
+    if tag == R_AU || tag == R_ERR {
+        sock.write_all(&(body.len() as u32).to_le_bytes())?;
+        sock.write_all(body)?;
+    }
+    Ok(())
+}
+
+/// Reads one reply: its tag and the descriptors that rode on it, and its body
+/// into `body` when the tag carries one.
+pub fn recv_reply(sock: &mut UnixStream, body: &mut Vec<u8>) -> std::io::Result<(u8, Vec<OwnedFd>)> {
+    let (tag, fds) = recv_tag(sock)?;
+    body.clear();
+    if tag == R_AU || tag == R_ERR {
+        let mut len = [0u8; 4];
+        sock.read_exact(&mut len)?;
+        body.resize(u32::from_le_bytes(len) as usize, 0);
+        sock.read_exact(body)?;
+    }
+    Ok((tag, fds))
+}
+
 /// Where the helper lives: told outright, or beside the running executable --
 /// which is `target/<profile>/` for the editor and one directory up from
 /// `deps/` for a test binary.
-fn child_bin() -> Option<PathBuf> {
-    if let Some(pinned) = std::env::var_os("VE_HW_CHILD_BIN") {
-        return Some(PathBuf::from(pinned));
+fn locate_child() -> Option<PathBuf> {
+    if let Some(pinned) = crate::envcfg::var_os("VE_HW_CHILD_BIN") {
+        let pinned = PathBuf::from(pinned);
+        return pinned.is_file().then_some(pinned);
     }
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?.to_path_buf();
@@ -396,11 +407,77 @@ fn child_bin() -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
-/// Whether an isolated encoder can be had at all -- a helper to run. `false`
-/// leaves the caller on the in-process seat, which is what a build that did not
-/// produce the helper has always had.
+/// The command that builds the child, as the warning and the test panics say it.
+pub const BUILD_CHILD: &str = "cargo build -p engine-hw --bin hw-child";
+
+/// Whether this machine has a DRM render node, the thing the hardware seats
+/// need. `false` on a machine with no GPU, where a missing child is expected.
+pub fn render_node_present() -> bool {
+    std::fs::read_dir("/dev/dri").is_ok_and(|dir| {
+        dir.flatten()
+            .any(|entry| entry.file_name().to_string_lossy().starts_with("renderD"))
+    })
+}
+
+/// Where the child binary is, or `None` when it is not built next to the
+/// editor (and `VE_HW_CHILD_BIN` does not name a file). A missing child on a
+/// machine with a render node is warned about once, on stderr.
+pub fn child_path() -> Option<PathBuf> {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    let found = locate_child();
+    if found.is_none() {
+        WARNED.call_once(|| {
+            if render_node_present() {
+                eprintln!(
+                    "edith: hardware decode/encode is off: this machine has a GPU but hw-child is not built. \
+                     Run `{BUILD_CHILD}` (or set VE_HW_CHILD_BIN to a built hw-child)."
+                );
+            }
+        });
+    }
+    found
+}
+
+/// Whether an isolated child can be had at all -- a binary to run. `false`
+/// means every hardware seat answers "no" and the software codec takes over.
 pub fn available() -> bool {
-    child_bin().is_some()
+    child_path().is_some()
+}
+
+/// Starts the child with `args` (its mode first, then the mode's own arguments)
+/// and hands it one end of a socket pair as its standard input, which is the
+/// only channel the child has. Its stdout goes to our stderr: an MCP client
+/// reads our stdout as JSON-RPC only. `None` when there is no child binary or
+/// it will not start.
+pub fn spawn_child(args: &[OsString]) -> Option<(Child, UnixStream)> {
+    let bin = child_path()?;
+    let (mine, theirs) = UnixStream::pair().ok()?;
+    mine.set_read_timeout(Some(timeout())).ok()?;
+    let mut command = Command::new(bin);
+    crate::envcfg::apply(&mut command);
+    let child = command
+        .args(args)
+        .stdin(Stdio::from(OwnedFd::from(theirs)))
+        .stdout(Stdio::from(std::io::stderr().as_fd().try_clone_to_owned().ok()?))
+        .spawn()
+        .ok()?;
+    Some((child, mine))
+}
+
+/// The child's side of the containment: it dies with the parent, so an editor
+/// that is killed or aborts does not leave a driver holder behind. Called
+/// first thing in the child.
+pub fn die_with_parent() {
+    let _ = set_parent_process_death_signal(Some(Signal::KILL));
+}
+
+/// How long one call to the child may take before the child is treated as hung
+/// (`VE_HW_TIMEOUT_MS`, 15 s by default).
+pub fn timeout() -> Duration {
+    let ms = crate::envcfg::var("VE_HW_TIMEOUT_MS")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(15_000);
+    Duration::from_millis(ms)
 }
 
 /// The test-only stand-in seat: a child that opens no driver at all, so the
@@ -408,14 +485,16 @@ pub fn available() -> bool {
 /// which is the only machine where they matter and the only one where the real
 /// trigger cannot be pulled.
 pub fn faked() -> bool {
-    std::env::var_os("VE_HW_TEST_FAKE").is_some()
+    crate::envcfg::var_os("VE_HW_TEST_FAKE").is_some()
 }
 
 /// A hardware encode session living in another process.
 pub struct Remote {
     child: Child,
     sock: UnixStream,
-    shm: Shm,
+    /// The staging buffer, once the child has said it is open. `None` only while
+    /// [`Remote::spawn`] is still reading that answer.
+    shm: Option<Shm>,
     open: Open,
     /// The last access unit, owned here: the child's buffer is in the child.
     au: Vec<u8>,
@@ -453,11 +532,7 @@ impl Remote {
     /// A wedged ring does not always `abort()` -- it can simply stop -- and a
     /// timeout is the only thing that tells those apart from a slow frame.
     fn timeout() -> Duration {
-        let ms = std::env::var("VE_HW_TIMEOUT_MS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(15_000);
-        Duration::from_millis(ms)
+        timeout()
     }
 
     /// How long the *next* call may take: the ceiling until this child has
@@ -475,23 +550,13 @@ impl Remote {
     /// across the process boundary -- no driver, no entrypoint, a size refused
     /// -- and the caller takes the software encoder exactly as it always did.
     pub fn spawn(open: Open) -> Option<Self> {
-        let bin = child_bin()?;
-        let (mine, theirs) = UnixStream::pair().ok()?;
-        mine.set_read_timeout(Some(Self::timeout())).ok()?;
-        // The socket is the child's stdin, which is how it crosses `exec`
-        // without a `pre_exec` of our own. Its stdout and stderr stay ours, so
-        // whatever the driver prints is still in the editor's log.
-        let child = Command::new(bin)
-            .args(open.argv())
-            .stdin(Stdio::from(OwnedFd::from(theirs)))
-            .spawn()
-            .ok()?;
+        let mut args = vec![OsString::from("encode")];
+        args.extend(open.argv().into_iter().map(OsString::from));
+        let (child, mine) = spawn_child(&args)?;
         let mut remote = Self {
             child,
             sock: mine,
-            // Replaced by the child's own mapping below; a zero-length one
-            // allocates nothing and keeps the field non-optional.
-            shm: Shm::empty(),
+            shm: None,
             open,
             au: Vec::new(),
             lost: None,
@@ -501,8 +566,8 @@ impl Remote {
         // The child answers once its encoder is open: a byte, and with it the
         // descriptor of the staging buffer it made for this session's size.
         match recv_tag(&remote.sock) {
-            Ok((1, fds)) if fds.len() == 1 => {
-                remote.shm = Shm::map(fds[0].as_raw_fd(), open.frame_bytes()).ok()?;
+            Ok((1, mut fds)) if fds.len() == 1 => {
+                remote.shm = Some(Shm::from_fd(fds.remove(0), open.frame_bytes()));
                 Some(remote)
             }
             // Anything else is "no seat here", including a child that died
@@ -552,17 +617,19 @@ impl Remote {
         force_key: bool,
     ) -> crate::Result<Option<&[u8]>> {
         let total = y.len() + u.len() + v.len();
-        if total > self.shm.len {
+        let Some(shm) = self.shm.as_ref() else {
+            return Err("the staging buffer was never opened".to_owned().into());
+        };
+        if total > shm.capacity() {
             return Err(format!(
                 "a {width}x{height} picture does not fit the staging buffer opened for {}x{}",
                 self.open.width, self.open.height
             )
             .into());
         }
-        let bytes = self.shm.bytes();
-        bytes[..y.len()].copy_from_slice(y);
-        bytes[y.len()..y.len() + u.len()].copy_from_slice(u);
-        bytes[y.len() + u.len()..total].copy_from_slice(v);
+        if let Err(e) = shm.write_picture(&[y, u, v]) {
+            return Err(format!("cannot stage the picture: {e}").into());
+        }
         let mut msg = vec![T_ENCODE];
         msg.extend_from_slice(&width.to_le_bytes());
         msg.extend_from_slice(&height.to_le_bytes());
@@ -572,8 +639,9 @@ impl Remote {
 
     /// Feeds one picture the decoder left on the GPU. The descriptors go over
     /// with the message, so the buffer itself never moves.
-    pub fn encode_dma(&mut self, dma: &VhDma, force_key: bool) -> crate::Result<Option<&[u8]>> {
-        let fds: Vec<RawFd> = dma.fd.iter().copied().filter(|&fd| fd >= 0).collect();
+    pub fn encode_dma(&mut self, frame: &DmaFrame, force_key: bool) -> crate::Result<Option<&[u8]>> {
+        let dma: &VhDma = &frame.desc;
+        let fds: Vec<RawFd> = frame.fds.iter().map(AsRawFd::as_raw_fd).collect();
         let mut msg = vec![T_DMA];
         msg.extend_from_slice(&dma.fourcc.to_le_bytes());
         msg.extend_from_slice(&dma.modifier.to_le_bytes());
@@ -668,28 +736,26 @@ impl Drop for Remote {
     }
 }
 
-// As the in-process session: one thread at a time (the export worker).
-unsafe impl Send for Remote {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Descriptors really cross the socket, and the mapping really is shared:
-    /// the two halves of the frame hand-off, checked without a driver.
+    /// Descriptors really cross the socket, and the buffer really is shared: the
+    /// two halves of the frame hand-off, checked without a driver.
     #[test]
-    fn a_mapping_and_its_descriptor_cross_a_socket() {
+    fn a_buffer_and_its_descriptor_cross_a_socket() {
+        use std::os::fd::AsRawFd;
         let (a, b) = UnixStream::pair().expect("socketpair");
-        let (mut mine, fd) = Shm::create(64).expect("memfd");
-        mine.bytes()[..5].copy_from_slice(b"hello");
+        let (mine, fd) = Shm::create(64).expect("memfd");
+        mine.write_picture(&[b"hello"]).expect("stage");
         send_msg(&a, &[7u8], &[fd.as_raw_fd()]).expect("send");
-        let (tag, fds) = recv_tag(&b).expect("recv");
+        let (tag, mut fds) = recv_tag(&b).expect("recv");
         assert_eq!(tag, 7);
         assert_eq!(fds.len(), 1, "the descriptor came over");
-        let mut theirs = Shm::map(fds[0].as_raw_fd(), 64).expect("map the received descriptor");
-        assert_eq!(&theirs.bytes()[..5], b"hello", "one store, two mappings");
-        theirs.bytes()[0] = b'j';
-        assert_eq!(&mine.bytes()[..5], b"jello", "and it is shared both ways");
+        let theirs = Shm::from_fd(fds.remove(0), 64);
+        assert_eq!(theirs.read_bytes(5).expect("read"), b"hello", "one store, two handles");
+        theirs.write_picture(&[b"j"]).expect("write back");
+        assert_eq!(mine.read_bytes(5).expect("read"), b"jello", "and it is shared both ways");
     }
 
     /// A dead peer must come back as an error, never as a `SIGPIPE` that kills

@@ -2,13 +2,16 @@
 //! interleaved f32 over a bounded channel, same shape as `decode`. Uses its own
 //! reader so the video demuxer stays single-owner.
 //!
-//! Three readers, one output. An mp4 goes through `mp4`+`symphonia-codec-aac` as
-//! it always has -- that path also yields the raw access units the export
-//! copies, which is the only reason it is kept separate -- and a standalone
+//! Three readers, one output. An mp4 goes through `mp4` as it always has -- that
+//! path also yields the raw access units the export copies, which is the only
+//! reason it is kept separate -- and every AAC stream, from any container, is
+//! decoded by `ec-aac`, HE-AAC (SBR) included. A standalone
 //! audio file (`crate::is_audio`: mp3, wav, flac, ogg, ALAC, ADTS) goes through
 //! symphonia's own format probe, as does the AAC track of a **Matroska** file:
 //! same reader, `mkv` instead of `isomp4`, and a 5.1 film soundtrack folded to
-//! stereo on the way out ([`SymDecoder`]). An mp4's **AC-3** track is the third: the same
+//! stereo on the way out ([`SymDecoder`]). An ADTS file is read by [`crate::adts`],
+//! since symphonia's ADTS reader sits behind the `aac` feature this project does
+//! not link. An mp4's **AC-3** track is the third: the same
 //! sample tables, decoded by `ec-ac3` and downmixed to stereo by the
 //! decoder itself, which is what lets a 5.1 BluRay remux play on a stereo
 //! timeline. Everything downstream of [`Track`] sees the
@@ -26,22 +29,20 @@
 //! fallback to the only track it has.
 
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use mp4::{AudioObjectType, ChannelConfig, MediaType, Mp4Reader, Mp4Track, TrackType};
-use symphonia_codec_aac::AacDecoder;
+use crate::mp4track;
+use ec_core::CodecId;
 use symphonia_core::codecs::audio::{
     AudioCodecParameters, AudioDecoder, AudioDecoderOptions,
-    well_known::{CODEC_ID_AAC, CODEC_ID_OPUS},
+    well_known::{CODEC_ID_AAC, CODEC_ID_OPUS, CODEC_ID_VORBIS},
 };
 use symphonia_core::formats::probe::Hint;
-// `TrackType` is the name both readers give their track kinds; the mp4 one is
-// imported above and used far more often here, so symphonia's is the one aliased.
 use symphonia_core::formats::{
     FormatOptions, FormatReader, SeekMode, SeekTo, TrackType as SymKind,
 };
@@ -51,22 +52,36 @@ use symphonia_core::packet::Packet;
 use symphonia_core::units;
 use symphonia_core::units::{Time, TimeBase};
 
+use crate::duck::{Duck, Ducker};
 use crate::eq::{EqParams, EqState};
-use crate::stretch::TimeStretch;
 use crate::limiter::{Limiter, LimiterState};
+use crate::stretch::TimeStretch;
+use crate::voice::VoiceFx;
+
+/// The rate a mix runs at when nothing picks one: the highest rate among the
+/// sources it names, so a 22.05 kHz voiceover beside a 48 kHz bed is mixed at
+/// 48 kHz and the bed is not resampled down to the voice. A mix whose sources
+/// are all 44.1 kHz stays 44.1 kHz, and 48 kHz-only stays 48 kHz. Only when
+/// every source is below 44.1 kHz (a 22.05 kHz voiceover alone, say) does the
+/// mix go to 48 kHz, which every AAC output accepts and which a WebM or
+/// Matroska Opus output needs. `None` when no source has a track.
+fn mix_rate(rates: impl IntoIterator<Item = u32>) -> Option<u32> {
+    rates
+        .into_iter()
+        .max()
+        .map(|rate| if rate < 44_100 { 48_000 } else { rate })
+}
 
 /// ffmpeg's AAC-LC encoder delay, used when the file carries no edit list.
 /// (HE-AAC/iTunes files use 2112, but those are rejected as unsupported here.)
 const DEFAULT_PRIMING: u64 = 1024;
 
-/// An edit list entry that only shifts the timeline, carrying no media.
-const EMPTY_EDIT: u64 = u32::MAX as u64;
-
 /// What the sound of a *Matroska* file is read with, named for a refusal:
 /// symphonia's registry as this project enables it (see the feature list in
-/// `Cargo.toml`) plus the two families no symphonia version carries and this
-/// project decodes anyway -- AC-3/E-AC-3 through `ec-ac3` ([`MkvAc3Track`])
-/// and Opus through `ec-opus` ([`SymDecoder::Opus`]).
+/// `Cargo.toml`) plus the families no symphonia version carries and this
+/// project decodes anyway -- AAC through `ec-aac` ([`SymDecoder::Aac`]),
+/// AC-3/E-AC-3 through `ec-ac3` ([`MkvAc3Track`]) and Opus through `ec-opus`
+/// ([`SymDecoder::Opus`]).
 ///
 /// Written down per container because capability is not one set: an mp4 video's
 /// sound never reaches symphonia ([`Track::open`] answers before it), so it
@@ -74,11 +89,53 @@ const EMPTY_EDIT: u64 = u32::MAX as u64;
 /// long after that stopped being true, which is how a user came to re-encode a
 /// film whose FLAC track already played; `capability_matrix` opens one file per
 /// codec named here.
-const MKV_DECODED: &str = "AAC, AC-3/E-AC-3, ALAC, FLAC, MP3, Opus, PCM and Vorbis";
+const MKV_DECODED: &str = "AAC, AC-3/E-AC-3, ALAC, FLAC, MP3, Opus, PCM, TrueHD/MLP and Vorbis";
+
+/// The name a person knows a sound codec by, from a Matroska `CodecID` (`A_WAVPACK4`, `A_MPEG/L2`)
+/// or a bare codec tag (`WAVPACK4`, `MPC`). A tag nothing names comes back as its own text with the
+/// `A_` prefix and any `/` suffix taken off, which is still better than the id.
+pub fn codec_display_name(raw: &str) -> String {
+    let id = raw.strip_prefix("A_").unwrap_or(raw);
+    let upper = id.to_ascii_uppercase();
+    let known = match upper.as_str() {
+        "MPEG/L1" => "MP1",
+        "MPEG/L2" => "MP2",
+        "MPEG/L3" => "MP3",
+        "WAVPACK4" | "WAVPACK" => "WavPack",
+        "MPC" | "MPC8" | "MUSEPACK" => "Musepack",
+        "TTA" | "TTA1" => "TTA",
+        "ALAC" => "ALAC",
+        "SPEEX" => "Speex",
+        "AC3" | "AC-3" => "AC-3",
+        "EAC3" | "E-AC-3" => "E-AC-3",
+        "MS/ACM" => "ACM",
+        "TRUEHD" | "MLP" => "TrueHD",
+        _ => "",
+    };
+    if !known.is_empty() {
+        return known.to_string();
+    }
+    let family = upper.split('/').next().unwrap_or(&upper);
+    let named = match family {
+        "WMA" | "WMAV1" | "WMAV2" | "WMAPRO" | "WMALOSSLESS" => "WMA",
+        "AAC" => "AAC",
+        "DTS" => "DTS",
+        "VORBIS" => "Vorbis",
+        "OPUS" => "Opus",
+        "FLAC" => "FLAC",
+        "REAL" => "RealAudio",
+        "PCM" => "PCM",
+        _ => "",
+    };
+    if !named.is_empty() {
+        return named.to_string();
+    }
+    id.split('/').next().unwrap_or(id).to_string()
+}
 
 /// ...and the mp4 half: [`AacTrack`] and [`Ac3Track`], which is where a video
 /// file's sound is read and where it stops.
-const MP4_DECODED: &str = "AAC-LC and AC-3/E-AC-3";
+const MP4_DECODED: &str = "AAC-LC, HE-AAC v1/v2 and AC-3/E-AC-3";
 
 /// Packets decoded and thrown away ahead of a seek target: one for the MDCT
 /// overlap-add that reconstructs the target packet, one to warm the decoder.
@@ -147,6 +204,24 @@ pub struct AudioProbe {
     pub channels: u16,
 }
 
+/// A diagnostic line for stderr, printed only under `EDITH_DEBUG` and then once
+/// per distinct line for the life of the process. The same file is opened many
+/// times in one run (every probe, every open), and an unsupported track used to
+/// print the same line each time. Anything a user must act on goes in a returned
+/// warning instead ([`crate::PlaybackSession::import_with_warnings`]).
+pub(crate) fn debug_once(line: String) {
+    static SEEN: std::sync::OnceLock<Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    if std::env::var_os("EDITH_DEBUG").is_none() {
+        return;
+    }
+    let seen = SEEN.get_or_init(Default::default);
+    let fresh = seen.lock().map(|mut set| set.insert(line.clone())).unwrap_or(true);
+    if fresh {
+        eprintln!("{line}");
+    }
+}
+
 /// One audio stream of a file as its header describes it. Every audio track is
 /// described, decodable or not: a picker shows the ones we refuse greyed out
 /// rather than pretending a BluRay remux has fewer streams than it has.
@@ -155,13 +230,9 @@ pub struct StreamInfo {
     /// Position among this file's audio tracks in file order — the `stream`
     /// [`AudioSession::open_multi_streams`] takes.
     pub index: usize,
-    /// Container codec.
-    ///
-    /// corner-cut: mp4 0.14 parses `mp4a` sample entries and silently drops every
-    /// other kind (`stsd.rs` `_ => {}`), keeping no fourcc, so an AC-3/DTS/PCM
-    /// stream can only be `"unknown"` here — enough to grey a row out, not
-    /// enough to name the codec. Upgrade path is reading the sample entry's
-    /// fourcc out of the file ourselves.
+    /// Codec, named by its sample entry's fourcc read out of the file by hand
+    /// (mp4 0.14 keeps none for a kind it does not parse). `"unknown"` only where
+    /// the fourcc itself cannot be read.
     pub codec: String,
     /// `0` for a stream whose sample entry mp4 0.14 does not parse.
     pub channels: u16,
@@ -173,6 +244,15 @@ pub struct StreamInfo {
     /// that no width is refused. The grey-out rule, mirroring what `Track::open`
     /// answers one file at a time.
     pub decodable: bool,
+    /// Bits per sample, for a PCM track whose sample entry states them. `None`
+    /// for every compressed codec, and for a Matroska track (its `BitDepth` is
+    /// not read here).
+    pub bit_depth: Option<u8>,
+    /// Bits per second this track's own samples take over the file's stated
+    /// playing time -- the same measure as [`crate::MediaBitrate::audio`]. `None`
+    /// where the header does not state the length, and for Matroska, whose
+    /// per-track bytes need a cluster walk this listing does not do.
+    pub bitrate: Option<u64>,
 }
 
 /// The mix settings a *running* mixer reads: what each lane is turned by on its
@@ -198,7 +278,7 @@ pub struct MixControls {
     /// The lane amplitudes and the limiter, together: they are set together and
     /// a mixer that read half of one change and half of the next would be
     /// mixing a state nobody asked for.
-    state: Mutex<(Vec<f32>, Limiter)>,
+    state: Mutex<(Vec<f32>, Vec<Vec<Duck>>, Limiter)>,
     /// A mixer thread has these; see the type docs.
     live: AtomicBool,
     /// The open these were handed to finished without a mixer: a silent
@@ -209,22 +289,46 @@ pub struct MixControls {
     /// apart either rebuilds the sound under a cold open, once per fader nudge,
     /// or hands a mix to nobody and never notices.
     detached: AtomicBool,
+    /// The highest level each lane has reached since it was last read, after
+    /// its gain and before the sum. Written by the mixer once per block (never
+    /// on the device's callback); read and cleared by [`Self::take_lane_peaks`].
+    lane_peaks: Mutex<Vec<f32>>,
 }
 
 impl MixControls {
-    pub fn new(gains: Vec<f32>, limiter: Limiter) -> Arc<Self> {
+    pub fn new(gains: Vec<f32>, ducks: Vec<Vec<Duck>>, limiter: Limiter) -> Arc<Self> {
         Arc::new(Self {
             version: AtomicU64::new(0),
-            state: Mutex::new((gains, limiter)),
+            lane_peaks: Mutex::new(vec![0.0; gains.len()]),
+            state: Mutex::new((gains, ducks, limiter)),
             live: AtomicBool::new(false),
             detached: AtomicBool::new(false),
         })
     }
 
+    /// Raises lane `lane`'s peak to `peak` if that is higher. A lane with no
+    /// slot (a mix handed more lanes than it was built with) is ignored rather
+    /// than grown here: it is a meter, not the mix.
+    fn note_lane_peak(&self, lane: usize, peak: f32) {
+        if let Some(held) = self.lane_peaks.lock().unwrap().get_mut(lane)
+            && peak > *held
+        {
+            *held = peak;
+        }
+    }
+
+    /// The per-lane peaks since the last call, and starts them over from zero.
+    pub fn take_lane_peaks(&self) -> Vec<f32> {
+        let mut held = self.lane_peaks.lock().unwrap();
+        let taken = held.clone();
+        held.iter_mut().for_each(|p| *p = 0.0);
+        taken
+    }
+
     /// Hands the running mixer a new mix. Cheap enough for a key repeat: a lock
     /// held for a `Vec` swap and an atomic.
-    pub fn set(&self, gains: Vec<f32>, limiter: Limiter) {
-        *self.state.lock().unwrap() = (gains, limiter);
+    pub fn set(&self, gains: Vec<f32>, ducks: Vec<Vec<Duck>>, limiter: Limiter) {
+        *self.state.lock().unwrap() = (gains, ducks, limiter);
         self.version.fetch_add(1, Ordering::Release);
     }
 
@@ -246,7 +350,8 @@ impl MixControls {
 
     /// The mix, if it has moved since `seen`. `None` -- the every-block case --
     /// takes no lock.
-    fn changed(&self, seen: &mut u64) -> Option<(Vec<f32>, Limiter)> {
+    #[allow(clippy::type_complexity)]
+    fn changed(&self, seen: &mut u64) -> Option<(Vec<f32>, Vec<Vec<Duck>>, Limiter)> {
         let now = self.version.load(Ordering::Acquire);
         if now == *seen {
             return None;
@@ -413,92 +518,114 @@ impl AudioSession {
         fps: f64,
         sample_rate: Option<u32>,
     ) -> crate::Result<Option<(AudioMeta, Receiver<AudioChunk>)>> {
-        // The first source that really *opens* a track, which is not always
-        // index 0 and not always the first non-image one: a still image has no
-        // track by definition, and a video whose file carries none (a screen
-        // recording with no sound) has `Track::open` answer `None`. Pinning to
-        // the first non-image source regardless would return `Ok(None)` for a
-        // whole timeline whenever that one source happened to be silent,
-        // silencing every later clip that does have sound -- the very failure
-        // `PlaybackSession::open_project`'s device walk exists to prevent, and
-        // it has to hold here too or the walk is defeated at playback.
-        //
-        // A source that cannot be opened at all is skipped like a silent one,
-        // so a broken file at the head of the list cannot take a later clip's
-        // sound down with it; the last error is kept and returned only when
-        // *nothing* opens, which is today's answer for a timeline of one broken
-        // source.
-        let mut first: Option<(usize, Track)> = None;
-        let mut refused: Option<crate::Error> = None;
+        Self::open_lane(sources, segs, eqs, speeds, fades, fps, sample_rate, None)
+    }
+
+    /// [`open_multi_streams_speed_at_fade`](Self::open_multi_streams_speed_at_fade)
+    /// with the timeline's width given instead of derived from this lane alone.
+    /// A mix has one width for every lane ([`mix_width`]): a lane whose own
+    /// sources are all mono must still run at the mix's width, or its samples
+    /// are summed as frames of the wrong size and it plays at half its length.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one private opener behind the public family; the parameters are the public ones plus the width"
+    )]
+    fn open_lane(
+        sources: &[(PathBuf, usize)],
+        segs: &[(Option<usize>, f64, f64)],
+        eqs: &[Option<EqParams>],
+        speeds: &[Option<crate::project::Stretch>],
+        fades: &[Option<crate::project::Fade>],
+        fps: f64,
+        sample_rate: Option<u32>,
+        width: Option<u16>,
+    ) -> crate::Result<Option<(AudioMeta, Receiver<AudioChunk>)>> {
+        // Every source the segments name is opened here, once, before the
+        // timeline's width is settled. The width is the *widest* of them: a mono
+        // voiceover first on the lane with a stereo music bed under it used to
+        // pin the whole mix to mono and fold the bed down with it. The rate and
+        // the length are still the first opened source's, as they always were.
+        // A source with no audio track at all is silence -- its segments are
+        // silence, exactly as a gap's are, and the slot stays empty to say so --
+        // and a source that cannot be opened is an error once a segment names it.
+        let mut named = vec![false; sources.len()];
+        for &(source, ..) in segs {
+            if let Some(source) = source {
+                *named
+                    .get_mut(source)
+                    .ok_or_else(|| format!("segment names source {source} of {}", sources.len()))? = true;
+            }
+        }
+        // The *rate* is not held to the timeline's: a source written at another
+        // one is read through its segment's [`Resample`], the very interpolator a
+        // speeded clip already goes through, so it plays at the pitch it was
+        // recorded at. The layout is held: see the width check below. A still
+        // image has no track by definition.
+        // The length is still the first non-image source's that opens, named
+        // or not, as it always was: an unnamed source is opened for that alone, and
+        // one that cannot be opened is skipped rather than refused. Only the named
+        // ones take part in the width and the rate, and only they are played.
+        let mut opened: Vec<Option<Track>> = sources.iter().map(|_| None).collect();
         for (at, (path, stream)) in sources.iter().enumerate() {
             if crate::is_image(path) {
                 continue;
             }
-            match Track::open(path, *stream) {
-                Ok(Some(track)) => {
-                    first = Some((at, track));
-                    break;
-                }
-                Ok(None) => {}
-                Err(e) => refused = Some(e),
-            }
-        }
-        let Some((at, first)) = first else {
-            return match refused {
-                Some(e) => Err(e),
-                None => Ok(None),
+            opened[at] = if named[at] {
+                Track::open(path, *stream)?
+            } else {
+                Track::open(path, *stream).ok().flatten()
             };
+        }
+        let Some(first_at) = opened.iter().position(Option::is_some) else {
+            return Ok(None);
         };
-        // The timeline's meta is that source's: policy makes every other source
-        // match it, and the checks below hold them to that.
+        let first = opened[first_at].as_ref().expect("found above");
+        // The rate, when no caller picked one: the highest of the named sources'
+        // (see [`mix_rate`]). A lane of only unnamed sources falls back to the
+        // first one that opened.
+        let rate = sample_rate.unwrap_or_else(|| {
+            mix_rate(
+                opened
+                    .iter()
+                    .zip(&named)
+                    .filter(|(_, named)| **named)
+                    .filter_map(|(track, _)| track.as_ref())
+                    .map(|t| t.sample_rate()),
+            )
+            .unwrap_or_else(|| first.sample_rate())
+        });
+        // The length is counted in samples of the first source's own rate, so it
+        // is restated at the mix's rate: the same seconds either way.
+        let length = first.total_samples().map(|n| {
+            n.saturating_mul(u64::from(rate)) / u64::from(first.sample_rate().max(1))
+        });
         let meta = AudioMeta {
-            sample_rate: sample_rate.unwrap_or_else(|| first.sample_rate()),
-            channels: first.channels(),
-            total_samples: first.total_samples(),
+            sample_rate: rate,
+            channels: width.unwrap_or_else(|| {
+                opened
+                    .iter()
+                    .zip(&named)
+                    .filter(|(_, named)| **named)
+                    .filter_map(|(track, _)| track.as_ref())
+                    .map(|t| t.channels())
+                    .max()
+                    .unwrap_or_else(|| first.channels())
+            }),
+            total_samples: length,
         };
-        // Built here only so an undecodable stream is an `Err` from the opener
-        // rather than a silently empty channel; the worker makes its own.
-        first.check_decoder()?;
 
         let mut tracks: Vec<Option<Track>> = sources.iter().map(|_| None).collect();
-        // ...and which of them turned out to have no track at all, so a silent
-        // source is opened once like any other rather than once per segment
-        // naming it.
-        let mut silent: Vec<bool> = sources.iter().map(|_| false).collect();
-        tracks[at] = Some(first);
-        for &(source, ..) in segs {
-            let Some(source) = source else {
-                continue; // a gap opens no file
-            };
-            if silent.get(source) == Some(&true) {
-                continue;
-            }
-            let slot = tracks
-                .get_mut(source)
-                .ok_or_else(|| format!("segment names source {source} of {}", sources.len()))?;
-            if slot.is_some() {
-                continue; // already opened, and the checks below already ran
-            }
-            let (path, stream) = &sources[source];
-            // A source with no audio track at all is not a failure: its
-            // segments are silence, exactly as a gap's are, and the slot stays
-            // empty to say so. That is what a silent clip on an audio lane
-            // means -- a picture over a hole.
-            let Some(track) = Track::open(path, *stream)? else {
-                silent[source] = true;
+        for (source, track) in opened.into_iter().enumerate() {
+            let Some(track) = track.filter(|_| named[source]) else {
                 continue;
             };
-            // The *rate* is no longer held to the timeline's: a source written at
-            // another one is read through its segment's [`Resample`] below, the
-            // very interpolator a speeded clip already goes through, so it plays
-            // at the pitch it was recorded at over the seconds it was placed for.
-            // The layout still is -- one output device carries one width, and
-            // everything wider than a pair is already folded to one. A mono
-            // source is the one exception (DEBT #46): [`widen`] duplicates it
-            // into every channel below, the same as [`PlaybackSession`]'s own
-            // gate ([`crate::playback::audio_matches_probed`]) now allows.
-            if track.channels() != meta.channels && !(track.channels() == 1 && meta.channels > 1)
-            {
+            // One output device carries one width, and everything wider than a
+            // pair is already folded to one. A mono source is the one exception
+            // (DEBT #46): [`widen`] duplicates it into every channel of a stereo
+            // timeline. The same gate as [`PlaybackSession`]'s own
+            // ([`crate::playback::audio_matches_probed`]), so what plays exports.
+            let mono_into_wider = track.channels() == 1 && meta.channels > 1;
+            if track.channels() != meta.channels && !mono_into_wider {
                 return Err(format!(
                     "source {source} is {} ch, the timeline is {} ch",
                     track.channels(),
@@ -507,19 +634,44 @@ impl AudioSession {
                 .into());
             }
             track.check_decoder()?;
-            *slot = Some(track);
+            tracks[source] = Some(track);
         }
 
+        let owed_by_segment = owed_samples(segs, speeds, meta.sample_rate);
+        // The segments played backwards, as the blocks they are decoded in
+        // (`reverse_blocks`), beside the segment list the way the rate chains are.
+        let mut reversed: Vec<Option<Vec<Segment>>> = segs.iter().map(|_| None).collect();
         let segments: Vec<Segment> = segs
             .iter()
+            .enumerate()
             // A gap, and a source with no track to decode, are the same stretch
             // of nothing: as many frames of silence as the window is long.
-            .map(|&(source, start_secs, end_secs)| {
+            .map(|(i, &(source, start_secs, end_secs))| {
                 match source.and_then(|source| Some((source, tracks[source].as_ref()?))) {
-                    Some((source, track)) => track.segment(source, start_secs, end_secs),
-                    None => Segment::silence(
+                    Some((source, track)) => {
+                        let mut seg = track.segment(source, start_secs, end_secs);
+                        // A plain window at the mix rate reads exactly what it owes:
+                        // its end is set from the running count, not the source's own
+                        // rounding, so the cuts never drift against the picture. A
+                        // reversed one at real time is as plain as a forward one: it
+                        // reads the same window, last to first.
+                        let backwards = speeds.get(i).and_then(Option::as_ref).is_some_and(|s| s.reverse);
+                        let plain = speeds.get(i).is_none_or(|s| s.as_ref().is_none_or(crate::project::Stretch::is_straight));
+                        if let (true, true, Some(owed)) = (
+                            plain,
+                            track.sample_rate() == meta.sample_rate,
+                            owed_by_segment[i],
+                        ) {
+                            seg.media_end = seg.media_target + owed;
+                        }
+                        if backwards {
+                            reversed[i] = Some(reverse_blocks(track, source, start_secs, &seg));
+                        }
+                        seg
+                    }
+                    None => Segment::silence(owed_by_segment[i].unwrap_or(
                         ((end_secs - start_secs).max(0.0) * f64::from(meta.sample_rate)) as u64,
-                    ),
+                    )),
                 }
             })
             .collect();
@@ -575,27 +727,31 @@ impl AudioSession {
             .iter()
             .zip(segs)
             .enumerate()
-            .map(|(i, (seg, &(_, start_secs, end_secs)))| {
+            .map(|(i, (seg, _))| {
                 let rate = seg
                     .source
                     .and_then(|source| tracks[source].as_ref())
                     .map_or(meta.sample_rate, Track::sample_rate);
                 let ratio = f64::from(rate) / f64::from(meta.sample_rate.max(1));
-                let stretch = speeds.get(i).and_then(Option::as_ref);
+                // A direction alone is no change of time: it needs no stretch.
+                let stretch = speeds
+                    .get(i)
+                    .and_then(Option::as_ref)
+                    .filter(|s| !s.is_straight());
                 if stretch.is_none() && rate == meta.sample_rate {
                     return None;
                 }
+                // A pitch shift is a stretch and a resample together (see [`Stretch::pitch`]):
+                // the resample reads `2^(pitch/12)` times as fast, so the pitch moves by that,
+                // and the stretch takes back the same factor, so the length does not change.
+                let pitch = stretch.map_or(1.0, crate::project::Stretch::pitch_ratio);
                 let channels = usize::from(meta.channels);
                 // A speeded clip states the timeline it owes; a plain one owes
                 // the window it was placed for, and an open-ended window owes
                 // whatever its source has ([`Resample::UNBOUNDED`]).
-                let secs = stretch.map_or(end_secs - start_secs, |s| s.timeline_secs);
-                let owed = match (secs * f64::from(meta.sample_rate)).round() {
-                    frames if frames.is_finite() && frames >= 0.0 => {
-                        (frames as u64).min(Resample::UNBOUNDED - 1)
-                    }
-                    frames if frames > 0.0 => Resample::UNBOUNDED,
-                    _ => 0,
+                let owed = match owed_by_segment[i] {
+                    Some(frames) => frames.min(Resample::UNBOUNDED - 1),
+                    None => Resample::UNBOUNDED,
                 };
                 Some(match stretch {
                     // A rate conversion alone: the resampler owns the
@@ -609,8 +765,16 @@ impl AudioSession {
                     // is asked for -- and the stretch lands the timeline's
                     // frames exactly.
                     Some(s) => Rate {
-                        resample: Resample::new(ratio, Resample::UNBOUNDED),
-                        stretch: Some(TimeStretch::new(s.step, owed, channels)),
+                        resample: Resample::new(ratio * pitch, Resample::UNBOUNDED),
+                        stretch: Some(TimeStretch::new(
+                            s.step / pitch,
+                            owed,
+                            channels,
+                            // Samples per timeline frame: what turns the ramp's
+                            // frames into the stretch's own samples.
+                            s.ramp
+                                .map(|r| (r.scaled(1.0 / pitch), f64::from(meta.sample_rate) / s.fps)),
+                        )),
                     },
                 })
             })
@@ -628,7 +792,13 @@ impl AudioSession {
         let fades: Vec<Option<crate::project::Fade>> = segments
             .iter()
             .enumerate()
-            .map(|(i, _)| fades.get(i).copied().flatten().map(|f| f.scaled(fade_ratio)))
+            .map(|(i, _)| {
+                fades
+                    .get(i)
+                    .cloned()
+                    .flatten()
+                    .map(|f| f.scaled(fade_ratio))
+            })
             .collect();
 
         let (tx, rx) = sync_channel(32);
@@ -642,6 +812,7 @@ impl AudioSession {
                     eqs,
                     speeds,
                     fades,
+                    reversed,
                     timeline,
                     tx,
                 })
@@ -754,7 +925,17 @@ impl AudioSession {
         // No fades on this path -- see `open_multi_streams_speed_at`'s same
         // placeholder.
         Self::open_mixed_streams_master_at_fade(
-            sources, lanes, eqs, speeds, &[], 1.0, gains, limiter, sample_rate,
+            sources,
+            lanes,
+            eqs,
+            speeds,
+            &[],
+            1.0,
+            gains,
+            &[],
+            &[],
+            limiter,
+            sample_rate,
         )
     }
 
@@ -762,6 +943,10 @@ impl AudioSession {
     /// with a fade envelope per segment; see
     /// [`open_mixed_streams_live_fade`](Self::open_mixed_streams_live_fade).
     /// `fps` is [`open_multi_streams_speed_at_fade`](Self::open_multi_streams_speed_at_fade)'s.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "public mix openers form one family, each fixing one more argument of the next; a parameter struct would only rename the list at every step"
+    )]
     pub fn open_mixed_streams_master_at_fade(
         sources: &[(PathBuf, usize)],
         lanes: &[Vec<(Option<usize>, f64, f64)>],
@@ -770,11 +955,24 @@ impl AudioSession {
         fades: &[Vec<Option<crate::project::Fade>>],
         fps: f64,
         gains: &[f32],
+        ducks: &[Vec<Duck>],
+        voices: &[VoiceFx],
         limiter: Limiter,
         sample_rate: Option<u32>,
     ) -> crate::Result<Option<(AudioMeta, Receiver<AudioChunk>)>> {
         Self::open_mixed_streams_live_fade(
-            sources, lanes, eqs, speeds, fades, fps, gains, limiter, None, sample_rate,
+            sources,
+            lanes,
+            eqs,
+            speeds,
+            fades,
+            fps,
+            gains,
+            ducks,
+            voices,
+            limiter,
+            None,
+            sample_rate,
         )
     }
 
@@ -786,6 +984,10 @@ impl AudioSession {
     /// `gains`/`limiter` still say what it starts as -- they are what decides
     /// whether there is a mixer at all -- and the handle is marked live only
     /// when there is one. An export passes `None`: nothing can move under it.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "public mix openers form one family, each fixing one more argument of the next; a parameter struct would only rename the list at every step"
+    )]
     pub fn open_mixed_streams_live(
         sources: &[(PathBuf, usize)],
         lanes: &[Vec<(Option<usize>, f64, f64)>],
@@ -799,7 +1001,18 @@ impl AudioSession {
         // No fades on this path -- see `open_multi_streams_speed_at`'s same
         // placeholder.
         Self::open_mixed_streams_live_fade(
-            sources, lanes, eqs, speeds, &[], 1.0, gains, limiter, live, sample_rate,
+            sources,
+            lanes,
+            eqs,
+            speeds,
+            &[],
+            1.0,
+            gains,
+            &[],
+            &[],
+            limiter,
+            live,
+            sample_rate,
         )
     }
 
@@ -809,6 +1022,10 @@ impl AudioSession {
     /// the same walk the segments come from. A short or missing list means
     /// the rest play flat, the eq list's rule. `fps` is the timeline rate
     /// those fades were built at ([`crate::project::Fade::scaled`]).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "public mix openers form one family, each fixing one more argument of the next; a parameter struct would only rename the list at every step"
+    )]
     pub fn open_mixed_streams_live_fade(
         sources: &[(PathBuf, usize)],
         lanes: &[Vec<(Option<usize>, f64, f64)>],
@@ -817,6 +1034,8 @@ impl AudioSession {
         fades: &[Vec<Option<crate::project::Fade>>],
         fps: f64,
         gains: &[f32],
+        ducks: &[Vec<Duck>],
+        voices: &[VoiceFx],
         limiter: Limiter,
         live: Option<&Arc<MixControls>>,
         sample_rate: Option<u32>,
@@ -824,7 +1043,7 @@ impl AudioSession {
         let [first, ..] = lanes else {
             return Ok(None);
         };
-        if !Self::is_mixed(lanes.len(), gains, limiter) {
+        if !Self::is_mixed(lanes.len(), gains, limiter, voices) {
             let flat = Vec::new();
             let plain = Vec::new();
             let flat_fade = Vec::new();
@@ -838,6 +1057,10 @@ impl AudioSession {
                 sample_rate,
             );
         }
+        // Settled once for the whole mix, as the width is: every lane is opened
+        // at the same rate, so no lane's own sources pick a rate of their own.
+        let (width, mix_rate) = Self::mix_format(sources, lanes)?;
+        let sample_rate = sample_rate.or(mix_rate);
         let mut meta = None;
         let mut rxs = Vec::with_capacity(lanes.len());
         for (i, segs) in lanes.iter().enumerate() {
@@ -847,7 +1070,7 @@ impl AudioSession {
             let flat = Vec::new();
             let flat_fade = Vec::new();
             let plain = Vec::new();
-            let Some((lane_meta, rx)) = Self::open_multi_streams_speed_at_fade(
+            let Some((lane_meta, rx)) = Self::open_lane(
                 sources,
                 segs,
                 eqs.get(i).unwrap_or(&flat),
@@ -855,9 +1078,16 @@ impl AudioSession {
                 fades.get(i).unwrap_or(&flat_fade),
                 fps,
                 sample_rate,
+                width,
             )?
             else {
                 return Ok(None);
+            };
+            // A lane with voice processors on runs them on its own stream, before
+            // anything is summed ([`crate::voice`]); one without is left as it was.
+            let rx = match voices.get(i).filter(|v| v.is_active()) {
+                Some(fx) => crate::voice::spawn_stage(rx, fx, lane_meta.sample_rate, usize::from(lane_meta.channels)),
+                None => rx,
             };
             meta = Some(lane_meta);
             rxs.push(rx);
@@ -873,6 +1103,9 @@ impl AudioSession {
         let state = limiter
             .is_active()
             .then(|| LimiterState::new(&limiter, meta.sample_rate, channels));
+        // One list per lane, padded with no duck: a short list is "unducked from here on".
+        let mut ducks = ducks.to_vec();
+        ducks.resize(lanes.len(), Vec::new());
         // Marked before the spawn rather than inside it: a caller asks this the
         // moment the open returns, and a flag set on the far thread would still
         // read dead.
@@ -883,8 +1116,50 @@ impl AudioSession {
         let rate = meta.sample_rate;
         thread::Builder::new()
             .name("audio-mix".into())
-            .spawn(move || mix(&rxs, channels, gains, state, rate, live.as_deref(), &tx))?;
+            .spawn(move || {
+                mix(
+                    &rxs,
+                    channels,
+                    MixState { gains, ducks, limiter: state },
+                    rate,
+                    live.as_deref(),
+                    &tx,
+                )
+            })?;
         Ok(Some((meta, rx)))
+    }
+
+    /// The width and the rate every lane of a mix runs at, from the sources any
+    /// lane names. The width is the widest of them (a mono source counts as
+    /// mono, so a mono-only mix stays mono). Each lane used to derive its own
+    /// from its own sources, which put a mono voice lane beside a stereo bed at
+    /// one channel while the sum was two: the voice was then read as half as
+    /// many frames, and ended at half its length. The rate is [`mix_rate`] over
+    /// the same sources: a lane of its own would otherwise mix a 22.05 kHz
+    /// voiceover at its own rate beside a 48 kHz bed. Each part is `None` when
+    /// no lane names a source with an audio track.
+    fn mix_format(
+        sources: &[(PathBuf, usize)],
+        lanes: &[Vec<(Option<usize>, f64, f64)>],
+    ) -> crate::Result<(Option<u16>, Option<u32>)> {
+        let mut width: Option<u16> = None;
+        let mut rates = Vec::new();
+        for &(source, ..) in lanes.iter().flatten() {
+            let Some(source) = source else {
+                continue;
+            };
+            let (path, stream) = sources
+                .get(source)
+                .ok_or_else(|| format!("segment names source {source} of {}", sources.len()))?;
+            if crate::is_image(path) {
+                continue;
+            }
+            if let Some(track) = Track::open(path, *stream)? {
+                width = Some(width.map_or(track.channels(), |w| w.max(track.channels())));
+                rates.push(track.sample_rate());
+            }
+        }
+        Ok((width, mix_rate(rates)))
     }
 
     /// Whether these settings put the timeline through the **mixer**: more than
@@ -896,8 +1171,8 @@ impl AudioSession {
     /// answer *before* the open now that it happens on another thread, and the
     /// answer must not be spelled out twice: what it decides is whether a fader
     /// is handed to a running mixer or rebuilds the stream.
-    pub(crate) fn is_mixed(lanes: usize, gains: &[f32], limiter: Limiter) -> bool {
-        lanes > 1 || limiter.is_active() || gains.iter().any(|&g| g != 1.0)
+    pub(crate) fn is_mixed(lanes: usize, gains: &[f32], limiter: Limiter, voices: &[VoiceFx]) -> bool {
+        lanes > 1 || limiter.is_active() || gains.iter().any(|&g| g != 1.0) || voices.iter().any(VoiceFx::is_active)
     }
 
     /// Why [`open`](Self::open) came back silent for a file that *has* sound:
@@ -906,6 +1181,10 @@ impl AudioSession {
     /// -- nothing to tell the user there. Header only, and only worth calling
     /// once the open has already returned no audio.
     pub fn unsupported(path: impl AsRef<Path>) -> crate::Result<Option<String>> {
+        // An Ogg Speex stream is named, not decoded: the reason is what the import warns with.
+        if crate::demux::is_ogg_speex(path.as_ref()) {
+            return Ok(Some(crate::demux::SPEEX_REFUSAL.to_string()));
+        }
         // Matroska: what symphonia reads out of one ([`Track::open`]) plus the
         // AC-3 and E-AC-3 whose blocks are handed to the Dolby decoder
         // ([`MkvAc3Track`]) and the Opus its own decoder takes; everything else
@@ -916,9 +1195,26 @@ impl AudioSession {
             let Some(codec) = crate::demux::matroska_audio_codec(path.as_ref())? else {
                 return Ok(None);
             };
+            let name = codec_display_name(&codec);
             // An AC-3 track that came up silent all the same is one that could
             // not be read -- a laced block, an unreadable syncframe -- and the
             // reader's own words are the ones worth showing.
+            // A TrueHD track its decoder opens is sound, not an unsupported one.
+            if matches!(MkvTruehdTrack::open(path.as_ref()), Ok(Some(_))) {
+                return Ok(None);
+            }
+            // ...and so is a DTS track `ec-dts` opens; one it refuses (XLL) says why.
+            if (crate::extaudio::is_mkv_dts(&codec) || crate::extaudio::is_mkv_mpeg_layer(&codec))
+                && let Some(first) = crate::demux::matroska_audio_tracks(path.as_ref())?.first()
+            {
+                match crate::extaudio::ExtFileTrack::open_native(path.as_ref(), first.number) {
+                    Ok(Some(_)) => return Ok(None),
+                    Err(e) => {
+                        return Ok(Some(format!("the {name} track of this Matroska file cannot be decoded: {e}")));
+                    }
+                    Ok(None) => {}
+                }
+            }
             return Ok(Some(match MkvAc3Track::open(path.as_ref()) {
                 Ok(Some(_)) => return Ok(None),
                 // ...and the same question asked of the other reader, because a
@@ -934,29 +1230,45 @@ impl AudioSession {
                     return Ok(None);
                 }
                 Ok(None) => format!(
-                    "the {codec} track of this Matroska file cannot be decoded — {MKV_DECODED} are"
+                    "the {name} track of this Matroska file cannot be decoded — {MKV_DECODED} are"
                 ),
-                Err(e) => format!("the {codec} track of this Matroska file cannot be decoded: {e}"),
+                Err(e) => format!("the {name} track of this Matroska file cannot be decoded: {e}"),
             }));
         }
-        let file = File::open(path.as_ref())?;
-        let size = file.metadata()?.len();
-        let reader = Mp4Reader::read_header(BufReader::new(file), size)?;
+        // A transport stream: the first sound track, if the build cannot decode it.
+        if crate::demux::is_mpeg_system(path.as_ref()) {
+            let file = crate::demux::ts::describe(path.as_ref())?;
+            let flavor = crate::demux::ts::Flavor::of(path.as_ref());
+            return Ok(file.audio.first().and_then(|a| match (&a.refusal, a.stream) {
+                (Some(why), _) => Some(crate::demux::ts::refusal_text_for(why, false, flavor)),
+                (None, None) => Some(crate::demux::ts::refusal_text_for(
+                    &format!("the {} audio track cannot be decoded", a.codec),
+                    false,
+                    flavor,
+                )),
+                _ => None,
+            }));
+        }
         // File order, out of `moov.traks`: naming a codec off a `HashMap` walk
         // would tell the user about a different track from one run to the next
-        // on a film with two ([`audio_track_ids`], and the same trap the video
-        // pick had in `demux::Mp4Demuxer::open`).
-        Ok(audio_track_ids(&reader)
-            .first()
-            .and_then(|id| reader.tracks().get(id))
-            .map(|t| match t.media_type() {
-                Ok(media) => {
-                    format!("the {media} audio track cannot be decoded — {MP4_DECODED} are")
+        // on a film with two.
+        let reader = mp4track::open(path.as_ref())?;
+        // Flagged only when the decoders `open` itself would try cannot take the
+        // first track: AC-3 first, then the AAC reader, as `open_track` orders
+        // them. A track either one opens is playable, so not a refusal.
+        if matches!(Ac3Track::open(path.as_ref(), 0), Ok(Some(_)))
+            || matches!(Track::open(path.as_ref(), 0), Ok(Some(_)))
+        {
+            return Ok(None);
+        }
+        Ok(mp4track::audio_tracks(&reader).first().map(|&(_, stream)| {
+            match stream.and_then(|s| mp4track::codec(&reader, s)) {
+                Some(codec) => {
+                    format!("the {} audio track cannot be decoded — {MP4_DECODED} are", codec.name())
                 }
-                Err(_) => {
-                    format!("the audio track is in a codec we cannot decode — {MP4_DECODED} are")
-                }
-            }))
+                None => format!("the audio track is in a codec we cannot decode — {MP4_DECODED} are"),
+            }
+        }))
     }
 
     /// The audio parameters of `path`'s `stream`, for checking an import
@@ -989,6 +1301,7 @@ impl AudioSession {
     /// and an ALAC `.m4a` only half is.
     pub fn probe_streams(path: impl AsRef<Path>) -> crate::Result<Vec<StreamInfo>> {
         let path = path.as_ref();
+        crate::demux::refuse_speex(path)?;
         // A Matroska file lists one row per `TrackEntry` of audio -- a
         // dual-audio remux has two, and the second one used to be invisible --
         // numbered by [`mkv_stream_order`]: the track that already plays first,
@@ -1018,34 +1331,86 @@ impl AudioSession {
                 // A track symphonia cannot even describe is listed undecodable
                 // by the name the container gives it, rather than taking the
                 // whole listing down with it: the other language still plays.
-                let sym = match &ac3 {
-                    Some(_) => None,
-                    None => SymTrack::open_track(path, entry.number).ok().flatten(),
+                // TrueHD and MLP through their own decoder, the same way.
+                let truehd = matches!(entry.codec.as_str(), "A_TRUEHD" | "A_MLP")
+                    .then(|| MkvTruehdTrack::open_track(path, entry.number).ok().flatten())
+                    .flatten();
+                let ext = (crate::extaudio::is_mkv_dts(&entry.codec) || crate::extaudio::is_mkv_mpeg_layer(&entry.codec))
+                    .then(|| crate::extaudio::ExtFileTrack::open_native(path, entry.number).ok().flatten())
+                    .flatten();
+                let sym = match (&ac3, &truehd, &ext) {
+                    (None, None, None) => SymTrack::open_track(path, entry.number).ok().flatten(),
+                    _ => None,
                 };
-                let channels = ac3.as_ref().map_or_else(
-                    || sym.as_ref().map_or(0, |t| t.channels),
-                    |t| t.channels,
-                );
+                // What the row describes: the Dolby decoders' own output where one
+                // took the track, symphonia's where it did not.
+                let (channels, sample_rate) = match (&ac3, &truehd) {
+                    (Some(t), _) => (t.channels, t.sample_rate),
+                    (_, Some(t)) => (t.channels, t.sample_rate),
+                    _ if ext.is_some() => ext.as_ref().map_or((0, 0), |t| (t.channels(), t.sample_rate)),
+                    _ => sym
+                        .as_ref()
+                        .map_or((0, 0), |t| (t.channels, t.sample_rate)),
+                };
                 streams.push(StreamInfo {
                     index,
+                    bit_depth: None,
+                    bitrate: None,
                     codec: mkv_codec_name(&entry.codec),
                     channels,
-                    sample_rate: ac3.as_ref().map_or_else(
-                        || sym.as_ref().map_or(0, |t| t.sample_rate),
-                        |t| t.sample_rate,
-                    ),
+                    sample_rate,
                     lang: (entry.language != "und" && !entry.language.is_empty())
                         .then(|| entry.language.clone()),
                     // No width gate any more: `channels` is what reaches the
                     // timeline, which [`downmix`] makes a pair out of whatever
                     // the file carries. What greys a row out is a codec nothing
                     // here decodes, and nothing else.
-                    decodable: ac3.is_some() || sym.is_some_and(|t| t.decoder().is_ok()),
+                    decodable: ac3.is_some()
+                        || truehd.is_some()
+                        || ext.is_some()
+                        || sym.is_some_and(|t| t.decoder().is_ok()),
                 });
             }
             return Ok(streams);
         }
+        // A transport stream lists every sound track of its program in PMT order, the ones
+        // this build has no decoder for (LATM and the like) greyed out by name.
+        if crate::demux::is_mpeg_system(path) {
+            let file = crate::demux::ts::describe(path)?;
+            return Ok(file
+                .audio
+                .iter()
+                .enumerate()
+                .map(|(index, a)| {
+                    let track = a
+                        .stream
+                        .and_then(|_| crate::demux::ts::TsAudio::open(path, index).ok().flatten());
+                    StreamInfo {
+                        index,
+                        bit_depth: crate::demux::ts::pcm_depth(a.codec_id),
+                        bitrate: None,
+                        codec: a.codec.clone(),
+                        channels: track.as_ref().map_or(a.channels, |t| t.channels()),
+                        sample_rate: track.as_ref().map_or(a.sample_rate, |t| t.sample_rate),
+                        lang: a.language.clone().filter(|l| l != "und"),
+                        decodable: track.is_some_and(|t| t.decoder().is_ok()),
+                    }
+                })
+                .collect());
+        }
         if crate::is_audio(path) {
+            if let Some(track) = crate::extaudio::ExtFileTrack::open(path, 0)? {
+                return Ok(vec![StreamInfo {
+                    index: 0,
+                    codec: track.codec_name().into(),
+                    channels: track.channels(),
+                    sample_rate: track.sample_rate,
+                    lang: None,
+                    decodable: track.decoder().is_ok(),
+                    bit_depth: None,
+                    bitrate: None,
+                }]);
+            }
             let track = SymTrack::open_required(path)?;
             return Ok(vec![StreamInfo {
                 index: 0,
@@ -1056,55 +1421,72 @@ impl AudioSession {
                 // way an mdhd does, and a lone track needs no telling apart.
                 lang: None,
                 decodable: track.decoder().is_ok(),
+                bit_depth: None,
+                bitrate: None,
             }]);
         }
-        let file = File::open(path)?;
-        let size = file.metadata()?.len();
-        let reader = Mp4Reader::read_header(BufReader::new(file), size)?;
-        Ok(audio_track_ids(&reader)
+        let reader = mp4track::open(path)?;
+        // The playing time the header states, which is what a track's bytes are
+        // divided by for its rate. A header that states none leaves the rate out.
+        let secs = reader.duration_secs();
+        Ok(mp4track::audio_tracks(&reader)
             .into_iter()
             .enumerate()
-            .map(|(index, id)| {
-                let track = &reader.tracks()[&id];
-                let aac = matches!(track.media_type(), Ok(MediaType::AAC));
-                // An AC-3 track describes itself through its own reader: mp4
-                // 0.14 parses no sample entry for it, so `channel_config` and
-                // `sample_freq_index` have nothing to say. What is listed is
-                // the *decoded* shape -- stereo, because that is what the §7.8
-                // downmix hands the timeline (see [`Ac3Track`]).
+            .map(|(index, (track_id, stream))| {
+                let codec = stream.and_then(|s| mp4track::codec(&reader, s));
+                let bitrate = stream
+                    .zip(secs)
+                    .and_then(|(s, secs)| {
+                        crate::demux::bits_per_second(mp4track::sample_bytes(&reader, s), secs)
+                    });
+                let aac = codec == Some(CodecId::Aac);
+                // An AC-3 track is described through its own reader: what is
+                // listed is the *decoded* shape -- stereo, because that is what
+                // the §7.8 downmix hands the timeline (see [`Ac3Track`]).
                 let ac3 = (!aac)
                     .then(|| Ac3Track::open(path, index).ok().flatten())
                     .flatten();
-                let lang = track.language();
+                // DTS, ADPCM, A-law / mu-law and AMR go through `ec-probe`'s reader.
+                let ext = (!aac && ac3.is_none() && codec.is_some_and(crate::extaudio::is_ext_codec))
+                    .then(|| crate::extaudio::ExtFileTrack::open(path, index).ok().flatten())
+                    .flatten();
+                let lang = mp4track::language(&reader, track_id).filter(|l| l != "und");
+                let profile = stream
+                    .and_then(|s| mp4track::extradata(&reader, s))
+                    .and_then(|asc| asc_fields(&asc).ok())
+                    .map(|(profile, _, _)| profile);
                 StreamInfo {
                     index,
+                    bit_depth: None,
+                    bitrate,
                     codec: match (aac, &ac3) {
                         (true, _) => "aac",
                         (_, Some(_)) => "ac-3",
-                        _ => "unknown",
+                        _ => match codec.filter(|c| crate::extaudio::is_ext_codec(*c)) {
+                            Some(c) => c.name(),
+                            None => "unknown",
+                        },
                     }
                     .into(),
-                    channels: ac3
-                        .as_ref()
-                        .map_or_else(|| track.channel_config().map_or(0, channel_count), |t| {
-                            t.channels
-                        }),
-                    sample_rate: ac3.as_ref().map_or_else(
-                        || track.sample_freq_index().map_or(0, |f| f.freq()),
-                        |t| t.sample_rate,
-                    ),
-                    lang: (!lang.is_empty() && lang != "und").then(|| lang.to_string()),
+                    channels: match (&ac3, &ext) {
+                        (Some(t), _) => t.channels,
+                        (_, Some(t)) => t.channels(),
+                        _ => stream.map_or(0, |s| mp4track::channels(&reader, s) as u16),
+                    },
+                    sample_rate: match (&ac3, &ext) {
+                        (Some(t), _) => t.sample_rate,
+                        (_, Some(t)) => t.sample_rate,
+                        _ => stream.map_or(0, |s| mp4track::sample_rate(&reader, s)),
+                    },
+                    lang,
                     // The profile still gates -- the writer rebuilds an
                     // AudioSpecificConfig and calls it LC -- but the layout no
                     // longer does: a 5.1 or 7.1 AAC track decodes through
                     // `ec-aac` and folds to the pair the timeline carries
                     // ([`aac_decoder`]).
                     decodable: ac3.is_some()
-                        || aac
-                            && matches!(
-                                track.audio_profile(),
-                                Ok(AudioObjectType::AacLowComplexity)
-                            ),
+                        || ext.is_some()
+                        || aac && matches!(profile, Some(AAC_LC | AAC_SBR | AAC_PS)),
                 }
             })
             .collect())
@@ -1122,8 +1504,30 @@ impl AudioSession {
     /// Stream 0: this answers for a standalone audio file, whose only stream
     /// that is. A video source's length is its frame count, never this.
     pub fn duration_secs(path: impl AsRef<Path>) -> crate::Result<Option<f64>> {
+        Self::stream_duration_secs(path, 0)
+    }
+
+    /// [`duration_secs`](Self::duration_secs) for audio stream `stream` of the file: its own
+    /// playing time, which can be longer than the picture a video file carries.
+    pub fn stream_duration_secs(path: impl AsRef<Path>, stream: usize) -> crate::Result<Option<f64>> {
         let path = path.as_ref();
-        let Some(track) = Track::open(path, 0)? else {
+        let timed = Self::decoded_secs(path, stream);
+        if let Ok(Some(secs)) = timed {
+            return Ok(Some(secs));
+        }
+        // A track nothing here opens or decodes cannot be timed by reading it, but the
+        // file's own header states how long it plays: that length is what it is held to,
+        // so its sound comes in silent rather than refused for want of a duration.
+        match crate::demux::header_audio_secs(path, stream) {
+            Some(secs) => Ok(Some(secs)),
+            None => timed,
+        }
+    }
+
+    /// [`stream_duration_secs`](Self::stream_duration_secs) by reading the track: its sample
+    /// count, or a decode of it when the count is not stated.
+    fn decoded_secs(path: &Path, stream: usize) -> crate::Result<Option<f64>> {
+        let Some(track) = Track::open(path, stream)? else {
             return Ok(None);
         };
         let rate = f64::from(track.sample_rate().max(1));
@@ -1227,7 +1631,10 @@ impl AudioSession {
         let sample_rate = params.sample_rate;
         let mut err = 0i64;
         let mut packets: Vec<AacPacket> = Vec::new();
-        for &(source, start_secs, end_secs) in segs {
+        for (at, &(source, start_secs, end_secs)) in segs.iter().enumerate() {
+            // The last segment is the only one no later join pays a rounding
+            // debt in, so its run rounds up ([`packet_run_last`]).
+            let last = at + 1 == segs.len();
             // A gap, and a clip whose source carries no track, are the same hole
             // to write: silence for as long as the window is.
             let named = match source {
@@ -1244,7 +1651,11 @@ impl AudioSession {
                 // would play a packet early. It is not part of the run, so it
                 // owes the rounding debt nothing.
                 let priming = u32::from(packets.is_empty());
-                for _ in 0..packet_run(&mut err, ideal, u32::MAX) + priming {
+                let run = match last {
+                    true => packet_run_last(&mut err, ideal, u32::MAX),
+                    false => packet_run(&mut err, ideal, u32::MAX),
+                };
+                for _ in 0..run + priming {
                     packets.push(AacPacket {
                         bytes: bytes.clone(),
                         samples: SAMPLES_PER_PACKET,
@@ -1268,16 +1679,20 @@ impl AudioSession {
             // and neither must a segment behind a leading gap, which already
             // paid the priming in silence.
             let head = (packets.is_empty() && start_id > 1).then(|| start_id - 1);
+            let run = match last {
+                true => packet_run_last(&mut err, ideal, available),
+                false => packet_run(&mut err, ideal, available),
+            };
             let ids = head
                 .into_iter()
-                .chain(start_id..start_id + packet_run(&mut err, ideal, available));
+                .chain(start_id..start_id + run);
             for id in ids {
-                let Some(sample) = track.reader.read_sample(track.track_id, id)? else {
+                let Some(sample) = mp4track::sample(&mut track.reader, track.stream, id)? else {
                     let count = track.sample_count;
                     return Err(format!("audio sample {id} of {count} is missing").into());
                 };
                 packets.push(AacPacket {
-                    bytes: sample.bytes.to_vec(),
+                    bytes: sample.data.to_vec(),
                     samples: SAMPLES_PER_PACKET,
                 });
             }
@@ -1346,6 +1761,15 @@ fn source_at<'a>(
 fn copy_track(path: &Path, stream: usize) -> crate::Result<Option<AacTrack>> {
     match Track::open(path, stream)? {
         None => Ok(None),
+        // An HE-AAC track has packets of 2048 frames and a config the copy
+        // cannot rebuild, so it is re-encoded like every other uncopyable source.
+        Some(Track::Aac(track)) if track.sbr => Err(format!(
+            "a packet copy needs AAC-LC in an mp4; {} is HE-AAC",
+            path.file_name()
+                .unwrap_or(path.as_os_str())
+                .to_string_lossy(),
+        )
+        .into()),
         Some(Track::Aac(track)) => Ok(Some(track)),
         // A Matroska source gets its own words: its packets *are* AAC, so
         // "export needs AAC audio today" would read as a contradiction. What
@@ -1372,6 +1796,11 @@ fn copy_track(path: &Path, stream: usize) -> crate::Result<Option<AacTrack>> {
         // sample table can hold. The export decodes it and encodes AAC, exactly
         // as it does for every other source no copy reaches.
         Some(Track::Ac3(_) | Track::Mkv(_)) => Err(uncopyable(path, "AC-3")),
+        // The same reason again: a TrueHD access unit is not an `mp4a` sample.
+        Some(Track::Truehd(_)) => Err(uncopyable(path, "TrueHD")),
+        Some(Track::Ext(_)) => Err(uncopyable(path, "DTS, ADPCM, A-law, mu-law or AMR")),
+        // A transport stream's packets are not an mp4's sample table either.
+        Some(Track::Ts(_)) => Err(uncopyable(path, "an MPEG system stream's sound")),
     }
 }
 
@@ -1397,7 +1826,16 @@ enum Track {
     /// The same AC-3 decoder, fed out of a Matroska file's blocks instead of an
     /// mp4's sample table.
     Mkv(MkvAc3Track),
+    /// Dolby TrueHD or MLP, out of a Matroska file's blocks, decoded by
+    /// `ec-truehd`.
+    Truehd(MkvTruehdTrack),
+    /// DTS, ADPCM, A-law / mu-law and AMR out of a Matroska, mp4 / QuickTime /
+    /// 3GP, WAVE or raw file, read by `ec-probe` ([`crate::extaudio`]).
+    Ext(Box<crate::extaudio::ExtFileTrack>),
     Sym(SymTrack),
+    /// One sound track of an MPEG transport stream, its own demuxer under it
+    /// ([`crate::demux::ts`]): AAC in ADTS, AC-3, E-AC-3, MP3 and HDMV LPCM.
+    Ts(Box<crate::demux::ts::TsAudio>),
 }
 
 impl Track {
@@ -1415,6 +1853,8 @@ impl Track {
     /// has exactly one, so any `stream` above 0 there is a promise the file
     /// cannot keep — an `Err`, the same as naming a stream an mp4 does not have.
     fn open(path: &Path, stream: usize) -> crate::Result<Option<Self>> {
+        crate::demux::refuse_speex(path)?;
+        crate::demux::refuse_asf(path)?;
         // A Matroska file goes to symphonia, whose `mkv` reader is the one thing
         // here that reads its packets -- neither mp4 reader can open the file at
         // all -- except for the two codecs symphonia has no decoder for at any
@@ -1446,6 +1886,16 @@ impl Track {
                 )
                 .into());
             };
+            // TrueHD and MLP go to their own decoder out of the same blocks. An
+            // open failure is returned, not passed on: symphonia cannot read the
+            // track either, and the silence it would give is the bug
+            // [`MkvTruehdTrack`] exists to avoid -- an Atmos track's refusal is
+            // the answer the user needs.
+            if matches!(entry.codec.as_str(), "A_TRUEHD" | "A_MLP")
+                && let Some(track) = MkvTruehdTrack::open_track(path, entry.number)?
+            {
+                return Ok(Some(Self::Truehd(track)));
+            }
             match MkvAc3Track::open_track(path, entry.number) {
                 Ok(Some(track)) => return Ok(Some(Self::Mkv(track))),
                 Ok(None) => {}
@@ -1453,7 +1903,7 @@ impl Track {
                 // same file next and may read the track perfectly well (a laced
                 // block is [`MkvAc3Track`]'s limitation, not the file's), and
                 // if it cannot either, *its* `Err` is the one that comes back.
-                Err(e) => eprintln!("matroska audio: {}: {e}", path.display()),
+                Err(e) => debug_once(format!("matroska audio: {}: {e}", path.display())),
             }
             // Two things are silent here and no more: a file with no audio
             // track at all, and a track whose codec nothing in this project
@@ -1462,30 +1912,59 @@ impl Track {
             // same answer the mp4 arm gives: turned into silence it would play
             // and export as a hole with only an eprintln to say why, which is a
             // bug wearing a feature's clothes.
+            // DTS (and its DTS-HD core) through `ec-dts`, out of the same blocks. An
+            // open failure is returned: an XLL-only lossless track is refused by name.
+            if (crate::extaudio::is_mkv_dts(&entry.codec) || crate::extaudio::is_mkv_mpeg_layer(&entry.codec))
+                && let Some(track) = crate::extaudio::ExtFileTrack::open_native(path, entry.number)?
+            {
+                return Ok(Some(Self::Ext(Box::new(track))));
+            }
+            // Speex has no reader in this build (symphonia cannot open it): silent, and
+            // `AudioSession::unsupported` names it for the warning.
+            if codec_display_name(&entry.codec) == "Speex" {
+                return Ok(None);
+            }
             let Some(track) = SymTrack::open_track(path, entry.number)? else {
                 return Ok(None);
             };
             if let Err(e) = track.decoder() {
-                eprintln!("matroska audio: {}: {e}", path.display());
+                debug_once(format!("matroska audio: {}: {e}", path.display()));
                 return Ok(None);
             }
             return Ok(Some(Self::Sym(track)));
+        }
+        // A transport stream is read by its own demuxer, whatever the sound in it is.
+        if crate::demux::is_mpeg_system(path) {
+            return Ok(crate::demux::ts::TsAudio::open(path, stream)?.map(|t| Self::Ts(Box::new(t))));
         }
         let audio_file = crate::is_audio(path);
         // Ahead of the AAC reader, because that one answers "not AAC" for a
         // *named* stream with an `Err` and an AC-3 track is not an error any
         // more. `Ok(None)` here means "not an AC-3 track", so every other file
         // falls through to exactly the reader it always used.
-        if !audio_file
-            && let Some(track) = Ac3Track::open(path, stream)?
-        {
+        if !audio_file && let Some(track) = Ac3Track::open(path, stream)? {
             return Ok(Some(Self::Ac3(track)));
         }
         match AacTrack::open(path, stream) {
             Ok(Some(track)) => return Ok(Some(Self::Aac(track))),
-            Ok(None) if !audio_file => return Ok(None),
-            Err(e) if !audio_file => return Err(e),
+            Ok(None) if !audio_file => {
+                // Not AAC: DTS, ADPCM, A-law / mu-law or AMR in an mp4 / QuickTime / 3GP file.
+                return Ok(crate::extaudio::ExtFileTrack::open(path, stream)?.map(|t| Self::Ext(Box::new(t))));
+            }
+            Err(e) if !audio_file => {
+                return match crate::extaudio::ExtFileTrack::open(path, stream) {
+                    Ok(Some(t)) => Ok(Some(Self::Ext(Box::new(t)))),
+                    _ => Err(e),
+                };
+            }
             _ => {}
+        }
+        // A WAVE file that is not plain PCM (ADPCM, A-law, mu-law, DTS), a raw `.dts`
+        // or `.amr`: `ec-probe`'s reader, ahead of symphonia's.
+        if stream == 0
+            && let Some(track) = crate::extaudio::ExtFileTrack::open(path, 0)?
+        {
+            return Ok(Some(Self::Ext(Box::new(track))));
         }
         if stream > 0 {
             return Err(format!("{}: audio stream {stream} of 1 stream", path.display()).into());
@@ -1498,7 +1977,10 @@ impl Track {
             Self::Aac(t) => t.sample_rate,
             Self::Ac3(t) => t.sample_rate,
             Self::Mkv(t) => t.sample_rate,
+            Self::Truehd(t) => t.sample_rate,
+            Self::Ext(t) => t.sample_rate,
             Self::Sym(t) => t.sample_rate,
+            Self::Ts(t) => t.sample_rate,
         }
     }
 
@@ -1515,7 +1997,11 @@ impl Track {
             Self::Ac3(t) => t.channels,
             // The same decoder, out of a Matroska file.
             Self::Mkv(t) => t.channels,
+            // Folded to a pair by [`downmix`] in the worker; see [`MkvTruehdTrack`].
+            Self::Truehd(t) => t.channels,
+            Self::Ext(t) => t.channels(),
             Self::Sym(t) => t.channels,
+            Self::Ts(t) => t.channels(),
         }
     }
 
@@ -1525,7 +2011,10 @@ impl Track {
             Self::Aac(t) => t.total_samples,
             Self::Ac3(t) => t.total_samples,
             Self::Mkv(t) => t.total_samples,
+            Self::Truehd(t) => t.total_samples,
+            Self::Ext(t) => t.total_samples,
             Self::Sym(t) => t.total_samples,
+            Self::Ts(t) => t.total_samples,
         }
     }
 
@@ -1536,7 +2025,8 @@ impl Track {
             Self::Ac3(t) => t.priming,
             // Matroska writes no edit list and AC-3 has no encoder delay:
             // block 0 is sample 0.
-            Self::Mkv(_) => 0,
+            Self::Mkv(_) | Self::Truehd(_) | Self::Ts(_) => 0,
+            Self::Ext(t) => t.priming,
             Self::Sym(t) => t.priming,
         }
     }
@@ -1548,6 +2038,29 @@ impl Track {
             Self::Aac(t) => t.segment(source, start_secs, end_secs),
             Self::Ac3(t) => t.segment(source, start_secs, end_secs),
             Self::Mkv(t) => t.segment(source, start_secs, end_secs),
+            Self::Truehd(t) => t.segment(source, start_secs, end_secs),
+            Self::Ext(t) => {
+                let rate = f64::from(t.sample_rate);
+                let media_target = (start_secs.max(0.0) * rate).round() as u64 + t.priming;
+                Segment {
+                    source: Some(source),
+                    start_id: 0,
+                    start_pos: 0,
+                    media_target,
+                    media_end: (((end_secs.max(0.0) * rate).round() as u64).saturating_add(t.priming)).max(media_target),
+                }
+            }
+            Self::Ts(t) => {
+                let rate = f64::from(t.sample_rate);
+                let media_target = (start_secs.max(0.0) * rate).round() as u64;
+                Segment {
+                    source: Some(source),
+                    start_id: 0,
+                    start_pos: 0,
+                    media_target,
+                    media_end: ((end_secs.max(0.0) * rate).round() as u64).max(media_target),
+                }
+            }
             Self::Sym(t) => {
                 let media_target = t.media(start_secs);
                 Segment {
@@ -1573,6 +2086,14 @@ impl Track {
             }
             Self::Mkv(t) => {
                 ac3_decoder(t.requested)?;
+            }
+            // Its first access unit was decoded by the opener already.
+            Self::Truehd(_) => {}
+            Self::Ext(t) => {
+                t.decoder()?;
+            }
+            Self::Ts(t) => {
+                t.decoder()?;
             }
             Self::Sym(t) => {
                 t.decoder()?;
@@ -1601,6 +2122,22 @@ struct SymTrack {
     source_channels: u16,
     /// Frames per channel of audible audio, `None` when the header does not say.
     total_samples: Option<u64>,
+    /// Frames withheld at the very end of the track and never played: the
+    /// `DiscardPadding` of Vorbis in Matroska, whose blocks carry no granule to
+    /// cut by. Zero for everything else (Ogg Vorbis is cut by its granules, per
+    /// packet).
+    tail_hold: u64,
+    /// Every packet of a Matroska Vorbis track with its exact start in samples
+    /// ([`VorbisStarts`]). Matroska stamps a block in whole milliseconds, up to
+    /// half a millisecond (22 samples at 44.1 kHz) off the samples it holds, so
+    /// a track with this index is read by it -- packet by packet, and sought by
+    /// sample -- rather than through symphonia's stamp-based reader. `None` for
+    /// everything else, which keeps its packets' own timestamps or granules.
+    vorbis_starts: Option<VorbisStartsRef>,
+    /// The file the indexed packets are read from.
+    vorbis_file: Option<File>,
+    /// The index of the next packet [`SymTrack::next_packet`] reads.
+    vorbis_next: usize,
     /// Encoder delay, and **always zero here**: symphonia 0.6 drops the leading
     /// frames itself, so a reader that skipped `Track::delay` on top would skip
     /// them twice. Kept as a field because [`Track::priming`] asks every track
@@ -1646,10 +2183,7 @@ impl SymTrack {
     fn open_inner(path: &Path, number: Option<u64>) -> crate::Result<Option<Self>> {
         let reader = sym_reader(path)?;
         let track = match number {
-            Some(number) => reader
-                .tracks()
-                .iter()
-                .find(|t| u64::from(t.id) == number),
+            Some(number) => reader.tracks().iter().find(|t| u64::from(t.id) == number),
             None => reader.default_track(SymKind::Audio),
         };
         let Some(track) = track else {
@@ -1665,17 +2199,53 @@ impl SymTrack {
         else {
             return Err(format!("{} declares no audio codec", path.display()).into());
         };
-        let sample_rate = params
-            .sample_rate
-            .ok_or_else(|| format!("{} declares no sample rate", path.display()))?;
-        let channels = params
-            .channels
-            .as_ref()
-            .map(|c| c.count() as u16)
+        // An AAC track's rate is the one `ec-aac` decodes at, which for HE-AAC
+        // is the SBR extension rate (2x the core the container may state). An
+        // ADTS stream carries no config to read that from, so its header's rate
+        // is only the core's until the first frames are decoded (see below).
+        let mut sample_rate = match (params.codec, params.extra_data.as_deref()) {
+            (CODEC_ID_AAC, Some(asc)) => aac_output_rate(asc)?,
+            _ => params.sample_rate,
+        }
+        .ok_or_else(|| format!("{} declares no sample rate", path.display()))?;
+        let mut channels = params.channels.as_ref().map(|c| c.count() as u16);
+        // A plain-LC config, or an ADTS stream with none, may still be HE-AAC by
+        // implicit signalling: its rate only doubles once a frame has carried an
+        // SBR payload, so the first frames are decoded to read the real rate.
+        if params.codec == CODEC_ID_AAC
+            && aac_may_be_implicit(params.extra_data.as_deref())?
+            && let Some(primed) = sym_aac_prime(path, track_id, params.extra_data.as_deref())?
+        {
+            sample_rate = primed.sample_rate;
+            channels = Some(primed.channels);
+        }
+        let channels = channels
             .ok_or_else(|| format!("{} declares no channel layout", path.display()))?;
-        let codec = symphonia::default::get_codecs()
-            .get_audio_decoder(params.codec)
-            .map_or("an unsupported format", |d| d.codec.info.short_name);
+        // Vorbis in Matroska states no length on the track and its blocks carry
+        // no granule: the last block's padding is what its muxer says to drop
+        // from the end ([`crate::demux::matroska_tail_padding_ns`]).
+        let tail_hold = match params.codec {
+            CODEC_ID_VORBIS => crate::demux::matroska_tail_padding_ns(path, u64::from(track_id))
+                .map_or(0, |ns| (ns as f64 * f64::from(sample_rate) / 1e9).round() as u64),
+            _ => 0,
+        };
+        let vorbis_starts = match params.codec {
+            CODEC_ID_VORBIS if crate::demux::is_matroska(path) => {
+                matroska_vorbis_starts(path, u64::from(track_id), &params)
+            }
+            _ => None,
+        };
+        let vorbis_file = match vorbis_starts {
+            Some(_) => Some(File::open(path)?),
+            None => None,
+        };
+        // AAC is decoded by `ec-aac`, which symphonia's registry does not list.
+        let codec = match params.codec {
+            CODEC_ID_AAC => "aac",
+            _ => symphonia::default::get_codecs()
+                .get_audio_decoder(params.codec)
+                .map_or("an unsupported format", |d| d.codec.info.short_name),
+        };
         // The one codec here that *does* owe a priming number: Opus states its
         // encoder delay in the stream itself (`OpusHead`'s pre-skip, 312 samples
         // on a film remux) and neither reader drops it, because symphonia trims
@@ -1699,6 +2269,10 @@ impl SymTrack {
             channels: channels.min(2),
             source_channels: channels,
             total_samples: num_frames.map(|n| n.saturating_sub(priming)),
+            tail_hold,
+            vorbis_starts,
+            vorbis_file,
+            vorbis_next: 0,
             priming,
             time_base,
             params,
@@ -1717,11 +2291,10 @@ impl SymTrack {
     /// packets we skipped, exactly as on the AAC path.
     ///
     /// Which decoder is not the caller's business, and it is not always
-    /// symphonia's: its AAC decoder refuses anything wider than stereo outright
-    /// (`aac/mod.rs:93`, "aac: aac too complex"), which is exactly the 5.1 and
-    /// 7.1 tracks of a film, so those go to `ec-aac` instead
-    /// ([`aac_decoder`]), and it has no Opus decoder at all, so that one goes to
-    /// `ec-opus` ([`SymDecoder::Opus`]).
+    /// symphonia's: it has no AAC decoder in this build at all (its HE-AAC
+    /// refusal, "aac: aac too complex", is why), so every AAC track goes to
+    /// `ec-aac` instead ([`aac_decoder`]), and it has no Opus decoder either, so
+    /// that one goes to `ec-opus` ([`SymDecoder::Opus`]).
     fn decoder(&self) -> crate::Result<SymDecoder> {
         let from = usize::from(self.source_channels);
         if self.params.codec == CODEC_ID_OPUS {
@@ -1729,11 +2302,15 @@ impl SymTrack {
                 opus_layout(self.params.extra_data.as_deref().unwrap_or_default(), from)?;
             // 48 kHz whatever the container says: that is the only rate Opus
             // decodes at, and the rate both readers declare for it.
-            let decoder = ec_opus::MultistreamDecoder::with_rate(48_000, streams, coupled, &mapping);
+            let decoder =
+                ec_opus::MultistreamDecoder::with_rate(48_000, streams, coupled, &mapping);
             return Ok(SymDecoder::Opus(Box::new(decoder), from));
         }
         if self.params.codec == CODEC_ID_AAC {
             return aac_decoder(&self.params, from);
+        }
+        if self.params.codec == CODEC_ID_VORBIS {
+            return vorbis_decoder(&self.params);
         }
         Ok(SymDecoder::Sym(
             symphonia::default::get_codecs()
@@ -1745,7 +2322,35 @@ impl SymTrack {
     /// `secs` on this source's audible timeline into media samples (priming
     /// included, so it compares directly against a decoded position).
     fn media(&self, secs: f64) -> u64 {
-        ((secs * f64::from(self.sample_rate)) as u64).saturating_add(self.priming)
+        ((secs * f64::from(self.sample_rate)).round() as u64).saturating_add(self.priming)
+    }
+
+    /// Where the packet stamped `ts` begins, exactly, for a track with an index
+    /// ([`VorbisStarts`]). `None` where there is none, or `ts` is not one of its
+    /// packets' stamps.
+    fn exact_start(&self, ts: units::Timestamp) -> Option<u64> {
+        let starts = self.vorbis_starts.as_deref()?;
+        Some(starts.packets[starts.at(ts.get())?].start)
+    }
+
+    /// The next packet of the track: from the index's file where the track has
+    /// one, stamped with its own stamp, and from the reader otherwise.
+    fn next_packet(&mut self) -> Result<Option<Packet>, String> {
+        let (Some(starts), Some(file)) = (self.vorbis_starts.as_deref(), self.vorbis_file.as_mut())
+        else {
+            return self.reader.next_packet().map_err(|e| e.to_string());
+        };
+        let Some(block) = starts.packets.get(self.vorbis_next) else {
+            return Ok(None);
+        };
+        self.vorbis_next += 1;
+        crate::demux::check_extent(file, block.at, block.len).map_err(|e| e.to_string())?;
+        let mut data = vec![0u8; block.len];
+        file.seek(SeekFrom::Start(block.at))
+            .and_then(|_| file.read_exact(&mut data))
+            .map_err(|e| format!("reading a Vorbis block: {e}"))?;
+        let stamp = units::Timestamp::new(block.stamp);
+        Ok(Some(Packet::new(self.track_id, stamp, units::Duration::ZERO, data)))
     }
 
     /// A packet timestamp in the track's time base, as a media position: the
@@ -1760,7 +2365,10 @@ impl SymTrack {
     /// with it, on the same sample.
     fn samples_at(&self, ts: symphonia_core::units::Timestamp) -> u64 {
         let secs = self.time_base.calc_time_saturating(ts).as_secs_f64();
-        ((secs.max(0.0) * f64::from(self.sample_rate)) as u64).saturating_sub(self.priming)
+        // Rounded, not truncated: a position is a whole sample, and the seconds
+        // it was converted through sit a sample low when truncated (11840 came
+        // back 11839), which the seek test's exact check caught.
+        ((secs.max(0.0) * f64::from(self.sample_rate)).round() as u64).saturating_sub(self.priming)
     }
 
     /// Puts the reader **at or before** `media_target`, [`SYM_PRE_ROLL`] ahead
@@ -1786,6 +2394,18 @@ impl SymTrack {
     /// cluster, 0.094 s, whatever it was asked for. Opening again costs 2 ms on
     /// a 5 GB film, which is what a seek is allowed to cost.
     fn seek_to(&mut self, media_target: u64) {
+        // With an index the packet is found by its sample, not by a seek of the
+        // container's: the decoder starts at the packet before the first one
+        // whose start is at or before the target, since a fresh decoder answers
+        // nothing for the packet it starts on and the next one is the first
+        // that answers. Nothing is read here; [`SymTrack::next_packet`] reads it.
+        if let Some(starts) = self.vorbis_starts.as_deref() {
+            let at_or_before = starts
+                .packets
+                .partition_point(|p| p.start <= media_target);
+            self.vorbis_next = at_or_before.saturating_sub(2);
+            return;
+        }
         let rate = f64::from(self.sample_rate.max(1));
         let mut back = SYM_PRE_ROLL;
         // Enough for any overshoot a cue table can hold: each attempt asks from
@@ -1832,7 +2452,16 @@ impl SymTrack {
 
 /// One symphonia reader over `path`, which is both how a track is opened and
 /// how it is seeked ([`SymTrack::seek_to`]).
+///
+/// A raw ADTS stream is read by [`crate::adts`] rather than probed: symphonia's
+/// own ADTS reader lives behind the `aac` feature this project does not link,
+/// and an ADTS sync word is the one thing it would have answered to anyway.
 fn sym_reader(path: &Path) -> crate::Result<Box<dyn FormatReader>> {
+    let mut head = [0u8; 2];
+    if File::open(path)?.read(&mut head)? == 2 && ec_aac::is_adts(&head) {
+        let mss = MediaSourceStream::new(Box::new(File::open(path)?), Default::default());
+        return Ok(Box::new(crate::adts::AdtsReader::try_new(mss)?));
+    }
     let mss = MediaSourceStream::new(Box::new(File::open(path)?), Default::default());
     // The extension is a hint, not a decision: the probe reads the magic and
     // is free to disagree, which is what makes a mislabelled file work.
@@ -1854,13 +2483,20 @@ fn sym_reader(path: &Path) -> crate::Result<Box<dyn FormatReader>> {
 /// [`downmix`] folds from; 1 and 2 fold to nothing.
 enum SymDecoder {
     Sym(Box<dyn AudioDecoder>, usize),
-    /// Boxed because the decoder carries its own IMDCT tables and this enum is
+    /// Every AAC track, mono to 7.1 and LC or HE-AAC: `ec-aac` takes the config
+    /// the track carries, or the first ADTS frame's when it carries none. Boxed
+    /// because the decoder carries its own IMDCT and SBR tables and this enum is
     /// moved into the worker.
     Aac(Box<ec_aac::AacDecoder>, usize),
     /// Every Opus track, mono to 7.1: one multistream decoder -- the streams of
     /// a packet, the channel mapping table and the routing between them are all
     /// its business -- and the same width.
     Opus(Box<ec_opus::MultistreamDecoder>, usize),
+    /// Every Vorbis track, Ogg or Matroska, mono to 7.1: `ec-vorbis` decodes
+    /// the blocks, in the stream's channel order, and the second field is the
+    /// width. The third maps each of those channels to the family's order
+    /// ([`ec_vorbis::channel_map`]).
+    Vorbis(Box<ec_vorbis::VorbisDecoder>, usize, Vec<usize>),
 }
 
 impl SymDecoder {
@@ -1874,7 +2510,26 @@ impl SymDecoder {
                 let pcm = decoder
                     .decode(&packet.data, None)
                     .map_err(|e| format!("AAC decode failed: {e}"))?;
+                // `pcm.sample_rate` is what this block is at; the track was
+                // opened at the same rate ([`aac_output_rate`]), so the timeline
+                // and the samples agree. The frame count comes from the block
+                // itself, not from a fixed packet size, because HE-AAC carries
+                // twice the frames of its core.
                 *out = pcm.samples;
+                downmix(out, *from);
+            }
+            Self::Vorbis(decoder, from, to_ec) => {
+                let blocks = decoder
+                    .decode_audio(&packet.data)
+                    .map_err(|e| format!("Vorbis decode failed: {e}"))?;
+                let mut planes = vec![Vec::new(); blocks.len()];
+                for (channel, plane) in blocks.into_iter().enumerate() {
+                    if let Some(&slot) = to_ec.get(channel) {
+                        planes[slot] = plane;
+                    }
+                }
+                interleave_planes(&planes, out);
+                vorbis_packet_window(out, planes.len(), packet);
                 downmix(out, *from);
             }
             Self::Opus(decoder, from) => {
@@ -1892,25 +2547,358 @@ impl SymDecoder {
     }
 }
 
-/// The decoder an AAC track of `from` channels needs: symphonia's own refuses
-/// anything wider than stereo outright (`aac/mod.rs:93`, "aac: aac too
-/// complex"), which is exactly the 5.1 and 7.1 tracks of a film, so those go to
-/// `ec-aac` instead -- the same routing [`SymTrack::decoder`] does for a
-/// Matroska file, asked once here so an mp4's multichannel track takes it too.
-fn aac_decoder(params: &AudioCodecParameters, from: usize) -> crate::Result<SymDecoder> {
-    if from > 2 {
-        let asc = params
-            .extra_data
-            .as_deref()
-            .ok_or("a multichannel AAC track with no AudioSpecificConfig")?;
-        let decoder = ec_aac::AacDecoder::with_config_bytes(asc)
-            .map_err(|e| format!("multichannel AAC decoder init failed: {e}"))?;
-        return Ok(SymDecoder::Aac(Box::new(decoder), from));
+/// The decoder for a Vorbis track: `ec-vorbis`, from the identification and
+/// setup headers symphonia states in the track's extra data (the same layout
+/// in Ogg and in Matroska).
+fn vorbis_decoder(params: &AudioCodecParameters) -> crate::Result<SymDecoder> {
+    let decoder = vorbis_headers(params)?;
+    let channels = usize::from(decoder.identification().channels);
+    let (_, to_ec) = ec_vorbis::channel_map(channels);
+    Ok(SymDecoder::Vorbis(Box::new(decoder), channels, to_ec))
+}
+
+/// `ec-vorbis` built from a Vorbis track's headers, without a decoding state.
+fn vorbis_headers(params: &AudioCodecParameters) -> crate::Result<ec_vorbis::VorbisDecoder> {
+    let extra = params
+        .extra_data
+        .as_deref()
+        .ok_or("a Vorbis track carries no headers")?;
+    // symphonia states the identification header (30 bytes, fixed by Vorbis I)
+    // and then the setup header; `ec-vorbis` wants all three, so the comment
+    // header is written here as an empty one.
+    let (ident, setup) = extra
+        .split_at_checked(VORBIS_IDENT_LEN)
+        .ok_or("a Vorbis track's identification header is short")?;
+    ec_vorbis::VorbisDecoder::new(&[ident, VORBIS_EMPTY_COMMENTS, setup])
+        .map_err(|e| format!("Vorbis headers: {e}").into())
+}
+
+/// The starts of a Matroska Vorbis track's packets, in samples from its first.
+///
+/// Packet `n` answers the quarter of block `n-1` plus the quarter of block `n`
+/// samples (`ec-vorbis` `packet_blocksize`), and the first packet answers none,
+/// so the count of every packet before it is its exact position. The timestamp
+/// alone cannot give that, since it is rounded to milliseconds, so the blocks
+/// are counted: one byte each (their mode), in the cached block list of
+/// [`crate::demux::matroska_track_blocks`]. The walk costs one read per block, and
+/// it is kept per file, so a seek pays it once.
+type VorbisStartsRef = Arc<VorbisStarts>;
+
+/// The packets of one Matroska Vorbis track, in storage order.
+struct VorbisStarts {
+    packets: Vec<VorbisPacket>,
+}
+
+struct VorbisPacket {
+    /// The block's own timestamp in the file, in `TimestampScale` ticks.
+    stamp: i64,
+    /// Where the packet's samples begin, in the track's own count from its start.
+    start: u64,
+    /// Where the block's bytes are, and how many.
+    at: u64,
+    len: usize,
+}
+
+impl VorbisStarts {
+    /// The index of the packet stamped `stamp`.
+    fn at(&self, stamp: i64) -> Option<usize> {
+        self.packets.binary_search_by_key(&stamp, |p| p.stamp).ok()
     }
-    Ok(SymDecoder::Sym(
-        Box::new(AacDecoder::try_new(params, &AudioDecoderOptions::default())?),
-        from,
-    ))
+}
+
+type StartsKey = (PathBuf, u64, u64, Option<std::time::SystemTime>);
+
+/// The most files whose packet index is kept; a seek reuses one of them.
+const VORBIS_STARTS_KEPT: usize = 8;
+
+static VORBIS_STARTS: Mutex<Vec<(StartsKey, VorbisStartsRef)>> = Mutex::new(Vec::new());
+
+fn matroska_vorbis_starts(
+    path: &Path,
+    number: u64,
+    params: &AudioCodecParameters,
+) -> Option<VorbisStartsRef> {
+    let meta = std::fs::metadata(path).ok()?;
+    let key: StartsKey = (path.to_path_buf(), number, meta.len(), meta.modified().ok());
+    if let Ok(kept) = VORBIS_STARTS.lock()
+        && let Some((_, hit)) = kept.iter().find(|(k, _)| *k == key)
+    {
+        return Some(Arc::clone(hit));
+    }
+    let starts = Arc::new(vorbis_starts_walk(path, number, params)?);
+    if let Ok(mut kept) = VORBIS_STARTS.lock() {
+        if kept.len() >= VORBIS_STARTS_KEPT {
+            kept.remove(0);
+        }
+        kept.push((key, Arc::clone(&starts)));
+    }
+    Some(starts)
+}
+
+fn vorbis_starts_walk(
+    path: &Path,
+    number: u64,
+    params: &AudioCodecParameters,
+) -> Option<VorbisStarts> {
+    let blocks = crate::demux::matroska_track_blocks(path, number)?;
+    // The search by stamp needs them in order, which Matroska requires of a track.
+    if blocks.windows(2).any(|w| w[0].0 >= w[1].0) {
+        return None;
+    }
+    let headers = vorbis_headers(params).ok()?;
+    let mut file = File::open(path).ok()?;
+    let mut packets = Vec::with_capacity(blocks.len());
+    let (mut samples, mut previous) = (0u64, None::<usize>);
+    for (stamp, at, len) in blocks {
+        packets.push(VorbisPacket {
+            stamp,
+            start: samples,
+            at,
+            len,
+        });
+        // The mode is in a packet's first byte, so the first bytes are all that is read.
+        let mut head = [0u8; 8];
+        let n = len.min(head.len());
+        file.seek(SeekFrom::Start(at)).ok()?;
+        file.read_exact(&mut head[..n]).ok()?;
+        let size = headers.packet_blocksize(&head[..n]).ok()?;
+        if let Some(previous) = previous {
+            samples += (previous / 4 + size / 4) as u64;
+        }
+        previous = Some(size);
+    }
+    Some(VorbisStarts { packets })
+}
+
+/// The fixed length of a Vorbis identification header (Vorbis I, A.2).
+const VORBIS_IDENT_LEN: usize = 30;
+
+/// A Vorbis comment header with an empty vendor string and no comments, framed:
+/// what `ec-vorbis` needs where symphonia's extra data carries none.
+const VORBIS_EMPTY_COMMENTS: &[u8] = b"\x03vorbis\x00\x00\x00\x00\x00\x00\x00\x00\x01";
+
+/// Interleaves per-channel planes, in the order they are given.
+fn interleave_planes(planes: &[Vec<f32>], out: &mut Vec<f32>) {
+    let frames = planes.first().map_or(0, Vec::len);
+    out.clear();
+    out.reserve(frames * planes.len());
+    for frame in 0..frames {
+        for plane in planes {
+            out.push(plane.get(frame).copied().unwrap_or(0.0));
+        }
+    }
+}
+
+/// Cuts one Vorbis packet's decoded block down to the samples symphonia says
+/// the packet owns: `dur` after its trims, from `trim_start`. Symphonia takes
+/// both from the page granules (the stream's last block overhangs its end and
+/// the first block has nothing before it), so the cut is the container's own.
+/// A packet stating no duration keeps all of its block.
+fn vorbis_packet_window(out: &mut Vec<f32>, channels: usize, packet: &Packet) {
+    let channels = channels.max(1);
+    let frames = out.len() / channels;
+    let start = usize::try_from(packet.trim_start.get())
+        .unwrap_or(usize::MAX)
+        .min(frames);
+    let end = match packet.dur.get() {
+        0 => frames,
+        dur => usize::try_from(dur).unwrap_or(usize::MAX).saturating_add(start).min(frames),
+    };
+    out.truncate(end * channels);
+    out.drain(..start * channels);
+}
+
+/// Samples per channel of a full HE-AAC frame: the SBR output of a 1024-sample
+/// core. A frame whose header is missing comes out as the core alone, half this.
+const SBR_FULL_FRAME: usize = 2048;
+
+/// The packet an SBR track's decoder starts on: the nearest one at or before
+/// `from` whose own frame decodes with its SBR header, so every frame after it
+/// is reconstructed. Headers come back every few packets (every 10 in libfdk's
+/// streams), not on each one; a fresh decoder on a headerless frame gives its
+/// core alone, which is how a frame without its header is told apart. Packet 1
+/// always carries one.
+fn sbr_start_packet(track: &mut AacTrack, from: u32) -> u32 {
+    let mut id = from.max(1);
+    while id > 1 {
+        if sbr_packet_has_header(track, id) {
+            return id;
+        }
+        id -= 1;
+    }
+    1
+}
+
+/// Whether packet `id`, decoded on its own by a fresh decoder, comes out as a
+/// full SBR frame. A failed read or decode counts as no.
+fn sbr_packet_has_header(track: &mut AacTrack, id: u32) -> bool {
+    let Ok(Some(sample)) = mp4track::sample(&mut track.reader, track.stream, id) else {
+        return false;
+    };
+    let Ok(mut decoder) = aac_decoder(&track.params, track.source_channels()) else {
+        return false;
+    };
+    let packet = Packet::new(
+        track.track_id,
+        units::Timestamp::new(sample.dts.unwrap_or(0)),
+        units::Duration::new(u64::from(sample.duration.unwrap_or(0).max(0) as u32)),
+        &sample.data[..],
+    );
+    let mut out = Vec::new();
+    if decoder.decode(&packet, &mut out).is_err() {
+        return false;
+    }
+    out.len() >= SBR_FULL_FRAME * track.source_channels()
+}
+
+/// Where packet `id` starts on the track's timeline, from its time-to-sample
+/// entries (`(count, delta)` runs, as [`packet_at`] reads them).
+fn packet_start_ts(stts: &[(u32, u32)], id: u32) -> u64 {
+    let mut first = 1u32;
+    let mut ts = 0u64;
+    for &(count, delta) in stts {
+        if id < first + count {
+            return ts + u64::from(id - first) * u64::from(delta);
+        }
+        first += count;
+        ts += u64::from(count) * u64::from(delta);
+    }
+    ts
+}
+
+/// The decoder for an AAC track of `from` channels: `ec-aac`, whatever the
+/// width and whether or not the stream is HE-AAC. symphonia's own refused SBR
+/// outright ("aac: aac too complex", `aac/mod.rs:91-96`), so it is not asked.
+///
+/// The config is the track's AudioSpecificConfig when it has one (mp4 `esds`,
+/// Matroska `CodecPrivate`), which is what arms SBR. An ADTS stream has none,
+/// and `ec-aac` takes its parameters from the first frame it reads.
+fn aac_decoder(params: &AudioCodecParameters, from: usize) -> crate::Result<SymDecoder> {
+    let decoder = match params.extra_data.as_deref() {
+        Some(asc) => ec_aac::AacDecoder::with_config_bytes(asc)
+            .map_err(|e| format!("AAC decoder init failed: {e}"))?,
+        None => ec_aac::AacDecoder::new(),
+    };
+    Ok(SymDecoder::Aac(Box::new(decoder), from))
+}
+
+/// The rate an AudioSpecificConfig decodes at: the extension rate for HE-AAC
+/// (SBR reconstructed), the core rate otherwise. `Err` for a config `ec-aac`
+/// cannot parse, which is a track that will not decode either.
+fn aac_output_rate(asc: &[u8]) -> crate::Result<Option<u32>> {
+    let decoder = ec_aac::AacDecoder::with_config_bytes(asc)
+        .map_err(|e| format!("AAC config does not parse: {e}"))?;
+    Ok(decoder.output_sample_rate())
+}
+
+/// How many access units the implicit-SBR probe decodes. An SBR payload shows
+/// in the first frame that carries one, and every SBR frame carries one, so two
+/// frames are enough and bound the cost of opening a track.
+const AAC_PRIME_UNITS: usize = 2;
+
+/// Whether an AAC track's rate can still change under implicit SBR: no config
+/// (ADTS), or a plain AAC-LC one. An explicit SBR config states its rate, and a
+/// PS one states its stereo output and rate, so neither is decoded to find out.
+fn aac_may_be_implicit(asc: Option<&[u8]>) -> crate::Result<bool> {
+    let Some(asc) = asc else {
+        return Ok(true);
+    };
+    let decoder = ec_aac::AacDecoder::with_config_bytes(asc)
+        .map_err(|e| format!("AAC config does not parse: {e}"))?;
+    Ok(decoder.sbr_support() == ec_aac::SbrSupport::NotSignalled)
+}
+
+/// What an AAC track decodes at, as a throwaway decoder finds it after its first
+/// access units.
+struct AacPrimed {
+    sample_rate: u32,
+    channels: u16,
+    /// Whether an implicit SBR payload switched the rate on.
+    implicit: bool,
+}
+
+/// Decodes up to [`AAC_PRIME_UNITS`] of `units` through a fresh decoder, built
+/// from `asc` or else from the first ADTS header, and reads back the rate it
+/// now decodes at. `None` when no unit decodes: the caller keeps the rate its
+/// container states, and the decode error surfaces on playback as it always has.
+fn aac_prime(asc: Option<&[u8]>, units: &[&[u8]]) -> crate::Result<Option<AacPrimed>> {
+    let mut decoder = match asc {
+        Some(asc) => ec_aac::AacDecoder::with_config_bytes(asc)
+            .map_err(|e| format!("AAC config does not parse: {e}"))?,
+        None => ec_aac::AacDecoder::new(),
+    };
+    let mut channels = None;
+    for unit in units.iter().take(AAC_PRIME_UNITS) {
+        let Ok(pcm) = decoder.decode(unit, None) else {
+            break;
+        };
+        channels = Some(pcm.channels);
+        if decoder.sbr_implicit() {
+            break;
+        }
+    }
+    let (Some(channels), Some(sample_rate)) = (channels, decoder.output_sample_rate()) else {
+        return Ok(None);
+    };
+    Ok(Some(AacPrimed {
+        sample_rate,
+        channels,
+        implicit: decoder.sbr_implicit(),
+    }))
+}
+
+/// The first `count` packets of track `track_id` (for Matroska, its `TrackNumber`),
+/// read through a fresh reader. Empty where the file cannot be read or has none,
+/// and then the caller keeps what the header states.
+pub(crate) fn first_packets(path: &Path, track_id: u32, count: usize) -> Vec<Vec<u8>> {
+    let Ok(mut reader) = sym_reader(path) else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(count);
+    while out.len() < count {
+        match reader.next_packet() {
+            Ok(Some(packet)) if packet.track_id == track_id => out.push(packet.data.to_vec()),
+            Ok(Some(_)) => {}
+            _ => break,
+        }
+    }
+    out
+}
+
+/// [`aac_prime`] over the first packets of `track_id`, read through a fresh
+/// reader on `path`. A raw ADTS frame carries its own header, so it is decoded
+/// as it stands.
+fn sym_aac_prime(
+    path: &Path,
+    track_id: u32,
+    asc: Option<&[u8]>,
+) -> crate::Result<Option<AacPrimed>> {
+    let mut reader = sym_reader(path)?;
+    let mut units: Vec<Box<[u8]>> = Vec::with_capacity(AAC_PRIME_UNITS);
+    while units.len() < AAC_PRIME_UNITS {
+        match reader.next_packet()? {
+            Some(packet) if packet.track_id == track_id => units.push(packet.data),
+            Some(_) => {}
+            None => break,
+        }
+    }
+    let refs: Vec<&[u8]> = units.iter().map(|u| &u[..]).collect();
+    aac_prime(asc, &refs)
+}
+
+/// [`aac_prime`] over the first samples of an mp4 track, read through a fresh
+/// reader on `path`: the track's own reader is borrowed by the track it opens.
+fn mp4_aac_prime(path: &Path, stream: u32, asc: &[u8]) -> crate::Result<Option<AacPrimed>> {
+    let mut reader = mp4track::open(path)?;
+    let mut units: Vec<Vec<u8>> = Vec::with_capacity(AAC_PRIME_UNITS);
+    for id in 1..=AAC_PRIME_UNITS as u32 {
+        match mp4track::sample(&mut reader, stream, id) {
+            Ok(Some(sample)) => units.push(sample.data.to_vec()),
+            _ => break,
+        }
+    }
+    let refs: Vec<&[u8]> = units.iter().map(Vec::as_slice).collect();
+    aac_prime(Some(asc), &refs)
 }
 
 /// The encoder delay of an Opus track, in samples at 48 kHz: bytes 10 and 11 of
@@ -1918,9 +2906,21 @@ fn aac_decoder(params: &AudioCodecParameters, from: usize) -> crate::Result<SymD
 /// short to hold one -- there is nothing to subtract that we can trust.
 fn opus_pre_skip(head: &[u8]) -> u64 {
     match head {
-        [b'O', b'p', b'u', b's', b'H', b'e', b'a', b'd', _, _, lo, hi, ..] => {
-            u64::from(u16::from_le_bytes([*lo, *hi]))
-        }
+        [
+            b'O',
+            b'p',
+            b'u',
+            b's',
+            b'H',
+            b'e',
+            b'a',
+            b'd',
+            _,
+            _,
+            lo,
+            hi,
+            ..,
+        ] => u64::from(u16::from_le_bytes([*lo, *hi])),
         _ => 0,
     }
 }
@@ -1969,7 +2969,10 @@ fn opus_layout(head: &[u8], channels: usize) -> crate::Result<(usize, usize, Vec
     if streams < 1 || coupled > streams || decoded > 255 {
         return Err(format!("an Opus track of {streams} streams, {coupled} coupled").into());
     }
-    if !mapping.iter().all(|&m| m == 255 || usize::from(m) < decoded) {
+    if !mapping
+        .iter()
+        .all(|&m| m == 255 || usize::from(m) < decoded)
+    {
         return Err(format!("an Opus channel mapping outside its {decoded} streams").into());
     }
     Ok((streams, coupled, mapping))
@@ -2074,9 +3077,25 @@ fn downmix(samples: &mut Vec<f32>, from: usize) {
 /// handed back (already folded to 1 or 2 by [`downmix`] at its own door) and
 /// `to` is the timeline's own width ([`mix`]'s `channels`); anything that is
 /// not exactly the mono-into-wider case is left untouched -- a source already
-/// at `to`, and a source wider than `to`, which stays [`downmix`]'s refusal
-/// (DEBT #46: only 1-ch -> N-ch became legal, not the reverse).
+/// at `to`, and a source wider than `to` other than a stereo pair onto a mono
+/// timeline. That one is the remix the other way: each frame's two channels
+/// are averaged into the timeline's single one (half of each, so full scale
+/// in is full scale out), the same fold ffmpeg's `-ac 1` makes. Without it a
+/// stereo file joining a mono timeline would hand the mixer twice the samples
+/// it expects and play at double speed.
 fn widen(samples: &mut Vec<f32>, from: usize, to: usize) {
+    if from == 2 && to == 1 {
+        let mut out = Vec::with_capacity(samples.len() / 2);
+        out.extend(
+            samples
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|f| (f[0] + f[1]) * 0.5),
+        );
+        *samples = out;
+        return;
+    }
     if from != 1 || to <= 1 {
         return;
     }
@@ -2101,8 +3120,8 @@ fn widen(samples: &mut Vec<f32>, from: usize, to: usize) {
 /// 3/2 puts its centre and surrounds where the matrix says — so no width is
 /// refused or mislabelled.
 struct Ac3Track {
-    reader: Mp4Reader<BufReader<File>>,
-    track_id: u32,
+    reader: mp4track::Reader,
+    stream: u32,
     sample_count: u32,
     sample_rate: u32,
     channels: u16,
@@ -2127,36 +3146,33 @@ impl Ac3Track {
     /// hand ([`crate::demux::sample_entry`]); the rate and the channel count
     /// come out of the first syncframe, which is where AC-3 states them.
     fn open(path: &Path, stream: usize) -> crate::Result<Option<Self>> {
-        let file = File::open(path)?;
-        let size = file.metadata()?.len();
-        let mut reader = Mp4Reader::read_header(BufReader::new(file), size)?;
-        let ids = audio_track_ids(&reader);
-        let Some(&track_id) = ids.get(stream) else {
+        let mut reader = mp4track::open(path)?;
+        let Some(&(track_id, stream_id)) = mp4track::audio_tracks(&reader).get(stream) else {
             return Ok(None);
         };
-        if !matches!(crate::demux::sample_entry(path, track_id), Ok((kind, _)) if &kind == b"ac-3")
-        {
+        let Some(stream_id) = stream_id else {
+            return Ok(None);
+        };
+        if &mp4track::sample_entry(&reader, track_id) != b"ac-3" {
             return Ok(None);
         }
-        let track = &reader.tracks()[&track_id];
-        let timescale = track.timescale();
-        let duration = track.trak.mdia.mdhd.duration;
-        let edit = edit_media_time(track);
-        let stts: Vec<(u32, u32)> = stts_pairs(track).collect();
-        let sample_count = reader.sample_count(track_id)?;
+        let timescale = mp4track::timescale(&reader, stream_id);
+        let duration = mp4track::duration(&reader, stream_id).unwrap_or(0);
+        let edit = mp4track::media_time(&reader, track_id);
+        let stts = mp4track::stts(&reader, stream_id);
+        let sample_count = mp4track::sample_count(&reader, stream_id);
 
-        let first = reader
-            .read_sample(track_id, 1)?
+        let first = mp4track::sample(&mut reader, stream_id, 1)?
             .ok_or("the AC-3 track has no samples")?;
-        let sample_rate = ec_ac3::syncinfo::parse(&first.bytes)
+        let sample_rate = ec_ac3::syncinfo::parse(&first.data)
             .map_err(|e| format!("not a readable AC-3 syncframe: {e:?}"))?
             .sample_rate;
-        let nfchans = ec_ac3::bsi::parse(first.bytes.get(5..).unwrap_or_default())
+        let nfchans = ec_ac3::bsi::parse(first.data.get(5..).unwrap_or_default())
             .map_err(|e| format!("not a readable AC-3 bit stream information: {e:?}"))?
             .nfchans;
         let requested = (nfchans > 1).then_some(2);
         let mut decoder = ac3_decoder(requested)?;
-        let channels = decode_ac3(&mut decoder, &first.bytes)?
+        let channels = decode_ac3(&mut decoder, &first.data)?
             .map(|(pcm, samples)| (pcm.len() as u64 / samples.max(1)) as u16)
             .filter(|&c| c > 0)
             .ok_or("the first AC-3 syncframe decoded to nothing")?;
@@ -2167,7 +3183,7 @@ impl Ac3Track {
             .and_then(|t| scale(t, sample_rate, timescale))
             .unwrap_or(0);
         Ok(Some(Self {
-            track_id,
+            stream: stream_id,
             sample_count,
             sample_rate,
             channels,
@@ -2183,7 +3199,7 @@ impl Ac3Track {
 
     /// `secs` on this source's audible timeline into media samples.
     fn media(&self, secs: f64) -> u64 {
-        ((secs * f64::from(self.sample_rate)) as u64).saturating_add(self.priming)
+        ((secs * f64::from(self.sample_rate)).round() as u64).saturating_add(self.priming)
     }
 
     /// One `[start, end)` window, resolved to syncframes and media samples —
@@ -2247,6 +3263,10 @@ impl MkvAc3Track {
         let Some(mut mkv) = mkv else {
             return Ok(None);
         };
+        // A TrueHD or MLP track has blocks too, and its own decoder ([`MkvTruehdTrack`]).
+        if !matches!(mkv.codec, "ac3" | "eac3") {
+            return Ok(None);
+        }
         let first = mkv
             .frame(0)?
             .ok_or("the AC-3 track of this Matroska file has no blocks")?;
@@ -2291,7 +3311,7 @@ impl MkvAc3Track {
     /// `secs` on this source's timeline into media samples. No priming: the
     /// container carries no edit list and AC-3 no encoder delay.
     fn media(&self, secs: f64) -> u64 {
-        (secs.max(0.0) * f64::from(self.sample_rate)) as u64
+        (secs.max(0.0) * f64::from(self.sample_rate)).round() as u64
     }
 
     /// One `[start, end)` window, resolved to blocks and media samples —
@@ -2346,8 +3366,10 @@ fn decode_ac3(
     match decoder.decode_frame(bytes) {
         Ok(frame) => Ok(Some((
             frame.data[0]
-                .chunks_exact(4)
-                .map(|s| f32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|s| f32::from_le_bytes(*s))
                 .collect(),
             frame.samples as u64,
         ))),
@@ -2361,7 +3383,8 @@ fn decode_ac3(
 /// otherwise keep a borrow alive on the reader the worker needs mutably — a real
 /// AAC track has one entry, so it is two `u32`s.
 struct AacTrack {
-    reader: Mp4Reader<BufReader<File>>,
+    reader: mp4track::Reader,
+    stream: u32,
     track_id: u32,
     sample_count: u32,
     sample_rate: u32,
@@ -2370,9 +3393,15 @@ struct AacTrack {
     priming: u64,
     total_samples: Option<u64>,
     stts: Vec<(u32, u32)>,
-    config: ChannelConfig,
+    /// Channels the decoder emits, from the config: 1 for mono.
+    layout_channels: usize,
     freq_index: u8,
     chan_conf: u8,
+    /// HE-AAC: the stream carries SBR, so [`sample_rate`](Self::sample_rate) is
+    /// the extension rate and a packet holds twice the core's frames. Such a
+    /// track decodes but cannot be packet-copied, because the copy writes an
+    /// AAC-LC config back out from `freq_index`/`chan_conf`.
+    sbr: bool,
     /// A fresh decoder is built from these per segment: seeking mid-stream
     /// leaves MDCT and PNS state that belongs to the packets we skipped.
     params: AudioCodecParameters,
@@ -2389,59 +3418,99 @@ impl AacTrack {
     /// promise instead, so out of range or not AAC there is an `Err` rather than
     /// silence the caller did not ask for.
     fn open(path: &Path, stream: usize) -> crate::Result<Option<Self>> {
-        let file = File::open(path)?;
-        let size = file.metadata()?.len();
-        let reader = Mp4Reader::read_header(BufReader::new(file), size)?;
-
-        let ids = audio_track_ids(&reader);
-        let Some(track) = ids.get(stream).map(|id| &reader.tracks()[id]) else {
+        let reader = mp4track::open(path)?;
+        let audio = mp4track::audio_tracks(&reader);
+        let Some(&(track_id, codec_stream)) = audio.get(stream) else {
             return match stream {
                 0 => Ok(None),
                 n => Err(format!(
                     "{}: audio stream {n} of {} streams",
                     path.display(),
-                    ids.len()
+                    audio.len()
                 )
                 .into()),
             };
         };
-        if !matches!(track.media_type(), Ok(MediaType::AAC)) {
-            return match stream {
-                0 => Ok(None),
-                n => Err(format!("{}: audio stream {n} is not AAC", path.display()).into()),
-            };
-        }
-        // Refuse early with a message instead of failing packet by packet — and
-        // a copy carries no profile of its own: the writer rebuilds the
-        // AudioSpecificConfig from `freq_index`/`chan_conf` and calls it LC, so a
-        // non-LC source would be mislabelled rather than merely unplayable.
-        match track.audio_profile()? {
-            AudioObjectType::AacLowComplexity => {}
-            other => return Err(format!("unsupported AAC profile: {other:?} (only AAC-LC)").into()),
-        }
+        let stream_id = match codec_stream {
+            Some(s) if mp4track::codec(&reader, s) == Some(CodecId::Aac) => s,
+            _ => {
+                return match stream {
+                    0 => Ok(None),
+                    n => Err(format!("{}: audio stream {n} is not AAC", path.display()).into()),
+                };
+            }
+        };
+        // The config as the file states it, extension frequency and all: the
+        // decoder needs the SBR part, which a bare rate and channel count do not
+        // carry.
+        let asc: Box<[u8]> = mp4track::extradata(&reader, stream_id)
+            .ok_or_else(|| format!("{}: AAC track has no config", path.display()))?;
+        // Refuse early with a message instead of failing packet by packet. LC,
+        // HE-AAC v1 (SBR) and HE-AAC v2 (SBR with PS) all decode through `ec-aac`.
+        let (mut sbr, ps) = match asc_fields(&asc)?.0 {
+            AAC_LC => (false, false),
+            AAC_SBR => (true, false),
+            AAC_PS => (true, true),
+            other => {
+                return Err(format!(
+                    "unsupported AAC profile: audio object type {other} (only AAC-LC, HE-AAC v1 and v2)"
+                )
+                .into());
+            }
+        };
 
-        let track_id = track.track_id();
-        let sample_rate = track.sample_freq_index()?.freq();
-        let timescale = track.timescale();
-        let priming = priming_samples(track, sample_rate);
-        let (_, freq_index, chan_conf) = asc_fields(track)?;
+        let mut layout_channels = mp4track::channels(&reader, stream_id);
+        if layout_channels == 0 {
+            return Err(format!("{}: AAC config declares no channels", path.display()).into());
+        }
+        // The rate `ec-aac` decodes at, which for HE-AAC is the extension rate:
+        // the container's own rate is the core's, and a timeline counted in it
+        // would run at half speed against the decoded samples.
+        let mut sample_rate = aac_output_rate(&asc)?
+            .ok_or_else(|| format!("{}: AAC config declares no sample rate", path.display()))?;
+        // Plain LC may carry SBR by implicit signalling: the rate is the decoded
+        // one, read off the first access units, as for an ADTS or mkv stream.
+        if aac_may_be_implicit(Some(&asc[..]))?
+            && let Some(primed) = mp4_aac_prime(path, stream_id, &asc)?
+        {
+            sample_rate = primed.sample_rate;
+            sbr |= primed.implicit;
+            // The decoder's own width: an implicit PS payload makes a mono core
+            // stereo, and the container's channel count does not say so.
+            layout_channels = usize::from(primed.channels);
+        }
+        // Explicit HE-AAC v2 is stereo whatever the core's channel count.
+        if ps {
+            layout_channels = 2;
+        }
+        let timescale = mp4track::timescale(&reader, stream_id);
+        let priming = priming_samples(
+            mp4track::media_time(&reader, track_id),
+            sample_rate,
+            timescale,
+        );
+        let (_, freq_index, chan_conf) = asc_fields(&asc)?;
+        let duration = mp4track::duration(&reader, stream_id);
         let mut params = AudioCodecParameters::new();
         params
             .for_codec(CODEC_ID_AAC)
             .with_sample_rate(sample_rate)
-            .with_extra_data(audio_specific_config(track)?);
+            .with_extra_data(asc);
         let this = Self {
+            sample_count: mp4track::sample_count(&reader, stream_id),
+            stts: mp4track::stts(&reader, stream_id),
+            total_samples: duration
+                .and_then(|d| scale(d, sample_rate, timescale))
+                .map(|d| d.saturating_sub(priming)),
+            stream: stream_id,
             track_id,
-            sample_count: reader.sample_count(track_id)?,
             sample_rate,
             timescale,
             priming,
-            total_samples: scale(track.trak.mdia.mdhd.duration, sample_rate, timescale)
-                .map(|d| d.saturating_sub(priming)),
-            stts: stts_pairs(track).collect(),
-            config: track.channel_config()?,
+            layout_channels,
             freq_index,
             chan_conf,
+            sbr,
             params,
             reader,
         };
@@ -2451,15 +3520,15 @@ impl AacTrack {
     /// What reaches the timeline: mono, or the stereo everything wider is folded
     /// to by [`downmix`] at the decoder's door.
     fn channels(&self) -> u16 {
-        match self.config {
-            ChannelConfig::Mono => 1,
+        match self.source_channels() {
+            1 => 1,
             _ => 2,
         }
     }
 
     /// What the decoder emits, which is what the fold reads.
     fn source_channels(&self) -> usize {
-        usize::from(channel_count(self.config).max(1))
+        self.layout_channels.max(1)
     }
 
     fn track_params(&self) -> AacTrackParams {
@@ -2474,7 +3543,7 @@ impl AacTrack {
     /// included, so it compares directly against a decoded position).
     /// `f64::INFINITY` saturates.
     fn media(&self, secs: f64) -> u64 {
-        ((secs * f64::from(self.sample_rate)) as u64).saturating_add(self.priming)
+        ((secs * f64::from(self.sample_rate)).round() as u64).saturating_add(self.priming)
     }
 
     /// One `[start, end)` window of this source's seconds, resolved to its own
@@ -2484,7 +3553,8 @@ impl AacTrack {
         let target_ts = unscale(media_target, self.sample_rate, self.timescale);
         // Two packets of pre-roll: AAC-LC's MDCT overlap-add needs the previous
         // packet to cancel aliasing, plus one more to warm the decoder up. Their
-        // output is discarded below, so this only costs decode time.
+        // output is discarded below, so this only costs decode time. An SBR track
+        // is walked back further when it is decoded ([`sbr_start_packet`]).
         let (start_id, start_ts) = packet_at(self.stts.iter().copied(), target_ts, PRE_ROLL);
         Segment {
             source: Some(source),
@@ -2495,6 +3565,20 @@ impl AacTrack {
             media_end: self.media(end_secs).max(media_target),
         }
     }
+}
+
+/// [`packet_run`] for the last segment of a copy. Rounded to nearest, the debt
+/// that run leaves is never paid: `test_sync.mp4`'s 4.0 s is 172.27 packets, so
+/// 172 were copied and the sound stopped 6 ms short of its picture. Nothing
+/// follows the last segment to take the shortfall, so this rounds up instead --
+/// at most one packet, under a frame, past the picture.
+fn packet_run_last(err: &mut i64, ideal: i64, available: u32) -> u32 {
+    let packet = i64::from(SAMPLES_PER_PACKET);
+    let ideal = ideal.min(i64::from(available) * packet);
+    let want = (ideal - *err) as f64 / packet as f64;
+    let n = (want.ceil().max(0.0) as i64).min(i64::from(available)) as u32;
+    *err += i64::from(n) * packet - ideal;
+    n
 }
 
 /// How many whole packets to copy for a window of `ideal` samples per channel,
@@ -2534,19 +3618,14 @@ fn packet_run(err: &mut i64, ideal: i64, available: u32) -> u32 {
 /// ever looked), and everything else asks symphonia for its default track,
 /// which is `FlagDefault` where a muxer set one and the first readable track
 /// where nobody did.
-fn mkv_stream_order(path: &Path, tracks: &[crate::demux::MkvAudioTrack]) -> Vec<usize> {
+pub(crate) fn mkv_stream_order(path: &Path, tracks: &[crate::demux::MkvAudioTrack]) -> Vec<usize> {
     // One track is its own order, and it is the common case: no second probe
     // for the file that cannot have a second answer.
     if tracks.len() < 2 {
         return (0..tracks.len()).collect();
     }
     let head = match tracks.first() {
-        Some(first)
-            if matches!(first.codec.as_str(), "A_AC3" | "A_EAC3")
-                && matches!(MkvAc3Track::open_track(path, first.number), Ok(Some(_))) =>
-        {
-            0
-        }
+        Some(first) if dolby_track_opens(path, first) => 0,
         // A file symphonia will not open at all keeps file order: the open
         // itself is where that failure is reported, not the numbering.
         _ => SymTrack::open(path)
@@ -2564,6 +3643,22 @@ fn mkv_stream_order(path: &Path, tracks: &[crate::demux::MkvAudioTrack]) -> Vec<
         .collect()
 }
 
+/// Whether `entry` is an AC-3, E-AC-3, TrueHD or MLP track one of the Dolby
+/// decoders reads straight out of the blocks, and that decoder opens. The
+/// question [`mkv_stream_order`] asks of the file's first track.
+fn dolby_track_opens(path: &Path, entry: &crate::demux::MkvAudioTrack) -> bool {
+    match entry.codec.as_str() {
+        "A_AC3" | "A_EAC3" => matches!(MkvAc3Track::open_track(path, entry.number), Ok(Some(_))),
+        "A_TRUEHD" | "A_MLP" => {
+            matches!(MkvTruehdTrack::open_track(path, entry.number), Ok(Some(_)))
+        }
+        id if crate::extaudio::is_mkv_dts(id) || crate::extaudio::is_mkv_mpeg_layer(id) => {
+            matches!(crate::extaudio::ExtFileTrack::open_native(path, entry.number), Ok(Some(_)))
+        }
+        _ => false,
+    }
+}
+
 /// The name a Matroska audio row wears: the container's own codec id, cut down
 /// to what a picker shows — `A_AAC` is `aac`, `A_EAC3` is `e-ac-3`.
 ///
@@ -2576,80 +3671,25 @@ fn mkv_codec_name(id: &str) -> String {
         "A_AC3" => "ac-3".into(),
         "A_EAC3" => "e-ac-3".into(),
         "A_MPEG/L3" => "mp3".into(),
+        "A_MPEG/L1" | "A_MPEG/L2" => codec_display_name(id).to_ascii_lowercase(),
         _ => id.strip_prefix("A_").unwrap_or(id).to_ascii_lowercase(),
     }
 }
 
-/// This file's audio tracks in file order — the order a stream index counts in.
-/// It comes out of `moov.traks` and not `Mp4Reader::tracks`, which is a
-/// `HashMap`: iterating that would make "stream 0" a different track from one
-/// run to the next on any file carrying more than one.
-fn audio_track_ids<R>(reader: &Mp4Reader<R>) -> Vec<u32> {
-    reader
-        .moov
-        .traks
-        .iter()
-        .filter(|trak| {
-            matches!(
-                TrackType::try_from(&trak.mdia.hdlr.handler_type),
-                Ok(TrackType::Audio)
-            )
-        })
-        .map(|trak| trak.tkhd.track_id)
-        .collect()
-}
+/// The AAC `audioObjectType`s this reads: LC, HE-AAC v1 (LC with SBR) and
+/// HE-AAC v2 (SBR with Parametric Stereo).
+const AAC_LC: u8 = 2;
+const AAC_SBR: u8 = 5;
+const AAC_PS: u8 = 29;
 
-/// Channels in an AAC channel configuration. The config number *is* the channel
-/// count up to 5.1; 7.1 is the one that is not.
-fn channel_count(config: ChannelConfig) -> u16 {
-    match config {
-        ChannelConfig::SevenOne => 8,
-        other => other as u16,
+/// `(profile, freq_index, chan_conf)` out of an `AudioSpecificConfig` (ISO
+/// 14496-3 §1.6.2.1): the first five bits are the object type, the next four
+/// the sampling-frequency index, the next four the channel configuration.
+fn asc_fields(asc: &[u8]) -> crate::Result<(u8, u8, u8)> {
+    match asc {
+        [a, b, ..] => Ok((a >> 3, ((a & 0x7) << 1) | (b >> 7), (b >> 3) & 0xf)),
+        _ => Err("AudioSpecificConfig shorter than its fixed header".into()),
     }
-}
-
-/// `(profile, freq_index, chan_conf)` out of the esds descriptor. Returned as a
-/// tuple because mp4 0.14's `DecoderSpecificDescriptor` is unnameable outside
-/// the crate (same trap as `SttsEntry`, see [`packet_at`]).
-fn asc_fields(track: &Mp4Track) -> crate::Result<(u8, u8, u8)> {
-    let esds = track
-        .trak
-        .mdia
-        .minf
-        .stbl
-        .stsd
-        .mp4a
-        .as_ref()
-        .and_then(|mp4a| mp4a.esds.as_ref())
-        .ok_or("AAC track has no esds descriptor")?;
-    let cfg = &esds.es_desc.dec_config.dec_specific;
-    Ok((cfg.profile, cfg.freq_index, cfg.chan_conf))
-}
-
-/// The 2-byte AAC-LC AudioSpecificConfig, rebuilt from the esds fields; mp4 0.14
-/// parses those out and drops the raw bytes, so this is the exact inverse of its
-/// writer (`mp4box/mp4a.rs` `DecoderSpecificDescriptor::write_box`).
-fn audio_specific_config(track: &Mp4Track) -> crate::Result<Box<[u8]>> {
-    let (profile, freq_index, chan_conf) = asc_fields(track)?;
-    Ok(Box::new([
-        (profile << 3) | (freq_index >> 1),
-        (freq_index << 7) | (chan_conf << 3),
-    ]))
-}
-
-/// The stts entries as the `(sample_count, sample_delta)` pairs [`packet_at`]
-/// walks; the box's own entry type is `pub(crate)` in mp4 0.14. Shared with
-/// `demux`, which walks a video trak's table with the same two helpers.
-pub(crate) fn stts_pairs(track: &Mp4Track) -> impl Iterator<Item = (u32, u32)> + '_ {
-    track
-        .trak
-        .mdia
-        .minf
-        .stbl
-        .stts
-        .entries
-        .iter()
-        .map(|e| (e.sample_count, e.sample_delta))
 }
 
 /// Encoder delay in samples-per-channel: the edit list's first real entry says
@@ -2658,30 +3698,10 @@ pub(crate) fn stts_pairs(track: &Mp4Track) -> impl Iterator<Item = (u32, u32)> +
 /// corner-cut: an explicit `media_time` of 0 is taken at face value (no trim).
 /// Muxers that write a zero edit list despite a primed stream would leak the
 /// priming; upgrade path is preferring the codec delay when it disagrees.
-fn priming_samples(track: &Mp4Track, sample_rate: u32) -> u64 {
-    edit_media_time(track)
-        .and_then(|t| scale(t, sample_rate, track.timescale()))
+fn priming_samples(media_time: Option<u64>, sample_rate: u32, timescale: u32) -> u64 {
+    media_time
+        .and_then(|t| scale(t, sample_rate, timescale))
         .unwrap_or(DEFAULT_PRIMING)
-}
-
-/// `media_time` of the edit list's first real entry, in the track's own
-/// timescale: where the presentation starts inside the media. `None` when there
-/// is no edit list, or only empty entries -- those shift the timeline rather
-/// than trim the media, and neither track honours that shift (see
-/// [`priming_samples`]'s corner-cut). Shared with `demux`, which owes the video
-/// track the same trim.
-pub(crate) fn edit_media_time(track: &Mp4Track) -> Option<u64> {
-    track
-        .trak
-        .edts
-        .as_ref()
-        .and_then(|edts| edts.elst.as_ref())
-        .and_then(|elst| {
-            elst.entries
-                .iter()
-                .map(|e| e.media_time)
-                .find(|&t| t != EMPTY_EDIT && t != u64::MAX)
-        })
 }
 
 /// `value` from the track timescale into samples-per-channel. `None` on a zero
@@ -2770,6 +3790,47 @@ impl Segment {
             media_end: frames,
         }
     }
+}
+
+/// The sample of a mix at `rate` that `secs` of timeline (from the mix's start) ends on:
+/// the one rounding [`owed_samples`] makes of its running total, so anything that
+/// has to land on the mix's own samples (an export's warm-up) counts them the same way.
+pub(crate) fn timeline_sample(secs: f64, rate: u32) -> u64 {
+    (secs * f64::from(rate)).round() as u64
+}
+
+/// What each segment of a mix owes the timeline in samples, `None` for an
+/// open-ended window. The sample each segment ends on is the running total of
+/// the seconds it owes, rounded once against the mix rate, and a segment owes
+/// the difference of two such roundings. Rounding each segment's own length
+/// instead drifts: one frame at 59.94 fps is 800.8 samples, so every cut would
+/// gain or lose up to a fifth of a sample, and a few thousand short cuts add up
+/// to tens of samples.
+fn owed_samples(
+    segs: &[(Option<usize>, f64, f64)],
+    speeds: &[Option<crate::project::Stretch>],
+    rate: u32,
+) -> Vec<Option<u64>> {
+    let mut total_secs = 0.0f64;
+    let mut at = 0u64;
+    segs.iter()
+        .enumerate()
+        .map(|(i, &(_, start_secs, end_secs))| {
+            let secs = speeds
+                .get(i)
+                .copied()
+                .flatten()
+                .map_or(end_secs - start_secs, |s| s.timeline_secs);
+            if !secs.is_finite() {
+                return None;
+            }
+            total_secs += secs.max(0.0);
+            let end = timeline_sample(total_secs, rate);
+            let owed = end.saturating_sub(at);
+            at = end;
+            Some(owed)
+        })
+        .collect()
 }
 
 /// One segment's rate conversion: the decoded samples read at the ratio of
@@ -2919,12 +3980,7 @@ impl Rate {
         }
     }
 
-    fn flush(
-        &mut self,
-        channels: usize,
-        timeline: &mut u64,
-        tx: &SyncSender<AudioChunk>,
-    ) -> bool {
+    fn flush(&mut self, channels: usize, timeline: &mut u64, tx: &SyncSender<AudioChunk>) -> bool {
         match self.stretch.as_mut() {
             Some(stretch) => stretch.flush(channels, timeline, tx),
             None => self.resample.flush(channels, timeline, tx),
@@ -2952,6 +4008,9 @@ struct Worker {
     /// `None` for one that plays flat -- [`emit`]'s last effect, run after
     /// the rate and the equalizer.
     fades: Vec<Option<crate::project::Fade>>,
+    /// One per entry of `segments` again: the blocks a segment played backwards is
+    /// decoded in ([`reverse_blocks`]), or `None` for one that plays forwards.
+    reversed: Vec<Option<Vec<Segment>>>,
     /// `start_sample` of the first chunk.
     timeline: u64,
     tx: SyncSender<AudioChunk>,
@@ -2970,15 +4029,22 @@ struct Worker {
 /// The accumulator is reused across turns; the one allocation per chunk is the
 /// buffer the channel takes ownership of, and none of this is the RT path (the
 /// device callback reads the ring the feeder has already filled).
+/// The gains, ducks and limiter a mix starts from, carried as one value.
+struct MixState {
+    gains: Vec<f32>,
+    ducks: Vec<Vec<Duck>>,
+    limiter: Option<LimiterState>,
+}
+
 fn mix(
     rxs: &[Receiver<AudioChunk>],
     channels: usize,
-    mut gains: Vec<f32>,
-    mut limiter: Option<LimiterState>,
+    state: MixState,
     rate: u32,
     controls: Option<&MixControls>,
     tx: &SyncSender<AudioChunk>,
 ) {
+    let MixState { mut gains, mut ducks, mut limiter } = state;
     // The version of the mix these gains and this limiter came from; see the
     // reload at the head of the loop.
     let mut seen = 0;
@@ -2988,15 +4054,50 @@ fn mix(
     let mut base = 0;
     let mut emitted = 0;
     let mut out: Vec<f32> = Vec::new();
+    // Per lane: the block after its gain and its duck, whether the lane had
+    // samples in this block, and the key a duck reads. Kept between blocks so
+    // the steady path allocates nothing beyond the chunk it sends.
+    let mut scaled: Vec<Vec<f32>> = rxs.iter().map(|_| Vec::new()).collect();
+    let mut filled: Vec<bool> = rxs.iter().map(|_| false).collect();
+    // Per lane, per duck: the key that duck reads this block.
+    let mut keys: Vec<Vec<Vec<f32>>> = rxs.iter().map(|_| Vec::new()).collect();
+    // Per lane, one detector per duck, each with the key it reads: a lane ducked
+    // under several keys is reduced by each of them in turn.
+    let mut duckers: Vec<Vec<(usize, Ducker)>> = ducks
+        .iter()
+        .map(|lane| {
+            lane.iter()
+                .map(|d| (d.under, Ducker::new(d, rate)))
+                .collect()
+        })
+        .collect();
     loop {
         // A mix moved while the stream plays, picked up between two blocks:
         // the levels change at a block boundary and nothing else changes at
         // all -- no flush, no re-open, no hole. The limiter is *retuned* rather
         // than rebuilt, so its delay line keeps running and the sample count
         // the master clock is made of does not move ([`LimiterState::retune`]).
-        if let Some((next, params)) = controls.and_then(|c| c.changed(&mut seen)) {
+        if let Some((next, next_ducks, params)) = controls.and_then(|c| c.changed(&mut seen)) {
             gains = next;
             gains.resize(rxs.len(), 1.0);
+            ducks = next_ducks;
+            ducks.resize(rxs.len(), Vec::new());
+            // A duck that keeps its lane and its key keeps its detector and its
+            // reduction; a new one starts at rest; one that was taken away is gone.
+            for (slot, lane_ducks) in duckers.iter_mut().zip(&ducks) {
+                let mut old = std::mem::take(slot);
+                *slot = lane_ducks
+                    .iter()
+                    .map(|duck| match old.iter().position(|(under, _)| *under == duck.under) {
+                        Some(at) => {
+                            let (_, mut ducker) = old.swap_remove(at);
+                            ducker.retune(duck, rate);
+                            (duck.under, ducker)
+                        }
+                        None => (duck.under, Ducker::new(duck, rate)),
+                    })
+                    .collect();
+            }
             match limiter.as_mut() {
                 Some(state) => state.retune(&params),
                 // First time it has ever been switched in on this stream: the
@@ -3029,23 +4130,80 @@ fn mix(
             .min()
             .filter(|&f| f > 0)
         else {
+            // The mix has run out: the limiter still holds the stream's last frames, which go
+            // out limited rather than being dropped (the export pads a shortfall with silence,
+            // and that cut reads as an overshoot).
+            if let Some(limiter) = limiter.as_mut() {
+                let tail = limiter.drain();
+                if !tail.is_empty() {
+                    let samples = tail.iter().map(|s| s.clamp(-1.0, 1.0)).collect();
+                    let _ = tx.send(AudioChunk { start_sample: base + emitted, samples });
+                }
+            }
             return;
         };
         let block = frames * channels;
+        // Each lane's own volume, applied on its way into the sum: this is the
+        // one place every lane's samples pass through, so a lane that is turned
+        // down is turned down in an export exactly as it is in the room. Unity
+        // is a multiply by 1.0, which f32 leaves alone.
+        for (i, lane) in pending.iter_mut().enumerate() {
+            filled[i] = !lane.is_empty();
+            if !filled[i] {
+                continue;
+            }
+            let gain = gains.get(i).copied().unwrap_or(1.0);
+            let dst = &mut scaled[i];
+            dst.clear();
+            dst.extend(lane.drain(..block).map(|sample| sample * gain));
+        }
+        // Auto-ducking. A ducked lane is reduced by each of its keys' signals as
+        // they stood after gain and before any duck, so no duck keys off another
+        // duck's output: every key is read first, then the ducks are applied in
+        // turn. A key that had no samples this block is silence, and lets its
+        // duck go. A duck naming its own lane, or none, does nothing.
+        for i in 0..rxs.len() {
+            keys[i].resize_with(duckers[i].len(), Vec::new);
+            for (j, (under, _)) in duckers[i].iter().enumerate() {
+                let under = *under;
+                if under == i || under >= rxs.len() {
+                    continue;
+                }
+                let key = &mut keys[i][j];
+                key.clear();
+                if filled[under] {
+                    key.extend_from_slice(&scaled[under]);
+                } else {
+                    key.resize(block, 0.0);
+                }
+            }
+        }
+        for i in 0..rxs.len() {
+            if !filled[i] {
+                continue;
+            }
+            for (j, (under, ducker)) in duckers[i].iter_mut().enumerate() {
+                if *under == i || *under >= rxs.len() {
+                    continue;
+                }
+                ducker.process(&keys[i][j], &mut scaled[i], channels);
+            }
+        }
         out.clear();
         out.resize(block, 0.0);
-        for (i, lane) in pending
-            .iter_mut()
-            .enumerate()
-            .filter(|(_, p)| !p.is_empty())
-        {
-            // The lane's own volume, applied on its way into the sum: this is
-            // the one place every lane's samples pass through, so a lane that
-            // is turned down is turned down in an export exactly as it is in
-            // the room. Unity is a multiply by 1.0, which f32 leaves alone.
-            let gain = gains.get(i).copied().unwrap_or(1.0);
-            for (sum, sample) in out.iter_mut().zip(lane.drain(..block)) {
-                *sum += sample * gain;
+        for (i, lane) in scaled.iter().enumerate() {
+            if !filled[i] {
+                continue;
+            }
+            let mut peak = 0.0f32;
+            for (sum, &level) in out.iter_mut().zip(lane) {
+                peak = peak.max(level.abs());
+                *sum += level;
+            }
+            // Read by the level meters ([`MixControls::take_lane_peaks`]); the
+            // sum above is the same arithmetic it always was.
+            if let Some(controls) = controls {
+                controls.note_lane_peak(i, peak);
             }
         }
         // ...and the master limiter over the sum, before the clamp: what the
@@ -3073,7 +4231,6 @@ fn mix(
 }
 
 fn run(mut w: Worker) {
-    let mut interleaved = Vec::new();
     let channels = w.channels;
     // Chunk numbering is continuous across every join, source ones included.
     let mut timeline = w.timeline;
@@ -3088,12 +4245,16 @@ fn run(mut w: Worker) {
     let mut fades = std::mem::take(&mut w.fades);
     // ...and a short fade list is "flat from here on", the same rule again.
     fades.resize_with(segments.len(), || None);
+    let mut reversed = std::mem::take(&mut w.reversed);
+    // ...and a short reversal list is "forwards from here on".
+    reversed.resize_with(segments.len(), || None);
 
-    for (((seg, eq), speed), fade) in segments
+    for ((((seg, eq), speed), fade), backwards) in segments
         .iter()
         .zip(eqs.iter_mut())
         .zip(speeds.iter_mut())
         .zip(fades.iter_mut())
+        .zip(reversed.iter())
     {
         let Some(source) = seg.source else {
             // A gap: hand the device real silence rather than nothing at all,
@@ -3117,112 +4278,209 @@ fn run(mut w: Worker) {
         let Some(track) = w.tracks[source].as_mut() else {
             continue; // opener fills every named source; nothing to decode
         };
-        let track = match track {
-            Track::Sym(track) => {
-                if !run_sym(
-                    track,
-                    seg,
-                    eq.as_mut(),
-                    speed,
-                    fade,
-                    channels,
-                    &mut timeline,
-                    &w.tx,
-                ) || !settle(speed, channels, &mut timeline, &w.tx)
-                {
-                    return; // consumer went away
-                }
-                continue;
-            }
-            Track::Mkv(track) => {
-                if !run_mkv_ac3(
-                    track,
-                    seg,
-                    eq.as_mut(),
-                    speed,
-                    fade,
-                    channels,
-                    &mut timeline,
-                    &w.tx,
-                ) || !settle(speed, channels, &mut timeline, &w.tx)
-                {
-                    return; // consumer went away
-                }
-                continue;
-            }
-            Track::Ac3(track) => {
-                if !run_ac3(
-                    track,
-                    seg,
-                    eq.as_mut(),
-                    speed,
-                    fade,
-                    channels,
-                    &mut timeline,
-                    &w.tx,
-                ) || !settle(speed, channels, &mut timeline, &w.tx)
-                {
-                    return; // consumer went away
-                }
-                continue;
-            }
-            Track::Aac(track) => track,
+        let chain = Chain {
+            eq: eq.as_mut(),
+            speed: &mut *speed,
+            fade: &mut *fade,
+            channels,
+            timeline: &mut timeline,
+            tx: &w.tx,
         };
-        let mut decoder = match aac_decoder(&track.params, track.source_channels()) {
-            Ok(decoder) => decoder,
-            Err(e) => {
-                eprintln!("audio decoder init failed: {e}");
-                return;
-            }
+        let more = match backwards {
+            Some(blocks) => run_backwards(track, blocks, chain),
+            None => run_segment(track, seg, chain),
         };
-        let mut pos = seg.start_pos;
-
-        for id in seg.start_id..=track.sample_count {
-            if pos >= seg.media_end {
-                break; // segment done, on to the next one
-            }
-            let sample = match track.reader.read_sample(track.track_id, id) {
-                Ok(Some(sample)) => sample,
-                Ok(None) => break,
-                Err(e) => {
-                    eprintln!("audio demux error at sample {id}: {e}");
-                    break;
-                }
-            };
-            let packet = Packet::new(
-                track.track_id,
-                units::Timestamp::new(sample.start_time as i64),
-                units::Duration::new(u64::from(sample.duration)),
-                &sample.bytes[..],
-            );
-            if let Err(e) = decoder.decode(&packet, &mut interleaved) {
-                eprintln!("audio decode error at sample {id}: {e}");
-                break;
-            }
-            // decoder.decode already folded to track.channels(); widen the mono
-            // case up to the timeline's own width before dividing by it below.
-            widen(&mut interleaved, usize::from(track.channels()), channels);
-            let next = pos + (interleaved.len() / channels) as u64;
-            if !emit(
-                &mut interleaved,
-                channels,
-                seg,
-                eq.as_mut(),
-                speed.as_mut(),
-                fade.as_mut(),
-                pos,
-                next,
-                &mut timeline,
-                &w.tx,
-            ) {
-                return; // consumer went away
-            }
-            pos = next;
-        }
-        if !settle(speed, channels, &mut timeline, &w.tx) {
+        if !(more && settle(speed, channels, &mut timeline, &w.tx)) {
             return; // consumer went away
         }
     }
+}
+
+/// One segment of one source, decoded forwards through `chain`. `false` means the
+/// consumer went away, or the decoder could not be built and the rest of the mix
+/// is not worth decoding.
+fn run_segment(track: &mut Track, seg: &Segment, chain: Chain<'_>) -> bool {
+    let Chain {
+        mut eq,
+        speed,
+        fade,
+        channels,
+        timeline,
+        tx,
+    } = chain;
+    let track = match track {
+        Track::Sym(track) => return run_sym(track, seg, Chain { eq, speed, fade, channels, timeline, tx }),
+        Track::Ts(track) => return run_ts(track, seg, Chain { eq, speed, fade, channels, timeline, tx }),
+        Track::Truehd(track) => {
+            return run_mkv_truehd(track, seg, Chain { eq, speed, fade, channels, timeline, tx });
+        }
+        Track::Ext(track) => return run_ext(track, seg, Chain { eq, speed, fade, channels, timeline, tx }),
+        Track::Mkv(track) => return run_mkv_ac3(track, seg, Chain { eq, speed, fade, channels, timeline, tx }),
+        Track::Ac3(track) => return run_ac3(track, seg, Chain { eq, speed, fade, channels, timeline, tx }),
+        Track::Aac(track) => track,
+    };
+    let mut interleaved = Vec::new();
+    // An SBR track starts on a packet that carries its own header, which
+    // may be ahead of the segment's pre-roll; its position is that packet's.
+    let (start_id, mut pos) = if track.sbr {
+        let id = sbr_start_packet(track, seg.start_id);
+        let ts = packet_start_ts(&track.stts, id);
+        (id, scale(ts, track.sample_rate, track.timescale).unwrap_or(0))
+    } else {
+        (seg.start_id, seg.start_pos)
+    };
+    let mut decoder = match aac_decoder(&track.params, track.source_channels()) {
+        Ok(decoder) => decoder,
+        Err(e) => {
+            eprintln!("audio decoder init failed: {e}");
+            return false;
+        }
+    };
+
+    for id in start_id..=track.sample_count {
+        if pos >= seg.media_end {
+            break; // segment done, on to the next one
+        }
+        let sample = match mp4track::sample(&mut track.reader, track.stream, id) {
+            Ok(Some(sample)) => sample,
+            Ok(None) => break,
+            Err(e) => {
+                eprintln!("audio demux error at sample {id}: {e}");
+                break;
+            }
+        };
+        let packet = Packet::new(
+            track.track_id,
+            units::Timestamp::new(sample.dts.unwrap_or(0)),
+            units::Duration::new(u64::from(sample.duration.unwrap_or(0).max(0) as u32)),
+            &sample.data[..],
+        );
+        if let Err(e) = decoder.decode(&packet, &mut interleaved) {
+            eprintln!("audio decode error at sample {id}: {e}");
+            break;
+        }
+        // decoder.decode already folded to track.channels(); widen the mono
+        // case up to the timeline's own width before dividing by it below.
+        widen(&mut interleaved, usize::from(track.channels()), channels);
+        let next = pos + (interleaved.len() / channels) as u64;
+        if !emit(
+            &mut interleaved,
+            seg,
+            Chain {
+                eq: eq.as_deref_mut(),
+                speed: &mut *speed,
+                fade: &mut *fade,
+                channels,
+                timeline: &mut *timeline,
+                tx,
+            },
+            pos,
+            next,
+        ) {
+            return false; // consumer went away
+        }
+        pos = next;
+    }
+    true
+}
+
+/// How long one block of a reversed segment is, in seconds of the source: the most
+/// that is ever held decoded at once, whatever the clip's length -- a stereo pair at
+/// 48 kHz is 750 KB of it.
+const REVERSE_BLOCK_SECS: u64 = 2;
+
+/// The blocks a reversed `seg` (the window `[media_target, media_end)` of `track`,
+/// opened for the seconds from `start_secs`) is decoded in, in the order they are
+/// *played*: the last stretch of the window first. Each is a segment of its own,
+/// resolved against the packet table like any other, and trimmed to the exact
+/// samples it owns so the blocks tile the window with nothing lost between.
+fn reverse_blocks(track: &Track, source: usize, start_secs: f64, seg: &Segment) -> Vec<Segment> {
+    let rate = u64::from(track.sample_rate().max(1));
+    let step = REVERSE_BLOCK_SECS * rate;
+    let mut blocks = Vec::new();
+    let mut end = seg.media_end;
+    while end > seg.media_target {
+        let from = end.saturating_sub(step).max(seg.media_target);
+        let (a, b) = (from - seg.media_target, end - seg.media_target);
+        let mut block = track.segment(
+            source,
+            start_secs + a as f64 / rate as f64,
+            start_secs + b as f64 / rate as f64,
+        );
+        // The seconds only find the packets; the samples are exact.
+        block.media_target = from;
+        block.media_end = end;
+        blocks.push(block);
+        end = from;
+    }
+    blocks
+}
+
+/// A reversed segment: each block decoded forwards into memory, turned end for end
+/// and handed to the rate, the equalizer and the fade as if it were the decoder's
+/// own -- so a reversed clip is filtered, speeded and faded exactly as a forward one,
+/// from the sound's last sample down. `false` as for [`run_segment`].
+fn run_backwards(track: &mut Track, blocks: &[Segment], chain: Chain<'_>) -> bool {
+    let Chain {
+        eq,
+        speed,
+        fade,
+        channels,
+        timeline,
+        tx,
+    } = chain;
+    // A block's chunks are collected here on the way out of the decoder: a block is
+    // seconds of packets, never more than this many.
+    let (hold, held) = sync_channel(1 << 14);
+    let mut eq = eq;
+    for block in blocks {
+        let mut at = 0u64;
+        let mut none = None;
+        let mut flat = None;
+        let ok = run_segment(
+            track,
+            block,
+            Chain {
+                eq: None,
+                speed: &mut none,
+                fade: &mut flat,
+                channels,
+                timeline: &mut at,
+                tx: &hold,
+            },
+        );
+        let mut samples: Vec<f32> = Vec::new();
+        while let Ok(chunk) = held.try_recv() {
+            samples.extend_from_slice(&chunk.samples);
+        }
+        // Frame order reversed, the channels of a frame left as they are.
+        let frames = samples.len() / channels.max(1);
+        for f in 0..frames / 2 {
+            let (a, b) = (f * channels, (frames - 1 - f) * channels);
+            for c in 0..channels {
+                samples.swap(a + c, b + c);
+            }
+        }
+        if !samples.is_empty()
+            && !deliver(
+                &mut samples,
+                Chain {
+                    eq: eq.as_deref_mut(),
+                    speed: &mut *speed,
+                    fade: &mut *fade,
+                    channels,
+                    timeline: &mut *timeline,
+                    tx,
+                },
+            )
+        {
+            return false;
+        }
+        if !ok {
+            return false;
+        }
+    }
+    true
 }
 
 /// Pays out whatever silence a speeded segment still owes the timeline (see
@@ -3256,18 +4514,28 @@ fn settle(
 /// two call sites agreeing. Trimmed first, so the pre-roll a listener never
 /// hears cannot ring the filter either. Nothing is allocated -- the device
 /// callback is two hand-offs downstream of here in any case.
-fn emit(
-    interleaved: &mut Vec<f32>,
+/// What one segment writes through: its equalizer, rate and fade, each carried
+/// from one decoded buffer to the next, and the timeline and channel count the
+/// samples land on. Passed whole so `emit` and the per-codec loops share one
+/// shape instead of threading the same ten values through every call.
+struct Chain<'a> {
+    eq: Option<&'a mut EqState>,
+    speed: &'a mut Option<Rate>,
+    fade: &'a mut Option<crate::project::Fade>,
     channels: usize,
-    seg: &Segment,
-    eq: Option<&mut EqState>,
-    speed: Option<&mut Rate>,
-    fade: Option<&mut crate::project::Fade>,
-    pos: u64,
-    next: u64,
-    timeline: &mut u64,
-    tx: &SyncSender<AudioChunk>,
-) -> bool {
+    timeline: &'a mut u64,
+    tx: &'a SyncSender<AudioChunk>,
+}
+
+fn emit(interleaved: &mut Vec<f32>, seg: &Segment, chain: Chain<'_>, pos: u64, next: u64) -> bool {
+    let Chain {
+        eq,
+        speed,
+        fade,
+        channels,
+        timeline,
+        tx,
+    } = chain;
     if next <= seg.media_target {
         return true;
     }
@@ -3282,6 +4550,31 @@ fn emit(
     if interleaved.is_empty() {
         return true; // nothing left of it; the loop head ends the segment
     }
+    deliver(
+        interleaved,
+        Chain {
+            eq,
+            speed,
+            fade,
+            channels,
+            timeline,
+            tx,
+        },
+    )
+}
+
+/// Sends the samples of one decoded, window-trimmed buffer on their way: through the
+/// rate, the equalizer and the fade, in that order, and out as the next chunk.
+/// `false` means the consumer went away.
+fn deliver(interleaved: &mut Vec<f32>, chain: Chain<'_>) -> bool {
+    let Chain {
+        eq,
+        speed,
+        fade,
+        channels,
+        timeline,
+        tx,
+    } = chain;
     // The rate first, the filter second: what the equalizer's bands are set in
     // is the frequency a listener hears, and after a resample that is not the
     // frequency the file was written at. A segment at real time has no
@@ -3302,7 +4595,9 @@ fn emit(
     // takes, exactly as the equalizer's does.
     if let Some(fade) = fade {
         fade.apply(interleaved, channels);
-        fade.elapsed = fade.elapsed.saturating_add((interleaved.len() / channels) as u32);
+        fade.elapsed = fade
+            .elapsed
+            .saturating_add((interleaved.len() / channels) as u32);
     }
     let chunk = AudioChunk {
         start_sample: *timeline,
@@ -3316,16 +4611,15 @@ fn emit(
 /// come out of the same mp4 tables, the window rules are [`emit`]'s as always,
 /// and what reaches the mixer is already the stereo downmix. `false` means the
 /// consumer went away.
-fn run_ac3(
-    track: &mut Ac3Track,
-    seg: &Segment,
-    mut eq: Option<&mut EqState>,
-    speed: &mut Option<Rate>,
-    fade: &mut Option<crate::project::Fade>,
-    channels: usize,
-    timeline: &mut u64,
-    tx: &SyncSender<AudioChunk>,
-) -> bool {
+fn run_ac3(track: &mut Ac3Track, seg: &Segment, chain: Chain<'_>) -> bool {
+    let Chain {
+        mut eq,
+        speed,
+        fade,
+        channels,
+        timeline,
+        tx,
+    } = chain;
     let mut decoder = match ac3_decoder(track.requested) {
         Ok(decoder) => decoder,
         Err(e) => {
@@ -3338,7 +4632,7 @@ fn run_ac3(
         if pos >= seg.media_end {
             return true; // segment done, on to the next one
         }
-        let sample = match track.reader.read_sample(track.track_id, id) {
+        let sample = match mp4track::sample(&mut track.reader, track.stream, id) {
             Ok(Some(sample)) => sample,
             Ok(None) => return true,
             Err(e) => {
@@ -3346,7 +4640,7 @@ fn run_ac3(
                 return true;
             }
         };
-        let (mut interleaved, samples) = match decode_ac3(&mut decoder, &sample.bytes) {
+        let (mut interleaved, samples) = match decode_ac3(&mut decoder, &sample.data) {
             Ok(Some(decoded)) => decoded,
             Ok(None) => continue, // the decoder wants another frame first
             Err(e) => {
@@ -3360,15 +4654,17 @@ fn run_ac3(
         let next = pos + samples;
         if !emit(
             &mut interleaved,
-            channels,
             seg,
-            eq.as_deref_mut(),
-            speed.as_mut(),
-            fade.as_mut(),
+            Chain {
+                eq: eq.as_deref_mut(),
+                speed: &mut *speed,
+                fade: &mut *fade,
+                channels,
+                timeline: &mut *timeline,
+                tx,
+            },
             pos,
             next,
-            timeline,
-            tx,
         ) {
             return false;
         }
@@ -3381,16 +4677,15 @@ fn run_ac3(
 /// instead of mp4 samples. The decoder, the window rules ([`emit`]) and the
 /// stereo downmix are the same ones; only where a packet comes from differs.
 /// `false` means the consumer went away.
-fn run_mkv_ac3(
-    track: &mut MkvAc3Track,
-    seg: &Segment,
-    mut eq: Option<&mut EqState>,
-    speed: &mut Option<Rate>,
-    fade: &mut Option<crate::project::Fade>,
-    channels: usize,
-    timeline: &mut u64,
-    tx: &SyncSender<AudioChunk>,
-) -> bool {
+fn run_mkv_ac3(track: &mut MkvAc3Track, seg: &Segment, chain: Chain<'_>) -> bool {
+    let Chain {
+        mut eq,
+        speed,
+        fade,
+        channels,
+        timeline,
+        tx,
+    } = chain;
     let mut decoder = match ac3_decoder(track.requested) {
         Ok(decoder) => decoder,
         Err(e) => {
@@ -3424,21 +4719,276 @@ fn run_mkv_ac3(
         let next = pos + samples;
         if !emit(
             &mut interleaved,
-            channels,
             seg,
-            eq.as_deref_mut(),
-            speed.as_mut(),
-            fade.as_mut(),
+            Chain {
+                eq: eq.as_deref_mut(),
+                speed: &mut *speed,
+                fade: &mut *fade,
+                channels,
+                timeline: &mut *timeline,
+                tx,
+            },
             pos,
             next,
-            timeline,
-            tx,
         ) {
             return false;
         }
         pos = next;
     }
     true
+}
+
+/// The Matroska TrueHD / MLP track: every block is one access unit, decoded by
+/// `ec-truehd`, which is bit-exact against ffmpeg. The decoder hands back the
+/// highest presentation the unit carries (7.1 where the stream has it, else 5.1,
+/// else stereo), and [`downmix`] folds that to the pair the timeline carries, as
+/// it does for every multichannel source. An Atmos track's 4th substream is
+/// refused by `ec-truehd` by name, and so is the open.
+struct MkvTruehdTrack {
+    mkv: crate::demux::MkvAudio,
+    sample_rate: u32,
+    /// Samples per channel in every access unit. Constant across a stream, so a
+    /// block's first sample is `id * au_samples` exactly, with no rounding from
+    /// Matroska's millisecond timestamps.
+    au_samples: u64,
+    /// What the decoder emits: 2, 6 or 8 channels, before [`downmix`].
+    source_channels: usize,
+    /// What reaches the timeline: the source's width, or a pair for anything wider.
+    channels: u16,
+    total_samples: Option<u64>,
+}
+
+/// Blocks scanned for the first decodable access unit when a track is opened. A
+/// decoder emits nothing until it has seen a restart header, which a stream
+/// carries every few access units.
+const TRUEHD_PROBE_BLOCKS: usize = 256;
+
+/// Blocks decoded before a seek target so the decoder has seen its restart
+/// header by the time the window starts (about 0.8 s at 48 kHz).
+const TRUEHD_PRE_ROLL: u32 = 40;
+
+impl MkvTruehdTrack {
+    /// `Ok(None)` when the file's first audio track is not TrueHD or MLP.
+    fn open(path: &Path) -> crate::Result<Option<Self>> {
+        Self::from_blocks(crate::demux::MkvAudio::open(path)?)
+    }
+
+    /// [`open`](Self::open) on one named track ([`crate::demux::MkvAudioTrack::number`]).
+    fn open_track(path: &Path, number: u64) -> crate::Result<Option<Self>> {
+        Self::from_blocks(crate::demux::MkvAudio::open_track(path, number)?)
+    }
+
+    fn from_blocks(mkv: Option<crate::demux::MkvAudio>) -> crate::Result<Option<Self>> {
+        let Some(mut mkv) = mkv else {
+            return Ok(None);
+        };
+        if !matches!(mkv.codec, "truehd" | "mlp") {
+            return Ok(None);
+        }
+        // Rate, layout and access-unit length all come out of the stream's own
+        // major sync, as the decoder reads them: the first frame it can emit says
+        // them. A first block the decoder cannot yet decode is not an error.
+        let mut decoder = ec_truehd::TrueHdDecoder::new();
+        let mut first = None;
+        for id in 0..mkv.blocks().min(TRUEHD_PROBE_BLOCKS) {
+            let Some(bytes) = mkv.frame(id)? else {
+                break;
+            };
+            match decoder.decode_access_unit(&bytes) {
+                Ok(Some(frame)) => {
+                    first = Some(frame);
+                    break;
+                }
+                Ok(None) | Err(ec_core::Error::NeedMore) => {}
+                Err(e) => return Err(format!("TrueHD: {e}").into()),
+            }
+        }
+        let frame = first.ok_or(
+            "the TrueHD track of this Matroska file has no decodable access unit in its first blocks",
+        )?;
+        if frame.rate == 0 || frame.samples == 0 {
+            return Err("the TrueHD track of this Matroska file states no sample rate".into());
+        }
+        let source_channels = frame.layout.channel_count();
+        let au_samples = frame.samples as u64;
+        Ok(Some(Self {
+            sample_rate: frame.rate,
+            au_samples,
+            source_channels,
+            channels: source_channels.min(2) as u16,
+            total_samples: Some(mkv.blocks() as u64 * au_samples),
+            mkv,
+        }))
+    }
+
+    /// `secs` on this source's timeline into media samples. No priming: a
+    /// Matroska file carries no edit list and TrueHD no encoder delay.
+    fn media(&self, secs: f64) -> u64 {
+        (secs.max(0.0) * f64::from(self.sample_rate)).round() as u64
+    }
+
+    /// One `[start, end)` window, resolved to blocks and media samples. The
+    /// decoder is started [`TRUEHD_PRE_ROLL`] blocks early; what it decodes before
+    /// the target is dropped by [`emit`].
+    fn segment(&self, source: usize, start_secs: f64, end_secs: f64) -> Segment {
+        let media_target = self.media(start_secs);
+        let start_id = self.mkv.block_at(start_secs, TRUEHD_PRE_ROLL as usize);
+        Segment {
+            source: Some(source),
+            start_id: start_id as u32,
+            start_pos: start_id as u64 * self.au_samples,
+            media_target,
+            media_end: self.media(end_secs).max(media_target),
+        }
+    }
+}
+
+/// One segment of a Matroska TrueHD / MLP track: [`run_mkv_ac3`]'s shape, with
+/// the access unit's position computed from its block index rather than summed,
+/// so a decoded unit that is not emitted (the decoder still warming up) cannot
+/// shift every sample after it.
+fn run_mkv_truehd(track: &mut MkvTruehdTrack, seg: &Segment, chain: Chain<'_>) -> bool {
+    let Chain {
+        mut eq,
+        speed,
+        fade,
+        channels,
+        timeline,
+        tx,
+    } = chain;
+    let mut decoder = ec_truehd::TrueHdDecoder::new();
+    for id in seg.start_id as usize.. {
+        let pos = id as u64 * track.au_samples;
+        if pos >= seg.media_end {
+            return true; // segment done, on to the next one
+        }
+        let block = match track.mkv.frame(id) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return true, // end of the track
+            Err(e) => {
+                eprintln!("audio demux error at block {id}: {e}");
+                return true;
+            }
+        };
+        let frame = match decoder.decode_access_unit(&block) {
+            Ok(Some(frame)) => frame,
+            // No output yet (no restart header seen): nothing to emit for this unit.
+            Ok(None) | Err(ec_core::Error::NeedMore) => continue,
+            Err(e) => {
+                eprintln!("audio decode error at block {id}: {e}");
+                return true;
+            }
+        };
+        let mut interleaved = truehd_f32(&frame);
+        downmix(&mut interleaved, track.source_channels);
+        widen(&mut interleaved, usize::from(track.channels), channels);
+        let next = pos + frame.samples as u64;
+        if !emit(
+            &mut interleaved,
+            seg,
+            Chain {
+                eq: eq.as_deref_mut(),
+                speed,
+                fade,
+                channels,
+                timeline,
+                tx,
+            },
+            pos,
+            next,
+        ) {
+            return false;
+        }
+    }
+    true
+}
+
+/// One segment of a DTS / ADPCM / A-law / mu-law / AMR track read by `ec-probe`
+/// ([`crate::extaudio`]): the reader is seeked a pre-roll ahead of the window, a
+/// fresh decoder runs from there, and each packet lands at the media position its
+/// timestamp states (summed from the last one when it states none). `false` means
+/// the consumer went away.
+fn run_ext(track: &mut crate::extaudio::ExtFileTrack, seg: &Segment, chain: Chain<'_>) -> bool {
+    let Chain {
+        mut eq,
+        speed,
+        fade,
+        channels,
+        timeline,
+        tx,
+    } = chain;
+    let mut decoder = match track.decoder() {
+        Ok(decoder) => decoder,
+        Err(e) => {
+            eprintln!("audio decoder init failed: {e}");
+            return true;
+        }
+    };
+    let rate = f64::from(track.sample_rate.max(1));
+    if let Err(e) = track.seek(seg.media_target as f64 / rate) {
+        eprintln!("audio seek error: {e}");
+        return true;
+    }
+    let mut next_pos = 0u64;
+    loop {
+        let (stated, block) = match track.next_packet() {
+            Ok(Some(p)) => p,
+            Ok(None) => return true, // end of the track
+            Err(e) => {
+                eprintln!("audio demux error: {e}");
+                return true;
+            }
+        };
+        let pos = stated.unwrap_or(next_pos);
+        if pos >= seg.media_end {
+            return true; // segment done, on to the next one
+        }
+        let (mut interleaved, source_channels) = match decoder.decode(&block) {
+            Ok(Some(decoded)) => decoded,
+            Ok(None) => {
+                next_pos = pos;
+                continue;
+            }
+            Err(e) => {
+                eprintln!("audio decode error: {e}");
+                return true;
+            }
+        };
+        let frames = (interleaved.len() / source_channels.max(1)) as u64;
+        downmix(&mut interleaved, source_channels);
+        widen(&mut interleaved, usize::from(track.channels()), channels);
+        let next = pos + frames;
+        next_pos = next;
+        if !emit(
+            &mut interleaved,
+            seg,
+            Chain {
+                eq: eq.as_deref_mut(),
+                speed,
+                fade,
+                channels,
+                timeline,
+                tx,
+            },
+            pos,
+            next,
+        ) {
+            return false;
+        }
+    }
+}
+
+/// The decoder's S32 output as f32 in `[-1, 1)`, interleaved. Its samples carry
+/// 24 significant bits (left-justified in 32), so both the widening to f32 and
+/// the division by 2^31 are exact.
+pub(crate) fn truehd_f32(frame: &ec_core::frame::AudioFrame) -> Vec<f32> {
+    frame
+        .data
+        .first()
+        .into_iter()
+        .flat_map(|plane| plane.as_chunks::<4>().0.iter())
+        .map(|s| i32::from_ne_bytes(*s) as f32 / 2_147_483_648.0)
+        .collect()
 }
 
 /// One segment of a standalone audio file: seek the reader to just before the
@@ -3450,16 +5000,132 @@ fn run_mkv_ac3(
 /// the AAC path's two-packet pre-roll does. A reader that cannot seek at all
 /// simply decodes from wherever it is; the window rules still hold, it is only
 /// slower. `false` means the consumer went away.
-fn run_sym(
-    track: &mut SymTrack,
-    seg: &Segment,
-    mut eq: Option<&mut EqState>,
-    speed: &mut Option<Rate>,
-    fade: &mut Option<crate::project::Fade>,
-    channels: usize,
-    timeline: &mut u64,
-    tx: &SyncSender<AudioChunk>,
-) -> bool {
+/// One segment of a transport stream's sound: the track's own demuxer is sought a
+/// pre-roll ahead of the window, a fresh decoder runs from there, and each packet lands at
+/// the media position its timestamp states (the sound that starts after the picture leaves
+/// silence in front of it; sound before the picture is trimmed away). `false` means the
+/// consumer went away.
+fn run_ts(track: &mut crate::demux::ts::TsAudio, seg: &Segment, chain: Chain<'_>) -> bool {
+    let Chain {
+        mut eq,
+        speed,
+        fade,
+        channels,
+        timeline,
+        tx,
+    } = chain;
+    let rate = i128::from(track.sample_rate);
+    let mut decoder = match track.decoder() {
+        Ok(decoder) => decoder,
+        Err(e) => {
+            eprintln!("audio decoder init failed: {e}");
+            return true;
+        }
+    };
+    let target_secs = seg.media_target as f64 / track.sample_rate as f64;
+    if let Err(e) = track.seek((target_secs - track.pre_roll_secs()).max(0.0)) {
+        eprintln!("audio demux seek failed: {e}");
+        return true;
+    }
+    let mut at: Option<i128> = None;
+    let mut first = true;
+    loop {
+        let (stamp, bytes) = match track.next_packet() {
+            Ok(Some(packet)) => packet,
+            Ok(None) => return true, // end of the file, and of the segment
+            Err(e) => {
+                eprintln!("audio demux error: {e}");
+                return true;
+            }
+        };
+        // The count of samples decoded since the last stamp is the position, until a stamp
+        // disagrees with it by more than a fiftieth of a second (a dropped packet, a splice).
+        let pos = match at {
+            Some(running) if (running - stamp).abs() <= rate / 50 => running,
+            _ => stamp,
+        };
+        if pos >= seg.media_end as i128 {
+            return true;
+        }
+        let decoded = match decoder.decode(&bytes) {
+            Ok(Some(decoded)) => decoded,
+            Ok(None) => continue,
+            Err(e) => {
+                eprintln!("audio decode error at sample {pos}: {e}");
+                return true;
+            }
+        };
+        let mut interleaved = decoded.samples;
+        let width = decoded.channels.max(1);
+        at = Some(pos + i128::from(decoded.frames));
+        downmix(&mut interleaved, width);
+        widen(&mut interleaved, width.min(2), channels);
+        let frames = (interleaved.len() / channels) as i128;
+        // A packet that starts before the clip does: the frames in front of 0 are dropped.
+        let (mut pos, mut frames) = (pos, frames);
+        if pos < 0 {
+            let cut = ((-pos).min(frames)) as usize;
+            interleaved.drain(..cut * channels);
+            pos += cut as i128;
+            frames -= cut as i128;
+        }
+        if frames <= 0 {
+            continue;
+        }
+        // The first sound of the run begins after the window does: the gap is silence,
+        // so the sound keeps its offset from the picture.
+        if first {
+            first = false;
+            let target = seg.media_target as i128;
+            if pos > target {
+                let gap = (pos.min(seg.media_end as i128) - target) as usize;
+                let mut silence = vec![0.0f32; gap * channels];
+                if !emit(
+                    &mut silence,
+                    seg,
+                    Chain {
+                        eq: eq.as_deref_mut(),
+                        speed: &mut *speed,
+                        fade: &mut *fade,
+                        channels,
+                        timeline: &mut *timeline,
+                        tx,
+                    },
+                    target as u64,
+                    pos.min(seg.media_end as i128) as u64,
+                ) {
+                    return false;
+                }
+            }
+        }
+        if !emit(
+            &mut interleaved,
+            seg,
+            Chain {
+                eq: eq.as_deref_mut(),
+                speed: &mut *speed,
+                fade: &mut *fade,
+                channels,
+                timeline: &mut *timeline,
+                tx,
+            },
+            pos as u64,
+            (pos + frames) as u64,
+        ) {
+            return false;
+        }
+    }
+}
+
+fn run_sym(track: &mut SymTrack, seg: &Segment, chain: Chain<'_>) -> bool {
+    let Chain {
+        mut eq,
+        speed,
+        fade,
+        channels,
+        timeline,
+        tx,
+    } = chain;
     let mut decoder = match track.decoder() {
         Ok(decoder) => decoder,
         Err(e) => {
@@ -3474,8 +5140,11 @@ fn run_sym(
     // cannot carry it, because the frames of one laced block all share the
     // block's -- accumulating is what both mp4 readers here already do.
     let mut at: Option<u64> = None;
+    // The withheld tail (see `SymTrack::tail_hold`) and the position of its first frame.
+    let mut held: Vec<f32> = Vec::new();
+    let mut held_pos = 0u64;
     loop {
-        let packet = match track.reader.next_packet() {
+        let packet = match track.next_packet() {
             Ok(Some(packet)) => packet,
             Ok(None) => return true, // end of the file, and of the segment
             Err(e) => {
@@ -3486,7 +5155,16 @@ fn run_sym(
         if packet.track_id != track.track_id {
             continue; // another track of the same container
         }
-        let pos = *at.get_or_insert_with(|| track.samples_at(packet.pts));
+        // A Matroska Vorbis packet's own start is exact ([`SymTrack::exact_start`]);
+        // the running count and the stamp only answer where there is no index.
+        let pos = track.exact_start(packet.pts).or(at).unwrap_or_else(|| match track.params.codec {
+            // A Vorbis run from the top starts at the top. Matroska stamps its
+            // blocks a few milliseconds past the samples they hold (ffmpeg
+            // starts the same file at 0), so the first block's stamp is not the
+            // start of the run.
+            CODEC_ID_VORBIS if seg.media_target == 0 => 0,
+            _ => track.samples_at(packet.pts),
+        });
         if pos >= seg.media_end {
             return true; // segment done, on to the next one
         }
@@ -3498,21 +5176,50 @@ fn run_sym(
         // [`downmix`]); widen the mono case up to the timeline's own width
         // before anything below divides by it.
         widen(&mut interleaved, usize::from(track.channels), channels);
+        if interleaved.is_empty() {
+            // A packet that answers nothing (a fresh decoder's first block
+            // only primes the overlap) is not a position: the packet that
+            // does answer carries its own timestamp, and counting on from this
+            // one's is what put a seeked Vorbis file 1025 samples off its timeline.
+            at = None;
+            continue;
+        }
         let next = pos + (interleaved.len() / channels) as u64;
         at = Some(next);
+        // The last `tail_hold` frames of the track are not played: they wait
+        // here, and whatever is still held when the file ends is dropped.
+        let (pos, next) = if track.tail_hold > 0 {
+            if held.is_empty() {
+                held_pos = pos;
+            }
+            held.append(&mut interleaved);
+            let keep = usize::try_from(track.tail_hold)
+                .unwrap_or(usize::MAX)
+                .saturating_mul(channels);
+            let release = held.len().saturating_sub(keep);
+            interleaved.extend(held.drain(..release));
+            let released = (interleaved.len() / channels) as u64;
+            let from = held_pos;
+            held_pos += released;
+            (from, from + released)
+        } else {
+            (pos, next)
+        };
         // Reborrowed per packet: the filter memory has to carry across the
         // packet boundary, so this is one `EqState` for the whole segment.
         if !emit(
             &mut interleaved,
-            channels,
             seg,
-            eq.as_deref_mut(),
-            speed.as_mut(),
-            fade.as_mut(),
+            Chain {
+                eq: eq.as_deref_mut(),
+                speed: &mut *speed,
+                fade: &mut *fade,
+                channels,
+                timeline: &mut *timeline,
+                tx,
+            },
             pos,
             next,
-            timeline,
-            tx,
         ) {
             return false;
         }
@@ -3521,7 +5228,11 @@ fn run_sym(
 
 #[cfg(test)]
 mod tests {
-    use super::{PRE_ROLL, SAMPLES_PER_PACKET, downmix, packet_at, packet_run, vorbis_to_film_order};
+    use super::{
+        MixControls, PRE_ROLL, SAMPLES_PER_PACKET, downmix, packet_at, packet_run, packet_run_last,
+        vorbis_to_film_order,
+    };
+    use crate::limiter::Limiter;
 
     const C: f32 = std::f32::consts::FRAC_1_SQRT_2;
 
@@ -3539,7 +5250,14 @@ mod tests {
             (5, &[(1.0, 0.0), (0.0, 1.0), (C, C), (C, 0.0), (0.0, C)]),
             (
                 6,
-                &[(1.0, 0.0), (0.0, 1.0), (C, C), (0.0, 0.0), (C, 0.0), (0.0, C)],
+                &[
+                    (1.0, 0.0),
+                    (0.0, 1.0),
+                    (C, C),
+                    (0.0, 0.0),
+                    (C, 0.0),
+                    (0.0, C),
+                ],
             ),
             (
                 7,
@@ -3624,7 +5342,10 @@ mod tests {
         let mut lfe = vec![0.0f32; 8];
         lfe[7] = 1.0;
         vorbis_to_film_order(&mut lfe, 8);
-        assert_eq!(lfe[3], 1.0, "the LFE lands where the fold drops it: {lfe:?}");
+        assert_eq!(
+            lfe[3], 1.0,
+            "the LFE lands where the fold drops it: {lfe:?}"
+        );
     }
 
     /// A real AAC track: one stts entry, N packets of 1024.
@@ -3715,6 +5436,23 @@ mod tests {
     }
 
     #[test]
+    fn the_last_run_rounds_up_so_the_copy_reaches_its_picture() {
+        // test_sync.mp4: 4.0 s at 44100 is 172.27 packets. Nearest copies 172 and
+        // leaves 6 ms unwritten; the last run takes the 173rd, which runs 16 ms
+        // past the picture -- under a frame.
+        let ideal = 176_400;
+        let mut err = 0;
+        assert_eq!(packet_run(&mut err, ideal, u32::MAX), 172);
+        let mut err = 0;
+        assert_eq!(packet_run_last(&mut err, ideal, u32::MAX), 173);
+        assert_eq!(err, 173 * 1024 - ideal);
+        // A whole number of packets is not rounded up, and the track's end caps it.
+        let mut err = 0;
+        assert_eq!(packet_run_last(&mut err, 1024 * 10, u32::MAX), 10);
+        assert_eq!(packet_run_last(&mut err, 1024 * 10, 4), 4);
+    }
+
+    #[test]
     fn packet_run_forgives_a_debt_the_track_cannot_pay() {
         // Asking a second of a track with ten packets left: it delivers ten and
         // does not make the next segment copy the shortfall from elsewhere.
@@ -3741,33 +5479,19 @@ mod tests {
     /// decoder turns it into exactly one packet of exactly zero.
     #[test]
     fn a_silent_packet_decodes_to_a_packet_of_zero() {
-        use super::{AacDecoder, AudioDecoder, AudioDecoderOptions, silent_packet};
-        use symphonia_core::codecs::audio::{AudioCodecParameters, well_known::CODEC_ID_AAC};
-        use symphonia_core::{packet::Packet, units};
+        use super::silent_packet;
 
         for (chan_conf, channels) in [(1u8, 1usize), (2, 2)] {
             // AAC-LC (profile 2), 44100 (freq_index 4), `chan_conf` channels.
-            let asc: Box<[u8]> = Box::new([(2 << 3) | (4 >> 1), (4 << 7) | (chan_conf << 3)]);
-            let mut params = AudioCodecParameters::new();
-            params
-                .for_codec(CODEC_ID_AAC)
-                .with_sample_rate(44100)
-                .with_extra_data(asc);
-            let mut decoder =
-                AacDecoder::try_new(&params, &AudioDecoderOptions::default()).expect("decoder");
+            // `4 << 7` in a u8 is zero: freq_index 4 has no low bits to put in byte 1.
+            let asc = [(2 << 3) | (4 >> 1), chan_conf << 3];
+            let mut decoder = ec_aac::AacDecoder::with_config_bytes(&asc).expect("decoder");
             let bytes = silent_packet(chan_conf).expect("silence");
-            let packet = Packet::new(
-                0,
-                units::Timestamp::new(0),
-                units::Duration::new(u64::from(SAMPLES_PER_PACKET)),
-                &bytes[..],
-            );
-            let buf = decoder.decode(&packet).expect("decodes as AAC-LC");
-            let mut out = Vec::new();
-            buf.copy_to_vec_interleaved::<f32>(&mut out);
-            assert_eq!(out.len(), SAMPLES_PER_PACKET as usize * channels);
+            let pcm = decoder.decode(&bytes, None).expect("decodes as AAC-LC");
+            assert_eq!(pcm.channels as usize, channels);
+            assert_eq!(pcm.samples.len(), SAMPLES_PER_PACKET as usize * channels);
             assert!(
-                out.iter().all(|&s| s == 0.0),
+                pcm.samples.iter().all(|&s| s == 0.0),
                 "{chan_conf} ch is not silent"
             );
         }
@@ -3776,4 +5500,128 @@ mod tests {
             "beyond stereo is refused, not faked"
         );
     }
+
+    #[test]
+    fn lane_peaks_keep_the_highest_level_until_read() {
+        let controls = MixControls::new(vec![1.0, 1.0], Vec::new(), Limiter::default());
+        controls.note_lane_peak(0, 0.25);
+        controls.note_lane_peak(0, 0.5);
+        controls.note_lane_peak(0, 0.125);
+        controls.note_lane_peak(1, 0.75);
+        controls.note_lane_peak(7, 1.0);
+        assert_eq!(
+            controls.take_lane_peaks(),
+            vec![0.5, 0.75],
+            "the highest level since the last read, per lane; a lane with no slot is ignored"
+        );
+        assert_eq!(
+            controls.take_lane_peaks(),
+            vec![0.0, 0.0],
+            "a read starts the meters over"
+        );
+    }
+
+    /// A stereo clip on a mono timeline is no longer refused: the export folds
+    /// its pair to the one channel the timeline carries ([`super::widen`]), the
+    /// same as playback does. The file comes back mono, and the stereo clip's
+    /// span is audible in it -- silent there would mean the fold dropped it.
+    #[test]
+    fn a_mono_clip_then_a_stereo_clip_exports_stereo() {
+        use crate::export::{ExportSettings, Format};
+        use crate::project::{Clip, LaneKind, Project, Source, Speed};
+        use crate::scale::FitPolicy;
+
+        let assets = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets");
+        let mono = assets.join("test_seek_chirp.mkv");
+        let stereo = assets.join("test_av1_grain.mkv");
+        let meta = crate::demux::Demuxer::open(&assets.join("test_av.mp4"))
+            .expect("open test_av")
+            .0;
+        let clip = |start, source| Clip {
+            speed_keys: Vec::new(),
+            reversed: false,
+            stabilise: None, deinterlace: Default::default(), mark: Default::default(),
+            angle: Default::default(),
+            fade_in: 0,
+            fade_out: 0,
+            transition_out: 0,
+            transition_kind: Default::default(),
+            visualizer: 0,
+            viz_paint: 0,
+            gain_db: 0.0,
+            gain_keys: Vec::new(),
+            pan: 0,
+            transform_keys: Vec::new(),
+            opacity_keys: Vec::new(),
+            color_keys: Vec::new(),
+            effects: Vec::new(),
+            start,
+            in_frame: 0,
+            out_frame: 30,
+            source,
+            link: None,
+            eq: None,
+            color: None,
+            fit: FitPolicy::default(),
+            speed: Speed::NORMAL,
+            transform: None,
+            pitch: 0,
+        };
+        // One second of the mono source, then one second of the stereo one.
+        let project = Project::from_parts(
+            vec![Source::new(&mono, 0), Source::new(&stereo, 0)],
+            vec![(LaneKind::Audio, vec![clip(0, 0), clip(30, 1)])],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("a mono clip with a stereo clip after it");
+
+        let out = crate::scratch::Scratch::file("ve_stereo_on_mono", "wav");
+        let handle = crate::export::start(
+            project,
+            meta,
+            &out,
+            &ExportSettings {
+                format: Format::Wav,
+                ..Default::default()
+            },
+            None,
+        );
+        let started = std::time::Instant::now();
+        while !handle.is_finished() {
+            assert!(started.elapsed().as_secs() < 120, "export did not finish in 120s");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        handle
+            .result()
+            .expect("a finished export has an outcome")
+            .expect("a mono clip then a stereo clip exports");
+
+        let (audio, chunks) = crate::AudioSession::open(&out)
+            .expect("reopen the export")
+            .expect("the export has audio");
+        let mut samples = Vec::new();
+        for chunk in chunks {
+            samples.extend(chunk.samples);
+        }
+        // The timeline is as wide as its widest clip: the mono clip is widened
+        // into both channels, and the stereo one is kept rather than folded.
+        assert_eq!(audio.channels, 2, "a stereo clip makes the timeline stereo");
+        let rate = f64::from(audio.sample_rate);
+        let rms = |from: f64, to: f64| {
+            let at = |secs: f64| (secs * rate) as usize;
+            let window = &samples[at(from).min(samples.len())..at(to).min(samples.len())];
+            assert!(!window.is_empty(), "no samples in [{from}, {to})");
+            (window.iter().map(|s| f64::from(*s) * f64::from(*s)).sum::<f64>() / window.len() as f64)
+                .sqrt()
+        };
+        let mono_span = rms(0.05, 0.95);
+        let stereo_span = rms(1.05, 1.95);
+        println!("rms: mono clip {mono_span:.4}  stereo clip {stereo_span:.4}");
+        assert!(mono_span > 0.01, "the mono clip is audible");
+        assert!(stereo_span > 0.01, "the stereo clip is audible on the stereo timeline");
+        std::fs::remove_file(&out).ok();
+    }
 }
+

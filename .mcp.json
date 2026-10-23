@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "edith": {
+      "command": "/home/tahinli/Documents/Code/Rust/edith/target/release/edith_mcp"
+    }
+  }
+}

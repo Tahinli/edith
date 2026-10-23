@@ -25,6 +25,7 @@
 //! `colr`, H.264 VUI, HEVC VUI and AV1 `color_config` all point at.
 
 use crate::demux::Codec;
+use crate::scale::Sample;
 
 /// The YUV->RGB matrix a stream's chroma was coded against. Only the three that
 /// exist in practice: SD (BT.601), HD (BT.709) and UHD/HDR (BT.2020
@@ -71,16 +72,24 @@ impl Default for ColorDescription {
     }
 }
 
+/// Whether a `width` x `height` picture is standard definition, and so BT.601:
+/// the rule both the untagged guess and the output's declared matrix read, so
+/// the tag and the pixels cannot disagree. SD is the one family of rasters that
+/// is both at most 854 wide (the 480-line 16:9 raster is 854x480; the 4:3 and
+/// PAL-storage ones are 640 and 720) and at most 576 lines (PAL and NTSC).
+/// Anything taller than 576 lines is HD, as it always was, and anything wider
+/// than 854 is HD too -- a 1000x562 canvas is not a 576-line picture, so it is
+/// not SD merely for being short.
+pub fn is_sd(width: u32, height: u32) -> bool {
+    width <= 854 && height <= 576
+}
+
 impl ColorDescription {
-    /// The three tiers collapsed into one answer. `height` is the coded picture
-    /// height the heuristic reads when nothing else said anything.
+    /// The three tiers collapsed into one answer. `width` and `height` are the
+    /// coded picture size the heuristic reads when nothing else said anything.
     pub fn resolve(container: Tags, bitstream: Tags, height: u32) -> Self {
         let tags = container.over(bitstream);
         Self {
-            // The ffmpeg/mpv rule, and the reason it is a rule: an untagged
-            // 1080p file is HD material and an untagged 480p one came off SD
-            // material, and guessing the other way is a visible green/magenta
-            // shift on faces.
             matrix: tags.matrix.unwrap_or(if height >= 720 {
                 Matrix::Bt709
             } else {
@@ -91,8 +100,37 @@ impl ColorDescription {
         }
     }
 
-    /// What an export of a `height`-line canvas *declares itself to be*, and
-    /// therefore what every clip on it is remapped into: the same 720-line rule
+    /// [`resolve`](Self::resolve) with the size rule ([`is_sd`]) in place of the
+    /// height-only one: what a picture of `width` x `height` is read as untagged.
+    pub fn resolve_sized(container: Tags, bitstream: Tags, width: u32, height: u32) -> Self {
+        let tags = container.over(bitstream);
+        Self {
+            // The ffmpeg/mpv rule, and the reason it is a rule: an untagged
+            // 1080p file is HD material and an untagged 480p one came off SD
+            // material, and guessing the other way is a visible green/magenta
+            // shift on faces. The size rule is [`is_sd`].
+            matrix: tags.matrix.unwrap_or(if is_sd(width, height) {
+                Matrix::Bt601
+            } else {
+                Matrix::Bt709
+            }),
+            transfer: tags.transfer.unwrap_or(Transfer::Sdr),
+            full_range: tags.full_range.unwrap_or(false),
+        }
+    }
+
+    /// Whether [`resolve_sized`](Self::resolve_sized) read the matrix off the size
+    /// rule ([`is_sd`]) rather than off a tag: true when neither the container nor
+    /// the bitstream names a matrix this engine renders with. A matrix it names
+    /// but does not render (FCC, SMPTE 240M, ICtCp) counts as not named, since
+    /// the size rule is what decided it. Transfer and range have their own fixed
+    /// fallbacks (SDR, limited), not the size rule, so this says nothing about them.
+    pub fn matrix_assumed(container: Tags, bitstream: Tags) -> bool {
+        container.over(bitstream).matrix.is_none()
+    }
+
+    /// What an export of a `width` x `height` canvas *declares itself to be*, and
+    /// therefore what every clip on it is remapped into: the same size rule
     /// [`resolve`](Self::resolve)'s heuristic reads, so a file written here is
     /// read back as the space it was written in even by a reader that drops the
     /// tags. Limited range because both encoders here are configured for it, and
@@ -104,6 +142,20 @@ impl ColorDescription {
                 Matrix::Bt709
             } else {
                 Matrix::Bt601
+            },
+            transfer: Transfer::Sdr,
+            full_range: false,
+        }
+    }
+
+    /// [`output`](Self::output) with the size rule ([`is_sd`]) in place of the
+    /// height-only one. Every export declares itself with this one.
+    pub fn output_sized(width: u32, height: u32) -> Self {
+        Self {
+            matrix: if is_sd(width, height) {
+                Matrix::Bt601
+            } else {
+                Matrix::Bt709
             },
             transfer: Transfer::Sdr,
             full_range: false,
@@ -276,8 +328,9 @@ fn sei_value(sei: &[u8], at: &mut usize) -> Option<usize> {
 /// Rewrites planar 4:2:0 samples coded against `from` as the same picture coded
 /// against `to`, in place. Both spaces here are limited range with the same
 /// primaries, so this is the matrix and nothing else: no gamut mapping, no range
-/// scaling, and the 16/128/128 of black lands on itself either way -- which is
-/// what makes a letterboxed bar and a gap's black frame cost nothing.
+/// scaling (a full-range picture is brought to limited first, by
+/// [`limit_range`]), and the 16/128/128 of black lands on itself either way --
+/// which is what makes a letterboxed bar and a gap's black frame cost nothing.
 ///
 /// Derived from the two matrices, not tabulated: with R,G,B eliminated between
 /// them, luma picks up a chroma term and the two chroma planes mix only with
@@ -287,7 +340,7 @@ fn sei_value(sei: &[u8], at: &mut usize) -> Option<usize> {
 /// other matrix in this engine.
 ///
 /// A no-op when the two spaces are the same, so the caller may hand any pair.
-pub fn remap(from: Matrix, to: Matrix, y: &mut [u8], u: &mut [u8], v: &mut [u8], width: usize) {
+pub fn remap<T: Sample>(from: Matrix, to: Matrix, y: &mut [T], u: &mut [T], v: &mut [T], width: usize) {
     // BT.2020 is never an output here (see [`ColorDescription::output`]) and a
     // 2020 source arrives on the tone-mapping path, not this one.
     // On normalised samples the two rows are Y' = Y - 0.1182 Cb - 0.2127 Cr,
@@ -303,17 +356,53 @@ pub fn remap(from: Matrix, to: Matrix, y: &mut [u8], u: &mut [u8], v: &mut [u8],
         _ => return,
     };
     let [yb, yr, ub, ur, vb, vr] = coeffs;
+    // The same arithmetic at either depth: a 10-bit span is four times the 8-bit
+    // one, so the coefficients are unchanged and the rounding is one code.
+    let (neutral, top) = (T::NEUTRAL.code() as i32, T::MAX as i32);
     let cw = width.div_ceil(2);
     for (i, y) in y.iter_mut().enumerate() {
         let (row, col) = (i / width, i % width);
         let ci = (row / 2) * cw + col / 2;
-        let (d, e) = (u[ci] as i32 - 128, v[ci] as i32 - 128);
-        *y = (*y as i32 + ((yb * d + yr * e + 128) >> 8)).clamp(0, 255) as u8;
+        let (d, e) = (u[ci].code() as i32 - neutral, v[ci].code() as i32 - neutral);
+        *y = T::from_code(
+            (y.code() as i32 + ((yb * d + yr * e + 128) >> 8)).clamp(0, top) as u32,
+        );
     }
     for (u, v) in u.iter_mut().zip(v) {
-        let (d, e) = (*u as i32 - 128, *v as i32 - 128);
-        *u = (128 + ((ub * d + ur * e + 128) >> 8)).clamp(0, 255) as u8;
-        *v = (128 + ((vb * d + vr * e + 128) >> 8)).clamp(0, 255) as u8;
+        let (d, e) = (u.code() as i32 - neutral, v.code() as i32 - neutral);
+        *u = T::from_code((neutral + ((ub * d + ur * e + 128) >> 8)).clamp(0, top) as u32);
+        *v = T::from_code((neutral + ((vb * d + vr * e + 128) >> 8)).clamp(0, top) as u32);
+    }
+}
+
+/// Rescales planar 4:2:0 samples coded full range (every code 0..255) into the
+/// limited range every output here is declared as, in place: Y' = 16 + Y * 219 / 255
+/// and C' = 128 + (C - 128) * 224 / 255, each rounded to the nearest code. Black
+/// lands on 16, white on 235 (chroma on 16 and 240), and mid grey stays on 128.
+///
+/// Runs before [`remap`], whose coefficients are written for limited codes: a
+/// full-range picture that is matrix-converted without this is read with the
+/// wrong span. A table per plane, so the cost is one lookup per sample.
+pub fn limit_range<T: Sample>(y: &mut [T], u: &mut [T], v: &mut [T]) {
+    // The limited spans of the 8-bit codes, scaled to the sample's depth: black at
+    // 16 and 64, neutral at 128 and 512, 219 and 876 luma codes, 224 and 896 chroma.
+    let max = f64::from(T::MAX);
+    let depth = max + 1.0;
+    let (black, neutral) = (depth / 16.0, depth / 2.0);
+    let (luma_span, chroma_span) = (depth * 219.0 / 256.0, depth * 224.0 / 256.0);
+    let luma: Vec<T> = (0..=T::MAX)
+        .map(|code| T::from_code((black + f64::from(code) * luma_span / max).round() as u32))
+        .collect();
+    let chroma: Vec<T> = (0..=T::MAX)
+        .map(|code| {
+            T::from_code((neutral + (f64::from(code) - neutral) * chroma_span / max).round() as u32)
+        })
+        .collect();
+    for sample in y.iter_mut() {
+        *sample = luma[sample.code() as usize];
+    }
+    for sample in u.iter_mut().chain(v.iter_mut()) {
+        *sample = chroma[sample.code() as usize];
     }
 }
 
@@ -324,9 +413,44 @@ pub struct Tags {
     pub matrix: Option<Matrix>,
     pub transfer: Option<Transfer>,
     pub full_range: Option<bool>,
+    /// The H.273 code points as the tier wrote them, for a copy to write back
+    /// as they were. The enums above are what renders, and they name only the
+    /// codes this engine implements; these keep the rest (SMPTE 240M, say), and
+    /// the primaries, which nothing here renders with. `None` is "said nothing",
+    /// unspecified (0 and 2 in H.273) included.
+    pub matrix_code: Option<u16>,
+    pub transfer_code: Option<u16>,
+    pub primaries: Option<u16>,
+}
+
+/// An H.273 code point as a tier states it: `None` for the two values that say
+/// nothing, 0 (reserved) and 2 (unspecified), in every table.
+fn said(code: u64) -> Option<u16> {
+    u16::try_from(code).ok().filter(|&c| c != 0 && c != 2)
 }
 
 impl Tags {
+    /// What a stream written with `color` declares -- every field said, the
+    /// code points exactly as [`ColorDescription::codes`] writes them.
+    pub fn of(color: ColorDescription) -> Self {
+        let (primaries, transfer, matrix) = color.codes();
+        Self {
+            matrix: Some(color.matrix),
+            transfer: Some(color.transfer),
+            full_range: Some(color.full_range),
+            matrix_code: Some(matrix),
+            transfer_code: Some(transfer),
+            primaries: Some(primaries),
+        }
+    }
+
+    /// The same tags with the primaries code the container states (H.273
+    /// `colour_primaries`, Matroska `Primaries`, an mp4 `colr` field).
+    pub fn with_primaries(mut self, code: u64) -> Self {
+        self.primaries = said(code);
+        self
+    }
+
     /// H.273 code points, as every container and every bitstream writes them.
     /// `range` is the Matroska `Range` code -- 0 unspecified, 1 limited, 2 full,
     /// 3 "whatever the matrix implies", which is a non-answer here. A source
@@ -356,6 +480,9 @@ impl Tags {
                 2 => Some(true),
                 _ => None,
             },
+            matrix_code: said(matrix),
+            transfer_code: said(transfer),
+            primaries: None,
         }
     }
 
@@ -365,6 +492,9 @@ impl Tags {
             matrix: self.matrix.or(next.matrix),
             transfer: self.transfer.or(next.transfer),
             full_range: self.full_range.or(next.full_range),
+            matrix_code: self.matrix_code.or(next.matrix_code),
+            transfer_code: self.transfer_code.or(next.transfer_code),
+            primaries: self.primaries.or(next.primaries),
         }
     }
 }
@@ -389,10 +519,112 @@ pub fn bitstream_tags(codec: Codec, sets: &[u8]) -> Tags {
             .filter(|n| n.len() > 2)
             .map(|n| hevc_sps(&rbsp(&n[2..])))
             .unwrap_or_default(),
-        Codec::Av1 => av1_sequence_header(sets),
+        Codec::Av1 => av1_sequence_header(sets).0,
         Codec::Vp9 => Tags::default(),
         Codec::Vp8 => Tags::default(),
+        Codec::Mpeg2 => mpeg2_tags(sets),
+        Codec::ProRes | Codec::Dnxhd | Codec::Mjpeg | Codec::Dv | Codec::Mpeg4 | Codec::MsMpeg4 | Codec::Raw => Tags::default(),
     }
+}
+
+/// How a picture's samples are laid out in the chroma planes: the share of the
+/// luma grid each chroma plane gets, or none at all. Read off the bitstream, not
+/// the container, which states no chroma format anywhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Chroma {
+    /// Monochrome: luma only, no chroma plane.
+    Gray,
+    /// Chroma at half the luma resolution both ways.
+    C420,
+    /// Chroma at half the width and full height.
+    C422,
+    /// Chroma at full resolution.
+    C444,
+}
+
+impl Chroma {
+    /// The `chroma_format_idc` of H.264 and HEVC (0 to 3), which AV1 spells as a
+    /// monochrome flag and a pair of subsampling bits.
+    fn from_idc(idc: u32) -> Option<Self> {
+        match idc {
+            0 => Some(Self::Gray),
+            1 => Some(Self::C420),
+            2 => Some(Self::C422),
+            3 => Some(Self::C444),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for Chroma {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Gray => "gray",
+            Self::C420 => "4:2:0",
+            Self::C422 => "4:2:2",
+            Self::C444 => "4:4:4",
+        })
+    }
+}
+
+/// The chroma format the stream's own parameter sets state, out of the same
+/// places [`bitstream_tags`] reads: the SPS `chroma_format_idc` for H.264 and
+/// HEVC, the sequence header's monochrome flag and subsampling bits for AV1.
+/// `Some(C420)` for VP8, which has no other format, and `None` for VP9, whose
+/// format is in its keyframe header and not in any parameter set -- the demuxer
+/// reads that itself. `None` as well where the sets are absent or malformed.
+pub fn bitstream_chroma(codec: Codec, sets: &[u8]) -> Option<Chroma> {
+    match codec {
+        Codec::H264 => nal_units(sets)
+            .find(|n| n.first().is_some_and(|b| b & 0x1f == 7))
+            .and_then(|n| h264_chroma(&rbsp(&n[1..]))),
+        Codec::Hevc => nal_units(sets)
+            .find(|n| n.first().is_some_and(|b| (b >> 1) & 0x3f == 33))
+            .filter(|n| n.len() > 2)
+            .and_then(|n| hevc_chroma(&rbsp(&n[2..]))),
+        Codec::Av1 => av1_sequence_header(sets).1,
+        Codec::Vp9 => None,
+        Codec::Vp8 => Some(Chroma::C420),
+        Codec::Mpeg2 => mpeg2_chroma(sets),
+        Codec::ProRes | Codec::Dnxhd | Codec::Mjpeg | Codec::Dv => None,
+        // Part 2 and H.263 are 8-bit 4:2:0 by definition (the decoder has no other layout).
+        Codec::Mpeg4 | Codec::MsMpeg4 => Some(Chroma::C420),
+        // The raw layout (4:4:4 for RGB, 4:2:2 or 4:2:0 for YUV) is read off the first picture.
+        Codec::Raw => None,
+    }
+}
+
+/// `profile_idc` values whose SPS carries `chroma_format_idc` (ITU-T H.264
+/// §7.3.2.1.1). Every other profile is 8-bit 4:2:0 by definition.
+const H264_CHROMA_PROFILES: [u32; 13] = [
+    100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135,
+];
+
+/// The H.264 SPS walked as far as `chroma_format_idc`, which sits right after
+/// `seq_parameter_set_id` in the profiles that carry it.
+fn h264_chroma(rbsp: &[u8]) -> Option<Chroma> {
+    let mut b = Bits::new(rbsp);
+    let profile_idc = b.u(8);
+    b.skip(8 + 8); // constraint flags + reserved, level_idc
+    b.ue(); // seq_parameter_set_id
+    if !H264_CHROMA_PROFILES.contains(&profile_idc) {
+        return Some(Chroma::C420);
+    }
+    let idc = b.ue();
+    (!b.overrun()).then(|| Chroma::from_idc(idc)).flatten()
+}
+
+/// The HEVC SPS walked as far as `chroma_format_idc`, past the profile/tier
+/// record and the SPS id -- the same prefix [`hevc_sps`] counts.
+fn hevc_chroma(rbsp: &[u8]) -> Option<Chroma> {
+    let mut b = Bits::new(rbsp);
+    b.skip(4); // sps_video_parameter_set_id
+    let max_sub_layers_minus1 = b.u(3);
+    b.bit(); // sps_temporal_id_nesting_flag
+    profile_tier_level(&mut b, max_sub_layers_minus1);
+    b.ue(); // sps_seq_parameter_set_id
+    let idc = b.ue();
+    (!b.overrun()).then(|| Chroma::from_idc(idc)).flatten()
 }
 
 /// The Annex-B NAL units in `buf`, payloads only: start codes are three or four
@@ -503,10 +735,10 @@ impl<'a> Bits<'a> {
     /// `se(v)`, signed exp-Golomb: the unsigned code zig-zagged.
     fn se(&mut self) -> i32 {
         let k = self.ue();
-        if k % 2 == 0 {
+        if k.is_multiple_of(2) {
             -((k / 2) as i32)
         } else {
-            ((k + 1) / 2) as i32
+            k.div_ceil(2) as i32
         }
     }
 }
@@ -808,13 +1040,63 @@ fn vui_colour(b: &mut Bits) -> Tags {
     )
 }
 
+/// The body of the extension of `id` (ISO 13818-2 §6.2.2.x) in an MPEG-2 sequence
+/// header run: the bytes after `00 00 01 B5`, the id in the high nibble of the first.
+pub(crate) fn mpeg2_extension(sets: &[u8], id: u8) -> Option<&[u8]> {
+    let mut at = 0;
+    while let Some(i) = sets.get(at..)?.windows(4).position(|w| w[..3] == [0, 0, 1] && w[3] == 0xB5) {
+        let body = sets.get(at + i + 4..)?;
+        if body.first().is_some_and(|b| b >> 4 == id) {
+            return Some(body);
+        }
+        at += i + 4;
+    }
+    None
+}
+
+/// The colour description of an MPEG-2 sequence display extension (§6.3.6), when the
+/// header run carries one. Video is limited range by definition.
+fn mpeg2_tags(sets: &[u8]) -> Tags {
+    let Some(b) = mpeg2_extension(sets, 2) else {
+        return Tags::default();
+    };
+    // id(4) video_format(3) colour_description(1), then primaries, transfer, matrix.
+    if b.len() < 4 || b[0] & 1 == 0 {
+        return Tags::default();
+    }
+    Tags::from_codes(u64::from(b[3]), u64::from(b[2]), 1)
+}
+
+/// `chroma_format` of an MPEG-2 sequence extension (§6.3.5). MPEG-1 has no extension
+/// and is 4:2:0.
+fn mpeg2_chroma(sets: &[u8]) -> Option<Chroma> {
+    let Some(b) = mpeg2_extension(sets, 1) else {
+        return Some(Chroma::C420);
+    };
+    match b.get(1)? >> 1 & 3 {
+        1 => Some(Chroma::C420),
+        2 => Some(Chroma::C422),
+        3 => Some(Chroma::C444),
+        _ => None,
+    }
+}
+
+/// Whether an MPEG-2 sequence is coded progressive (`progressive_sequence`); MPEG-1
+/// always is. A sequence that says nothing is taken as interlaced-capable.
+pub(crate) fn mpeg2_progressive(sets: &[u8]) -> bool {
+    match mpeg2_extension(sets, 1) {
+        Some(b) => b.get(1).is_some_and(|b| b & 8 != 0),
+        None => sets.windows(4).any(|w| w == [0, 0, 1, 0xB3]),
+    }
+}
+
 /// `color_config` out of the sequence header OBU (AV1 §5.5.1, §5.5.2), which is
 /// what `av1C`/`CodecPrivate` carries and what both demuxers re-inject ahead of
 /// every keyframe. The whole header before it is counted, and most of it is
 /// conditional -- the operating points and the decoder model in particular.
-fn av1_sequence_header(obus: &[u8]) -> Tags {
+fn av1_sequence_header(obus: &[u8]) -> (Tags, Option<Chroma>) {
     let Some(payload) = sequence_header_obu(obus) else {
-        return Tags::default();
+        return (Tags::default(), None);
     };
     let mut b = Bits::new(payload);
     let seq_profile = b.u(3);
@@ -849,7 +1131,7 @@ fn av1_sequence_header(obus: &[u8]) -> Tags {
                 // decoder model declared, plus low_delay_mode_flag. The lengths
                 // were skipped above, so a file with a decoder model is where
                 // this walk stops being able to count.
-                return Tags::default();
+                return (Tags::default(), None);
             }
             if initial_display_delay && b.bit() == 1 {
                 b.skip(4); // initial_display_delay_minus_1[i]
@@ -938,11 +1220,9 @@ fn uvlc(b: &mut Bits) {
 
 /// `color_config` (AV1 §5.5.2). The bit depth and the subsampling are read only
 /// as far as they cost bits before `color_range`.
-fn av1_color_config(b: &mut Bits, seq_profile: u32) -> Tags {
+fn av1_color_config(b: &mut Bits, seq_profile: u32) -> (Tags, Option<Chroma>) {
     let high_bitdepth = b.bit() == 1;
-    if seq_profile == 2 && high_bitdepth {
-        b.bit(); // twelve_bit
-    }
+    let twelve_bit = seq_profile == 2 && high_bitdepth && b.bit() == 1;
     let mono_chrome = seq_profile != 1 && b.bit() == 1;
     let described = b.bit() == 1;
     let (primaries, transfer, matrix) = if described {
@@ -951,24 +1231,52 @@ fn av1_color_config(b: &mut Bits, seq_profile: u32) -> Tags {
         (2, 2, 2) // CP/TC/MC_UNSPECIFIED
     };
     if b.overrun() {
-        return Tags::default();
+        return (Tags::default(), None);
     }
+    // sRGB in an identity matrix is full range by definition, and the flag is
+    // not written -- and its subsampling is 4:4:4 whatever the profile.
+    let srgb = primaries == 1 && transfer == 13 && matrix == 0;
     let full_range = if mono_chrome {
         b.bit() == 1
-    } else if primaries == 1 && transfer == 13 && matrix == 0 {
-        // sRGB in an identity matrix is full range by definition, and the flag
-        // is not written.
+    } else if srgb {
         true
     } else {
         b.bit() == 1
     };
     if b.overrun() {
-        return Tags::default();
+        return (Tags::default(), None);
     }
-    Tags {
-        full_range: Some(full_range),
-        ..Tags::from_codes(u64::from(matrix), u64::from(transfer), 0)
-    }
+    // What follows the range is the subsampling the profile codes (AV1 §5.5.2):
+    // 4:2:0 in profile 0, 4:4:4 in profile 1, and in profile 2 4:2:2 unless the
+    // 12-bit flag asks for the two bits that say which. Monochrome has none.
+    let chroma = if mono_chrome {
+        Some(Chroma::Gray)
+    } else if srgb {
+        Some(Chroma::C444)
+    } else {
+        let (x, y) = match seq_profile {
+            0 => (1, 1),
+            1 => (0, 0),
+            _ if twelve_bit => {
+                let x = b.bit();
+                (x, if x == 1 { b.bit() } else { 0 })
+            }
+            _ => (1, 0),
+        };
+        match (x, y) {
+            (1, 1) => Some(Chroma::C420),
+            (1, 0) => Some(Chroma::C422),
+            (0, 0) => Some(Chroma::C444),
+            _ => None,
+        }
+    };
+    (
+        Tags {
+            full_range: Some(full_range),
+            ..Tags::from_codes(u64::from(matrix), u64::from(transfer), 0)
+        },
+        chroma,
+    )
 }
 
 #[cfg(test)]
@@ -988,6 +1296,45 @@ mod tests {
         meta.color
     }
 
+    fn chroma_of(name: &str) -> Option<Chroma> {
+        let (_, demuxer) = Demuxer::open(&asset(name)).unwrap_or_else(|e| panic!("open {name}: {e}"));
+        demuxer.chroma()
+    }
+
+    /// The chroma format each asset's bitstream states, pinned to what ffprobe
+    /// reports as its pixel format (`gray`, `yuv422p`, and 4:2:0 for the rest, 8-
+    /// and 10-bit alike), across the codecs and both containers.
+    #[test]
+    fn each_codec_states_its_chroma_format() {
+        use Chroma::*;
+        let cases = [
+            ("test_av1_444.mkv", C444),
+            ("test_av1_422.mkv", C422),
+            ("test_av1_gray.mkv", Gray),
+            ("test_av1_gray.mp4", Gray),
+            ("test_av1_420.mp4", C420),
+            ("test_hevc10.mkv", C420),
+            ("test_hevcsw_422.mp4", C422),
+            ("test_vp9_10.webm", C420),
+            ("test_vp9.webm", C420),
+            ("test_high.mp4", C420),
+            ("test_h264.mkv", C420),
+        ];
+        for (name, want) in cases {
+            assert_eq!(chroma_of(name), Some(want), "{name}");
+        }
+    }
+
+    /// The chroma text the probe prints, named the way the table in the doc
+    /// comment names them.
+    #[test]
+    fn chroma_names_read_as_the_probe_prints_them() {
+        assert_eq!(Chroma::Gray.to_string(), "gray");
+        assert_eq!(Chroma::C420.to_string(), "4:2:0");
+        assert_eq!(Chroma::C422.to_string(), "4:2:2");
+        assert_eq!(Chroma::C444.to_string(), "4:4:4");
+    }
+
     /// The tier order itself: a container tag beats both a bitstream tag and the
     /// heuristic, field by field.
     #[test]
@@ -995,7 +1342,7 @@ mod tests {
         let container = Tags::from_codes(9, 16, 1);
         let bitstream = Tags::from_codes(1, 1, 2);
         assert_eq!(
-            ColorDescription::resolve(container, bitstream, 2160),
+            ColorDescription::resolve_sized(container, bitstream, 3840, 2160),
             ColorDescription {
                 matrix: Matrix::Bt2020Ncl,
                 transfer: Transfer::Pq,
@@ -1005,7 +1352,7 @@ mod tests {
         // A container that tagged only the range leaves the rest to the SPS.
         let range_only = Tags::from_codes(0, 0, 2);
         assert_eq!(
-            ColorDescription::resolve(range_only, bitstream, 480),
+            ColorDescription::resolve_sized(range_only, bitstream, 854, 480),
             ColorDescription {
                 matrix: Matrix::Bt709,
                 transfer: Transfer::Sdr,
@@ -1015,16 +1362,34 @@ mod tests {
         // Nothing anywhere: the resolution decides, and only the resolution.
         let none = Tags::default();
         assert_eq!(
-            ColorDescription::resolve(none, none, 1080).matrix,
+            ColorDescription::resolve_sized(none, none, 1920, 1080).matrix,
             Matrix::Bt709
         );
         assert_eq!(
-            ColorDescription::resolve(none, none, 719).matrix,
+            ColorDescription::resolve_sized(none, none, 720, 576).matrix,
             Matrix::Bt601
         );
         assert_eq!(
             ColorDescription::default(),
-            ColorDescription::resolve(none, none, 480)
+            ColorDescription::resolve_sized(none, none, 720, 480)
+        );
+    }
+
+    /// The code points are kept as the file wrote them, not only as far as this
+    /// engine renders them: what a copy writes back. Unspecified says nothing, a
+    /// code the engine does not name is still the file's own, and an export
+    /// states the codes its space has.
+    #[test]
+    fn a_tag_keeps_the_code_points_the_file_wrote() {
+        assert_eq!(Tags::from_codes(2, 2, 0).with_primaries(2), Tags::default());
+        let kept = Tags::from_codes(7, 0, 0).with_primaries(1);
+        assert_eq!(
+            (kept.matrix_code, kept.primaries, kept.matrix),
+            (Some(7), Some(1), None)
+        );
+        assert_eq!(
+            Tags::of(ColorDescription::output_sized(720, 480)).matrix_code,
+            Some(6)
         );
     }
 
@@ -1143,6 +1508,9 @@ mod tests {
                 matrix: Some(Matrix::Bt709),
                 transfer: Some(Transfer::Sdr),
                 full_range: Some(false),
+                matrix_code: Some(1),
+                transfer_code: Some(1),
+                primaries: None,
             }
         );
     }
@@ -1193,6 +1561,9 @@ mod tests {
                 matrix: Some(Matrix::Bt709),
                 transfer: Some(Transfer::Sdr),
                 full_range: Some(false),
+                matrix_code: Some(1),
+                transfer_code: Some(1),
+                primaries: None,
             }
         );
     }
@@ -1267,17 +1638,32 @@ mod tests {
     /// with no tags would have assumed anyway.
     #[test]
     fn an_output_declares_the_space_its_height_implies() {
-        assert_eq!(ColorDescription::output(1080).matrix, Matrix::Bt709);
-        assert_eq!(ColorDescription::output(720).matrix, Matrix::Bt709);
-        assert_eq!(ColorDescription::output(576).matrix, Matrix::Bt601);
-        for height in [480, 1080] {
-            let out = ColorDescription::output(height);
+        assert_eq!(ColorDescription::output_sized(1920, 1080).matrix, Matrix::Bt709);
+        assert_eq!(ColorDescription::output_sized(1280, 720).matrix, Matrix::Bt709);
+        assert_eq!(ColorDescription::output_sized(720, 576).matrix, Matrix::Bt601);
+        for (width, height) in [(720, 480), (1920, 1080)] {
+            let out = ColorDescription::output_sized(width, height);
             assert_eq!(out.transfer, Transfer::Sdr);
             assert!(!out.full_range, "both encoders here are limited range");
         }
         // What the two containers write, in the one table both index.
-        assert_eq!(ColorDescription::output(1080).codes(), (1, 1, 1));
-        assert_eq!(ColorDescription::output(480).codes(), (6, 6, 6));
+        assert_eq!(ColorDescription::output_sized(1920, 1080).codes(), (1, 1, 1));
+        assert_eq!(ColorDescription::output_sized(720, 480).codes(), (6, 6, 6));
+    }
+
+    /// The size rule: SD is at most 854 wide and 576 lines, so a short wide
+    /// canvas (1000x562) is HD, not SD for being under 576 lines.
+    #[test]
+    fn sd_is_the_small_rasters_only() {
+        for (width, height) in [(720, 576), (720, 480), (640, 480), (854, 480)] {
+            assert!(is_sd(width, height), "{width}x{height} is SD");
+        }
+        for (width, height) in [(1000, 562), (1280, 720), (1024, 576), (900, 480), (720, 577)] {
+            assert!(!is_sd(width, height), "{width}x{height} is HD");
+        }
+        // The output declares the rule's answer, pixels and tags alike.
+        assert_eq!(ColorDescription::output_sized(1000, 562).matrix, Matrix::Bt709);
+        assert_eq!(ColorDescription::output_sized(1000, 562).codes().2, 1);
     }
 
     /// Limited-range 4:2:0 samples for one colour, in `matrix`, the float way --
@@ -1384,6 +1770,20 @@ mod tests {
             remap(matrix, matrix, &mut y, &mut u, &mut v, 64);
         }
         assert_eq!((y, u, v), (before_y, before_u, before_v));
+    }
+
+    /// The full byte becomes the limited span: black on 16, white on 235 and
+    /// chroma on 16 and 240, mid grey where it was, and the codes between are
+    /// scaled rather than clipped.
+    #[test]
+    fn a_full_range_picture_is_scaled_into_the_limited_span() {
+        let mut y = vec![0u8, 255, 130, 1, 254];
+        let mut u = vec![0u8, 255, 128, 128, 128];
+        let mut v = vec![255u8, 0, 128, 200, 56];
+        limit_range(&mut y, &mut u, &mut v);
+        assert_eq!(y, [16, 235, 128, 17, 234], "luma over 0..255 -> 16..235");
+        assert_eq!(u, [16, 240, 128, 128, 128], "chroma over 0..255 -> 16..240");
+        assert_eq!(v, [240, 16, 128, 191, 65]);
     }
 
     /// There and back is the picture again: the two directions are one matrix

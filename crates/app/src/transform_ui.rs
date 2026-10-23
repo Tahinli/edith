@@ -43,8 +43,29 @@ pub(crate) const ROTATE_STEP: f32 = 90.;
 /// card's longest label ("Position X" is short, but the value column is wider
 /// here for the crop rows' extra digit).
 pub(crate) const TRANSFORM_W: f32 = 460.;
-/// How much of a slider row the bar itself gets, [`crate::color_ui::COLOR_BAR_W`].
-pub(crate) const TRANSFORM_BAR_W: f32 = 240.;
+
+/// The slider's own range for a band: rotation reads as a signed turn,
+/// -180..180, so 0 degrees sits mid-track (stored 0..270 -- `-90` is 270).
+pub(crate) fn slider_range(band: usize) -> (f32, f32) {
+    match band {
+        ROTATE_BAND => (-180., 180.),
+        _ => {
+            let (_, low, high) = TRANSFORM_BANDS[band];
+            (low, high)
+        }
+    }
+}
+
+/// Where a band's knob sits for `value` (0..1), through [`slider_range`] --
+/// the one mapping the row draws and a drag reads back.
+pub(crate) fn knob_fraction(band: usize, value: f32) -> f32 {
+    let (low, high) = slider_range(band);
+    let value = match band {
+        ROTATE_BAND if value > 180. => value - 360.,
+        _ => value,
+    };
+    crate::ui::widgets::slider_fraction(value, low, high)
+}
 
 /// A slider value on the band's own grid: [`ROTATE_BAND`] snaps to
 /// [`ROTATE_STEP`] and wraps into its range, every other band snaps to

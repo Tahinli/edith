@@ -11,8 +11,10 @@
 use crate::ui::bench_stance;
 use crate::ui::dock_stance;
 use crate::ui::hitmap;
+use crate::ui::menubar;
 use crate::ui::settings_stance;
 use crate::ui::timeband_stance;
+use crate::ui::toolbar;
 use crate::ui::type_scale::{self, Typeset};
 use crate::*;
 
@@ -117,6 +119,49 @@ pub(crate) fn card_safe_action(action: crate::keymap::ActionId) -> bool {
     )
 }
 
+/// The strokes that keep their meaning while only a docked card is up
+/// ([`Player::docked_card_only`]): the transport and the room's own doors. The
+/// stepping, arrow and letter keys are left to the card, which reads them.
+pub(crate) fn docked_card_safe_action(action: crate::keymap::ActionId) -> bool {
+    use crate::keymap::ActionId;
+    matches!(
+        action,
+        ActionId::Play
+            | ActionId::GoStart
+            | ActionId::GoEnd
+            | ActionId::ShuttleStop
+            | ActionId::Export
+            | ActionId::Settings
+            | ActionId::ShowActions
+            | ActionId::Fullscreen
+            | ActionId::Theme
+            | ActionId::AccentColour
+    )
+}
+
+/// The strokes that keep their meaning while the Export tab shows: the transport's, and the
+/// ones that set what it exports -- I and O mark the range its In-Out choice uses, the arrows
+/// that step to the frame, and clearing the marks. The tab is a tab of the dock, not a sheet
+/// over the room, so the timeline stays in reach of the keyboard.
+pub(crate) fn export_tab_action(stroke: crate::keymap::ActionId) -> bool {
+    use crate::keymap::ActionId;
+    docked_card_safe_action(stroke)
+        || matches!(
+            stroke,
+            ActionId::SetIn | ActionId::SetOut | ActionId::ClearRange | ActionId::StepBack | ActionId::StepForward
+        )
+}
+
+/// Whether a docked card never reads this stroke. The cards read bare keys
+/// (arrows, digits, letters like `r`, `m`) and shift+arrow; a stroke with ctrl
+/// or alt, or shift on anything but an arrow, is nobody's card key, so the
+/// room's own bindings (Shift+E enable, Shift+R freeze, Ctrl+Alt+V...) answer it
+/// instead of the card swallowing it with the rest.
+pub(crate) fn docked_card_ignores(key: &str, ctrl: bool, shift: bool, alt: bool) -> bool {
+    let arrow = matches!(key, "left" | "right" | "up" | "down");
+    ctrl || alt || (shift && !arrow && key != "escape" && key != "tab")
+}
+
 /// The dock mounts only one of its two tabs at a time
 /// (`dock_stance::render`'s `match src_active`), so `focus_dock` only has a
 /// tree node under Sources and `focus_inspector` only under Clip -- focusing
@@ -166,11 +211,12 @@ impl Player {
     }
 }
 
-/// Fixed strip under the screen: timecode, transport, cut readout, contact
-/// strip, Export -- all placeholder at this step. Kept `pub(crate)` for
+/// Fixed strip under the screen: timecode, transport, cut readout -- one row
+/// of 44px (DESIGN §5). The overview strip moved up above the ruler, so the
+/// band no longer carries a minimap. Kept `pub(crate)` for
 /// `layout::split_bounds`'s bench ceiling, the same one-door reason
 /// [`LEDGER_H`] already is.
-pub(crate) const TIME_BAND_H: f32 = 88.;
+pub(crate) const TIME_BAND_H: f32 = 44.;
 /// The bench's untouched height -- [`Split::Bench`]'s own default, read by
 /// `layout::split_size` the same way the legacy tree's `library_w`/
 /// `inspector_w` feed `Split::Library`/`Split::Inspector`. A hand on the
@@ -180,10 +226,10 @@ pub(crate) const BENCH_H: f32 = 200.;
 /// `Split::Bench` drag formula (the seam sits above the fixed ledger, so a
 /// drag has to leave room for it) -- kept `pub(crate)` for that one door
 /// rather than a second copy of the number.
-pub(crate) const LEDGER_H: f32 = 28.;
-/// The dock's untouched width -- [`Split::Dock`]'s own default, the same
-/// role [`BENCH_H`] plays for the bench.
-pub(crate) const DOCK_W: f32 = 280.;
+pub(crate) const LEDGER_H: f32 = 24.;
+/// The dock's untouched width -- [`Split::Dock`]'s own default (DESIGN §5).
+/// Its floor is `layout::DOCK_MIN_W`, not the inspector's.
+pub(crate) const DOCK_W: f32 = 320.;
 /// What [`bench`] spends above `bench_stance::render`'s own content: the
 /// `bench` div's own `.border_t_1()` (1px) + its `py(4.)` top padding, and
 /// nothing else since the `BENCH` section head went (cleanse round 2 -- the
@@ -342,7 +388,10 @@ mod menu_floor_tests {
                         let at = menu_above(at, viewport, f, h);
                         let (x, y) = crate::oracle::menu_at(at, viewport, h);
                         assert!(y >= f, "y {y} walked above the menu floor {f}");
-                        assert!(x >= MENU_EDGE && x + MENU_W <= w - MENU_EDGE, "x {x} rows {rows}");
+                        assert!(
+                            x >= MENU_EDGE && x + MENU_W <= w - MENU_EDGE,
+                            "x {x} rows {rows}"
+                        );
                         assert!(
                             y >= MENU_EDGE && y + h <= v - MENU_EDGE,
                             "y {y} h {h} rows {rows}"
@@ -351,11 +400,8 @@ mod menu_floor_tests {
                     // The library menu's path: no floor, hung a row below the
                     // pointer, same clamp.
                     let h = MENU_PAD * 2. + crate::oracle::menu_rows_h(rows, viewport);
-                    let (x, y) = crate::oracle::menu_at(
-                        point(anchor.x, anchor.y + px(52.)),
-                        viewport,
-                        h,
-                    );
+                    let (x, y) =
+                        crate::oracle::menu_at(point(anchor.x, anchor.y + px(52.)), viewport, h);
                     assert!(x >= MENU_EDGE && x + MENU_W <= w - MENU_EDGE, "lib x {x}");
                     assert!(y >= MENU_EDGE && y + h <= v - MENU_EDGE, "lib y {y} h {h}");
                 }
@@ -402,6 +448,22 @@ mod menu_floor_tests {
         // A bogus reading below the bench never lets a menu climb: clamped.
         let (_, _, floor) = menu_floor(point(px(10.), px(10.)), viewport, BENCH_H, Some(9999.));
         assert_eq!(floor, region);
+    }
+}
+
+#[cfg(test)]
+mod project_readout_tests {
+    use super::*;
+
+    /// The ledger's resting readout (nothing selected): the timeline's length
+    /// as a timecode and in seconds, and its clip count; an empty timeline
+    /// says so rather than reading `00:00:00:00 · 0 clips`.
+    #[test]
+    fn the_resting_readout_names_the_length_and_the_clip_count() {
+        assert_eq!(project_readout(285, 2, 30.), "Timeline 0:10 · 2 clips");
+        assert_eq!(project_readout(50, 1, 25.), "Timeline 0:02 · 1 clip");
+        assert_eq!(project_readout(6600, 20, 30.), "Timeline 3:40 · 20 clips");
+        assert_eq!(project_readout(0, 0, 25.), "Empty timeline · drag media here to start");
     }
 }
 
@@ -454,7 +516,7 @@ thread_local! {
     // fitted into, which nothing upstream of paint knows. (Cleanse round 2,
     // 2026-09-10: the `scale 0.59` readout this also fed is deleted -- fit is
     // `^0` and the number was a state nobody acts on.)
-    static PICTURE_BOUNDS: Rc<Cell<Bounds<Pixels>>> = Rc::new(Cell::new(Bounds::default()));
+    pub(crate) static PICTURE_BOUNDS: Rc<Cell<Bounds<Pixels>>> = Rc::new(Cell::new(Bounds::default()));
 }
 
 /// The pure half of [`picture_bottom`]: the bottom edge of the `Contain`
@@ -482,117 +544,321 @@ pub(crate) fn picture_bottom(player: &Player) -> Option<f32> {
     fitted_bottom(PICTURE_BOUNDS.with(Rc::clone).get(), image.size(0))
 }
 
-/// A room verb at the ledger's right end (DESIGN §4, §5 as amended
-/// 2026-09-09 -- user decision "option C"): the name in `ink3`, its chord
-/// beside it, read live off the keymap so a rebind can never leave the
-/// strip showing a stroke that no longer fires it. Hover raises the plate
-/// (`ink2` + `raised`) the same way every other verb in the room does;
-/// active reads `ink1` + fill, the state the deleted rail's glyphs carried.
-fn room_ghost(
-    player: &Player,
-    name: &'static str,
-    action: ActionId,
-    active: bool,
-    cx: &mut Context<Player>,
-) -> impl IntoElement {
+/// Gap between the picture and the viewer's edge (DESIGN §6.2: "letterboxed
+/// and centred, with 12px padding").
+const VIEWER_PAD: f32 = 12.;
+
+/// The viewer header (REDESIGN §2.1): 28px on `e1` (24 on a window shorter than
+/// 800px), above the picture instead of a chip drawn over it. Left, the viewer's
+/// zoom and playback-quality choices and the guides toggle -- the viewer only
+/// fits the picture today, so they are drawn disabled with the reason; right,
+/// the project's format as a plain readout.
+fn viewer_header(player: &Player, window: &Window, cx: &mut Context<Player>) -> impl IntoElement {
+    use crate::ui::icons::{Icon, IconSize};
+    use crate::ui::kit::{Button, ButtonSize, ButtonStyle};
+    let t = crate::ui::theme::tokens();
+    let short = f32::from(window.viewport_size().height) < 800.;
+    let h = if short { crate::layout::redesign::VIEWER_HDR_H_SHORT } else { crate::layout::redesign::VIEWER_HDR_H };
+    // Each control sits in a fixed-width cell, so a longer value never moves its neighbours.
+    let dropdown = |id: &'static str, slot: usize, text: SharedString, w: f32, action: ActionId, cx: &mut Context<Player>| {
+        let yes = player.enable(action, None).yes();
+        div()
+            .relative()
+            .flex_none()
+            .w(px(w))
+            .child(bounds_probe(player.viewer_btns[slot].clone()))
+            .child(
+                Button::new(id)
+                    .style(ButtonStyle::Ghost)
+                    .size(ButtonSize::Small)
+                    .label(text)
+                    .min_w(w)
+                    .enabled(yes)
+                    .build()
+                    .child(Icon::ChevronDown.el(IconSize::Inline, t.ink3))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.act(action, window, cx)))
+                    .tooltip(crate::ui::widgets::action_hover(player, action))
+                    .children(crate::ui::hitmap::action(action, yes)),
+            )
+    };
+    let format = player.session.as_ref().map(|s| {
+        let (w, h) = s.resolution();
+        format!("{} · {} fps", size_label(w, h), fps_label(player.fps))
+    });
     div()
-        .id(name)
+        .id("stance-viewer-header")
         .flex_none()
+        .w_full()
+        .h(px(h))
         .flex()
         .items_center()
         .gap(px(4.))
-        .px(px(5.))
-        .py(px(2.))
-        .rounded(px(3.))
-        .cursor_pointer()
-        .when(active, |d| d.bg(rgb(DARK_RAISED())))
-        .hover(|s| s.bg(rgb(DARK_RAISED())).text_color(rgb(INK2())))
-        .tooltip(crate::ui::widgets::action_hover(player, action))
-        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.act(action, window, cx)))
-        .type_style(type_scale::mono(
-            type_scale::CHORD_METADATA_MIN_PX,
-            gpui::FontWeight::MEDIUM,
-        ))
-        .text_color(rgb(if active { INK1() } else { INK3() }))
-        // The pointer's way to this verb has to be findable by name -- with
-        // the rail gone this is the hitmap entry for each of the four, and
-        // for `keys` it is the only `ShowActions` control in the room.
-        .children(hitmap::action(action, true))
-        .child(name)
-        // Every command wears its chord (DESIGN §4) -- except one whose name
-        // already IS its stroke, the `?` over `?` rule the rail's last ghost
-        // was given ("why two ? exists").
-        .when(player.keymap.chord(action) != name, |el| {
-            el.child(
-                div()
-                    .type_style(type_scale::mono(
-                        type_scale::CHORD_METADATA_MIN_PX,
-                        gpui::FontWeight::MEDIUM,
-                    ))
-                    .text_color(rgb(INK3()))
-                    .child(player.keymap.chord(action)),
-            )
-        })
+        .px(px(12.))
+        .bg(rgb(t.e1))
+        .child(dropdown("vh-zoom", 0, player.viewer.zoom.label().into(), 64., ActionId::ViewZoom, cx))
+        .child(dropdown("vh-quality", 1, player.viewer.quality.closed_label().into(), 128., ActionId::PlaybackQuality, cx))
+        .child(dropdown("vh-guides", 2, format!("Guides: {}", player.viewer.guide.label()).into(), 136., ActionId::GuideStyle, cx))
+        .child(dropdown("vh-mask", 3, format!("Mask: {}", player.viewer.mask.label()).into(), 104., ActionId::GuideMask, cx))
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .flex()
+                .justify_end()
+                .overflow_hidden()
+                .type_style(type_scale::caption())
+                .text_color(rgb(t.ink2))
+                .children(source_name(player).map(|name| div().min_w(px(0.)).truncate().pr(px(8.)).child(name))),
+        )
+        .children(player.session.is_some().then(|| source_toggle(player, cx)))
+        // The readout is a door to the project's own settings, where the size
+        // and rate are changed: a hover says so, and a click goes there.
+        .children(format.map(|text| {
+            div()
+                .id("vh-project")
+                .flex_none()
+                .px(px(4.))
+                .rounded(px(4.))
+                .cursor_pointer()
+                .type_style(type_scale::caption())
+                .text_color(rgb(t.ink3))
+                .hover(|s| s.bg(rgb(t.e2)).text_color(rgb(t.ink1)))
+                .tooltip(crate::ui::widgets::overlay_tip_hover(
+                    "Project settings",
+                    "",
+                    Some("The size and frame rate of this project: click to change them"),
+                ))
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.settings_tab = crate::ui::settings_stance::SettingsTab::Project;
+                    this.open_settings(cx);
+                }))
+                .child(text)
+        }))
 }
 
-/// The separator between two room verbs -- the ledger's own mono middot,
-/// the same one the project identity already reads with.
-fn verb_dot() -> impl IntoElement {
+/// The name of the clip open in the source viewer, shown in the header while it is up.
+fn source_name(player: &Player) -> Option<SharedString> {
+    let (path, _) = player.source_target.as_ref().filter(|_| player.preview_session.is_some())?;
+    Some(stem(path).into())
+}
+
+/// The Source / Timeline switch of the viewer header: which of the two the
+/// picture shows. Source is the library item opened in the source viewer (its
+/// name is shown in the header beside it, [`source_name`]); Timeline
+/// is the edit. Both pills keep their width in either state, and Source is
+/// disabled until an item has been opened.
+fn source_toggle(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
+    use crate::ui::kit::{segmented, Segment};
+    let target = player.source_target.clone();
+    // The pill always says "Source": the clip's name is in the viewer header beside it, so the
+    // pill never changes width.
+    let label: SharedString = "Source".into();
+    let empty_source = player.source_hint && target.is_none();
+    let selected = usize::from(player.preview_session.is_none() && !empty_source);
+    let no_source = target.is_none();
+    let me = cx.entity();
     div()
+        .id("vh-source-wrap")
         .flex_none()
-        .type_style(type_scale::mono(
-            type_scale::CHORD_METADATA_MIN_PX,
-            gpui::FontWeight::MEDIUM,
+        .mr(px(8.))
+        .child(segmented(
+            "vh-source",
+            &[Segment::text(label), Segment::text("Timeline")],
+            selected,
+            player.session.is_some(),
+            None,
+            move |i, _, app| {
+                me.update(app, |this, cx| match (i, this.source_target.clone()) {
+                    (0, Some((path, stream))) if this.preview_session.is_none() => this.open_preview(&path, stream, cx),
+                    // Nothing opened yet: the viewer says how to open a clip, instead of nothing happening.
+                    (0, None) => {
+                        this.source_hint = true;
+                        cx.notify();
+                    }
+                    (1, _) => {
+                        this.source_hint = false;
+                        this.close_preview(cx);
+                        cx.notify();
+                    }
+                    _ => {}
+                })
+            },
         ))
-        .text_color(rgb(INK3()))
-        .child("·")
+        .tooltip(crate::ui::widgets::tip_hover(
+            "Source or timeline",
+            "Esc",
+            no_source.then_some("Double-click a media item to open it here"),
+        ))
+        .children(crate::ui::hitmap::control("viewer.source", "Source or timeline", target.is_some()))
 }
 
-/// The picture region: top of the centre column, takes the remaining space,
-/// never occluded (DESIGN §5, §11 check 6). Reuses [`Player::picture_area`]
-/// rather than a second image element -- the darkroom draws the same picture
-/// the legacy tree does -- and, at rest on a cut, letterboxes it by stacking
-/// the two-up OUT|IN judging *below* it as a flex sibling (DESIGN §6) rather
-/// than layering plates over it: the picture's own `flex_1` shrinks to make
-/// room, so every picture pixel that is drawn stays visible.
+/// What the Source side shows before any clip was opened in it: the way to open one.
+fn source_empty() -> impl IntoElement {
+    use crate::ui::icons::{Icon, IconSize};
+    let t = crate::ui::theme::tokens();
+    div()
+        .id("source-empty")
+        .absolute()
+        .top_0()
+        .bottom_0()
+        .left_0()
+        .right_0()
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .gap(px(8.))
+        .child(Icon::Film.el(IconSize::Hero, t.ink3))
+        .child(div().type_style(type_scale::title()).text_color(rgb(t.ink2)).child("Open a clip from Media to preview it here"))
+        .child(
+            div()
+                .type_style(type_scale::body())
+                .text_color(rgb(t.ink3))
+                .child("Double-click it, or right-click it and choose Open in source viewer"),
+        )
+}
+
+/// The picture region: top of the centre column, takes the remaining space.
+/// Reuses [`Player::picture_area`] rather than a second image element -- the
+/// darkroom draws the same picture the legacy tree does. The picture is fitted
+/// into the viewer minus [`VIEWER_PAD`] on every side, and nothing is drawn over it (DESIGN §6.2).
 fn screen(
     player: &mut Player,
     position: f64,
     window: &mut Window,
     cx: &mut Context<Player>,
 ) -> impl IntoElement {
-    let two_up = player.two_up().map(IntoElement::into_any_element);
     div()
         .id("stance-screen")
+        .on_mouse_down(
+            MouseButton::Right,
+            cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                this.open_viewer_menu(event.position, cx);
+            }),
+        )
         .flex_1()
         .min_h(px(0.))
         .flex()
         .flex_col()
+        .relative()
         // §4: room chrome takes 0 radius.
         .rounded(px(0.))
-        .bg(rgb(DARK_CANVAS()))
+        .bg(rgb(crate::ui::theme::tokens().matte))
+        .child(viewer_header(player, window, cx))
         .child(
             div()
                 .id("stance-picture")
+                .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, window, cx| {
+                    this.viewer_wheel(event, window, cx);
+                }))
+                .on_mouse_down(MouseButton::Left, cx.listener(|this, e: &MouseDownEvent, _, _| this.viewer_drag_start(e.position)))
+                .on_mouse_down(MouseButton::Middle, cx.listener(|this, e: &MouseDownEvent, _, _| this.viewer_drag_start(e.position)))
+                .on_mouse_move(cx.listener(|this, e: &MouseMoveEvent, window, cx| {
+                    if e.pressed_button.is_some() {
+                        this.viewer_drag_move(e.position, e.modifiers.shift, window, cx);
+                    } else {
+                        this.viewer_drag_end(cx);
+                    }
+                }))
+                .on_mouse_up(MouseButton::Left, cx.listener(|this, _: &MouseUpEvent, _, cx| this.viewer_drag_end(cx)))
+                .on_mouse_up(MouseButton::Middle, cx.listener(|this, _: &MouseUpEvent, _, cx| this.viewer_drag_end(cx)))
                 .flex_1()
                 .min_h(px(0.))
+                .p(px(VIEWER_PAD))
                 .flex()
-                .relative()
-                .child(player.picture_area(position, window, cx))
-                .child(bounds_probe(PICTURE_BOUNDS.with(Rc::clone))),
+                .gap(px(VIEWER_PAD))
+                // The source monitor's picture is draggable onto a lane: the
+                // marked part (the whole source with no marks) lands where it
+                // is let go, through the same door a library row uses.
+                .when_some(player.source_target.clone().filter(|_| player.preview_session.is_some()), |d, (path, stream)| {
+                    let ghost: SharedString = crate::file_name(&path).into();
+                    let me = cx.entity();
+                    d.on_drag(crate::interact::AssetDrag(path, stream), move |_, _, _, cx| {
+                        me.update(cx, |this, _| {
+                            this.drag_lane = None;
+                            this.drag_x = None;
+                        });
+                        cx.new(|_| crate::ui::widgets::Tip(ghost.clone()))
+                    })
+                })
+                .child(
+                    // The padded box is the picture's box: the bounds probe
+                    // measures it, so the fit and the subtitle placement both
+                    // work in the same inset region.
+                    div()
+                        .flex_1()
+                        .min_h(px(0.))
+                        .flex()
+                        .relative()
+                        .children(program_and_monitor(player, position, window, cx))
+                        .child(bounds_probe(PICTURE_BOUNDS.with(Rc::clone)))
+                        .children(player.viewer_handle_layer(window.scale_factor(), cx)),
+                ),
         )
-        .children(two_up)
-        // The preview's own plate, a flex sibling for the same reason two_up is
-        // one: drawn inside the picture it would cover the frame.
-        .children(player.preview_plate(cx))
+        // The preview's own plate, a flex sibling: drawn inside the picture it would cover the frame.
+        .children(player.source_strip(window, cx))
+        // Only while an edit point is being trimmed, rolled, slipped, slid or
+        // nudged: a split over the picture's own box, taking no room.
+        .children(player.trim_two_up())
 }
 
-/// Fixed-height strip under the screen: timecode leads, ghost transport, cut
-/// readout, the contact strip, boxed Export at the end (DESIGN §5,
-/// MOCK-SPEC.md "Time band"). Frame only -- every row and the Export chip's
-/// click live in [`crate::ui::timeband_stance`] now, the same split
-/// `bench_stance`/`dock_stance` already make for their
-/// regions.
+/// The narrowest strip the angle monitor takes beside the program picture, in px. Narrower than
+/// this, the monitor shares the row with the picture instead, and the picture gives it room.
+const MONITOR_STRIP_MIN: f32 = 200.;
+
+/// The free strip left of the program picture, in px, from the picture box as the last frame
+/// measured it and the picture as it is drawn (zoom, pan and fit included). `None` before the
+/// first paint has measured the box.
+fn monitor_strip(player: &Player, window: &Window) -> Option<f32> {
+    let b = PICTURE_BOUNDS.with(Rc::clone).get();
+    if b.size.width <= px(0.) || b.size.height <= px(0.) {
+        return None;
+    }
+    let (ox, oy) = (f32::from(b.origin.x), f32::from(b.origin.y));
+    let bx = (f32::from(b.size.width), f32::from(b.size.height));
+    let Some(image) = player.image.clone() else {
+        return Some(bx.0);
+    };
+    let native = player.viewer_native_or(&image);
+    let frame = crate::viewer_view::picture_rect(player.viewer.zoom, native, bx, (ox, oy), player.viewer_pan, window.scale_factor());
+    Some(frame.0 - ox)
+}
+
+/// The program picture and, while the angle monitor is on, the monitor. The monitor sits over
+/// the empty canvas left of the picture, so the picture keeps its exact geometry. Where that
+/// strip is narrower than [`MONITOR_STRIP_MIN`], the monitor is a flex sibling of the picture
+/// instead, and the picture makes room for it.
+fn program_and_monitor(player: &mut Player, position: f64, window: &mut Window, cx: &mut Context<Player>) -> Vec<AnyElement> {
+    let program = match player.source_hint && player.source_target.is_none() && player.preview_session.is_none() {
+        true => source_empty().into_any_element(),
+        false => player.picture_area(position, window, cx).into_any_element(),
+    };
+    if !(player.angle_monitor && player.preview_session.is_none()) {
+        return vec![program];
+    }
+    let strip = monitor_strip(player, window).filter(|s| *s >= MONITOR_STRIP_MIN);
+    let Some(monitor) = player.angle_monitor_view(cx, if strip.is_some() { 2 } else { 3 }) else {
+        return vec![program];
+    };
+    match strip {
+        Some(strip) => {
+            let overlay = div()
+                .absolute()
+                .top(px(VIEWER_PAD))
+                .bottom(px(VIEWER_PAD))
+                .left(px(VIEWER_PAD))
+                .w(px(strip - 2. * VIEWER_PAD))
+                .child(monitor);
+            vec![program, overlay.into_any_element()]
+        }
+        None => vec![monitor, program],
+    }
+}
+
+/// Fixed-height strip under the screen: timecode leads, the transport sits
+/// centred, the cut readout closes the row (DESIGN §5). Frame only -- every
+/// row lives in [`crate::ui::timeband_stance`], the same split
+/// `bench_stance`/`dock_stance` already make for their regions.
 fn time_band(player: &mut Player, position: f64, cx: &mut Context<Player>) -> impl IntoElement {
     // The position comes from `render`, the same one the screen and the ledger
     // read. Asking `active_session` here instead read the PREVIEW's clock while
@@ -600,12 +866,15 @@ fn time_band(player: &mut Player, position: f64, cx: &mut Context<Player>) -> im
     // readouts of one truth -- disagreed on screen.
     div()
         .id("stance-time-band")
+        .relative()
         .flex_none()
         .h(px(TIME_BAND_H))
-        .bg(rgb(DARK_PANEL()))
+        .bg(rgb(crate::ui::theme::tokens().e1))
         .border_t_1()
-        .border_color(rgba(DARK_SEAM()))
+        .border_color(rgba(crate::ui::theme::tokens().line))
         .flex()
+        // Measured, not computed: the record sheet hangs just above this band.
+        .child(crate::ui::anchor::probe("record-band"))
         .child(timeband_stance::render(player, position, cx))
 }
 
@@ -617,9 +886,11 @@ fn time_band(player: &mut Player, position: f64, cx: &mut Context<Player>) -> im
 fn bench(
     player: &mut Player,
     bench_h: f32,
-    _window: &mut Window,
+    window: &mut Window,
     cx: &mut Context<Player>,
 ) -> impl IntoElement {
+    let focused = player.focus_bench.is_focused(window);
+    bench_stance::set_window_h(f32::from(window.viewport_size().height));
     div()
         .id("stance-bench")
         .track_focus(&player.focus_bench)
@@ -629,7 +900,7 @@ fn bench(
                 let next = next_surface(Surface::Bench, event.keystroke.modifiers.shift);
                 this.focus_surface(next, window, cx);
                 cx.stop_propagation();
-            } else if is_focus_exit_key(key) {
+            } else if is_focus_exit_key(key) && !this.any_text_field() {
                 // A dismissible overlay (context menu, library menu, picker,
                 // any card, a live preview) opened by a click into the bench
                 // takes this escape first -- the same door the root handler
@@ -640,28 +911,31 @@ fn bench(
                     cx.stop_propagation();
                     return;
                 }
-                // Leaves the ring rather than deleting it: the root handle
-                // gets focus back, and a second escape there is what does
-                // whatever escape means at the root (nothing, today) --
-                // this must not itself bubble, or the root's own handler
-                // never sees a stroke that stayed a ring exit.
+                // Leaves the ring for the root and lets the stroke bubble on to it: the root
+                // answers escape as Deselect (the caption, title and clip selections go).
                 window.focus(&this.focus);
-                cx.stop_propagation();
                 cx.notify();
             }
         }))
         .flex_none()
         .h(px(bench_h))
+        // The toast stack hangs off this box (DESIGN §8), so it is the anchor.
+        .relative()
         // §4: lanes take 0 radius.
         .rounded(px(0.))
         .bg(rgb(DARK_CANVAS()))
         .border_t_1()
-        .border_color(rgba(DARK_SEAM()))
-        // No ring: a region is never outlined for holding focus (user
-        // 2026-09-10, "clicking through timeline draws a white overlay
-        // around the timeline"). Focus routing is untouched -- Tab/Shift-Tab
-        // still land here ([`next_surface`]) -- and the only ring left in
-        // the bench is the selection one a picked clip draws (DESIGN §2/§4).
+        // DESIGN §4.10: the focused region's top edge is the 1px ink2 rule,
+        // recoloured in place so no size moves. No ring or outline: a region
+        // is never outlined for holding focus (user 2026-09-10, "clicking
+        // through timeline draws a white overlay around the timeline"). Tab
+        // and Shift-Tab still land here ([`next_surface`]); the only ring left
+        // in the bench is the selection one a picked clip draws (DESIGN §2/§4).
+        .border_color(if focused {
+            rgb(INK2())
+        } else {
+            rgba(DARK_SEAM())
+        })
         .flex()
         .flex_col()
         // The 12px side gutter is spent INSIDE `bench_stance`'s own content
@@ -672,194 +946,364 @@ fn bench(
         // at frame 0 puts it, reached nothing at all and moved nothing,
         // silently (DESIGN §8: a release that has aimed has made an edit).
         // Same box, same pixels; only the catch-all's bounds grow.
-        .py(px(4.))
-        .child(bench_stance::render(player, bench_h - BENCH_CHROME_H, cx))
-}
-
-/// DESIGN §8's "needs a decision" notice: a red 3px spine, the state word,
-/// and the verbs that answer it -- state plus verb·chord, never a sentence.
-/// The room raises one per question that owns the keyboard (the
-/// unsaved-work close guard, the overwrite guard on save), each passing its
-/// own element id and line. It rises where notices rise, directly above the
-/// ledger, so it is never over the picture. The keys behind it live in the
-/// root `on_key_down` above.
-fn decision_plate(id: &'static str, line: &str) -> impl IntoElement {
-    div()
-        .id(id)
-        .flex_none()
-        .h(px(LEDGER_H))
-        .bg(rgb(DARK_PANEL()))
-        .border_t_1()
-        .border_color(rgba(DARK_SEAM()))
-        .flex()
-        .items_center()
-        // The spine is a child, not a border: a border colours all four sides
-        // at once and the seam above this strip is the panel's, not the
-        // notice's severity (the clip spine in `bench_stance` is drawn the
-        // same way for the same reason).
-        .child(div().flex_none().w(px(3.)).h_full().bg(rgb(STATUS_ERROR())))
+        // The edit toolbar tops the box (DESIGN §6.4), so its height is spent
+        // here out of `bench_h` and the lanes get what is left -- the same
+        // `TOOLBAR_H` the bench's floor (`BENCH_MIN_H`) already counts.
+        .child(toolbar::render(player, cx))
         .child(
             div()
-                .pl(px(12.))
-                .type_style(type_scale::mono(
-                    type_scale::CHORD_METADATA_MIN_PX,
-                    gpui::FontWeight::MEDIUM,
-                ))
-                .text_color(rgb(INK1()))
-                .child(line.to_owned()),
+                .flex_1()
+                .min_h(px(0.))
+                .py(px(4.))
+                .child(bench_stance::render(player, cx)),
         )
 }
 
-/// Thin strip at the bottom of the centre column: project identity, last
-/// action, export progress, position. Notices rise from here (DESIGN §5, §8).
-fn ledger(player: &Player, position: f64, cx: &mut Context<Player>) -> impl IntoElement {
-    let name = match player.project_path.as_os_str().is_empty() {
-        true => "untitled".to_string(),
-        false => stem(&player.project_path),
+/// DESIGN §8's toasts: ONE at a time, the newest notice, shown in the status
+/// bar ([`ledger`]) in place of its readout. Never over the timeline or the
+/// picture, and the bar's height is fixed, so no toast moves anything.
+///
+/// One toast: a 3px stripe in its tone, the line in INK1, the button its action
+/// wears as a ghost, and a ✕. An info or warn toast starts its hide timer the
+/// first frame it is drawn ([`Toast::timer_armed`]); the timer names the toast
+/// by id, so a late one finds nothing and hides nothing.
+/// The widest a toast grows in the status bar before its text is elided.
+pub(crate) const TOAST_MAX_W: f32 = 760.;
+
+/// REDESIGN §2's region heights for the stance, as new names (P3 adopts them
+/// and retires the legacy constants above). The shared definitions live in
+/// [`crate::layout::redesign`]; these four are the ones this module owns.
+#[allow(dead_code, reason = "defined by P1, adopted by P3")]
+pub(crate) mod redesign {
+    use crate::layout::redesign as r;
+    pub(crate) const TIME_BAND_H: f32 = r::TRANSPORT_H;
+    /// The bench (timeline panel) default share of the window height.
+    pub(crate) const BENCH_SHARE: f32 = r::TIMELINE_SHARE;
+    pub(crate) const LEDGER_H: f32 = r::STATUS_H;
+    pub(crate) const DOCK_W: f32 = r::DOCK_W;
+}
+
+/// The words a toast shows in its text box: the message, cut with an ellipsis to the width
+/// the box had on the last frame. The box is measured with a probe (as the readout is), so the
+/// cut is the one the strip paints. Before the first measurement the whole message is given and
+/// the box's own clip holds it; the probe asks for one more frame when its width changes.
+fn toast_words(text: &str, text_box: &Rc<Cell<Bounds<Pixels>>>, cx: &App) -> String {
+    let words = ledger_line(text);
+    // The probe covers the box with its 8 px side padding on each side.
+    // At least the room a toast can have: a box sized by its own text (a toast with no buttons)
+    // would otherwise never grow past the cut it was last given.
+    let width = (f32::from(text_box.get().size.width) - 16.).max(TOAST_MAX_W - 120.);
+    if width <= 0. {
+        return words;
+    }
+    bench_stance::clip::fit_label(cx, &words, width).unwrap_or_default()
+}
+
+/// A canvas that records the toast text box's bounds for [`toast_words`], and asks for
+/// another frame when the width changed, so the next frame cuts to the new width.
+fn toast_text_probe(into: Rc<Cell<Bounds<Pixels>>>) -> impl IntoElement {
+    canvas(
+        move |bounds, window, _| {
+            if into.replace(bounds).size.width != bounds.size.width {
+                window.request_animation_frame();
+            }
+        },
+        |_, _, _, _| (),
+    )
+    .absolute()
+    .size_full()
+}
+
+fn toast_card(toast: &Toast, text_box: &Rc<Cell<Bounds<Pixels>>>, cx: &mut Context<Player>) -> gpui::Stateful<gpui::Div> {
+    let id = toast.id;
+    if toast.hides() && !toast.timer_armed.replace(true) {
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(TOAST_HIDE).await;
+            let _ = this.update(cx, |this, cx| this.dismiss_toast(id, cx));
+        })
+        .detach();
+    }
+    let t = crate::ui::theme::tokens();
+    let (glyph, tone_ink) = match toast.tone {
+        Tone::Info => (crate::ui::icons::Icon::Info, t.ink3),
+        Tone::Warn => (crate::ui::icons::Icon::TriangleAlert, t.warn),
+        Tone::Err => (crate::ui::icons::Icon::CircleX, t.err),
     };
-    // The project's own name, extension dropped (`files::stem`, the bench's
-    // plates read with the same helper) and the middot the state word hangs
-    // off -- the word itself is a child of its own, because when the project
-    // is unsaved it is not a word but Save's door (below).
-    let identity = format!("{name} ·");
-    let dirty = player.autosave_dirty;
-    let last_action = player.notices.back().cloned().unwrap_or_else(|| "—".into());
-    // With the floating plate gone (user 2026-08-27, "we also have notifier
-    // at the ledger section"), this strip is the one notice surface left --
-    // a refusal or a failure keeps the tone the plate's severity spine
-    // carried ([`notice_tone`], the same word-read the legacy bar used),
-    // while everything routine stays at the strip's own quiet ink.
-    let tone = notice_tone(&last_action);
-    let action_ink = if tone == STATUS_ERROR() || tone == STATUS_WARNING() {
-        tone
-    } else {
-        INK3()
+    let ghost = |label: &'static str| {
+        div()
+            .flex_none()
+            .h(px(18.))
+            .px(px(8.))
+            .flex()
+            .items_center()
+            .rounded(px(4.))
+            .type_style(type_scale::caption_strong())
+            .text_color(rgb(t.ink2))
+            .hover(|s| s.bg(rgba(crate::ui::theme::WASH_HOVER)).text_color(rgb(crate::ui::theme::tokens().ink1)))
+            .cursor_pointer()
+            .child(label)
     };
+    div()
+        .id(SharedString::from(format!("stance-toast-{id}")))
+        // Shrinks only when the strip itself runs out (the format and verbs on
+        // the right keep their width): an ordinary message shows whole.
+        .flex_shrink()
+        .min_w(px(0.))
+        .max_w(px(TOAST_MAX_W))
+        .h(px(LEDGER_H - 2.))
+        .flex()
+        .items_center()
+        .overflow_hidden()
+        .rounded(px(6.))
+        .bg(rgb(t.e3))
+        .border_1()
+        .border_color(rgba(t.line_hi))
+        .pl(px(8.))
+        .child(glyph.el(crate::ui::icons::IconSize::Inline, tone_ink))
+        .child(
+            div()
+                .id(SharedString::from(format!("stance-toast-text-{id}")))
+                .flex_grow().flex_shrink()
+                .min_w(px(0.))
+                .px(px(8.))
+                // Cut short in the strip, whole on hover.
+                .tooltip(crate::ui::widgets::tip_hover(&toast.text, "", None))
+                // Ellipsis, not a bare cut: the name inside the message is
+                // elided through its middle first ([`ledger_line`]) so the
+                // state word at the front is never what gets dropped. Clipped
+                // at its own edge too, so the words never paint over the buttons.
+                .truncate()
+                .type_style(type_scale::caption())
+                .text_color(rgb(t.ink1))
+                .relative()
+                .child(toast_words(&toast.text, text_box, cx))
+                .child(toast_text_probe(text_box.clone())),
+        )
+        .children(toast.actions.iter().enumerate().map(|(index, action)| {
+            let label = match action {
+                ToastAction::Undo => "Undo",
+                ToastAction::Play(_) => "Play",
+                ToastAction::ShowInFolder(_) => "Show in folder",
+                ToastAction::Unlock(_) => "Unlock",
+                ToastAction::Reload => "Reload",
+                ToastAction::KeepMine => "Keep mine",
+                ToastAction::Recover => "Recover",
+                ToastAction::Discard => "Discard",
+                ToastAction::SaveThenOpen(_) => "Save",
+                ToastAction::OpenDiscarding(_) => "Don't save",
+            };
+            ghost(label)
+                .id(SharedString::from(format!(
+                    "stance-toast-action-{id}-{index}"
+                )))
+                .mx(px(6.))
+                .on_click(
+                    cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.toast_action(id, index, cx)
+                    }),
+                )
+        }))
+        .child(
+            div()
+                .id(SharedString::from(format!("stance-toast-close-{id}")))
+                .flex_none()
+                .w(px(28.))
+                .h_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(crate::ui::icons::Icon::X.el(crate::ui::icons::IconSize::Inline, t.ink3))
+                .on_click(
+                    cx.listener(move |this, _: &ClickEvent, _, cx| this.dismiss_toast(id, cx)),
+                ),
+        )
+}
+
+/// The clip readout the ledger's left side shows while a clip is selected
+/// (DESIGN §6.9): the source's stem, the length in seconds, and where the clip
+/// starts as a m:ss span. The transport already shows the timecode.
+/// `city_dusk · 9.5 s · starts at 0:00`.
+pub(crate) fn clip_readout(name: &str, start: u32, frames: u32, fps: f64) -> String {
+    format!(
+        "{name} · {:.1} s · starts at {}",
+        f64::from(frames) / fps,
+        bench_stance::mmss(f64::from(start) / fps),
+    )
+}
+
+/// A frame rate the way the status bar writes it: `30`, or `29.97` where the
+/// rate is fractional.
+/// `1920×1080 (1080p)`: the size with its common name when it has one, else just `W×H`.
+pub(crate) fn size_label(w: u32, h: u32) -> String {
+    let name = match (w, h) {
+        (1280, 720) => Some("720p"),
+        (1920, 1080) => Some("1080p"),
+        (2560, 1440) => Some("1440p"),
+        (3840, 2160) => Some("4K"),
+        _ => None,
+    };
+    match name {
+        Some(n) => format!("{w}×{h} ({n})"),
+        None => format!("{w}×{h}"),
+    }
+}
+
+pub(crate) fn fps_label(fps: f64) -> String {
+    format!("{fps:.2}")
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .to_string()
+}
+
+/// The gap readout the ledger's left side shows while a gap is picked (DESIGN
+/// §6.9): the hole's length in seconds and where it starts as a m:ss span.
+/// `Gap · 2.4 s · starts at 0:04`.
+pub(crate) fn gap_readout(start: u32, frames: u32, fps: f64) -> String {
+    format!(
+        "Gap · {:.1} s · starts at {}",
+        f64::from(frames) / fps,
+        bench_stance::mmss(f64::from(start) / fps),
+    )
+}
+
+/// The readout the ledger's left side shows while nothing is selected or
+/// picked (DESIGN §6.9 left blank then; the audit asked for the film's own
+/// length instead of nothing): the whole timeline's length as a m:ss span, and
+/// how many clips make it up. `Timeline 1:50 · 20 clips`; an empty timeline says so.
+pub(crate) fn project_readout(frames: u32, clips: usize, fps: f64) -> String {
+    if clips == 0 {
+        return "Empty timeline · drag media here to start".to_string();
+    }
+    format!(
+        "Timeline {} · {clips} {}",
+        bench_stance::mmss(f64::from(frames) / fps),
+        if clips == 1 { "clip" } else { "clips" },
+    )
+}
+
+/// The width of the status bar's readout slot.
+const READOUT_W: f32 = 300.;
+/// The slot while a trim says what it is doing: `Trimming both sides · Start −0.5 s · End +0.5 s`.
+const TRIM_LINE_W: f32 = 420.;
+
+/// Thin strip at the bottom of the centre column (DESIGN §6.9): the selected
+/// clip or picked gap (else the timeline's length) and export progress on the left, the picture's format
+/// and the two room verbs on the right. Project identity and save state live
+/// in the menu bar. Notices rise from here (DESIGN §5, §8).
+fn ledger(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
+    let fps = player.active_fps();
+    // A selected clip, else a picked gap. `Clip` is `Copy`, so the lookup
+    // hands back the clip itself and not a borrow of the session. A subtitle
+    // pick has no `Clip` and reads nothing here.
+    let selected = player
+        .session
+        .as_ref()
+        .zip(player.selected.anchor())
+        .filter(|(_, (lane, _))| lane.kind != LaneKind::Subtitle)
+        .and_then(|(s, (lane, idx))| s.lane_clips(lane).get(idx).cloned());
+    // One toast at a time, in this strip: it takes the readout's place for as
+    // long as it lives, so nothing is ever drawn over the timeline.
+    let toast = crate::notices::current_toast(&player.notices).map(|t| toast_card(t, &player.toast_text, cx));
+    // A trim in hand, or a roll armed, says what it is doing in this strip in place of the
+    // selection's readout (and the pointer's hint), so the transport band never changes.
+    let trimming = crate::ui::timeband_stance::trim_text(player).or_else(|| bench_stance::clip::trim_in_flight(player));
+    let trimming_now = trimming.is_some();
+    let readout = selected
+        .map(|c| {
+            let name = player
+                .sources()
+                .get(c.source)
+                .map_or_else(|| "clip".to_string(), |s| stem(&s.path));
+            clip_readout(&name, c.start, c.len(), fps)
+        })
+        .or_else(|| {
+            player
+                .gap_pick()
+                .map(|g| gap_readout(g.start, g.frames, fps))
+        })
+        // Nothing selected: the film's own length and clip count, so the
+        // strip never sits empty while a project is open.
+        .or_else(|| {
+            player.session.as_ref().map(|s| {
+                let frames = (s.timeline_duration() * fps).round() as u32;
+                let clips = s.lanes().iter().map(|&l| s.lane_clips(l).len()).sum();
+                project_readout(frames, clips, fps)
+            })
+        });
+    let readout = trimming.or(readout);
+    // What the file actions have to say is no longer read here: it rises as
+    // toasts above this strip (DESIGN §8), so the strip keeps
+    // its readout, export progress and the room's verbs only.
     let export = player
         .exporting()
-        .map(|h| format!("EXPORTING {:.0}%", h.progress() * 100.));
-    let tc = timecode(position, player.active_fps());
+        .map(|h| match h.stage() {
+            Some((name, f)) => format!("{name} {:.0}%", f * 100.),
+            None => format!("Exporting {:.0}%", h.progress() * 100.),
+        })
+        .or_else(|| player.reframe_words())
+        .or_else(|| player.mcam_words())
+        .or_else(|| player.render_words());
     div()
         .id("stance-ledger")
         .flex_none()
         .h(px(LEDGER_H))
-        .bg(rgb(DARK_PANEL()))
+        .bg(rgb(crate::ui::theme::tokens().e1))
         .border_t_1()
-        .border_color(rgba(DARK_SEAM()))
+        .border_color(rgba(crate::ui::theme::tokens().line))
         .flex()
         .items_center()
         .gap(px(14.))
         .px(px(12.))
-        // MOCK-SPEC.md "Ledger": "All mono" -- project identity, last
-        // action, export progress and position are all what the film/project
-        // says, not the room's own voice.
-        .child(
+        // The readout reads first, on the left: the same mono strip, so it is
+        // a status and not a dialog.
+        .children(toast)
+        .children(readout.filter(|_| player.notices.is_empty()).map(|r| {
             div()
-                .type_style(type_scale::mono(
-                    type_scale::CHORD_METADATA_MIN_PX,
-                    gpui::FontWeight::MEDIUM,
-                ))
-                .text_color(rgb(INK1()))
-                .child(identity),
-        )
-        // Saved is a state and reads as one; unsaved is a thing to *do*, and
-        // this is Save's home; the time band's parking-spot ghost, filed there only
-        // because the ledger was a concurrent builder's file, is deleted
-        // (cleanse round 2) -- the same room-verb ghost the four verbs at the
-        // strip's other end are built from, so its chord, its hover plate and
-        // its hitmap door all come from one place.
-        .child(match dirty {
-            true => room_ghost(player, "unsaved", ActionId::Save, false, cx).into_any_element(),
-            false => div()
+                .relative()
+                .child(bounds_probe(player.ledger_readout.clone()))
                 .flex_none()
-                .type_style(type_scale::mono(
-                    type_scale::CHORD_METADATA_MIN_PX,
-                    gpui::FontWeight::MEDIUM,
-                ))
-                .text_color(rgb(INK1()))
-                .child("saved")
-                .into_any_element(),
-        })
-        .child(
-            div()
-                .flex_1()
-                .min_w(px(0.))
-                // Ellipsis, not a bare cut: `.truncate()` stops mid-word with
-                // nothing saying it stopped (user report, `… 1 subtitle track(s)
-                // in `). The name inside the message is elided through its
-                // middle first ([`ledger_line`]) so the state word at the front
-                // is never what the strip drops.
-                .text_ellipsis()
-                .type_style(type_scale::mono(
-                    type_scale::CHORD_METADATA_MIN_PX,
-                    gpui::FontWeight::MEDIUM,
-                ))
-                .text_color(rgb(action_ink))
-                .child(ledger_line(&last_action)),
-        )
+                // A fixed slot: the readout changes with every selection, and what follows it
+                // (the drag hint) must not move with it.
+                .w(px(if trimming_now { TRIM_LINE_W } else { READOUT_W }))
+                .truncate()
+                .type_style(type_scale::caption())
+                .text_color(rgb(INK2()))
+                .child(r)
+        }))
         .children(export.map(|e| {
             div()
-                .type_style(type_scale::mono(
-                    type_scale::CHORD_METADATA_MIN_PX,
-                    gpui::FontWeight::MEDIUM,
-                ))
+                .flex_none()
+                // `Exporting 5%` to `Exporting 100%`: held at the widest.
+                .w(px(13. * bench_stance::char_w(type_scale::CHORD_METADATA_MIN_PX)))
+                .whitespace_nowrap()
+                .type_style(type_scale::caption())
                 .text_color(rgb(INK2()))
                 .child(e)
         }))
-        // The room's four verbs (DESIGN §5 as amended 2026-09-09, user
-        // decision "option C"): with the rail deleted, nothing on screen
-        // lists commands -- the KEYS tab is the list, every other verb is a
-        // key or a right-click on the thing -- except these four, which act
-        // on the room itself and so have no thing to be right-clicked on.
-        // They sit at the strip's right end, before the position, each
-        // wearing its chord.
-        .child(
+        // The pointer's drag hint, or the drag in flight and how far it has
+        // gone (`bench_stance::clip::drag_status`): here, in the strip, so
+        // nothing floats over the lanes to say it.
+        .children((!trimming_now).then(|| bench_stance::clip::drag_status(player)).flatten().map(|h| {
             div()
-                .flex_none()
-                .flex()
-                .items_center()
-                .gap(px(6.))
-                .child(room_ghost(
-                    player,
-                    "CC",
-                    ActionId::ToggleSubtitles,
-                    player.subs_on,
-                    cx,
-                ))
-                .child(verb_dot())
-                .child(room_ghost(
-                    player,
-                    "settings",
-                    ActionId::Settings,
-                    player.settings_open,
-                    cx,
-                ))
-                .child(verb_dot())
-                .child(room_ghost(
-                    player,
-                    "keys",
-                    ActionId::ShowActions,
-                    player.keys_open,
-                    cx,
-                ))
-                .child(verb_dot())
-                .child(room_ghost(
-                    player,
-                    "full",
-                    ActionId::Fullscreen,
-                    false,
-                    cx,
-                ))
-        )
-        .child(
-            div()
-                .flex_none()
-                .type_style(type_scale::mono(
-                    type_scale::CHORD_METADATA_MIN_PX,
-                    gpui::FontWeight::MEDIUM,
-                ))
+                .flex_shrink()
+                .min_w(px(0.))
+                .truncate()
+                .type_style(type_scale::caption())
                 .text_color(rgb(INK2()))
-                .child(tc),
+                .child(h)
+        }))
+        .child(div().flex_1().min_w(px(0.)))
+        // The dropped-frames words, at the right edge in a slot as wide as their longest
+        // form: they come and go without moving anything else in the strip.
+        .child(
+            div()
+                .flex_none()
+                .w(px(40. * bench_stance::char_w(type_scale::CHORD_METADATA_MIN_PX)))
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .type_style(type_scale::caption())
+                .text_color(rgb(INK2()))
+                .child(player.dropped_words().unwrap_or_default()),
         )
 }
 
@@ -878,6 +1322,8 @@ fn dock(
     window: &mut Window,
     cx: &mut Context<Player>,
 ) -> impl IntoElement {
+    // Either dock tab's handle counts: Sources and Clip are one region (§6.7).
+    let focused = player.focus_dock.is_focused(window) || player.focus_inspector.is_focused(window);
     div()
         .id("stance-dock")
         // The library's own answer to a file dragged in from outside: the
@@ -894,6 +1340,21 @@ fn dock(
         .flex()
         .flex_col()
         .child(dock_stance::render(player, dock_w, window_size, window, cx))
+        // DESIGN §4.10: the focused region's top rule, laid over the panel's
+        // first pixel row so no size moves.
+        .when(focused, |el| el.child(focus_top_rule()))
+}
+
+/// The 1px ink2 top rule that marks a focused region (DESIGN §4.10). Absolute,
+/// so it paints over the region's top edge without taking space in its flow.
+fn focus_top_rule() -> impl IntoElement {
+    div()
+        .absolute()
+        .top_0()
+        .left_0()
+        .right_0()
+        .h(px(1.))
+        .bg(rgb(INK2()))
 }
 
 /// A zero-size element whose only job is `window.on_mouse_event`'s door:
@@ -929,7 +1390,21 @@ pub(crate) fn render(
     window: &mut Window,
     cx: &mut Context<Player>,
 ) -> impl IntoElement {
-    let window_size = window.viewport_size();
+    // The window, and the room below the menu bar (DESIGN §6.1): the regions lay
+    // out against the room; only the root's own floating cards take the window.
+    let viewport = window.viewport_size();
+    let window_size = size(viewport.width, viewport.height - px(MENU_BAR_H));
+    // Dialogs: a fresh frame of tab stops, and the keyboard goes to the root whenever one opens
+    // (whatever field or control held it before), so Esc/Enter/Tab are always heard.
+    crate::ui::kit::tab_frame_reset();
+    let pool = player.dlg_pool.clone();
+    let dialog_up = player.dialog_up();
+    if dialog_up != player.dlg_was_up {
+        player.dlg_was_up = dialog_up;
+        if dialog_up {
+            window.focus(&player.focus);
+        }
+    }
     let position = player.playhead(player.drawn_duration());
     // The two seams a hand may drag (`Split::Dock`, `Split::Bench`): read
     // through the same door every legacy region measures itself by
@@ -939,11 +1414,91 @@ pub(crate) fn render(
     let bench_h = player.split_px(Split::Bench, window_size);
     div()
         .id("stance-room")
+        // Inter is the default face for any text that sets no role of its own.
+        .font_family(type_scale::INTER)
         .track_focus(&player.focus)
+        // A press anywhere leaves a text field first; the field's own click then reopens it.
+        .capture_any_mouse_down(cx.listener(|this, _: &MouseDownEvent, window, cx| {
+            // A click puts the ring away: it is the keyboard's.
+            crate::ui::kit::set_kbd_ring(false);
+            if this.any_text_field() {
+                this.blur_text_fields(window, cx);
+            }
+        }))
         .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
             let key = event.keystroke.key.as_str();
             let ctrl = event.keystroke.modifiers.control;
-            if event.is_held && !repeats(this.repeat_scope(), key, this.keymap.lookup(key, ctrl)) {
+            let shift = event.keystroke.modifiers.shift;
+            let alt = event.keystroke.modifiers.alt;
+            if event.is_held
+                && !repeats(this.repeat_scope(), key, this.keymap.lookup(key, ctrl, shift, alt))
+            {
+                return;
+            }
+            // Escape also cancels a clip drag in the air: a drag let go with no
+            // target sends no release that clears its dimmed source, snap line
+            // and shadow. Falls through, so escape still closes what it did.
+            if key == ESCAPE {
+                this.end_drag_preview(cx);
+            }
+            // Esc shuts an open menu-bar dropdown first (DESIGN §4.12).
+            if this.menu_open.is_some() && key == "escape" {
+                this.menu_open = None;
+                cx.notify();
+                return;
+            }
+            // The clip menu's Adjust submenu: Right opens it, Left closes it.
+            if let (Some(m), "left" | "right") = (this.context_menu.as_mut(), key)
+                && matches!(m.on, MenuOn::Clip(_))
+            {
+                m.adjust = key == "right";
+                cx.notify();
+                return;
+            }
+            // Every dialog: Tab walks its controls, a focused control keeps Enter and Space.
+            if this.dialog_up() && this.dialog_nav_key(key, shift, window, cx) {
+                return;
+            }
+            // The caption font list's search line takes the letters typed into it before the keymap.
+            if this.sub_font_key(key, ctrl, alt, event.keystroke.key_char.as_deref(), cx) {
+                return;
+            }
+            // An open kit dropdown list answers Up, Down and Enter before anything else.
+            if !ctrl && !alt && crate::ui::kit::list_nav(key, window, cx) {
+                cx.notify();
+                return;
+            }
+            // The About dialog: Esc or Enter closes it, and it takes no other key.
+            if this.about_open {
+                if matches!(key, "escape" | "enter") {
+                    this.about_open = false;
+                    cx.notify();
+                }
+                return;
+            }
+            // Left and Right walk the open menus, wrapping at the ends.
+            if let (Some(open), "left" | "right") = (this.menu_open, key) {
+                let n = crate::ui::menubar::Title::ALL.len();
+                let at = crate::ui::menubar::Title::ALL
+                    .iter()
+                    .position(|t| *t == open)
+                    .unwrap_or(0);
+                let to = match key == "right" {
+                    true => (at + 1) % n,
+                    false => (at + n - 1) % n,
+                };
+                this.menu_open = Some(crate::ui::menubar::Title::ALL[to]);
+                cx.notify();
+                return;
+            }
+            // Go to time's field on the transport owns the keyboard while it is typed into.
+            if this.time_edit.is_some() {
+                this.time_edit_key(key, ctrl, alt, event.keystroke.key_char.as_deref(), cx);
+                return;
+            }
+            // The File menu's project dialogs own the keyboard while one is up.
+            if this.proj_dialog.is_some() {
+                this.project_dialog_key(key, ctrl, alt, event.keystroke.key_char.as_deref(), cx);
                 return;
             }
             // The unsaved-work question (user 2026-09-10: "if timeline is not
@@ -954,20 +1509,30 @@ pub(crate) fn render(
             // saving, `esc` stays, any other key does nothing at all.
             if this.quit_ask {
                 match key {
+                    // Nothing to save, only exports to lose: Enter keeps the window, never closes it.
+                    "enter" if !this.close_dirty() => {
+                        this.quit_ask = false;
+                        cx.notify();
+                    }
                     "enter" => {
                         // The Save action's own door, so the notice, the
                         // sidecar cleanup and the dirty flag are the ones a
-                        // ctrl+s writes. corner-cut: a project with no path
-                        // yet says "NOTHING TO SAVE — no file open" and the
-                        // window still goes; this app has no save-as dialog
-                        // anywhere to route to (no file picker exists in the
-                        // tree), and every timeline with a clip on it got a
-                        // path from its first import (`project_path`).
+                        // ctrl+s writes. The window goes only once the file is
+                        // written: a failed save says why and keeps the work.
                         // corner-cut: the overwrite guard is Save's door (`Player::save_guarded`), not this plate's -- this save was already answered.
-                        this.save_project(cx);
+                        if this.save_project(cx) {
+                            window.remove_window();
+                        }
+                    }
+                    "d" => {
+                        // Don't save: the edits' autosave goes too, so the next open
+                        // does not offer them back as recovery.
+                        if this.close_dirty() {
+                            this.discard_unsaved_edits();
+                        }
+                        this.queue.cancel_all();
                         window.remove_window();
                     }
-                    "d" => window.remove_window(),
                     "escape" => {
                         this.quit_ask = false;
                         cx.notify();
@@ -975,6 +1540,11 @@ pub(crate) fn render(
                     _ => {}
                 }
                 return;
+            }
+            // A chord that is the app's, not text editing (Ctrl+K, Alt+T, Ctrl+Y ...), is never
+            // eaten by a field: the field is left and the chord runs.
+            if crate::player::blur::is_app_chord(key, ctrl, shift, alt) && this.any_text_field() {
+                this.blur_text_fields(window, cx);
             }
             // The overwrite question (user 2026-09-11: saving over an
             // existing file must warn first, "same pattern as the exit
@@ -1006,53 +1576,74 @@ pub(crate) fn render(
                 return;
             }
             // The export's own overwrite question (user 2026-09-11: "not just
-            // save but export too"). Raised inside [`Player::start_export`]
-            // after its refusals, with the export moment closed behind it --
-            // the moment is an overlay over exactly the strip this plate
-            // rises on. Same ownership as the plates above: `↵` marks the
-            // target this window's own and goes back through the door, which
-            // now passes the guard and starts the worker; `esc` keeps the
-            // file; any other key does nothing at all.
+            // save but export too"), asked inside the export sheet with three
+            // buttons. Its keys: `↵` replaces, `k` keeps both under a new
+            // name, `esc` keeps the file and goes back to the sheet; any
+            // other key does nothing at all ([`Player::answer_overwrite`]).
             if this.export_ask {
                 match key {
-                    "enter" => {
-                        // The answer IS the confirmation, so the target is
-                        // marked known *before* the door is re-entered --
-                        // the guard asks again otherwise.
-                        this.export_known = Some(this.export_path.clone());
-                        this.export_ask = false;
-                        this.start_export(cx);
-                    }
-                    "escape" => {
-                        this.export_ask = false;
-                        cx.notify();
-                    }
+                    "enter" => this.answer_overwrite(Overwrite::Replace, cx),
+                    "k" => this.answer_overwrite(Overwrite::KeepBoth, cx),
+                    "escape" => this.answer_overwrite(Overwrite::Cancel, cx),
                     _ => {}
                 }
                 return;
             }
-            // The recovery notice reads a key as more than "answered" (legacy
-            // `render.rs`'s own rule): `enter` loads the sidecar it named, any
-            // other key declines it. Asked before the generic dismiss below
-            // shares the door with it, not instead of it -- the darkroom
-            // notice bar advertised "enter recovers it, any other key keeps
-            // this" with no listener behind it until now (DESIGN §4).
-            if this.recovery_sidecar.is_some() {
-                if key == "enter" {
-                    this.recover_from_sidecar(cx);
-                } else if let Some(sidecar) = this.recovery_sidecar.take() {
-                    Player::discard_sidecar(&sidecar);
-                }
+            // Every open text field takes the keyboard here, in one place (`Player::text_field_key`):
+            // a letter, Backspace, Ctrl+A, the arrows and Escape go into the field, and none of them
+            // reaches the palette, the chords or the timeline. Only an app chord (Ctrl+K, Alt+T ...)
+            // leaves the field, and then runs.
+            if this.text_field_key(event, window, cx) {
+                return;
             }
-            // DESIGN §9 as amended 2026-09-09: `?` swings the dock to its
+            // The command palette (DESIGN §4.4) owns the keyboard while it is
+            // up: letters and digits go to its field, the arrows move the
+            // highlight, enter runs the row. Ctrl+K again and escape both shut
+            // it; nothing else reaches the keymap meanwhile.
+            if crate::ui::gallery::is_open() {
+                if key == "escape" {
+                    crate::ui::gallery::set_open(false);
+                    cx.notify();
+                }
+                return;
+            }
+            if this.palette_open {
+                let toggles =
+                    this.keymap.lookup(key, ctrl, shift, alt) == Some(ActionId::ShowActions);
+                match key {
+                    _ if toggles || key == "escape" => this.palette_open = false,
+                    "up" => this.palette_move(-1),
+                    "down" => this.palette_move(1),
+                    "enter" => this.palette_run(window, cx),
+                    "backspace" => {
+                        this.palette_query.pop();
+                        this.palette_sel = 0;
+                        this.palette_scroll.set_offset(point(px(0.), px(0.)));
+                    }
+                    _ => {
+                        if let Some(c) = typed(key).filter(|_| !ctrl) {
+                            this.palette_query.push(c);
+                            this.palette_sel = 0;
+                            this.palette_scroll.set_offset(point(px(0.), px(0.)));
+                        }
+                    }
+                }
+                cx.notify();
+                return;
+            }
+            // DESIGN §10.2: `?` and F1 are the ShowKeys action, which swings the dock to its
             // KEYS tab and a second `?` swings it back -- no plate, no hold,
             // no modal cheat-sheet. Asked ahead of the modal guard below so
             // the stroke is heard whatever else is up, and toggling here
             // rather than latching is what makes the same key the way out.
-            if key == "?" && !ctrl {
+            // `?` is shift+`/` on a US board, and a layout that reports the
+            // unshifted key name still means the same stroke.
+            if this.keymap.lookup(key, ctrl, shift, alt) == Some(ActionId::ShowKeys)
+                || (key == "/" && shift && !ctrl && !alt)
+            {
                 match this.keys_open {
                     true => this.keys_open = false,
-                    false => this.show_actions(cx),
+                    false => this.show_keys(cx),
                 }
                 cx.notify();
                 return;
@@ -1076,27 +1667,32 @@ pub(crate) fn render(
                     cx.notify();
                     return;
                 }
-                if let Some(c) = typed(key) {
+                if let Some(c) = typed(key).filter(|_| !ctrl && !alt) {
                     this.keys_filter.push(c);
                     cx.notify();
                     return;
                 }
             }
-            // The dock's Sources filter (MOCK-SPEC "Dock" §2), the same door
-            // legacy `render.rs` gives it: owns the keyboard only while it
-            // was clicked into (`dock_stance.rs` sets `dock_filter_edit` on
-            // that click regardless of which tree is drawing the row), a
-            // letter typed anywhere else in the room keeps meaning whatever
-            // the keymap says it means.
-            if this.dock_filter_edit {
-                if key == "escape" || key == "enter" {
-                    this.dock_filter_edit = false;
-                } else if key == "backspace" {
-                    this.dock_filter.pop();
-                } else if let Some(c) = typed(key) {
-                    this.dock_filter.push(c);
-                }
-                cx.notify();
+            // The Media panel's own keys (DESIGN §4, §6.7): with the panel
+            // focused and a row picked, Space previews it and `↵` adds it.
+            // Ahead of the keymap, so Space's Play never sees the stroke
+            // there; with nothing picked or a menu/card up, it falls through.
+            let panel_focused = this.focus_inspector.is_focused(window);
+            if !this.overlaid()
+                && this.transcript_key(key, ctrl, shift, alt, panel_focused, cx)
+            {
+                return;
+            }
+            let media_focused = this.dock_src_active && this.focus_dock.is_focused(window);
+            if !this.overlaid()
+                && let Some(item) = dock_stance::media_key(
+                    key,
+                    event.keystroke.modifiers,
+                    media_focused,
+                    this.selected_asset.is_some(),
+                )
+            {
+                this.act_on_picked_row(item, cx);
                 return;
             }
             // `↵` adds the picked source at the playhead (MOCK-SPEC "Dock"
@@ -1104,7 +1700,7 @@ pub(crate) fn render(
             // this and nothing answered it -- FAULT 1). Live only where a row
             // is actually picked, so a bare enter elsewhere still means
             // whatever it means below. `insert_source` already refuses
-            // visibly on its own ("NOTHING ADDED -- ...") when the span is
+            // visibly on its own ("Nothing added: ...") when the span is
             // occupied, so there is nothing further to paint here.
             if key == "enter"
                 && this.dock_src_active
@@ -1112,7 +1708,7 @@ pub(crate) fn render(
                 && this.exporting().is_none()
             {
                 if let Some((path, stream)) = this.selected_asset.clone() {
-                    this.insert_source(&path, stream, None, None, cx);
+                    this.append_source(&path, stream, cx);
                 }
                 cx.notify();
                 return;
@@ -1130,11 +1726,60 @@ pub(crate) fn render(
             //
             // Asked through the keymap rather than as a table of key literals:
             // a rebind moves the chord and this follows.
-            if let Some(action) = this.keymap.lookup(key, ctrl)
+            if let Some(action) = this.keymap.lookup(key, ctrl, shift, alt)
                 && card_safe_action(action)
             {
                 this.act(action, window, cx);
                 return;
+            }
+            // A docked card is not a modal: the transport and the room's own
+            // doors answer while it shows ([`docked_card_safe_action`]).
+            if this.docked_card_only()
+                && let Some(action) = this.keymap.lookup(key, ctrl, shift, alt)
+                && (docked_card_safe_action(action)
+                    || docked_card_ignores(key, ctrl, shift, alt))
+            {
+                this.act(action, window, cx);
+                return;
+            }
+            // The Export tab is a tab, not a sheet: the range it exports is marked on the
+            // timeline with I and O, so those strokes (and the transport's) still answer.
+            if this.export_open
+                && this.exporting().is_none()
+                && !this.export_ask
+                && this.context_menu.is_none()
+                && this.library_menu.is_none()
+                && this.picker.is_none()
+                && let Some(action) = this.keymap.lookup(key, ctrl, shift, alt)
+                && export_tab_action(action)
+            {
+                this.act(action, window, cx);
+                return;
+            }
+            // An open dropdown list: up and down move its highlighted row, enter picks it, escape
+            // (above) closes only the list; any other key still closes it.
+            if let Some(pk) = this.picker
+                && !ctrl
+                && !alt
+                && matches!(key, "up" | "down" | "enter")
+                && this.context_menu.is_none()
+                && this.library_menu.is_none()
+            {
+                let rows = this.choices(pk.of);
+                let live: Vec<usize> = (0..rows.len()).filter(|&n| this.export_choice_refusal(rows[n].0).is_none()).collect();
+                if let Some(at) = live.iter().position(|&n| n == pk.sel).or((!live.is_empty()).then_some(0)) {
+                    match key {
+                        "enter" => this.choose(rows[live[at]].0, cx),
+                        _ => {
+                            let to = crate::ui::choice::step(live.len(), at, key == "down");
+                            if let Some(p) = this.picker.as_mut() {
+                                p.sel = live[to];
+                            }
+                            cx.notify();
+                        }
+                    }
+                    return;
+                }
             }
             // The param cards' own key branches (arrows nudge the focused
             // slider, digits pick an EQ band, `r` resets, card verbs) --
@@ -1146,6 +1791,21 @@ pub(crate) fn render(
             // black box the way the old uniform guard made it.
             if this.param_card_key(key, event.keystroke.modifiers.shift, cx) {
                 cx.notify();
+                return;
+            }
+            // One rule: a docked card eats only the strokes it reads
+            // (`param_card_key` above answered `false` for this one); every
+            // other stroke belongs to the room's keymap. Only a sheet that
+            // covers the room, or a menu, blocks the keymap outright.
+            if this.docked_card_only()
+                && this.context_menu.is_none()
+                && this.library_menu.is_none()
+                && this.picker.is_none()
+            {
+                let hit = this.keymap.lookup(key, ctrl, shift, alt);
+                if let Some(action) = hit {
+                    this.act(action, window, cx);
+                }
                 return;
             }
             // Same modal guard the legacy handler's keys_open/export_open/
@@ -1170,6 +1830,7 @@ pub(crate) fn render(
             // to keep working.
             if this.card_open()
                 || this.context_menu.is_some()
+                || this.cue_menu.is_some()
                 || this.library_menu.is_some()
                 || this.picker.is_some()
             {
@@ -1200,6 +1861,7 @@ pub(crate) fn render(
                 // undo to a square of the screen a right-click left open would
                 // be the black box this handler no longer is.
                 this.context_menu = None;
+                this.cue_menu = None;
                 this.library_menu = None;
                 this.picker = None;
                 cx.notify();
@@ -1214,12 +1876,28 @@ pub(crate) fn render(
                 this.close_preview(cx);
                 return;
             }
-            if let Some(action) = this.keymap.lookup(key, ctrl) {
+            if key == ESCAPE && !ctrl && this.source_hint {
+                this.source_hint = false;
+                cx.notify();
+                return;
+            }
+            // Escape is Deselect, which an export refuses; said here with the
+            // chord that does cancel, so a press during an export is never a
+            // silent no-op that could be mistaken for a cancel.
+            if key == ESCAPE && !ctrl && this.exporting().is_some() {
+                let cancel = this.keymap.chord(ActionId::CancelExport);
+                this.notify_user(
+                    format!("Esc keeps the export running. {cancel} cancels it.").into(),
+                );
+                cx.notify();
+                return;
+            }
+            if let Some(action) = this.keymap.lookup(key, ctrl, shift, alt) {
                 // `ActionId::Export` used to be suppressed here because the
                 // darkroom drew no export surface for the card to land on
                 // (DESIGN §12 step 7's own hook). It has one now
                 // ([`timeband_stance::export_chip`] opens it, `render`
-                // below mounts [`Player::export_card`]/`export_progress_card`
+                // below mounts [`Player::export_card`]
                 // exactly where the legacy tree does), so `^e` dispatches
                 // like every other action.
                 this.act(action, window, cx);
@@ -1249,8 +1927,17 @@ pub(crate) fn render(
             }
         }))
         .on_mouse_move(cx.listener(Player::drag_move))
+        // A press off the cue editor's plate commits the words in it (the
+        // plate stops its own presses), so the words are not lost to a click.
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(Player::cue_edit_press_outside),
+        )
         .on_mouse_up(MouseButton::Left, cx.listener(Player::drag_release))
         .size_full()
+        // The menu bar is laid over the top rows (`menubar::bar`, absolute), so
+        // the room starts below it.
+        .pt(px(MENU_BAR_H))
         .flex()
         .bg(rgb(DARK_CANVAS()))
         .children(hitmap::frame())
@@ -1269,47 +1956,13 @@ pub(crate) fn render(
                 .flex_col()
                 .child(screen(player, position, window, cx))
                 .child(time_band(player, position, cx))
-                .child(divider(Split::Bench, player.split_drag == Some(Split::Bench), cx))
+                .child(divider(
+                    Split::Bench,
+                    player.split_drag == Some(Split::Bench),
+                    cx,
+                ))
                 .child(bench(player, bench_h, window, cx))
-                .when(player.quit_ask, |el| {
-                    el.child(decision_plate(
-                        "stance-quit-ask",
-                        "UNSAVED — save ↵ · discard d · stay esc",
-                    ))
-                })
-                .when(player.save_ask, |el| {
-                    el.child(decision_plate(
-                        "stance-save-ask",
-                        &format!(
-                            "OVERWRITE {} — overwrite ↵ · keep esc",
-                            file_name(&player.project_path)
-                        ),
-                    ))
-                })
-                // The export overwrite plate sits with the other two, under
-                // the ledger: [`Player::start_export`] closes the export
-                // moment when it raises this, so the card that would cover
-                // the strip is never up together with the question.
-                .when(player.export_ask, |el| {
-                    el.child(decision_plate(
-                        "stance-export-ask",
-                        &format!(
-                            "OVERWRITE {} — overwrite ↵ · keep esc",
-                            file_name(&player.export_path)
-                        ),
-                    ))
-                })
-                .child(ledger(player, position, cx))
-                .when(player.settings_open, |el| {
-                    el.child(settings_stance::render(player, window_size, cx))
-                })
-                // The export card and its running-progress sheet, mounted
-                // over the whole room exactly as the legacy tree mounts them
-                // (`render.rs`) -- the fix for the shipped "Export does
-                // nothing" defect: the chip/chord open `export_open`, this is
-                // what draws it once open.
-                .children(player.export_card(window_size, cx))
-                .children(player.export_progress_card(cx))
+                .child(ledger(player, cx))
                 // A maximized clip param card (EQ/Colour/Transform/Speed/
                 // Silence/Mix/Subtitle style) escapes the dock to mount here
                 // instead, the same window-space `stance-centre` context
@@ -1327,12 +1980,21 @@ pub(crate) fn render(
                         .children(player.color_card(window_size, cx))
                         .children(player.transform_card(window_size, cx))
                         .children(player.speed_card(window_size, cx))
+                        .children(player.effects_card(window_size, cx))
                         .children(player.silence_card(window_size, cx))
+                        .children(player.beats_card(window_size, cx))
                         .children(player.mix_card(window_size, cx))
+                        .children(player.markers_card(window_size, cx))
+                        .children(player.history_card(window_size, cx))
+                        .children(player.tools_card(window_size, cx))
                         .children(player.subtitle_style_card(window_size, cx))
                 }),
         )
-        .child(divider(Split::Dock, player.split_drag == Some(Split::Dock), cx))
+        .child(divider(
+            Split::Dock,
+            player.split_drag == Some(Split::Dock),
+            cx,
+        ))
         .child(dock(player, dock_w, window_size, window, cx))
         // All three hanging menus (DESIGN §9: "verbs of the thing under the
         // cursor") mount on the ROOT, and none of them inside
@@ -1349,7 +2011,19 @@ pub(crate) fn render(
         // may overlap, and `menu_floor`/`menu_at`'s window coordinates finally
         // mean what they say. Order is `render.rs`'s -- clip menu, library
         // menu, then the open list last so it floats over whichever row set it.
-        .children(player.context_card(window_size, cx))
-        .children(player.library_card(window_size, cx))
-        .children(player.picker_card(window_size, cx))
+        // The menu bar sits over the room's top edge and its click-away under
+        // the root's own menus; its dropdown is deferred, so it paints over both.
+        .child(menubar::bar(player, f32::from(viewport.width), f32::from(viewport.height), cx))
+        .children(menubar::backdrop(player, cx))
+        .children(player.context_card(viewport, cx))
+        .children(player.library_card(viewport, cx))
+        .children(player.picker_card(viewport, cx))
+        .children(player.settings_open.then(|| crate::ui::kit::tab_scope(&pool, || settings_stance::render(player, window_size, cx))))
+        .children(crate::ui::kit::tab_scope(&pool, || player.about_card(window_size, cx)))
+        .children(crate::ui::kit::tab_scope(&pool, || player.project_dialog_card(window_size, cx)))
+        // The command palette is the last thing painted: it floats over every
+        // card and menu above (DESIGN §4.4).
+        .children(player.command_palette(window_size, cx))
+        // The component gallery (a debug page for the design kit) covers it all.
+        .children(crate::ui::gallery::overlay(cx))
 }

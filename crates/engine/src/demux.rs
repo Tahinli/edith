@@ -19,10 +19,22 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::UNIX_EPOCH;
 
-use mp4::{Mp4Reader, Mp4Track, TrackType};
+use crate::colorspace::{
+    Chroma, ColorDescription, ContentLight, Tags, bitstream_chroma, bitstream_tags,
+};
+use crate::video_profile;
+use ec_h264_syntax::{AnnexBIter, Pps, Sps, unescape_rbsp};
+use ec_core::Demuxer as _;
 
-use crate::audio::{edit_media_time, packet_at, stts_pairs};
-use crate::colorspace::{ColorDescription, ContentLight, Tags, bitstream_tags};
+pub(crate) mod avi;
+pub mod captions;
+pub(crate) mod dv;
+pub(crate) mod ps;
+pub(crate) mod ts;
+pub use avi::is_avi;
+pub use dv::is_dv;
+pub use ps::{carries_picture, is_mpeg_system, is_mpegps};
+pub use ts::is_mpegts;
 
 const START_CODE: [u8; 4] = [0, 0, 0, 1];
 
@@ -110,10 +122,10 @@ pub fn cancelled_read_error() -> crate::Error {
     CANCELLED.into()
 }
 
-/// What the video track is coded with. Not a decoder choice by itself: H.264
-/// and AV1 have software decoders in this binary, and VP8's (`ec-vp8`) lives
-/// inside the plugin -- which is what [`Codec::needs_plugin`] says for the
-/// rest, per codec, in the words that stay true.
+/// What the video track is coded with. Not a decoder choice by itself: every
+/// codec here has a software decoder in this binary (`ec-h264`, `ec-h265`,
+/// `ec-av1`, `ec-vp9`, `ec-vp8`), so the plugin is an alternative to them, not a
+/// requirement, for playback and export alike.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Codec {
     H264,
@@ -121,6 +133,23 @@ pub enum Codec {
     Vp9,
     Vp8,
     Av1,
+    /// MPEG-1 and MPEG-2 video, out of a transport stream only.
+    Mpeg2,
+    /// Apple ProRes (422 Proxy to 4444 XQ): intra-only, software seat only.
+    ProRes,
+    /// Avid DNxHD / DNxHR: intra-only, software seat only.
+    Dnxhd,
+    /// Motion JPEG: intra-only, full range, software seat only.
+    Mjpeg,
+    /// DV video (DV25, DVCPRO25/50, DVCPRO HD): intra-only, software seat only.
+    Dv,
+    /// MPEG-4 Part 2 (Simple, Advanced Simple) and H.263 baseline: software seat only.
+    Mpeg4,
+    /// Microsoft MPEG-4 version 2 and 3 (DivX 3: `MP42`, `DIV3`...), in an AVI: software seat only.
+    MsMpeg4,
+    /// Uncompressed video in an AVI (`BI_RGB` 24 and 32 bit, YUY2, UYVY, I420, YV12): software
+    /// seat only.
+    Raw,
 }
 
 impl Codec {
@@ -132,39 +161,18 @@ impl Codec {
             Self::Vp9 => "VP9",
             Self::Vp8 => "VP8",
             Self::Av1 => "AV1",
+            Self::Mpeg2 => "MPEG-2",
+            Self::ProRes => "ProRes",
+            Self::Dnxhd => "DNxHD",
+            Self::Mjpeg => "MJPEG",
+            Self::Dv => "DV",
+            Self::Mpeg4 => "MPEG-4",
+            Self::MsMpeg4 => "MS-MPEG4",
+            Self::Raw => "Raw",
         }
     }
 
-    /// Why a file can be refused outright. Two true answers, one per shape of
-    /// "no decoder here": H.264 and AV1 have software seats of this project's
-    /// own (`ec-h264`, `ec-av1`) and are never refused for missing hardware on
-    /// the *playback* path; HEVC and VP9 have no software decoder at all, so
-    /// the refusal names the plugin as the only way. VP8's software decoder
-    /// *is* this project's own `ec-vp8`, inside the plugin, so "there is no
-    /// software decoder" would be a lie -- the refusal keeps naming the
-    /// plugin, because that is still the thing to make present. AV1's arm
-    /// is the one refusal left that can reach it: the software *export*
-    /// decoder is H.264-only (`export::SwDecoder`), so an AV1 source on a
-    /// machine with no plugin exports through nothing. Shared so playback and
-    /// export refuse in the same words.
-    pub fn needs_plugin(self) -> String {
-        match self {
-            Self::Vp8 => {
-                "VP8 needs the VA-API plugin (libengine_hw.so) — its decoder is ec-vp8, inside the plugin"
-                    .to_string()
-            }
-            Self::Av1 => {
-                "AV1 needs the VA-API plugin (libengine_hw.so) — playback decodes it in software, the software export path does not"
-                    .to_string()
-            }
-            other => format!(
-                "{name} needs the VA-API plugin (libengine_hw.so) — there is no software {name} decoder",
-                name = other.name(),
-            ),
-        }
-    }
-
-    /// The other refusal: the plugin *is* here and opened the file, and then
+    /// The refusal: the plugin *is* here and opened the file, and then
     /// could not decode a picture out of it. Not a missing decoder, and saying
     /// so would send the user installing something they already have.
     pub fn undecodable(self) -> String {
@@ -191,6 +199,64 @@ const CODEC_IDS: &[(Codec, &str, &[u8; 4])] = &[
     (Codec::Vp9, "V_VP9", b"vp09"),
     (Codec::Vp8, "V_VP8", b"vp08"),
     (Codec::Av1, "V_AV1", b"av01"),
+    (Codec::Mjpeg, "V_MJPEG", b"jpeg"),
+    // MPEG-4 Part 2: Simple, Advanced Simple and the (rare) Advanced profile ids are one
+    // decoder; `mp4v` carries the VOL header in its `esds`.
+    (Codec::Mpeg4, "V_MPEG4/ISO/ASP", b"mp4v"),
+    (Codec::Mpeg4, "V_MPEG4/ISO/SP", b"mp4v"),
+    (Codec::Mpeg4, "V_MPEG4/ISO/AP", b"mp4v"),
+];
+
+/// The mp4 sample entries that name a codec beside its [`CODEC_IDS`] row, or that have no
+/// Matroska id to share a row with: `mjpa` (Motion-JPEG A), the six ProRes flavours (Proxy,
+/// LT, Standard, HQ, 4444, 4444 XQ) and Avid's `AVdn` (DNxHD) / `AVdh` (DNxHR). The Matroska
+/// half of DNxHD is [`mkv_private_codec`]: its ids are generic ones that name the codec in
+/// `CodecPrivate`; ProRes has no Matroska id here ([`UNSUPPORTED`]).
+const MP4_ONLY: &[(Codec, &[u8; 4])] = &[
+    (Codec::Mjpeg, b"mjpa"),
+    // MJPEG-B: `ec-mjpeg` rewraps each field as a baseline JPEG.
+    (Codec::Mjpeg, b"mjpb"),
+    // Uncompressed video: `raw ` (RGB), `2vuy`, `yuvs`, `yuv2`, `v210`, `v410`, `b16g`. `raw ` and
+    // `yuvs` are PCM audio entries too; only a track whose handler is `vide` is a picture here.
+    (Codec::Raw, b"raw "),
+    (Codec::Raw, b"2vuy"),
+    (Codec::Raw, b"yuvs"),
+    (Codec::Raw, b"yuv2"),
+    (Codec::Raw, b"v210"),
+    (Codec::Raw, b"v410"),
+    (Codec::Raw, b"b16g"),
+    (Codec::ProRes, b"apco"),
+    (Codec::ProRes, b"apcs"),
+    (Codec::ProRes, b"apcn"),
+    (Codec::ProRes, b"apch"),
+    (Codec::ProRes, b"ap4h"),
+    (Codec::ProRes, b"ap4x"),
+    (Codec::Dnxhd, b"AVdn"),
+    (Codec::Dnxhd, b"AVdh"),
+    // H.263 baseline: the 3GPP (`s263`) and QuickTime (`h263`) entries.
+    (Codec::Mpeg4, b"s263"),
+    (Codec::Mpeg4, b"h263"),
+    // DV: the QuickTime entries for DV25 / DVCPRO25 (`dvc `, `dvcp`, `dvpp`, `dvcs`, `dvis`),
+    // DVCPRO50 (`dv5n`, `dv5p`, `dv5q`) and DVCPRO HD (`dvh*`). A frame names its own system.
+    (Codec::Dv, b"dvc "),
+    (Codec::Dv, b"dvcp"),
+    (Codec::Dv, b"dvpp"),
+    (Codec::Dv, b"dvcs"),
+    (Codec::Dv, b"dvis"),
+    (Codec::Dv, b"dv5n"),
+    (Codec::Dv, b"dv5p"),
+    (Codec::Dv, b"dv5q"),
+    (Codec::Dv, b"dvhq"),
+    (Codec::Dv, b"dvh1"),
+    (Codec::Dv, b"dvh2"),
+    (Codec::Dv, b"dvh3"),
+    (Codec::Dv, b"dvh4"),
+    (Codec::Dv, b"dvh5"),
+    (Codec::Dv, b"dvh6"),
+    (Codec::Dv, b"dvhp"),
+    (Codec::Dv, b"dvhs"),
+    (Codec::Dv, b"dvhn"),
+    (Codec::Dv, b"dvhr"),
 ];
 
 /// The written-down gaps: container ids -- a Matroska `CodecID` or a four-byte
@@ -207,7 +273,15 @@ const UNSUPPORTED: &[(&str, &str)] = &[
     ("V_MPEG2", "no MPEG-2 decoder, hardware or software"),
     (
         "V_MS/VFW/FOURCC",
-        "a codec inside a BITMAPINFOHEADER; nothing here unwraps one",
+        "a codec inside a BITMAPINFOHEADER; only Avid DNxHD/DNxHR (AVdn, AVdh) and the XviD / DivX 4-5 / FMP4 MPEG-4 Part 2 tags are unwrapped, nothing else",
+    ),
+    (
+        "V_QUICKTIME",
+        "a QuickTime sample description inside Matroska; only Avid DNxHD/DNxHR (AVdn, AVdh) is unwrapped, nothing else",
+    ),
+    (
+        "V_PRORES",
+        "Apple ProRes in Matroska; ec-matroska maps no ProRes id, so ProRes is read from QuickTime/MP4 only",
     ),
 ];
 
@@ -220,17 +294,132 @@ fn mkv_codec(id: &str) -> Option<Codec> {
         .map(|&(codec, ..)| codec)
 }
 
+/// The Matroska video codecs named only in `CodecPrivate`: Avid DNxHD/DNxHR inside a
+/// `V_QUICKTIME` track (the QuickTime sample description, whose four-character code follows
+/// its size) or a `V_MS/VFW/FOURCC` track (the BITMAPINFOHEADER's `biCompression`). The same
+/// rule `ec-matroska` applies.
+fn mkv_private_codec(id: &str, private: &[u8]) -> Option<Codec> {
+    let tag = match id {
+        "V_QUICKTIME" => private.get(4..8)?,
+        "V_MS/VFW/FOURCC" => private.get(16..20)?,
+        _ => return None,
+    };
+    if matches!(tag, b"AVdn" | b"AVdh") {
+        return Some(Codec::Dnxhd);
+    }
+    // A VfW track of the XviD / DivX 4-5 / FMP4 family (not MS-MPEG4 `DIV3`), as `ec-matroska`.
+    let up = tag.to_ascii_uppercase();
+    (id == "V_MS/VFW/FOURCC"
+        && matches!(&up[..], b"XVID" | b"XVIX" | b"DIVX" | b"DX50" | b"FMP4" | b"MP4V" | b"M4S2" | b"RMP4"))
+    .then_some(Codec::Mpeg4)
+}
+
+/// Whether an MPEG-4 Part 2 access unit carries its own Visual Object Sequence / Object
+/// Layer header (`00 00 01 B0`, `B5`, or a `20..2F` layer start) ahead of the first VOP
+/// (`B6`): where it does, the configuration out of the container is not injected again.
+pub(crate) fn has_vol(au: &[u8]) -> bool {
+    for w in au.windows(4) {
+        if w[..3] == [0, 0, 1] {
+            match w[3] {
+                0xB0 | 0xB5 | 0x20..=0x2F => return true,
+                0xB6 => return false,
+                _ => {}
+            }
+        }
+    }
+    false
+}
+
 /// Which codec an mp4 `stsd` sample entry fourcc names. The mp4 half of
 /// [`CODEC_IDS`], plus `hev1`: HEVC arrives under either fourcc and the record
-/// the parameter sets come out of is the same `hvcC` either way.
+/// the parameter sets come out of is the same `hvcC` either way; and the
+/// [`MP4_ONLY`] entries.
 fn mp4_codec(fourcc: &[u8; 4]) -> Option<Codec> {
     if fourcc == b"hev1" {
         return Some(Codec::Hevc);
+    }
+    if let Some(&(codec, _)) = MP4_ONLY.iter().find(|(_, f)| *f == fourcc) {
+        return Some(codec);
     }
     CODEC_IDS
         .iter()
         .find(|(_, _, mp4)| *mp4 == fourcc)
         .map(|&(codec, ..)| codec)
+}
+
+/// An `ec-mp4` error as the engine's: a cancelled read keeps its own message
+/// ([`cancelled_read_error`]'s words) so [`is_cancelled`] still recognises it.
+///
+/// Two of `ec-mp4`'s answers are the engine's plain words for a bad file. A file
+/// that stops before its `moov` is a truncated copy: `ec-mp4` says "need more
+/// data", which means nothing to someone holding a file. A file that is not an
+/// MP4 or QuickTime container at all (a text file given an `.mp4` name) is "not
+/// an mp4 or QuickTime container". Both keep the words the front ends match on
+/// ("a box with a larger size than it", "ftyp not found") so probe and import
+/// give the same refusal for them.
+pub(crate) fn mp4_error(e: ec_core::Error) -> crate::Error {
+    match e {
+        ec_core::Error::Io(io) => io.into(),
+        ec_core::Error::NeedMore => {
+            "file contains a box with a larger size than it: the file is truncated, \
+             its movie header (moov) is missing or cut short"
+                .to_string()
+                .into()
+        }
+        ec_core::Error::Unsupported { what, .. } if what == "this file" => {
+            "ftyp not found: it is not an mp4 or QuickTime container".to_string().into()
+        }
+        other => other.to_string().into(),
+    }
+}
+
+/// The first 16 bytes of an ASF file: the GUID of its Header Object, which every Windows Media
+/// file opens with, WMA and WMV alike.
+const ASF_HEADER_GUID: [u8; 16] = [
+    0x30, 0x26, 0xB2, 0x75, 0x8E, 0x66, 0xCF, 0x11, 0xA6, 0xD9, 0x00, 0xAA, 0x00, 0x62, 0xCE, 0x6C,
+];
+
+/// The refusal an ASF / WMV file gets: named, and never the mp4 "ftyp" one.
+pub(crate) const ASF_REFUSAL: &str =
+    "ASF/WMV (Windows Media) files are not supported: convert to MP4 or MKV";
+
+/// Refuses an ASF / WMV file by name ([`ASF_REFUSAL`]). Every other file passes, and so does
+/// one that cannot be read here: the reader that opens it says why.
+pub(crate) fn refuse_asf(path: &Path) -> crate::Result<()> {
+    let mut head = [0u8; 16];
+    let is_asf = File::open(path).and_then(|mut f| f.read_exact(&mut head)).is_ok()
+        && head == ASF_HEADER_GUID;
+    match is_asf {
+        true => Err(ASF_REFUSAL.to_string().into()),
+        false => Ok(()),
+    }
+}
+
+/// The refusal an audio-only Speex file gets (an Ogg whose first packet is a Speex header).
+pub(crate) const SPEEX_REFUSAL: &str = "Speex audio is not supported";
+
+/// Whether `path` is an Ogg file whose first packet is a Speex header (`Speex   `, eight bytes).
+/// The Ogg page header is 27 bytes, then one lacing byte per segment (`head[26]` of them), then
+/// the packet itself.
+pub(crate) fn is_ogg_speex(path: &Path) -> bool {
+    let mut head = [0u8; 4096];
+    let Ok(read) = File::open(path).and_then(|mut f| f.read(&mut head)) else {
+        return false;
+    };
+    let head = &head[..read];
+    if !head.starts_with(b"OggS") || head.len() < 27 {
+        return false;
+    }
+    let at = 27 + usize::from(head[26]);
+    head.get(at..).is_some_and(|packet| packet.starts_with(b"Speex   "))
+}
+
+/// Refuses an audio-only Speex file by name ([`SPEEX_REFUSAL`]).
+pub(crate) fn refuse_speex(path: &Path) -> crate::Result<()> {
+    match is_ogg_speex(path) {
+        true => Err(SPEEX_REFUSAL.to_string().into()),
+        false => Ok(()),
+    }
 }
 
 /// The one refusal that is an **answer**: this file carries no picture at all
@@ -361,7 +550,10 @@ impl Rotation {
 #[derive(Debug)]
 pub struct UnsupportedRotation {
     /// The angle the matrix states, where it states one at all -- `None` for a
-    /// mirror or a shear, which is not one -- for the sentence only.
+    /// mirror or a shear, which is not one -- for the sentence only. It is
+    /// counter-clockwise, as ffprobe reports a file's `rotation` side data, for
+    /// both containers: an mp4 matrix and an mkv roll that name the same turn
+    /// state the same number.
     pub degrees: Option<f64>,
 }
 
@@ -573,7 +765,7 @@ impl PixelAspect {
         // admit the two most common letterbox ratios. The raster bound has no
         // such conflict.
         let wide = u64::from(coded_width) * u64::from(self.h);
-        let scaled = (wide + u64::from(self.v) - 1) / u64::from(self.v);
+        let scaled = wide.div_ceil(u64::from(self.v));
         // Down to the even grid, not up: `(x | 1) & !1` is what this has always
         // done, and it is what an odd quotient rounds to. A 239:100 scope over
         // a 3840x2160 coded frame scales to 5163 and has always displayed
@@ -621,6 +813,9 @@ pub struct VideoMeta {
     /// which range -- resolved off the container's tags, the bitstream's, and
     /// the resolution, in that order. See [`crate::colorspace`].
     pub color: ColorDescription,
+    /// Whether [`VideoMeta::color`]'s matrix is the size rule's guess rather than
+    /// something the file states: see [`ColorDescription::matrix_assumed`].
+    pub matrix_assumed: bool,
     /// How far the picture must be turned to be seen right, off the container's
     /// display matrix: an mp4 `tkhd` matrix, or a Matroska `Projection` roll on
     /// a rectangular projection -- the same quarter turns read off either.
@@ -747,11 +942,8 @@ pub fn probe_bitrate(path: &Path) -> MediaBitrate {
     // lays the clip out at.
     let stated = match &demuxer {
         Demuxer::Mkv(d) => d.container_secs,
-        Demuxer::Mp4(d) => {
-            let mvhd = &d.reader.moov.mvhd;
-            (mvhd.timescale > 0 && mvhd.duration > 0)
-                .then(|| mvhd.duration as f64 / f64::from(mvhd.timescale))
-        }
+        Demuxer::Mp4(d) => d.reader.duration_secs(),
+        Demuxer::Ts(d) => d.container_secs(),
     };
     let secs = stated.unwrap_or(match meta.frame_rate > 0.0 {
         true => f64::from(meta.frame_count) / meta.frame_rate,
@@ -788,32 +980,32 @@ pub fn probe_bitrate(path: &Path) -> MediaBitrate {
             )
         }
         Demuxer::Mp4(d) => {
-            let tracks = d.reader.tracks();
-            // In file order, out of `moov.traks`, for [`Mp4Demuxer::open`]'s
-            // reason and for `audio::audio_track_ids`': `tracks()` is a
-            // `HashMap`, so "the audio track" of a dual-audio file would
-            // otherwise be a different one per run. Deliberately the *same*
-            // first-in-file rule the audio path picks stream 0 by, so the
-            // bitrate row and the audio row of one card name one track -- see
-            // [`MediaBitrate::audio`], which says what that number is not.
+            // In file order, the same first-in-file audio track the audio path
+            // picks, so the bitrate row and the audio row of one card name one
+            // track -- see [`MediaBitrate::audio`], which says what that number is
+            // not.
             let audio = d
                 .reader
-                .moov
-                .traks
+                .tracks()
                 .iter()
-                .map(|trak| trak.tkhd.track_id)
-                .find(|id| {
-                    tracks
-                        .get(id)
-                        .is_some_and(|t| matches!(t.track_type(), Ok(TrackType::Audio)))
+                .filter_map(|t| t.stream)
+                .find(|&stream| {
+                    d.reader.streams().iter().any(|s| {
+                        s.index == stream
+                            && matches!(s.params.media, ec_core::MediaParameters::Audio(_))
+                    })
                 });
-            let rate = |id| {
-                tracks
-                    .get(id)
-                    .map(mp4_track_bytes)
-                    .and_then(|bytes| bits_per_second(bytes, secs))
-            };
-            (rate(&d.track_id), audio.as_ref().and_then(rate))
+            let rate = |stream| bits_per_second(mp4_track_bytes(&d.reader, stream), secs);
+            (rate(d.stream), audio.and_then(rate))
+        }
+        // A transport stream indexes nothing, so the packets are counted: one walk of the
+        // file, the price the Matroska arm paid at open.
+        Demuxer::Ts(d) => {
+            let (video, audio) = d.stream_bytes();
+            (
+                video.and_then(|b| bits_per_second(b, secs)),
+                audio.and_then(|b| bits_per_second(b, secs)),
+            )
         }
     };
     MediaBitrate {
@@ -827,54 +1019,1505 @@ pub fn probe_bitrate(path: &Path) -> MediaBitrate {
 /// number worth showing: nothing measured either side, or a rate that rounds to
 /// zero. A `0` here would read as a real measurement, which is the one answer
 /// this must never give.
-fn bits_per_second(bytes: u64, secs: f64) -> Option<u64> {
+pub(crate) fn bits_per_second(bytes: u64, secs: f64) -> Option<u64> {
     (secs > 0.0)
         .then(|| (bytes as f64 * 8.0 / secs) as u64)
         .filter(|&bps| bps > 0)
 }
 
+/// How long the file states it plays, read from its header: Matroska's
+/// `Info.Duration`, or the mp4 `mvhd`. `None` where the header states none.
+fn stated_secs(demuxer: &Demuxer) -> Option<f64> {
+    match demuxer {
+        Demuxer::Mkv(d) => d.container_secs,
+        Demuxer::Mp4(d) => d.reader.duration_secs(),
+        Demuxer::Ts(d) => d.container_secs(),
+    }
+}
+
+/// What a file is, beside the rates [`probe_bitrate`] gives: the container it
+/// is wrapped in, how big it is, and what its picture is coded as. Every field
+/// the file does not state is `None`, the way [`MediaBitrate`] leaves out a rate
+/// it cannot measure.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct MediaFacts {
+    /// The container as a person names it: `mp4`, `mov`, `m4a`, `m4v`, `3gp`,
+    /// `mkv`, `webm`. The header decides where it can; the extension does the rest.
+    pub container: Option<String>,
+    /// The file's size on disk in bytes.
+    pub bytes: Option<u64>,
+    /// The picture track. `None` for a file with none: sound alone, a still, or
+    /// a file that will not open.
+    pub video: Option<VideoFacts>,
+    /// How long the file plays: for a picture, its playable frames over its
+    /// rate (the length the timeline gives it); the header's length where the
+    /// picture has none to count (mp4 `mvhd`, Matroska `Info.Duration`); for
+    /// sound alone the audio header's length. `None` for a still, or a file
+    /// whose header states none.
+    pub duration_secs: Option<f64>,
+    /// Every video, audio and subtitle stream of the file, in file order within
+    /// each kind. Empty where the header is not one this reads (a plain WAV or
+    /// MP3 gets its audio rows from [`crate::AudioSession::probe_streams`], with
+    /// no codec identifier). Kept beside the fields above, which are unchanged.
+    pub streams: Vec<StreamFacts>,
+    /// The file carries cover art: an ID3v2 `APIC` frame, a FLAC `PICTURE`
+    /// block, an mp4 `covr` atom, or a Matroska attachment of an `image/*` type.
+    /// A cover is never a playable stream: it is in no entry of `streams` and is
+    /// not `video`, so a song with a cover stays audio-only.
+    pub attached_pic: bool,
+}
+
+/// The playing time an mp4 or Matroska header states for audio stream `stream` (its index among
+/// the audio streams). `None` where the header states none, or the file is neither container.
+pub(crate) fn header_audio_secs(path: &Path, stream: usize) -> Option<f64> {
+    header_streams(path)
+        .ok()
+        .flatten()?
+        .into_iter()
+        .find(|s| s.kind == StreamKind::Audio && s.index == stream)?
+        .duration_secs
+        .filter(|&secs| secs > 0.0)
+}
+
+/// The kind of a stream [`StreamFacts`] describes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamKind {
+    Video,
+    Audio,
+    Subtitle,
+}
+
+/// One stream of a file as its header names it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StreamFacts {
+    pub kind: StreamKind,
+    /// Position among the file's streams of this kind. For audio in a Matroska
+    /// file this is the numbering [`crate::AudioSession::probe_streams`] hands
+    /// out (the track that plays first is 0), so it is the `stream` the audio
+    /// API takes; everywhere else it is file order.
+    pub index: usize,
+    /// The codec identifier as the file spells it: an mp4 sample entry's fourcc
+    /// (`avc1`, `hvc1`, `mp4a`, `Opus`, `fLaC`, `tx3g`, `wvtt`), or a Matroska
+    /// CodecID (`V_VP9`, `A_OPUS`, `S_TEXT/UTF8`). `None` where the header gives
+    /// none.
+    pub codec_id: Option<String>,
+    /// The stream's language as the header states it, the way ffprobe reads it:
+    /// an mp4 track's `elng` (an extended tag, when the file has one) and
+    /// otherwise its `mdhd` three-letter code, which is `und` where the file
+    /// says none; a Matroska audio or video track's `Language`, `und` where it
+    /// states none. `None` where the header states none, which is every subtitle
+    /// track of a Matroska file.
+    pub language: Option<String>,
+    /// Audio only: the channel count the header states. An mp4 sample entry's
+    /// `channelcount`, or an AC-3 / E-AC-3 `dac3` / `dec3` box's `acmod` and
+    /// `lfeon` (the sample entry's own count is 2 for most AC-3 files whatever
+    /// they carry); a Matroska `Channels`. `None` where the header states none.
+    pub channels: Option<u16>,
+    /// Audio only: the sample rate in Hz, from an mp4 sample entry or a
+    /// Matroska `SamplingFrequency`. `None` where the header states none (a
+    /// rate above 65535 Hz is stored as 0 in an mp4 entry, and reads as none).
+    pub sample_rate: Option<u32>,
+    /// The stream's own header length in seconds: the mp4 `mdhd` duration over
+    /// its timescale, which is the stream's length and not the playable one.
+    /// Matroska has no per-track length element, so every track of a Matroska
+    /// file reports the file's `Info.Duration` (`Duration` times `TimestampScale`)
+    /// and the same value for each of them. `None` where the header states none.
+    pub duration_secs: Option<f64>,
+    /// Audio only, and AAC only: the profile the header states, spelled the way
+    /// ffprobe spells it in its `profile` field: `LC`, `Main`, `SSR`, `LTP`,
+    /// `HE-AAC` (SBR), `HE-AACv2` (SBR and parametric stereo), `LD`, `ELD`.
+    /// Read from an mp4 `esds` AudioSpecificConfig, a Matroska `A_AAC`
+    /// `CodecPrivate` (the same config), or else an `A_AAC/MPEG4/...` CodecID
+    /// that names it. Explicit signalling is read off the config: an object
+    /// type of 5 or 29, or the backward-compatible sync extensions (SBR `0x2b7`,
+    /// PS `0x548`) after an AOT 2 config. A plain AAC-LC config carries SBR or PS
+    /// only implicitly, in its bitstream, so the first few packets are decoded to
+    /// find them: SBR gives `HE-AAC`, SBR with PS gives `HE-AACv2`, and neither
+    /// leaves `LC`. `None` for every other codec, and for an AAC header that
+    /// states no profile.
+    pub profile: Option<String>,
+    /// Audio only, and lossless only: the sample depth the stored stream
+    /// states, the way ffprobe reports it. FLAC's STREAMINFO `bits_per_sample`
+    /// (read from an mp4 `dfLa`, a Matroska `A_FLAC` `CodecPrivate`, or a bare
+    /// `.flac` file), ALAC's ALACSpecificConfig `bitDepth` (an mp4 `alac` box or
+    /// a Matroska `A_ALAC` `CodecPrivate`), and PCM's bit depth (a bare WAV's
+    /// `fmt ` chunk, a Matroska `BitDepth`). ffprobe's `bits_per_raw_sample` is
+    /// the same figure for FLAC and ALAC; for PCM it is `bits_per_sample`, the
+    /// one ffprobe fills. `None` for every lossy codec, and for a lossless stream
+    /// whose header states no depth (a PCM mp4 entry is not read).
+    pub bit_depth: Option<u32>,
+}
+
+/// The picture track of a file, as its header and first keyframe state it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VideoFacts {
+    pub codec: Codec,
+    /// The displayed size, as [`VideoMeta::width`] and [`VideoMeta::height`] give it.
+    pub width: u32,
+    pub height: u32,
+    /// `None` where the container states no rate.
+    pub frame_rate: Option<f64>,
+    /// Bits per luma sample. `None` where nothing here reads it: an H.264
+    /// stream's SPS is not parsed for its depth, and every other codec's is.
+    pub bit_depth: Option<u8>,
+    /// Whether the picture's colour matrix is the size rule's guess rather than
+    /// something the file states (no VUI, sequence header, `colr` or Matroska
+    /// `Colour` matrix): true exactly when [`VideoMeta::matrix_assumed`] is.
+    /// Transfer and range are not covered: they fall back to fixed values.
+    pub matrix_assumed: bool,
+    /// The profile the stream states, spelled as ffprobe spells its `profile`
+    /// field: H.264 from the SPS (`Baseline`, `Constrained Baseline`, `Main`,
+    /// `Extended`, `High`, `High 10`, `High 4:2:2`, `High 4:4:4 Predictive`, and
+    /// the intra variants), HEVC from the `hvcC` (`Main`, `Main 10`, `Main Still
+    /// Picture`, `Rext`), AV1 from the sequence header (`Main`, `High`,
+    /// `Professional`), VP9 from the frame header (`Profile 0` to `Profile 3`).
+    /// `None` where the stream states none of those.
+    pub profile: Option<&'static str>,
+    /// `Some("tff")` or `Some("bff")` for an interlaced H.264 stream: the field
+    /// that displays first. The stream's own flags decide it, the container's
+    /// `fiel` / `FieldOrder` is the fallback. `None` for a progressive stream and
+    /// for every other codec.
+    pub interlaced: Option<&'static str>,
+}
+
+/// How long the picture plays: its frame count over its rate. `None` where the
+/// container states no rate or the picture has no frames.
+fn picture_secs(meta: &VideoMeta) -> Option<f64> {
+    (meta.frame_rate > 0.0 && meta.frame_count > 0)
+        .then(|| f64::from(meta.frame_count) / meta.frame_rate)
+}
+
+/// One audio track as [`header_streams`] lists it: codec identifier, language,
+/// channel count, sample rate and AAC profile, each where the header states it.
+type AudioHeader = (
+    String,
+    Option<String>,
+    Option<u16>,
+    Option<u32>,
+    Option<&'static str>,
+    Option<u32>,
+);
+
+/// Every stream of an mp4-family or Matroska file, from its header alone: the
+/// codec identifier each one carries and the length its own header states.
+/// `None` for a file neither container reads (a WAV or MP3 has no header
+/// listing its tracks); `Err` only for an mp4 or Matroska header that will not
+/// walk.
+fn header_streams(path: &Path) -> crate::Result<Option<Vec<StreamFacts>>> {
+    if is_matroska(path) {
+        let mut file = File::open(path)?;
+        let end = file.metadata()?.len();
+        let segment = mkv_segment(&mut file, end)?;
+        let mut codecs = Vec::new();
+        // Every Matroska track gets the file's length: see `StreamFacts::duration_secs`.
+        let mut length = None;
+        let mut at = segment.0;
+        while let Some((id, body, stop)) = ebml_element(&mut file, at, segment.1)? {
+            match id {
+                CLUSTER => break,
+                TRACKS => codecs = mkv_track_codecs(&mut file, body, stop)?,
+                INFO => length = mkv_info_secs(&mut file, body, stop)?,
+                _ => {}
+            }
+            at = stop;
+        }
+        // Sound is numbered the way the audio API numbers it, so `index` is a
+        // stream `AudioSession::open_multi_streams` takes. A picture the decoder
+        // refuses by name (a display matrix that is not a quarter
+        // turn) fails that track walk too, and must not cost the whole list: the
+        // sound is then listed in file order, which is the numbering of a file
+        // with one audio track anyway.
+        // (codec, language, channels, sample rate) per audio track, in that order.
+        let audio: Vec<AudioHeader> = match matroska_audio_tracks(path) {
+            Ok(tracks) => crate::audio::mkv_stream_order(path, &tracks)
+                .into_iter()
+                .map(|at| {
+                    let t = &tracks[at];
+                    let profile = mkv_aac_profile(&t.codec, &t.config);
+                    // A plain AOT 2 config may carry an implicit SBR or PS payload:
+                    // the track's first blocks say which (only where it has a config).
+                    let profile = match profile {
+                        Some("LC") if !t.config.is_empty() => {
+                            let units: Vec<Vec<u8>> = crate::audio::first_packets(
+                                path,
+                                u32::try_from(t.number).unwrap_or(u32::MAX),
+                                IMPLICIT_PROFILE_UNITS,
+                            );
+                            Some(implicit_aac_profile(&t.config, &units))
+                        }
+                        other => other,
+                    };
+                    let bit_depth = mkv_lossless_depth(&t.codec, &t.config, t.bit_depth);
+                    (
+                        t.codec.clone(),
+                        Some(t.language.clone()),
+                        t.channels,
+                        t.sample_rate,
+                        profile,
+                        bit_depth,
+                    )
+                })
+                .collect(),
+            Err(_) => codecs
+                .iter()
+                .filter(|(kind, _, _)| *kind == 2)
+                .map(|(_, codec, _)| {
+                    (
+                        codec.clone(),
+                        None,
+                        None,
+                        None,
+                        mkv_aac_profile(codec, &[]),
+                        None,
+                    )
+                })
+                .collect(),
+        };
+        let mut out: Vec<StreamFacts> = audio
+            .into_iter()
+            .enumerate()
+            .map(
+                |(index, (codec, language, channels, sample_rate, profile, bit_depth))| {
+                    StreamFacts {
+                        kind: StreamKind::Audio,
+                        index,
+                        codec_id: Some(codec),
+                        language,
+                        channels,
+                        sample_rate,
+                        duration_secs: length,
+                        profile: profile.map(str::to_owned),
+                        bit_depth,
+                    }
+                },
+            )
+            .collect();
+        let (mut video, mut subtitle) = (0, 0);
+        for (kind, codec, language) in codecs {
+            let (kind, index) = match kind {
+                1 => {
+                    video += 1;
+                    (StreamKind::Video, video - 1)
+                }
+                0x11 => {
+                    subtitle += 1;
+                    (StreamKind::Subtitle, subtitle - 1)
+                }
+                _ => continue,
+            };
+            out.push(StreamFacts {
+                language: matches!(kind, StreamKind::Video).then_some(language),
+                kind,
+                index,
+                codec_id: Some(codec).filter(|c| !c.is_empty()),
+                channels: None,
+                sample_rate: None,
+                duration_secs: length,
+                profile: None,
+                bit_depth: None,
+            });
+        }
+        return Ok(Some(out));
+    }
+    if ps::is_mpeg_system(path) {
+        return ts::header_streams(path).map(Some);
+    }
+    let Some(moov) = read_top_level(path, b"moov")? else {
+        return Ok(None);
+    };
+    let (mut video, mut audio, mut subtitle) = (0, 0, 0);
+    let mut out = Vec::new();
+    for (_, trak) in boxes(&moov).filter(|(kind, _)| *kind == b"trak") {
+        let Some(mdia) = child(trak, b"mdia") else {
+            continue;
+        };
+        // The handler is a FullBox (4) then pre_defined (4), then the type.
+        let handler = child(mdia, b"hdlr").and_then(|h| h.get(8..12));
+        let (kind, slot) = match handler {
+            Some(b"vide") => (StreamKind::Video, &mut video),
+            Some(b"soun") => (StreamKind::Audio, &mut audio),
+            Some(b"sbtl" | b"text" | b"subt") => (StreamKind::Subtitle, &mut subtitle),
+            _ => continue,
+        };
+        // The first sample entry's fourcc, out of the same `stsd` the picture
+        // reader reads by hand: mp4 0.14 keeps no name for a kind it drops.
+        let entry = child(mdia, b"minf")
+            .and_then(|b| child(b, b"stbl"))
+            .and_then(|b| child(b, b"stsd"))
+            .and_then(|stsd| boxes(stsd.get(8..).unwrap_or_default()).next());
+        let codec_id = entry.map(|(fourcc, _)| String::from_utf8_lossy(fourcc).into_owned());
+        let (channels, sample_rate) = match (kind, entry) {
+            (StreamKind::Audio, Some((fourcc, payload))) => sound_entry_layout(fourcc, payload),
+            _ => (None, None),
+        };
+        let bit_depth = match (kind, entry) {
+            (StreamKind::Audio, Some((fourcc, payload))) => mp4_lossless_depth(fourcc, payload),
+            _ => None,
+        };
+        // An `mp4a` entry's `esds` (after the 28-byte sample entry header) states
+        // the AAC profile in its AudioSpecificConfig.
+        let profile = match entry {
+            Some((b"mp4a", payload)) => child(payload.get(28..).unwrap_or_default(), b"esds")
+                .and_then(esds_config)
+                .and_then(aac_profile_of_config)
+                .map(str::to_owned),
+            _ => None,
+        };
+        out.push(StreamFacts {
+            kind,
+            index: *slot,
+            codec_id,
+            language: mp4_language(mdia),
+            channels,
+            sample_rate,
+            duration_secs: child(mdia, b"mdhd").and_then(mdhd_secs),
+            profile,
+            bit_depth,
+        });
+        *slot += 1;
+    }
+    refine_mp4_profiles(path, &mut out);
+    Ok(Some(out))
+}
+
+/// Looks at the first samples of each mp4 audio track whose config states plain
+/// AAC-LC, to see whether an implicit SBR or PS payload makes it HE-AAC or
+/// HE-AACv2 (see [`implicit_aac_profile`]). The k-th audio stream here is the
+/// k-th audio track of `ec-mp4`, both being in file order. Errors leave the
+/// profile as the config states it.
+fn refine_mp4_profiles(path: &Path, streams: &mut [StreamFacts]) {
+    if !streams
+        .iter()
+        .any(|s| s.kind == StreamKind::Audio && s.profile.as_deref() == Some("LC"))
+    {
+        return;
+    }
+    let Ok(mut reader) = crate::mp4track::open(path) else {
+        return;
+    };
+    let tracks = crate::mp4track::audio_tracks(&reader);
+    for (facts, track) in streams
+        .iter_mut()
+        .filter(|s| s.kind == StreamKind::Audio)
+        .zip(tracks)
+    {
+        let (Some(stream), true) = (track.1, facts.profile.as_deref() == Some("LC")) else {
+            continue;
+        };
+        let Some(config) = crate::mp4track::extradata(&reader, stream) else {
+            continue;
+        };
+        let count = reader.samples(stream).len().min(IMPLICIT_PROFILE_UNITS);
+        let units: Vec<Vec<u8>> = (0..count)
+            .filter_map(|i| reader.read_sample(stream, i).ok())
+            .map(|packet| packet.data.to_vec())
+            .collect();
+        facts.profile = Some(implicit_aac_profile(&config, &units).to_owned());
+    }
+}
+
+/// The AAC profile, in ffprobe's spelling, that an AudioSpecificConfig states.
+/// Explicit signalling only, read from the header: an object type of 5 (HE-AAC)
+/// or 29 (HE-AACv2), or a plain AOT 2 config whose backward-compatible sync
+/// extensions (`0x2b7` for SBR, `0x548` for PS) name SBR and PS. A plain AOT 2
+/// config with no sync extension reads as `LC`; an implicit SBR or PS lives only
+/// in the bitstream, and [`implicit_aac_profile`] decodes the first frames for it.
+/// `None` for a config `ec_aac` will not read or an object type not listed.
+fn aac_profile_of_config(config: &[u8]) -> Option<&'static str> {
+    let cfg = ec_aac::parse_audio_specific_config(config).ok()?;
+    let (sbr, ps) = match *config.first()? >> 3 {
+        5 | 29 => (true, cfg.ps_present),
+        2 => sync_extension_flags(config)?,
+        1 => return Some("Main"),
+        3 => return Some("SSR"),
+        4 => return Some("LTP"),
+        23 => return Some("LD"),
+        39 => return Some("ELD"),
+        _ => return None,
+    };
+    Some(match (sbr, ps) {
+        (_, true) => "HE-AACv2",
+        (true, false) => "HE-AAC",
+        _ => "LC",
+    })
+}
+
+/// A bit reader over an AudioSpecificConfig, for the few fields past what
+/// `ec_aac` returns: its sync extensions do not say whether PS is signalled.
+#[derive(Clone, Copy)]
+struct ConfigBits<'a> {
+    data: &'a [u8],
+    at: usize,
+}
+
+impl ConfigBits<'_> {
+    fn bits(&mut self, n: usize) -> Option<u32> {
+        let mut v = 0u32;
+        for _ in 0..n {
+            let byte = *self.data.get(self.at / 8)?;
+            v = (v << 1) | u32::from((byte >> (7 - self.at % 8)) & 1);
+            self.at += 1;
+        }
+        Some(v)
+    }
+
+    fn left(&self) -> usize {
+        (self.data.len() * 8).saturating_sub(self.at)
+    }
+
+    /// Consumes the next `n` bits if they are the sync word `want`.
+    fn sync(&mut self, n: usize, want: u32) -> bool {
+        let mut look = *self;
+        if self.left() >= n && look.bits(n) == Some(want) {
+            *self = look;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Whether an AOT 2 config's backward-compatible sync extensions (ISO/IEC
+/// 14496-3 1.6.5.2) signal SBR and PS: `(sbr, ps)`. `None` for a config that
+/// does not parse as one. A config with a program config element, whose
+/// layout the extension walk does not follow, reads as neither.
+fn sync_extension_flags(config: &[u8]) -> Option<(bool, bool)> {
+    let mut r = ConfigBits {
+        data: config,
+        at: 0,
+    };
+    r.bits(5)?; // audioObjectType 2
+    if r.bits(4)? == 15 {
+        r.bits(24)?; // an explicit sampling frequency
+    }
+    if r.bits(4)? == 0 {
+        return Some((false, false));
+    }
+    // GASpecificConfig: frame_length_flag, then the core delay and extension flag.
+    r.bits(1)?;
+    if r.bits(1)? == 1 {
+        r.bits(14)?;
+    }
+    r.bits(1)?;
+    if !r.sync(11, 0x2b7) || r.bits(5)? != 5 {
+        return Some((false, false));
+    }
+    if r.bits(1)? == 0 {
+        return Some((false, false));
+    }
+    if r.bits(4)? == 15 {
+        r.bits(24)?;
+    }
+    let ps = r.sync(11, 0x548) && r.bits(1)? == 1;
+    Some((true, ps))
+}
+
+/// The profile an AOT 2 (`LC`) stream states once its first access units are
+/// decoded: an SBR payload makes it `HE-AAC`, an SBR payload with a PS one
+/// `HE-AACv2`, and neither leaves it `LC`. Only the first few units are read, so
+/// the cost is bounded however long the stream is. A unit that fails to decode
+/// ends the look, and what was seen before it stands.
+fn implicit_aac_profile(config: &[u8], units: &[Vec<u8>]) -> &'static str {
+    let Ok(mut decoder) = ec_aac::AacDecoder::with_config_bytes(config) else {
+        return "LC";
+    };
+    for unit in units.iter().take(IMPLICIT_PROFILE_UNITS) {
+        if decoder.decode(unit, None).is_err() || decoder.ps_implicit() {
+            break;
+        }
+    }
+    match (decoder.sbr_implicit(), decoder.ps_implicit()) {
+        (_, true) => "HE-AACv2",
+        (true, false) => "HE-AAC",
+        _ => "LC",
+    }
+}
+
+/// How many access units [`implicit_aac_profile`] reads: an SBR payload shows in
+/// the first frame that carries one, and PS rides with it.
+const IMPLICIT_PROFILE_UNITS: usize = 3;
+
+/// The sample depth a FLAC STREAMINFO states: `bits_per_sample` is five bits
+/// across bytes 12 and 13 of the 34-byte block (after the 10 bytes of block
+/// sizes, frame sizes, sample rate and channel count), stored minus one.
+fn flac_streaminfo_depth(info: &[u8]) -> Option<u32> {
+    let b = info.get(12..14)?;
+    Some(u32::from((((b[0] & 1) << 4) | (b[1] >> 4)) + 1))
+}
+
+/// The depth of a FLAC stream from its metadata blocks: a bare `fLaC` file's
+/// blocks, an mp4 `dfLa` body past its FullBox header, or a Matroska `A_FLAC`
+/// `CodecPrivate` (with or without the marker). STREAMINFO is always the first
+/// block, so anything else first reads as `None`.
+fn flac_depth_of(blocks: &[u8]) -> Option<u32> {
+    let blocks = blocks.strip_prefix(b"fLaC").unwrap_or(blocks);
+    let (&head, rest) = blocks.split_first()?;
+    if head & 0x7f != 0 {
+        return None;
+    }
+    let len = rest
+        .get(..3)?
+        .iter()
+        .fold(0usize, |n, &b| (n << 8) | usize::from(b));
+    flac_streaminfo_depth(rest.get(3..3 + len)?)
+}
+
+/// The bit depth of an ALACSpecificConfig: byte 5 of its 24 bytes (after the
+/// frame length and the version bytes). An mp4 `alac` box carries it behind a
+/// four-byte FullBox header, which is taken off here.
+fn alac_depth(config: &[u8]) -> Option<u32> {
+    let cfg = match config.len() {
+        28 => &config[4..],
+        _ => config,
+    };
+    (cfg.len() == 24)
+        .then(|| u32::from(cfg[5]))
+        .filter(|d| *d > 0)
+}
+
+/// The depth a Matroska lossless track states: a FLAC or ALAC config, or the
+/// `BitDepth` of a PCM track. `None` for anything lossy or float.
+fn mkv_lossless_depth(codec: &str, private: &[u8], pcm_bits: Option<u32>) -> Option<u32> {
+    match codec {
+        "A_FLAC" => flac_depth_of(private),
+        "A_ALAC" => alac_depth(private),
+        c if c.starts_with("A_PCM/INT/") => pcm_bits,
+        _ => None,
+    }
+}
+
+/// The depth an mp4 audio sample entry states, from the codec-specific box
+/// behind its 28-byte header: `dfLa` for FLAC, `alac` for ALAC.
+fn mp4_lossless_depth(fourcc: &[u8; 4], payload: &[u8]) -> Option<u32> {
+    let body = payload.get(28..).unwrap_or_default();
+    match fourcc {
+        b"fLaC" => child(body, b"dfLa").and_then(|d| flac_depth_of(d.get(4..)?)),
+        b"alac" => child(body, b"alac").and_then(alac_depth),
+        _ => None,
+    }
+}
+
+/// The bit depth of a bare FLAC or WAV file, read from its first 4 KiB: the
+/// STREAMINFO of a `fLaC` file, or a PCM `fmt ` chunk's `wBitsPerSample`. A
+/// float or compressed WAV, and every other file, reads as `None`.
+fn bare_bit_depth(path: &Path) -> Option<u32> {
+    let mut head = [0u8; 4096];
+    let read = File::open(path)
+        .and_then(|mut f| f.read(&mut head))
+        .unwrap_or(0);
+    let head = &head[..read];
+    if head.starts_with(b"fLaC") {
+        return flac_depth_of(head);
+    }
+    if head.get(..4) != Some(b"RIFF") || head.get(8..12) != Some(b"WAVE") {
+        return None;
+    }
+    let mut at = 12;
+    while let Some(id) = head.get(at..at + 4) {
+        let size = head
+            .get(at + 4..at + 8)?
+            .try_into()
+            .map(u32::from_le_bytes)
+            .ok()? as usize;
+        let body = head.get(at + 8..at + 8 + size);
+        if id == b"fmt " {
+            let fmt = body?;
+            let tag = u16::from_le_bytes(fmt.get(..2)?.try_into().ok()?);
+            // Plain PCM, or WAVE_FORMAT_EXTENSIBLE whose sub-format GUID is PCM.
+            let pcm = tag == 1 || (tag == 0xFFFE && matches!(fmt.get(24..26), Some([1, 0])));
+            let bits = u16::from_le_bytes(fmt.get(14..16)?.try_into().ok()?);
+            return (pcm && bits > 0).then_some(u32::from(bits));
+        }
+        at += 8 + size + (size & 1);
+    }
+    None
+}
+
+/// The AAC profile a Matroska `A_AAC` track states: its `CodecPrivate` config
+/// when it has one (ffmpeg writes one), else the `CodecID` spelling
+/// `A_AAC/MPEG{2,4}/{MAIN,LC,SSR,LTP}[/SBR]`, where `/SBR` is the explicit SBR
+/// signalling.
+fn mkv_aac_profile(codec: &str, private: &[u8]) -> Option<&'static str> {
+    if !codec.starts_with("A_AAC") {
+        return None;
+    }
+    aac_profile_of_config(private).or_else(|| {
+        let mut parts = codec.strip_prefix("A_AAC/")?.split('/');
+        if !matches!(parts.next()?, "MPEG2" | "MPEG4") {
+            return None;
+        }
+        let kind = parts.next()?;
+        let ext: Vec<&str> = parts.collect();
+        Some(match kind {
+            "MAIN" => "Main",
+            "SSR" => "SSR",
+            "LTP" => "LTP",
+            "LC" if ext.contains(&"SBR") => "HE-AAC",
+            "LC" => "LC",
+            _ => return None,
+        })
+    })
+}
+
+/// One MPEG-4 descriptor off the front of `buf`: its tag, its body and what
+/// follows it. The length is the 1-to-4-byte base-128 field every descriptor
+/// carries.
+fn descriptor(buf: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+    let tag = *buf.first()?;
+    let mut at = 1;
+    let mut len = 0usize;
+    for _ in 0..4 {
+        let b = *buf.get(at)?;
+        at += 1;
+        len = (len << 7) | usize::from(b & 0x7f);
+        if b & 0x80 == 0 {
+            break;
+        }
+    }
+    let end = at.checked_add(len)?;
+    Some((tag, buf.get(at..end)?, buf.get(end..)?))
+}
+
+/// The AudioSpecificConfig an `esds` box carries: the DecoderSpecificInfo
+/// (tag 5) inside the DecoderConfigDescriptor (tag 4) inside the
+/// ES_Descriptor (tag 3). `esds` is a FullBox, so its descriptors start after
+/// four bytes of version and flags.
+fn esds_config(esds: &[u8]) -> Option<&[u8]> {
+    let (tag, es, _) = descriptor(esds.get(4..)?)?;
+    if tag != 3 {
+        return None;
+    }
+    // ES_ID (2), then the flags byte, then the optional fields those flags name.
+    let flags = *es.get(2)?;
+    let mut rest = es.get(3..)?;
+    if flags & 0x80 != 0 {
+        rest = rest.get(2..)?;
+    }
+    if flags & 0x40 != 0 {
+        rest = rest.get(1 + usize::from(*rest.first()?)..)?;
+    }
+    if flags & 0x20 != 0 {
+        rest = rest.get(2..)?;
+    }
+    let (tag, dec, _) = descriptor(rest)?;
+    if tag != 4 {
+        return None;
+    }
+    // objectTypeIndication, streamType, bufferSizeDB, maxBitrate, avgBitrate: 13 bytes.
+    let mut sub = dec.get(13..)?;
+    while let Some((tag, body, after)) = descriptor(sub) {
+        if tag == 5 {
+            return Some(body);
+        }
+        sub = after;
+    }
+    None
+}
+
+/// The channel count and sample rate an mp4 audio sample entry states, from its
+/// payload (the bytes after the entry's own box header). The audio entry lays
+/// out 6 reserved bytes, the data reference index, 8 bytes of version and
+/// vendor, then `channelcount` at 16 and the 16.16 `samplerate` at 24. An AC-3
+/// or E-AC-3 entry's count is replaced by what its `dac3` / `dec3` box says.
+fn sound_entry_layout(fourcc: &[u8; 4], payload: &[u8]) -> (Option<u16>, Option<u32>) {
+    let channels = payload
+        .get(16..18)
+        .map(|b| u16::from_be_bytes([b[0], b[1]]))
+        .filter(|c| *c > 0);
+    let rate = payload
+        .get(24..28)
+        .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]) >> 16)
+        .filter(|r| *r > 0);
+    // The AudioSampleEntry header is 28 bytes; its child boxes follow it.
+    let boxed = match fourcc {
+        b"ac-3" => child(payload.get(28..).unwrap_or_default(), b"dac3").and_then(ac3_channels),
+        b"ec-3" => child(payload.get(28..).unwrap_or_default(), b"dec3").and_then(eac3_channels),
+        _ => None,
+    };
+    (boxed.or(channels), rate)
+}
+
+/// Channels from an AC-3 `dac3` payload: `acmod` (3 bits) and `lfeon` (1 bit)
+/// follow fscod (2), bsid (5) and bsmod (3), so they sit at bits 10..13 and 13
+/// of the 24-bit field.
+fn ac3_channels(payload: &[u8]) -> Option<u16> {
+    let bits = u32::from_be_bytes([0, *payload.first()?, *payload.get(1)?, *payload.get(2)?]);
+    Some(acmod_channels((bits >> 11) as u8 & 0x7, (bits >> 10) as u8 & 0x1))
+}
+
+/// Channels from an E-AC-3 `dec3` payload: the first independent substream's
+/// `acmod` and `lfeon` sit at bits 12..15 and 15 of the 24-bit field that
+/// starts after the 2-byte data rate and substream count.
+fn eac3_channels(payload: &[u8]) -> Option<u16> {
+    let bits = u32::from_be_bytes([
+        0,
+        *payload.get(2)?,
+        *payload.get(3)?,
+        *payload.get(4)?,
+    ]);
+    Some(acmod_channels((bits >> 9) as u8 & 0x7, (bits >> 8) as u8 & 0x1))
+}
+
+/// Full-range channels for an `acmod` and `lfeon` (ETSI TS 102 366, table 4.3).
+fn acmod_channels(acmod: u8, lfe: u8) -> u16 {
+    const MAIN: [u16; 8] = [2, 1, 2, 3, 3, 4, 4, 5];
+    MAIN[usize::from(acmod & 0x7)] + u16::from(lfe & 1)
+}
+
+/// A track's language as ffprobe reads it: the `elng` extended tag when the
+/// track has one, otherwise the `mdhd` three-letter code. `None` only where
+/// neither box is there to read.
+fn mp4_language(mdia: &[u8]) -> Option<String> {
+    // `elng` is a FullBox (4 bytes of version and flags) and then a NUL-ended
+    // tag such as `fr` or `fr-CA`; an empty one says nothing.
+    if let Some(tag) = child(mdia, b"elng").and_then(|e| e.get(4..)) {
+        let text = tag.split(|b| *b == 0).next().unwrap_or_default();
+        if !text.is_empty() {
+            return Some(String::from_utf8_lossy(text).into_owned());
+        }
+    }
+    let mdhd = child(mdia, b"mdhd")?;
+    // The packed ISO-639-2 code follows the timestamps: 16 bytes into a version 0
+    // box, 28 into a version 1 one (which has 64-bit times).
+    let at = match mdhd.first()? {
+        1 => 28,
+        _ => 16,
+    };
+    let packed = u16::from_be_bytes(mdhd.get(at + 4..at + 6)?.try_into().ok()?);
+    Some(unpack_language(packed))
+}
+
+/// Three 5-bit letters, each offset by `0x60`, packed into 15 bits. A code that
+/// is not three letters `a`-`z` says no language: a zero code (none written,
+/// `0x0000` decodes to backticks) and the `0x7fff` some muxers write (decodes to
+/// DELs) are both `und`, the spec's own word for it. This is the convention the
+/// Matroska path uses too ([`mkv_language`]), so an untagged track reads the
+/// same in either container.
+fn unpack_language(packed: u16) -> String {
+    let code: String = [10, 5, 0]
+        .into_iter()
+        .map(|shift| char::from(((packed >> shift) & 0x1f) as u8 + 0x60))
+        .collect();
+    if code.bytes().all(|b| b.is_ascii_lowercase()) {
+        code
+    } else {
+        "und".to_string()
+    }
+}
+
+/// The length an `mdhd` box states, in seconds: its duration over its timescale.
+/// Version 0 packs both as 32-bit fields, version 1 as 64-bit ones.
+fn mdhd_secs(payload: &[u8]) -> Option<f64> {
+    let (timescale, duration) = match payload.first()? {
+        1 => (
+            u32::from_be_bytes(payload.get(20..24)?.try_into().ok()?),
+            u64::from_be_bytes(payload.get(24..32)?.try_into().ok()?),
+        ),
+        _ => (
+            u32::from_be_bytes(payload.get(12..16)?.try_into().ok()?),
+            // All ones is the spec's "unknown", not a length.
+            match u32::from_be_bytes(payload.get(16..20)?.try_into().ok()?) {
+                u32::MAX => return None,
+                d => u64::from(d),
+            },
+        ),
+    };
+    (timescale > 0 && duration > 0).then(|| duration as f64 / f64::from(timescale))
+}
+
+/// The `DiscardPadding` of a Matroska audio track's last block, in nanoseconds:
+/// the trailing samples its muxer says a decoder drops. Vorbis in Matroska has
+/// no page granule to cut its end by, and its last block overhangs the stream
+/// by exactly this (ffmpeg writes it as the last packet's discard padding, and
+/// its decode ends there). `None` for anything that is not Matroska or a track
+/// with no block in it; `Some(0)` where the last block states no padding.
+pub(crate) fn matroska_tail_padding_ns(path: &Path, number: u64) -> Option<u64> {
+    let mut file = File::open(path).ok()?;
+    let end = file.metadata().ok()?.len();
+    let segment = mkv_segment(&mut file, end).ok()?;
+    let padding = mkv_last_discard(&mut file, segment, number).ok()??;
+    Some(u64::try_from(padding).unwrap_or(0))
+}
+
+/// Every block of track `number` in a Matroska file, in storage order, as
+/// `(ts, at, len)`: its timestamp in `TimestampScale` ticks (the value a
+/// packet's pts carries out of the reader), and the file offset and length of
+/// its bytes. Cached per file the way the audio index is ([`mkv_blocks`]).
+///
+/// `None` for anything that is not Matroska, a track with no blocks, or a track
+/// whose blocks are not stored as their own bytes (header stripping, zlib), since
+/// a caller reading `at..at+len` would then read something else.
+pub(crate) fn matroska_track_blocks(path: &Path, number: u64) -> Option<Vec<(i64, u64, usize)>> {
+    let mut file = File::open(path).ok()?;
+    let end = file.metadata().ok()?.len();
+    let segment = mkv_segment(&mut file, end).ok()?;
+    let plain = mkv_tracks(&mut file, segment)
+        .ok()?
+        .1
+        .iter()
+        .any(|t| t.number == number && t.unpack == Unpack::None);
+    if !plain {
+        return None;
+    }
+    let (blocks, _, _) = mkv_blocks(path, &mut file, segment, number).ok()?;
+    (!blocks.is_empty()).then(|| blocks.iter().map(|b| (b.ts, b.at, b.len)).collect())
+}
+
+/// The `DiscardPadding` (nanoseconds, zero where none) of the last block of track
+/// `number` in `segment`, by a header walk of every cluster: blocks are skipped,
+/// not read. `None` when the track has no block.
+fn mkv_last_discard(
+    file: &mut File,
+    segment: (u64, u64),
+    number: u64,
+) -> crate::Result<Option<i64>> {
+    let mut last: Option<i64> = None;
+    let mut at = segment.0;
+    while let Some((id, body, stop)) = ebml_element(file, at, segment.1)? {
+        at = stop;
+        if id != CLUSTER {
+            continue;
+        }
+        let mut child = body;
+        while let Some((cid, cbody, cstop)) = ebml_element(file, child, stop)? {
+            child = cstop;
+            let (block, padding) = match cid {
+                SIMPLE_BLOCK => (Some(mkv_block(file, cbody, cstop)?), 0),
+                BLOCK_GROUP => {
+                    let (mut block, mut padding) = (None, 0i64);
+                    let mut group = cbody;
+                    while let Some((gid, gbody, gstop)) = ebml_element(file, group, cstop)? {
+                        group = gstop;
+                        match gid {
+                            BLOCK => block = Some(mkv_block(file, gbody, gstop)?),
+                            DISCARD_PADDING => {
+                                padding = ebml_sint(&ebml_bytes(file, gbody, gstop)?)
+                            }
+                            _ => {}
+                        }
+                    }
+                    (block, padding)
+                }
+                _ => continue,
+            };
+            if block.is_some_and(|b| b.number == number) {
+                last = Some(padding);
+            }
+        }
+    }
+    Ok(last)
+}
+
+/// An EBML signed integer: big-endian two's complement in as many bytes as it
+/// takes, sign-extended.
+fn ebml_sint(bytes: &[u8]) -> i64 {
+    let negative = bytes.first().is_some_and(|b| b & 0x80 != 0);
+    bytes
+        .iter()
+        .take(8)
+        .fold(if negative { -1 } else { 0 }, |v, &b| {
+            (v << 8) | i64::from(b)
+        })
+}
+
+/// The length `Info` states, in seconds: `Duration` in `TimestampScale` ticks
+/// (the spec's 1 ms default where the scale is absent). `None` where there is
+/// no `Duration` or it is zero. Reads the header fields only, so it is not
+/// refused by a picture the playback path will not take.
+fn mkv_info_secs(file: &mut File, body: u64, stop: u64) -> crate::Result<Option<f64>> {
+    let (mut scale, mut duration) = (1_000_000u64, None);
+    let mut at = body;
+    while let Some(e) = ebml_element(file, at, stop)? {
+        match e.0 {
+            TIMESTAMP_SCALE => scale = ebml_uint(file, e.1, e.2)?.max(1),
+            DURATION => duration = Some(ebml_float(file, e.1, e.2)?),
+            _ => {}
+        }
+        at = e.2;
+    }
+    Ok(duration
+        .filter(|d| *d > 0.0)
+        .map(|d| d * scale as f64 / 1e9))
+}
+
+/// The length a Matroska file's `Info` states, in seconds, from its header alone.
+/// `None` for a file that is not Matroska, or whose header states none. This is
+/// the figure ffprobe reports as the container's duration.
+fn mkv_stated_secs(path: &Path) -> Option<f64> {
+    if !is_matroska(path) {
+        return None;
+    }
+    let mut file = File::open(path).ok()?;
+    let end = file.metadata().ok()?.len();
+    let segment = mkv_segment(&mut file, end).ok()?;
+    let mut at = segment.0;
+    while let Some((id, body, stop)) = ebml_element(&mut file, at, segment.1).ok()? {
+        match id {
+            CLUSTER => break,
+            INFO => return mkv_info_secs(&mut file, body, stop).ok().flatten(),
+            _ => {}
+        }
+        at = stop;
+    }
+    None
+}
+
+/// The playable length of an Ogg Opus stream, per RFC 7845 section 4: the last
+/// page's granule position minus the `OpusHead` pre-skip, over 48 kHz (Opus
+/// granules always count at 48 kHz, whatever the input rate). The pre-skip is
+/// priming no player plays, and it is what the decode path drops
+/// ([`crate::audio`]), so the timeline ends on the last sample. ffprobe's
+/// `format=duration` does not subtract it (3.0065 s on `test_tone.opus`, where
+/// the granule is 144312 and the pre-skip 312), and that is the one figure this
+/// does not match. `None` for anything else, or a stream whose last page
+/// finishes no packet.
+fn ogg_opus_secs(path: &Path) -> Option<f64> {
+    const OPUS_RATE: f64 = 48_000.0;
+    // Pages are at most a little over 64 KiB, so the last one starts in this tail.
+    const TAIL: u64 = 1 << 17;
+    let mut file = File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let mut head = [0u8; 512];
+    let read = file.read(&mut head).ok()?;
+    let head = &head[..read];
+    if !head.starts_with(b"OggS") {
+        return None;
+    }
+    // The `OpusHead` packet: version (1), channels (1), then the pre-skip as a
+    // little-endian u16 at byte 10 of the packet.
+    let opus_head = head.windows(8).position(|w| w == b"OpusHead")?;
+    let pre_skip = head
+        .get(opus_head + 10..opus_head + 12)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]))?;
+    file.seek(SeekFrom::Start(len.saturating_sub(TAIL))).ok()?;
+    let mut tail = Vec::new();
+    file.read_to_end(&mut tail).ok()?;
+    // A page header is 27 bytes plus its segment table; the capture pattern, the
+    // version byte (0) and the granule (-1 when no packet ends on the page) are
+    // what is read. Searched back from the end, so the last page wins.
+    let mut at = tail.len().checked_sub(14)?;
+    loop {
+        if tail[at..].starts_with(b"OggS") && tail[at + 4] == 0 {
+            let granule = i64::from_le_bytes(tail[at + 6..at + 14].try_into().ok()?);
+            if granule >= 0 {
+                let playable = (granule as u64).saturating_sub(u64::from(pre_skip));
+                return Some(playable as f64 / OPUS_RATE);
+            }
+        }
+        at = at.checked_sub(1)?;
+    }
+}
+
+/// The `(TrackType, CodecID)` of every `TrackEntry` in a Matroska `Tracks`
+/// element, in file order. Header only.
+fn mkv_track_codecs(file: &mut File, body: u64, stop: u64) -> crate::Result<Vec<(u64, String, String)>> {
+    let mut out = Vec::new();
+    let mut at = body;
+    while let Some((id, entry, entry_stop)) = ebml_element(file, at, stop)? {
+        if id == TRACK_ENTRY {
+            let (mut kind, mut codec) = (0, String::new());
+            let (mut language, mut bcp47) = (String::new(), String::new());
+            let mut inner = entry;
+            while let Some((field, fbody, fstop)) = ebml_element(file, inner, entry_stop)? {
+                match field {
+                    TRACK_TYPE => kind = ebml_uint(file, fbody, fstop)?,
+                    CODEC_ID => codec = string_of(file, fbody, fstop)?,
+                    TRACK_LANGUAGE => language = string_of(file, fbody, fstop)?,
+                    TRACK_LANGUAGE_BCP47 => bcp47 = string_of(file, fbody, fstop)?,
+                    _ => {}
+                }
+                inner = fstop;
+            }
+            out.push((kind, codec, mkv_language(&language, &bcp47)));
+        }
+        at = entry_stop;
+    }
+    Ok(out)
+}
+
+/// What `path` is, from its header alone -- one [`Demuxer::open`] and no decoder,
+/// the same cost [`probe_bitrate`] pays, so it belongs off the render thread.
+pub fn probe_media(path: &Path) -> MediaFacts {
+    let bytes = std::fs::metadata(path).ok().map(|m| m.len());
+    let container = container_name(path);
+    // A still has no playing time of its own. Sound has no picture to describe,
+    // and its length is the audio header's, which `AudioSession` reads cheaply.
+    if crate::is_image(path) {
+        return MediaFacts {
+            container,
+            bytes,
+            video: None,
+            duration_secs: None,
+            streams: Vec::new(),
+            attached_pic: false,
+        };
+    }
+    let attached_pic = has_cover_art(path);
+    if crate::is_audio(path) {
+        // A length the container states wins over one counted from the decoder:
+        // ffprobe reports the Matroska `Info` duration, and an Ogg Opus granule
+        // (both read from the header alone). An ADTS stream states none, so its
+        // length is its frame count (1024 samples per frame), which is what
+        // [`crate::AudioSession`] counts.
+        let stated = mkv_stated_secs(path).or_else(|| ogg_opus_secs(path));
+        let streams = header_streams(path).ok().flatten().unwrap_or_default();
+        let streams = match streams.is_empty() {
+            true => crate::AudioSession::probe_streams(path)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|s| StreamFacts {
+                    kind: StreamKind::Audio,
+                    index: s.index,
+                    codec_id: Some(audio_codec_id(path, &s.codec)),
+                    language: s.lang.clone(),
+                    channels: Some(s.channels).filter(|c| *c > 0),
+                    sample_rate: Some(s.sample_rate).filter(|r| *r > 0),
+                    duration_secs: stated.or_else(|| {
+                        crate::AudioSession::stream_duration_secs(path, s.index)
+                            .ok()
+                            .flatten()
+                    }),
+                    profile: None,
+                    bit_depth: bare_bit_depth(path),
+                })
+                .collect(),
+            false => streams,
+        };
+        return MediaFacts {
+            container,
+            bytes,
+            video: None,
+            duration_secs: stated
+                .or_else(|| crate::AudioSession::duration_secs(path).ok().flatten()),
+            streams,
+            attached_pic,
+        };
+    }
+    // Every stream the header names, and each one's own codec identifier and
+    // length. A header that will not walk leaves the list empty rather than
+    // taking the rest of the facts down with it.
+    let streams = match header_streams(path) {
+        Ok(Some(streams)) => streams,
+        _ => Vec::new(),
+    };
+    let (video, duration_secs) = match Demuxer::open(path) {
+        Ok((meta, mut demuxer)) => (
+            Some(VideoFacts {
+                codec: meta.codec,
+                width: meta.width,
+                height: meta.height,
+                frame_rate: (meta.frame_rate > 0.0).then_some(meta.frame_rate),
+                // An 8-bit H.264 stream states no depth of its own worth showing,
+                // so it is not answered with the 8 the demuxer falls back to; a
+                // High 10 one is.
+                bit_depth: (meta.codec != Codec::H264 || demuxer.bit_depth() > 8)
+                    .then(|| demuxer.bit_depth()),
+                matrix_assumed: meta.matrix_assumed,
+                profile: demuxer.profile(),
+                interlaced: crate::deinterlace::field_order(&mut demuxer, path),
+            }),
+            // The playable picture's length, which is what the timeline lays
+            // a video source out at ([`PlaybackSession::file_frames`]). The
+            // header's length can be a longer audio track's (a 2 s clip with a
+            // 60 s commentary); that one is reported beside it, not as this.
+            picture_secs(&meta).or_else(|| stated_secs(&demuxer)),
+        ),
+        // No picture track (sound alone, or a file that will not open as video):
+        // the audio header's length is the only one there is.
+        Err(_) => (
+            None,
+            crate::AudioSession::duration_secs(path).ok().flatten(),
+        ),
+    };
+    MediaFacts {
+        container,
+        bytes,
+        video,
+        duration_secs,
+        streams,
+        attached_pic,
+    }
+}
+
+/// Whether the file carries cover art, read from its header by what the bytes
+/// open with rather than the extension: an ID3v2 tag (`APIC`, or `PIC` in v2.2),
+/// a FLAC metadata block of type 6 (`PICTURE`), a Matroska attachment whose
+/// MIME type is `image/*`, or otherwise an mp4-family `moov` with an
+/// `udta/meta/ilst/covr` atom. Any read that fails answers `false`.
+fn has_cover_art(path: &Path) -> bool {
+    let Ok(mut file) = File::open(path) else {
+        return false;
+    };
+    let mut head = [0u8; 4];
+    if file.read_exact(&mut head).is_err() {
+        return false;
+    }
+    if head.starts_with(b"ID3") {
+        return id3_has_cover(path);
+    }
+    if &head == b"fLaC" {
+        return flac_has_picture(&mut file);
+    }
+    if is_matroska(path) {
+        return mkv_has_picture_attachment(&mut file).unwrap_or(false);
+    }
+    read_top_level(path, b"moov")
+        .ok()
+        .flatten()
+        .is_some_and(|moov| mp4_has_covr(&moov))
+}
+
+/// The ID3v2 tag at the start of `path`, walked frame by frame for a picture.
+/// The tag is read whole (its size is in its header) up to a 64 MiB cap, which
+/// is past any real tag; a larger one is read as having no cover it can see.
+fn id3_has_cover(path: &Path) -> bool {
+    const MAX_TAG: usize = 64 << 20;
+    let Ok(mut file) = File::open(path) else {
+        return false;
+    };
+    let mut head = [0u8; 10];
+    if file.read_exact(&mut head).is_err() {
+        return false;
+    }
+    let version = head[3];
+    let size = synchsafe(&head[6..10]);
+    if size > MAX_TAG {
+        return false;
+    }
+    // A tag cut short by the file's end still names the frames it holds. The
+    // capacity is what the file can back, not what the header claims.
+    let left = file.metadata().map_or(0, |m| m.len() as usize);
+    let mut tag = Vec::with_capacity(size.min(left));
+    if file.take(size as u64).read_to_end(&mut tag).is_err() {
+        return false;
+    }
+    let (id_len, size_len) = match version {
+        2 => (3, 3),
+        _ => (4, 4),
+    };
+    let mut at = 0;
+    if head[5] & 0x40 != 0 {
+        // An extended header: v2.3 gives its size plainly, v2.4 synchsafe and
+        // inclusive of its own four bytes.
+        let Some(ext) = tag.get(..4) else {
+            return false;
+        };
+        let ext = match version {
+            4 => synchsafe(ext),
+            _ => be_u32(ext) as usize + 4,
+        };
+        at = ext;
+    }
+    while let Some(frame) = tag.get(at..) {
+        let Some(id) = frame.get(..id_len) else {
+            break;
+        };
+        // Padding (a zero byte where a frame ID would be) ends the frames.
+        if id[0] == 0 {
+            break;
+        }
+        if id == b"APIC" || id == b"PIC" {
+            return true;
+        }
+        let Some(len_bytes) = frame.get(id_len..id_len + size_len) else {
+            break;
+        };
+        let body = match version {
+            4 => synchsafe(len_bytes),
+            _ => be_u32(len_bytes) as usize,
+        };
+        // The frame header: ID and size, then v2.3 and v2.4's two flag bytes.
+        let header = if version == 2 { 6 } else { 10 };
+        at += header + body;
+    }
+    false
+}
+
+/// Whether a FLAC stream's metadata blocks include a `PICTURE` (type 6). The
+/// blocks are skipped by seeking, so a large picture is never read.
+fn flac_has_picture(file: &mut File) -> bool {
+    // Past the `fLaC` marker.
+    if file.seek(SeekFrom::Start(4)).is_err() {
+        return false;
+    }
+    loop {
+        let mut header = [0u8; 4];
+        if file.read_exact(&mut header).is_err() {
+            return false;
+        }
+        let last = header[0] & 0x80 != 0;
+        if header[0] & 0x7f == 6 {
+            return true;
+        }
+        let len = i64::from(u32::from_be_bytes([0, header[1], header[2], header[3]]));
+        if last || file.seek(SeekFrom::Current(len)).is_err() {
+            return false;
+        }
+    }
+}
+
+/// Whether a Matroska file has an `Attachments` element naming an `image/*`
+/// file. Every child of the segment is visited, clusters skipped by their size,
+/// because a muxer may write the attachments after the clusters.
+fn mkv_has_picture_attachment(file: &mut File) -> crate::Result<bool> {
+    const ATTACHMENTS: u32 = 0x1941_A469;
+    const ATTACHED_FILE: u32 = 0x61A7;
+    const FILE_MIME_TYPE: u32 = 0x4660;
+    let end = file.metadata()?.len();
+    let segment = mkv_segment(file, end)?;
+    let mut at = segment.0;
+    while let Some((id, body, stop)) = ebml_element(file, at, segment.1)? {
+        if id == ATTACHMENTS {
+            let mut inner = body;
+            while let Some((attached, fbody, fstop)) = ebml_element(file, inner, stop)? {
+                if attached == ATTACHED_FILE {
+                    let mut field = fbody;
+                    while let Some((f, mbody, mstop)) = ebml_element(file, field, fstop)? {
+                        if f == FILE_MIME_TYPE
+                            && string_of(file, mbody, mstop)?.starts_with("image/")
+                        {
+                            return Ok(true);
+                        }
+                        field = mstop;
+                    }
+                }
+                inner = fstop;
+            }
+        }
+        at = stop;
+    }
+    Ok(false)
+}
+
+/// Whether an mp4 `moov` holds a `udta/meta/ilst/covr` atom. `meta` is a FullBox,
+/// so its four version and flag bytes come before its children.
+fn mp4_has_covr(moov: &[u8]) -> bool {
+    child(moov, b"udta")
+        .and_then(|udta| child(udta, b"meta"))
+        .and_then(|meta| meta.get(4..))
+        .and_then(|meta| child(meta, b"ilst"))
+        .and_then(|ilst| child(ilst, b"covr"))
+        .is_some()
+}
+
+/// An ID3v2 synchsafe integer: four bytes of seven bits each.
+fn synchsafe(bytes: &[u8]) -> usize {
+    bytes
+        .iter()
+        .fold(0usize, |acc, b| acc << 7 | usize::from(b & 0x7f))
+}
+
+/// A big-endian `u32` from up to four bytes, missing bytes read as zero.
+fn be_u32(bytes: &[u8]) -> u32 {
+    bytes
+        .iter()
+        .take(4)
+        .fold(0u32, |acc, b| acc << 8 | u32::from(*b))
+}
+
+/// The codec identifier of a sound-only file: what its header says when the
+/// header says it (`fLaC`, an MPEG audio frame, an Ogg `OpusHead` or
+/// `\x01vorbis`), and otherwise the name the audio reader gave the stream.
+fn audio_codec_id(path: &Path, probed: &str) -> String {
+    // The reader's own name wins whenever it has one; the header is read only to
+    // name a stream the reader could not (`an unsupported format`).
+    if !probed.starts_with("an ") && probed != "unknown" {
+        return probed.to_string();
+    }
+    let mut head = [0u8; 512];
+    let read = File::open(path)
+        .and_then(|mut f| f.read(&mut head))
+        .unwrap_or(0);
+    let head = &head[..read];
+    let sniffed = if head.starts_with(b"fLaC") {
+        Some("flac")
+    } else if head.starts_with(b"OggS") {
+        if head.windows(8).any(|w| w == b"OpusHead") {
+            Some("opus")
+        } else if head.windows(7).any(|w| w == b"\x01vorbis") {
+            Some("vorbis")
+        } else {
+            None
+        }
+    } else if mpeg_audio_at(head) {
+        Some("mp3")
+    } else {
+        None
+    };
+    sniffed.map_or_else(|| probed.to_string(), str::to_string)
+}
+
+/// Whether the bytes open with an MPEG audio frame: an ID3v2 tag (whose size
+/// is skipped) followed by a frame sync, or a frame sync at the very start.
+/// Only the start is looked at, so PCM or other data that happens to hold the
+/// sync bytes further in is not mistaken for MP3.
+fn mpeg_audio_at(head: &[u8]) -> bool {
+    let mut at = 0;
+    if head.starts_with(b"ID3") && head.len() >= 10 {
+        let size = head[6..10]
+            .iter()
+            .fold(0usize, |acc, b| acc << 7 | usize::from(b & 0x7f));
+        at = 10 + size;
+    }
+    head.get(at..at + 2)
+        .is_some_and(|w| w[0] == 0xff && w[1] & 0xe0 == 0xe0 && w[1] & 0x06 != 0)
+}
+
+/// Why a file's picture is refused, in the words the demuxer gives, or `None`
+/// when the picture opens or there is no picture to refuse (a still, a song, a
+/// sound-only container). [`probe_media`] lists the file's streams either way:
+/// this is the one answer beside them that says what is wrong with the picture.
+pub fn picture_refusal(path: &Path) -> Option<String> {
+    if crate::is_image(path) || crate::is_audio(path) {
+        return None;
+    }
+    match Demuxer::open(path) {
+        Ok(_) => None,
+        Err(e) if NoVideoTrack::is_it(&e) => None,
+        Err(e) => Some(e.to_string()),
+    }
+}
+
+/// The container a file is wrapped in. Matroska's `DocType` tells `webm` from
+/// the rest, and an mp4-family file's `ftyp` brand tells `mov` and `m4a` apart;
+/// anything the header does not settle is the extension, lowercased.
+fn container_name(path: &Path) -> Option<String> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase);
+    if is_matroska(path) {
+        let mut head = [0u8; 256];
+        let read = File::open(path)
+            .and_then(|mut f| f.read(&mut head))
+            .unwrap_or(0);
+        // The header says Matroska, so the name is Matroska's, whatever the extension
+        // says; only the audio-only Matroska extensions keep their own names.
+        return Some(match matroska_doctype(&head[..read]) {
+            Some("webm") => "webm".into(),
+            _ => match ext.as_deref() {
+                Some(e @ ("mka" | "mks" | "mk3d")) => e.into(),
+                _ => "mkv".into(),
+            },
+        });
+    }
+    if avi::is_avi(path) {
+        return Some("avi".into());
+    }
+    if dv::is_dv(path) {
+        return Some("dv".into());
+    }
+    if ps::is_mpegps(path) {
+        return Some(ps::container_name(path, ext.as_deref()));
+    }
+    if ts::is_mpegts(path) {
+        // The camcorder's and the disc's names are kept; any other is a plain `mpegts`.
+        return Some(match ext.as_deref() {
+            Some("mts" | "m2ts") => ext.unwrap_or_default(),
+            _ => "mpegts".into(),
+        });
+    }
+    match read_top_level(path, b"ftyp") {
+        Ok(Some(payload)) if payload.len() >= 4 => Some(container_from_brand(&payload[..4]).into()),
+        _ => ext,
+    }
+}
+
+/// The mp4-family name for an `ftyp` major brand. A brand this does not name is
+/// plain mp4, which is what the rest of the family reads as.
+fn container_from_brand(brand: &[u8]) -> &'static str {
+    match brand {
+        b"qt  " => "mov",
+        b"M4A " => "m4a",
+        b"M4V " | b"M4VH" | b"M4VP" => "m4v",
+        brand if brand.starts_with(b"3g") => "3gp",
+        _ => "mp4",
+    }
+}
+
+/// The `DocType` string of an EBML header, read from the first bytes of a
+/// file. Element id `0x4282`, and a one-byte size, which every DocType fits.
+fn matroska_doctype(head: &[u8]) -> Option<&str> {
+    let at = head.windows(2).position(|w| w == [0x42, 0x82])?;
+    let size = *head.get(at + 2)?;
+    if size & 0x80 == 0 {
+        return None;
+    }
+    let len = usize::from(size & 0x7f);
+    std::str::from_utf8(head.get(at + 3..at + 3 + len)?)
+        .ok()
+        .map(|s| s.trim_end_matches('\0'))
+}
+
 /// How many bytes of the file an mp4 track's samples are -- its share of the
 /// `mdat`, which over the container's seconds is its share of the byte rate.
 ///
-/// Not `Mp4Track::bitrate`, deliberately, though that looks like the ready-made
-/// answer. It divides by the track's *own* duration, which is the arithmetic
-/// [`MediaBitrate`] exists to not do; it truncates that duration to whole
-/// seconds (`mp4-0.14.0/src/track.rs:213`), so a file under a second comes back
-/// `0`; and for an `mp4a` track it answers `esds.avg_bitrate` instead, a number
-/// the encoder declared rather than one the file spends, which is `0` on any
-/// `esds` that declared none. Bytes are what all three of these fields agree to
-/// be measured in.
-///
-/// `Mp4Track::total_sample_size` is private to that crate; this is it, off the
-/// `stsz` fields that are not.
-fn mp4_track_bytes(track: &Mp4Track) -> u64 {
-    let stsz = &track.trak.mdia.minf.stbl.stsz;
-    match stsz.sample_size {
-        0 => stsz.sample_sizes.iter().map(|&n| u64::from(n)).sum(),
-        uniform => u64::from(uniform) * u64::from(track.sample_count()),
-    }
+/// Not the container's declared bitrate, deliberately: an `esds` states what the
+/// encoder declared rather than what the file spends, and a sample table divided
+/// by the track's own duration is the arithmetic [`MediaBitrate`] exists to not
+/// do. Bytes are what every reader agrees on, and the demuxer's sample index
+/// holds all of them, fragmented files included.
+fn mp4_track_bytes(reader: &ec_mp4::Mp4Demuxer<CancelableReader<BufReader<File>>>, stream: u32) -> u64 {
+    reader
+        .samples(stream)
+        .iter()
+        .map(|s| u64::from(s.size))
+        .sum()
 }
 
 /// The file, whichever container it came in. Which one is decided by the
 /// extension at [`Demuxer::open`] and never again: everything downstream --
 /// playback, export, the plugin -- speaks access units and display frames.
 pub enum Demuxer {
-    Mp4(Mp4Demuxer),
-    Mkv(MkvDemuxer),
+    Mp4(Box<Mp4Demuxer>),
+    Mkv(Box<MkvDemuxer>),
+    /// An AVI (`.avi`, `.divx`; [`avi`]), an MPEG transport stream (`.ts`, `.mts`, `.m2ts`, `.m2t`) or program stream (`.mpg`,
+    /// `.vob`, `.m2v`, ...; [`ps`]), both read by [`ts::TsDemuxer`].
+    Ts(Box<ts::TsDemuxer>),
 }
 
 impl Demuxer {
+    /// The colour tags the file's own container states, unspecified fields left
+    /// unspecified ([`Tags`]) -- for the writers that carry a source's samples
+    /// as they are, and must not declare more than the source did.
+    pub fn colour_tags(&self) -> Tags {
+        match self {
+            Self::Mp4(mp4) => mp4.colour_tags(),
+            Self::Mkv(mkv) => mkv.colour_tags(),
+            Self::Ts(ts) => ts.colour_tags(),
+        }
+    }
+
     pub fn open(path: &Path) -> crate::Result<(VideoMeta, Self)> {
-        let (meta, mut demuxer) = if is_matroska(path) {
+        let (mut meta, mut demuxer) = if is_matroska(path) {
             let (meta, mkv) = MkvDemuxer::open(path)?;
-            (meta, Self::Mkv(mkv))
+            (meta, Self::Mkv(Box::new(mkv)))
+        } else if ps::is_mpeg_system(path) {
+            let (meta, ts) = ts::TsDemuxer::open(path)?;
+            (meta, Self::Ts(Box::new(ts)))
         } else {
             let (meta, mp4) = Mp4Demuxer::open(path)?;
-            (meta, Self::Mp4(mp4))
+            (meta, Self::Mp4(Box::new(mp4)))
         };
         demuxer.fill_sei_light();
         demuxer.fill_vp9_depth()?;
+        demuxer.fill_vp8_profile();
+        demuxer.fill_intra(&mut meta, path)?;
         Ok((meta, demuxer))
+    }
+
+    /// The HEVC `general_profile_idc` of the picture track, from the `hvcC` the
+    /// container holds; `None` for any other codec. Read before the VA-API
+    /// plugin is asked for anything, because the vendored decoder has no
+    /// answer for the range-extensions profiles.
+    pub fn hevc_profile(&self) -> Option<u8> {
+        match self {
+            Self::Mp4(d) => d.hevc_profile,
+            Self::Mkv(d) => (d.codec == Codec::Hevc)
+                .then(|| d.private.get(1).map(|b| b & 0x1f))
+                .flatten(),
+            Self::Ts(d) => d.hevc_profile,
+        }
     }
 
     /// What the file says about how bright its pictures get, [`ContentLight`],
@@ -890,6 +2533,7 @@ impl Demuxer {
         match self {
             Self::Mp4(d) => d.light,
             Self::Mkv(d) => d.light,
+            Self::Ts(d) => d.light,
         }
     }
 
@@ -906,6 +2550,7 @@ impl Demuxer {
         let (codec, light) = match self {
             Self::Mp4(d) => (d.codec, d.light),
             Self::Mkv(d) => (d.codec, d.light),
+            Self::Ts(d) => (d.codec, d.light),
         };
         if codec != Codec::Hevc || light != ContentLight::default() {
             return;
@@ -919,6 +2564,117 @@ impl Demuxer {
         match self {
             Self::Mp4(d) => d.light = found,
             Self::Mkv(d) => d.light = found,
+            Self::Ts(d) => d.light = found,
+        }
+    }
+
+    /// The container's FourCC for an MPEG-4 Part 2 picture (`XVID`, `DIVX`, `DX50`...), where
+    /// the container states one (an AVI): `ec-mpeg4` picks the encoder's bug workarounds by it.
+    pub(crate) fn fourcc(&self) -> Option<[u8; 4]> {
+        match self {
+            Self::Ts(d) => d.fourcc,
+            _ => None,
+        }
+    }
+
+    /// The picture stream's own codec id, size and `BITMAPINFOHEADER` (an AVI's raw video), where
+    /// the container states them: what MS-MPEG4 (which has no header of its own) and raw video
+    /// are decoded from.
+    pub(crate) fn video_params(&self) -> Option<(ec_core::CodecId, u32, u32, &[u8])> {
+        match self {
+            Self::Ts(d) => Some((d.codec_id, d.size.0, d.size.1, &d.header)),
+            Self::Mp4(d) if d.codec == Codec::Raw => Some((d.codec_id, d.size.0, d.size.1, &d.header)),
+            _ => None,
+        }
+    }
+
+    /// What an intra-only track's (ProRes, DNxHD, MJPEG) first sample states: whether it is
+    /// interlaced and the field order. Default (progressive) for every other codec.
+    pub(crate) fn intra(&self) -> crate::decode::intra::IntraFacts {
+        match self {
+            Self::Mp4(d) => d.intra,
+            Self::Mkv(d) => d.intra,
+            Self::Ts(d) => d.intra,
+        }
+    }
+
+    /// Reads a ProRes, DNxHD or MJPEG track's first sample (one decode) and fills in what no
+    /// container states: bit depth, chroma format, the DNxHD profile, interlace and field
+    /// order, and the colour the stream itself states (MJPEG is full range). The cursor is
+    /// put back where it opened. A refusal by name (DNxHD alpha, 12-bit JPEG...) fails the
+    /// open, as a refused H.264 profile does; a sample that merely fails to decode does not.
+    fn fill_intra(&mut self, meta: &mut VideoMeta, path: &Path) -> crate::Result<()> {
+        let codec = match self {
+            Self::Mp4(d) => d.codec,
+            Self::Mkv(d) => d.codec,
+            // DV in an AVI or a raw `.dv`: the pictures state their own field order. (The
+            // other intra-only codecs in an AVI keep their container-stated defaults.)
+            Self::Ts(d) if matches!(d.codec, Codec::Dv | Codec::Raw) => d.codec,
+            _ => return Ok(()),
+        };
+        if !matches!(codec, Codec::ProRes | Codec::Dnxhd | Codec::Mjpeg | Codec::Dv | Codec::Raw) {
+            return Ok(());
+        }
+        let first = self.next_access_unit();
+        self.seek_to_sync_at_or_before(0);
+        let Ok(Some(sample)) = first else {
+            return Ok(());
+        };
+        let container = crate::deinterlace::container_order(path);
+        let Some(p) = crate::decode::intra::probe(codec, &sample, meta, container, self.video_params().map_or(&[][..], |p| p.3))? else {
+            return Ok(());
+        };
+        let mut facts = p.facts;
+        if codec == Codec::Mjpeg && facts.interlaced {
+            facts.order = container.filter(|o| o.is_interlaced()).unwrap_or(ec_core::Interlace::TopFieldFirst);
+        }
+        let tags = self.colour_tags();
+        meta.color = ColorDescription::resolve_sized(tags, p.tags, meta.width, meta.height);
+        meta.matrix_assumed = ColorDescription::matrix_assumed(tags, p.tags);
+        match self {
+            Self::Mp4(d) => {
+                d.bit_depth = p.bit_depth;
+                d.chroma = Some(p.chroma);
+                d.profile = d.profile.or(p.profile);
+                d.intra = facts;
+            }
+            Self::Mkv(d) => {
+                d.bit_depth = p.bit_depth;
+                d.chroma = Some(p.chroma);
+                d.profile = d.profile.or(p.profile);
+                d.intra = facts;
+            }
+            Self::Ts(d) => {
+                d.bit_depth = p.bit_depth;
+                d.chroma = Some(p.chroma);
+                d.profile = d.profile.or(p.profile);
+                d.intra = facts;
+            }
+        }
+        Ok(())
+    }
+
+    /// The profile of a VP8 track, from the frame tag of its first access unit
+    /// (see [`video_profile::vp8`]). Nothing else in the container states it.
+    fn fill_vp8_profile(&mut self) {
+        let codec = match self {
+            Self::Mp4(d) => d.codec,
+            Self::Mkv(d) => d.codec,
+            Self::Ts(d) => d.codec,
+        };
+        if codec != Codec::Vp8 {
+            return;
+        }
+        let first = self.next_access_unit();
+        self.seek_to_sync_at_or_before(0);
+        let Ok(Some(au)) = first else {
+            return;
+        };
+        let profile = video_profile::vp8(&au);
+        match self {
+            Self::Mp4(d) => d.profile = profile,
+            Self::Mkv(d) => d.profile = profile,
+            Self::Ts(d) => d.profile = profile,
         }
     }
 
@@ -928,7 +2684,7 @@ impl Demuxer {
     /// `TrackEntry` carries no configuration record at all, and the `vpcC` an mp4
     /// writes is optional and describes the file rather than the frame. So it is
     /// read where it is always true: the uncompressed header of the first
-    /// keyframe, which is what [`vp9_bit_depth`] parses.
+    /// keyframe, which is what [`vp9_keyframe`] parses.
     ///
     /// Assuming 8 instead is how a profile 2 stream would decode into an NV12
     /// pool and come back as garbage -- the plugin picks its surface pool off
@@ -937,6 +2693,7 @@ impl Demuxer {
         let codec = match self {
             Self::Mp4(d) => d.codec,
             Self::Mkv(d) => d.codec,
+            Self::Ts(d) => d.codec,
         };
         if codec != Codec::Vp9 {
             return Ok(());
@@ -946,14 +2703,26 @@ impl Demuxer {
         let Ok(Some(au)) = first else {
             return Ok(());
         };
-        // A 12-bit stream is refused by name here, exactly as a 12-bit AV1 is in
-        // `parse_av1c`: the plugin has an NV12 pool and a P010 one and no third.
-        let Some(depth) = vp9_bit_depth(&au)? else {
+        let Some((depth, chroma)) = vp9_keyframe(&au)? else {
             return Ok(());
         };
+        let profile = video_profile::vp9(&au);
         match self {
-            Self::Mp4(d) => d.bit_depth = depth,
-            Self::Mkv(d) => d.bit_depth = depth,
+            Self::Mp4(d) => {
+                d.bit_depth = depth;
+                d.chroma = chroma;
+                d.profile = profile;
+            }
+            Self::Mkv(d) => {
+                d.bit_depth = depth;
+                d.chroma = chroma;
+                d.profile = profile;
+            }
+            Self::Ts(d) => {
+                d.bit_depth = depth;
+                d.chroma = chroma;
+                d.profile = profile;
+            }
         }
         Ok(())
     }
@@ -963,6 +2732,7 @@ impl Demuxer {
         match self {
             Self::Mp4(d) => d.next_access_unit(),
             Self::Mkv(d) => d.next_access_unit(),
+            Self::Ts(d) => d.next_access_unit(),
         }
     }
 
@@ -974,6 +2744,55 @@ impl Demuxer {
         match self {
             Self::Mp4(d) => d.seek_to_sync_at_or_before(frame),
             Self::Mkv(d) => d.seek_to_sync_at_or_before(frame),
+            Self::Ts(d) => d.seek_to_sync_at_or_before(frame),
+        }
+    }
+
+    /// Whether the stream is soft telecine (it asks for 3:2 field repeats), so that
+    /// its pictures are the 23.976p film frames and the rate states them as that.
+    /// Read at open from a transport or program stream's first pictures.
+    pub fn soft_pulldown(&self) -> bool {
+        matches!(self, Self::Ts(d) if d.soft_pulldown)
+    }
+
+    /// The file this demuxer reads, where it kept the name.
+    pub fn path(&self) -> Option<&Path> {
+        match self {
+            Self::Mp4(d) => Some(&d.path),
+            Self::Mkv(d) => Some(&d.path),
+            Self::Ts(d) => Some(d.path()),
+        }
+    }
+
+    /// Whether this is MPEG-1/2 video.
+    pub(crate) fn is_mpeg2(&self) -> bool {
+        matches!(self, Self::Ts(d) if d.codec == Codec::Mpeg2)
+    }
+
+    /// Whether this is an H.264 stream whose SPS says it may carry interlaced
+    /// pictures (`frame_mbs_only_flag` 0: field pictures or MBAFF). The decode
+    /// layer deinterlaces exactly these, and keeps them off the GPU, whose
+    /// output order and field handling this engine does not control.
+    pub fn h264_interlaced(&self) -> bool {
+        let sets = match self {
+            Self::Mp4(d) if d.codec == Codec::H264 => &d.parameter_sets,
+            Self::Mkv(d) if d.codec == Codec::H264 => &d.config,
+            Self::Ts(d) if d.codec == Codec::H264 => &d.config,
+            // MPEG-2 video states it in the sequence extension, per sequence; the
+            // pictures then say for themselves which of them are interlaced.
+            Self::Ts(d) if d.codec == Codec::Mpeg2 => return !crate::colorspace::mpeg2_progressive(&d.config),
+            _ => return false,
+        };
+        video_profile::h264_interlaced(sets)
+    }
+
+    /// The profile the stream states, in ffprobe's spelling; see
+    /// [`VideoFacts::profile`]. Read at open.
+    pub fn profile(&self) -> Option<&'static str> {
+        match self {
+            Self::Mp4(d) => d.profile,
+            Self::Mkv(d) => d.profile,
+            Self::Ts(d) => d.profile,
         }
     }
 
@@ -987,6 +2806,75 @@ impl Demuxer {
         match self {
             Self::Mp4(d) => d.bit_depth,
             Self::Mkv(d) => d.bit_depth,
+            Self::Ts(d) => d.bit_depth,
+        }
+    }
+
+    /// Whether an HEVC stream's VPS, SPS and PPS all parse under `ec-h265-syntax`,
+    /// and at least one SPS does. Read out of the container's `hvcC` or
+    /// `CodecPrivate`; a stream that carries none there is read from its first
+    /// access unit instead, the cursor put back where it opened. `true` for any
+    /// other codec, which this does not look at.
+    ///
+    /// Parameter sets only, no picture: a stream whose sets the spec forbids
+    /// (`sps_max_sub_layers_minus1 = 7`, say) is refused before any decoder is
+    /// chosen, because the hardware driver will tolerate what the parser will not.
+    pub fn hevc_parameter_sets_parse(&mut self) -> bool {
+        let (codec, mut sets) = match self {
+            Self::Mp4(d) => (d.codec, d.parameter_sets.clone()),
+            Self::Mkv(d) => (d.codec, d.config.clone()),
+            Self::Ts(d) => (d.codec, d.config.clone()),
+        };
+        if codec != Codec::Hevc {
+            return true;
+        }
+        if sets.is_empty() {
+            let first = self.next_access_unit();
+            self.seek_to_sync_at_or_before(0);
+            match first {
+                Ok(Some(au)) => sets = au,
+                _ => return false,
+            }
+        }
+        let mut sps_parses = false;
+        for nal in ec_h265_syntax::split_annex_b(&sets) {
+            let rbsp = nal.rbsp();
+            let parses = match nal.header.nal_type {
+                ec_h265_syntax::NalUnitType::Vps => ec_h265_syntax::Vps::parse(&rbsp).is_ok(),
+                ec_h265_syntax::NalUnitType::Sps => {
+                    let ok = ec_h265_syntax::Sps::parse(&rbsp).is_ok();
+                    sps_parses |= ok;
+                    ok
+                }
+                ec_h265_syntax::NalUnitType::Pps => ec_h265_syntax::Pps::parse(&rbsp).is_ok(),
+                _ => true,
+            };
+            if !parses {
+                return false;
+            }
+        }
+        sps_parses
+    }
+
+    /// The chroma format of the picture track, read off the parameter sets for
+    /// H.264, HEVC and AV1, fixed at 4:2:0 for VP8 and read off the first
+    /// keyframe for VP9. `None` where none of those says anything -- a VP9 track
+    /// with no keyframe to read, or an H.264 or HEVC one whose sets are missing.
+    pub fn chroma(&self) -> Option<Chroma> {
+        match self {
+            Self::Mp4(d) => d.chroma,
+            Self::Mkv(d) => d.chroma,
+            Self::Ts(d) => d.chroma,
+        }
+    }
+
+    /// The scan order of the two fields of an interlaced MJPEG picture, where the container
+    /// states one: an AVI does ([`ec_riff::AviDemuxer::field_order`]; ffmpeg's convention,
+    /// bottom field first, for every MJPEG stream). For `MjpegDecoder::set_field_order`.
+    pub fn field_order(&self) -> Option<ec_core::frame::Interlace> {
+        match self {
+            Self::Ts(d) => d.field_order(),
+            _ => None,
         }
     }
 }
@@ -1002,17 +2890,43 @@ impl Demuxer {
 /// reader, so refusing them was this engine refusing a file it parses. The set
 /// is the standard's own and closed by it.
 pub fn is_matroska(path: &Path) -> bool {
-    path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
-        matches!(
-            e.to_ascii_lowercase().as_str(),
-            "mkv" | "mka" | "mks" | "mk3d" | "webm"
-        )
-    })
+    // The bytes say what the container is; the extension only answers when the
+    // header does not (an unreadable or too-short file, which then fails at open).
+    match sniff_container(path) {
+        Some(matroska) => matroska,
+        None => path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+            matches!(
+                e.to_ascii_lowercase().as_str(),
+                "mkv" | "mka" | "mks" | "mk3d" | "webm"
+            )
+        }),
+    }
+}
+
+/// `Some(true)` for an EBML header (Matroska/WebM), `Some(false)` for an ISO
+/// base media `ftyp` box (mp4 family), `None` when neither magic is there.
+fn sniff_container(path: &Path) -> Option<bool> {
+    let mut head = [0u8; 12];
+    let read = File::open(path).and_then(|mut f| f.read(&mut head)).ok()?;
+    let head = &head[..read];
+    if head.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) {
+        Some(true)
+    } else if head.len() >= 8 && &head[4..8] == b"ftyp" {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 pub struct Mp4Demuxer {
-    reader: Mp4Reader<CancelableReader<BufReader<File>>>,
-    track_id: u32,
+    reader: ec_mp4::Mp4Demuxer<CancelableReader<BufReader<File>>>,
+    /// The picture track's stream index in `reader`.
+    stream: u32,
+    /// The chroma format the stream states; see [`Demuxer::chroma`].
+    chroma: Option<Chroma>,
+    /// The video track's `colr` as the file wrote it ([`colr_tags`]), unspecified
+    /// fields left unspecified.
+    colour: Tags,
     sample_count: u32,
     /// 1-based sample id of *frame 0*: the edit list can start the presentation
     /// a couple of frames into the media, exactly as it does for audio priming
@@ -1026,6 +2940,8 @@ pub struct Mp4Demuxer {
     /// Bytes of the NAL length prefix each sample is written with, off `avcC`
     /// or `hvcC`. Unused by VP9.
     nal_length: usize,
+    /// `general_profile_idc` of an HEVC track; `None` for every other codec.
+    hevc_profile: Option<u8>,
     /// `stss` entries, ascending 1-based sample ids. Empty means no `stss` box
     /// at all, i.e. every sample is a sync sample.
     sync_samples: Vec<u32>,
@@ -1040,76 +2956,78 @@ pub struct Mp4Demuxer {
     next_sample: u32,
     /// Bits per luma sample; see [`Demuxer::bit_depth`].
     bit_depth: u8,
+    /// The stated profile; see [`Demuxer::profile`].
+    profile: Option<&'static str>,
     /// How bright the track says it gets; see [`Demuxer::light`].
     light: ContentLight,
+    /// What an intra-only track's first sample states; see [`Demuxer::intra`].
+    intra: crate::decode::intra::IntraFacts,
+    /// A raw video track's synthesized header (`ec_riff::MOV_MARKER`); empty for every other codec.
+    header: Vec<u8>,
+    codec_id: ec_core::CodecId,
+    size: (u32, u32),
+    /// The file this reads, for [`Demuxer::path`].
+    path: PathBuf,
 }
 
 impl Mp4Demuxer {
-    fn open(path: &Path) -> crate::Result<(VideoMeta, Self)> {
-        let file = File::open(path)?;
-        let size = file.metadata()?.len();
-        let reader = Mp4Reader::read_header(CancelableReader(BufReader::new(file)), size)?;
+    /// The video track's `colr` tags as the file wrote them ([`Demuxer::colour_tags`]).
+    pub fn colour_tags(&self) -> Tags {
+        self.colour
+    }
 
-        // In *file* order, out of `moov.traks` rather than `Mp4Reader::tracks`,
-        // which is a `HashMap`: iterating that would make "the video track" a
-        // different one from one run to the next on a file carrying two, and a
-        // saved `.edith` would reopen on the other picture. The audio side reads
-        // the same box for the same reason ([`crate::audio::audio_track_ids`]).
+    fn open(path: &Path) -> crate::Result<(VideoMeta, Self)> {
+        refuse_asf(path)?;
+        let file = File::open(path)?;
+        let reader = ec_mp4::Mp4Demuxer::new(CancelableReader(BufReader::new(file)))
+            .map_err(mp4_error)?;
+
+        // The picture track: the first one in *file* order (`moov.traks`, which is
+        // what the demuxer lists its tracks in) whose sample entry this engine
+        // reads. A `HashMap` walk would make "the video track" of a file with two
+        // a different one from one run to the next, and a saved `.edith` would
+        // reopen on the other picture. The audio side picks the same way
+        // ([`crate::audio::audio_track_ids`]).
         //
-        // The fourcc of the sample entry is what names the codec, read out of the
-        // file by hand: `mp4 0.14`'s `stsd` parser knows only a `hev1` entry
-        // (`stsd.rs:107`) and no `av01` at all, so an `hvc1`-tagged HEVC track --
-        // what Apple and ffmpeg's mov muxer write in practice -- and every AV1
-        // track report no media type through `media_type()`, and such a file used
-        // to read back as having no video. Its sample tables
-        // (`stts`/`stsz`/`stsc`/`stss`) are parsed regardless of the entry the
-        // crate dropped, so the fourcc is all that is missing. hvc1 differs from
-        // hev1 in that the parameter sets may not repeat in-band, which costs
-        // nothing: they are re-injected out of `hvcC` ahead of every sync sample
-        // either way, exactly as an AV1 sequence header is out of `av1C`.
-        let (track, codec) = reader
-            .moov
-            .traks
+        // The fourcc of the sample entry names the codec. An `hvc1`-tagged HEVC
+        // track -- what Apple and ffmpeg's mov muxer write in practice -- and an
+        // AV1 track both come out of the sample table with their own fourcc, so
+        // nothing needs a second parse to find them.
+        let (info, stream, codec) = reader
+            .tracks()
             .iter()
-            .filter_map(|trak| reader.tracks().get(&trak.tkhd.track_id))
             .find_map(|t| {
-                matches!(t.track_type(), Ok(TrackType::Video))
-                    .then(|| sample_entry(path, t.track_id()).ok())
-                    .flatten()
-                    .and_then(|(kind, _)| mp4_codec(&kind))
-                    .map(|codec| (t, codec))
+                let stream = t.stream?;
+                let codec = mp4_codec(&t.sample_entry)?;
+                let video = reader
+                    .streams()
+                    .iter()
+                    .find(|s| s.index == stream)
+                    .is_some_and(|s| matches!(s.params.media, ec_core::MediaParameters::Video(_)));
+                video.then_some((t.clone(), stream, codec))
             })
             // Named, for the same reason the Matroska door names it: "no video
             // track" is a lie about a file that has one in a codec this does not
             // read, and the fourcc is what tells a user which.
-            .ok_or_else(|| mp4_no_video(path, &reader))?;
-
-        let track_id = track.track_id();
-        // The turn the file was shot at, off its `tkhd` display matrix -- how
-        // every phone records "this is portrait". `track.width()`/`height()` are
-        // the *coded* ones for an H.264 track (the `avc1` sample entry), so a
-        // quarter turn is what makes this file's displayed size the swapped one,
-        // and the whole engine reads these two as the picture's size.
-        let rotation = match reader
-            .moov
-            .traks
+            .ok_or_else(|| mp4_no_video(reader.tracks()))?;
+        let Some(ec_core::MediaParameters::Video(video)) = reader
+            .streams()
             .iter()
-            .find(|trak| trak.tkhd.track_id == track_id)
-        {
-            // The values, not the type: `mp4`'s `tkhd` module is `pub(crate)`,
-            // so its `Matrix` cannot be named here -- but its fields are public
-            // and the four linear ones are all this needs.
-            Some(trak) => {
-                let m = &trak.tkhd.matrix;
-                rotation_of_matrix(m.a, m.b, m.c, m.d)?
-            }
-            None => Rotation::None,
+            .find(|s| s.index == stream)
+            .map(|s| s.params.media.clone())
+        else {
+            return Err(mp4_no_video(reader.tracks()));
         };
-        let (coded_w, coded_h) = (u32::from(track.width()), u32::from(track.height()));
-        // The same bound the Matroska door applies, on the same values: the
-        // mp4 crate types a track's dimensions as `u16`, which is a smaller
-        // claim than Matroska's but still eight times past the 8K ceiling --
-        // 65535x65535 is a legal `tkhd`, and it sizes the same buffers.
+
+        let track_id = info.track_id;
+        // The turn the file was shot at, off its `tkhd` display matrix -- how
+        // every phone records "this is portrait". The coded size is the sample
+        // entry's for H.264 and the `tkhd`'s for every other codec, which is what
+        // the engine reads as the picture's size. The matrix is `ec-mp4`'s reading
+        // of the track; an unsupported one is refused here, by name.
+        let rotation = rotation_of_track(info.rotation)?;
+        let (coded_w, coded_h) = (video.width, video.height);
+        // The same bound the Matroska door applies, on the same values.
         for stated in [coded_w, coded_h] {
             if stated > crate::MAX_RESOLUTION {
                 return Err(unsupported_display_size(u64::from(stated)));
@@ -1126,51 +3044,55 @@ impl Mp4Demuxer {
             true => (coded_h, pixel_aspect.width_factor(coded_w)),
             false => (pixel_aspect.width_factor(coded_w), coded_h),
         };
+        let frame_rate = video
+            .frame_rate
+            .map_or(0.0, |tb| tb.num() as f64 / tb.den() as f64);
         let meta = VideoMeta {
             width,
             height,
             coded_width: coded_w,
             coded_height: coded_h,
             pixel_aspect,
-            frame_rate: frame_rate(track),
+            frame_rate,
             frame_count: 0,
             codec,
             // Filled below, once the parameter sets the bitstream tier reads are
             // in hand.
             color: ColorDescription::default(),
+            matrix_assumed: false,
             rotation,
         };
-        let first_sample = first_frame_sample(stts_pairs(track), trim_ticks(track));
+        // Where frame 0 is: the sample the edit list starts the presentation on.
+        let first_sample = reader.first_frame_sample(stream);
         let mut parameter_sets = Vec::new();
         let mut nal_length = 4;
         let mut bit_depth = 8;
+        let mut hevc_profile = None;
+        let mut profile = None;
+        let mut header = Vec::new();
         match codec {
             Codec::H264 => {
-                let avcc = &track
-                    .trak
-                    .mdia
-                    .minf
-                    .stbl
-                    .stsd
-                    .avc1
-                    .as_ref()
-                    .ok_or("an H.264 track without an avc1 sample entry")?
-                    .avcc;
-                nal_length = usize::from(avcc.length_size_minus_one) + 1;
-                parameter_sets.extend_from_slice(&START_CODE);
-                parameter_sets.extend_from_slice(track.sequence_parameter_set()?);
-                parameter_sets.extend_from_slice(&START_CODE);
-                parameter_sets.extend_from_slice(track.picture_parameter_set()?);
+                let (_, entry) = sample_entry(path, track_id)?;
+                let avcc = child(entry.get(78..).unwrap_or_default(), b"avcC")
+                    .ok_or("an H.264 track without an avcC box")?;
+                let (len, sets) = parse_avcc(avcc)?;
+                nal_length = len;
+                bit_depth = avc_bit_depth(&sets)?;
+                parameter_sets = sets;
+                profile = video_profile::h264(&parameter_sets);
             }
-            // `mp4 0.14` reads one byte of `hvcC` and skips the rest
-            // (`hev1.rs:193`), so the parameter sets an HEVC decoder cannot
-            // start without are read out of the file by hand.
+            // The parameter sets an HEVC decoder cannot start without are read
+            // out of `hvcC` by hand, as the one record that carries them.
             Codec::Hevc => {
                 let hvcc = hvcc_record(path, track_id)?;
                 let (len, sets, depth) = parse_hvcc(&hvcc)?;
                 nal_length = len;
                 parameter_sets = sets;
                 bit_depth = depth;
+                // `general_profile_idc`, the low five bits of the byte after the
+                // configuration version.
+                hevc_profile = hvcc.get(1).map(|b| b & 0x1f);
+                profile = video_profile::hevc_record(&hvcc);
             }
             // The sequence header OBU out of `av1C`, re-injected ahead of every
             // sync sample exactly as [`MkvDemuxer`] does it off `CodecPrivate` --
@@ -1184,69 +3106,111 @@ impl Mp4Demuxer {
                 let (sets, depth) = parse_av1c(av1c)?;
                 parameter_sets = sets;
                 bit_depth = depth;
+                profile = video_profile::av1(&parameter_sets);
             }
-            // No parameter sets: a VP8 or VP9 sample is self-contained.
-            Codec::Vp8 | Codec::Vp9 => {}
+            // ProRes names its flavour in the sample entry's fourcc and nowhere else.
+            Codec::ProRes => profile = video_profile::prores(&info.sample_entry),
+            // The Visual Object Layer header out of the `esds`, put back ahead of every sync
+            // sample that lacks one. H.263 (`s263`, `h263`) states none: its picture header is
+            // the whole configuration.
+            Codec::Mpeg4 => {
+                parameter_sets = reader
+                    .streams()
+                    .iter()
+                    .find(|s| s.index == stream)
+                    .and_then(|s| s.params.extradata.as_ref())
+                    .map(|b| b.as_ref().to_vec())
+                    .unwrap_or_default();
+                profile = video_profile::mpeg4(Some(&info.sample_entry), &parameter_sets);
+            }
+            // No parameter sets: a VP8 or VP9 sample is self-contained, and so is every
+            // intra-only picture (their facts come from the first sample, `fill_intra`).
+            Codec::Vp8 | Codec::Vp9 | Codec::Mpeg2 | Codec::Dnxhd | Codec::Mjpeg | Codec::Dv => {}
+            // The synthesized header `ec-riff`'s raw decoder reads its layout from.
+            Codec::Raw => {
+                header = reader
+                    .streams()
+                    .iter()
+                    .find(|s| s.index == stream)
+                    .and_then(|s| s.params.extradata.as_ref())
+                    .map(|b| b.as_ref().to_vec())
+                    .unwrap_or_default();
+                profile = Some(video_profile::raw(&header));
+            }
+            // AVI only.
+            Codec::MsMpeg4 => {}
         }
-        let sync_samples = track
-            .trak
-            .mdia
-            .minf
-            .stbl
-            .stss
-            .as_ref()
-            .map(|stss| stss.entries.clone())
-            .unwrap_or_default();
-
-        let sample_count = reader.sample_count(track_id)?;
+        let chroma = bitstream_chroma(codec, &parameter_sets);
+        let samples = reader.samples(stream);
+        let sample_count = samples.len() as u32;
+        // An `stss` table, as the sample sync flags state it. An empty list means
+        // every sample is a sync sample, which is what a track with no `stss` box
+        // is, so an all-sync track is stored that way.
+        let sync_samples: Vec<u32> = if samples.iter().all(|s| s.sync) {
+            Vec::new()
+        } else {
+            samples
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.sync)
+                .map(|(i, _)| i as u32 + 1)
+                .collect()
+        };
         // Where a seek to frame 0 would put the cursor: the samples the edit list
         // trims are still read, they are references for the ones that show.
         let next_sample = sync_at_or_before(&sync_samples, first_sample);
-        // Only a track that carries composition offsets stores its samples out
-        // of display order, and only an `stss` table makes "which keyframe" a
-        // question at all -- without either, a sample id *is* a display index
-        // and the table below would be an index of itself.
-        let (sync_display, first_display) = match track.trak.mdia.minf.stbl.ctts.as_ref() {
-            Some(ctts) if !sync_samples.is_empty() => {
-                let times = composition_times(
-                    stts_pairs(track),
-                    ctts.entries
-                        .iter()
-                        .map(|e| (e.sample_count, e.sample_offset)),
-                );
-                let syncs = sync_display_order(&times, |i| {
-                    sync_samples.binary_search(&(i as u32 + 1)).is_ok()
-                });
-                (syncs, display_index(&times, first_sample - 1))
+        // Only a track that carries composition offsets *and* sync points stores
+        // its samples out of display order; the demuxer answers for that and
+        // says nothing otherwise.
+        let sync_display = reader.sync_in_display_order(stream);
+        let first_display = match sync_display.is_empty() {
+            true => 0,
+            false => {
+                let times: Vec<i64> = samples.iter().map(|s| s.cts).collect();
+                display_index(&times, first_sample - 1)
             }
-            _ => (Vec::new(), 0),
         };
+        let (container_tags, bitstream) = (
+            colr_tags(path, track_id).unwrap_or_default(),
+            bitstream_tags(codec, &parameter_sets),
+        );
         Ok((
             VideoMeta {
                 // The samples the edit list trims off the front are not frames of
                 // the presentation, so they are not counted as ones.
                 frame_count: sample_count.saturating_sub(first_sample - 1),
-                color: ColorDescription::resolve(
-                    colr_tags(path, track_id).unwrap_or_default(),
-                    bitstream_tags(codec, &parameter_sets),
+                color: ColorDescription::resolve_sized(
+                    container_tags,
+                    bitstream,
+                    meta.width,
                     meta.height,
                 ),
+                matrix_assumed: ColorDescription::matrix_assumed(container_tags, bitstream),
                 ..meta
             },
             Self {
                 reader,
-                track_id,
+                stream,
+                colour: colr_tags(path, track_id).unwrap_or_default(),
                 sample_count,
                 first_sample,
                 codec,
                 parameter_sets,
                 nal_length,
+                hevc_profile,
                 sync_samples,
                 sync_display,
                 first_display,
                 next_sample,
                 bit_depth,
+                profile,
+                chroma,
                 light: mp4_light(path, track_id),
+                intra: crate::decode::intra::IntraFacts::default(),
+                header,
+                codec_id: ec_core::CodecId::RawVideo,
+                size: (coded_w, coded_h),
+                path: path.to_path_buf(),
             },
         ))
     }
@@ -1257,32 +3221,48 @@ impl Mp4Demuxer {
         if self.next_sample > self.sample_count {
             return Ok(None);
         }
-        let sample = self.reader.read_sample(self.track_id, self.next_sample)?;
-        self.next_sample += 1;
-        let Some(sample) = sample else {
-            return Ok(None);
+        let index = self.next_sample.saturating_sub(1) as usize;
+        let packet = match self.reader.read_sample(self.stream, index) {
+            Ok(packet) => packet,
+            Err(ec_core::Error::Eof) => return Ok(None),
+            Err(e) => return Err(mp4_error(e)),
         };
+        self.next_sample += 1;
+        let is_sync = packet.flags.keyframe;
+        let bytes: &[u8] = &packet.data;
         // A VP8 or VP9 mp4 sample is one (super)frame the decoder parses on
         // its own: no length prefixes to strip, no parameter sets to re-inject.
-        if matches!(self.codec, Codec::Vp8 | Codec::Vp9) {
-            return Ok(Some(sample.bytes.to_vec()));
+        // A ProRes, DNxHD or MJPEG sample is one whole picture, likewise.
+        // A DV sample is one whole frame.
+        if matches!(self.codec, Codec::Vp8 | Codec::Vp9 | Codec::ProRes | Codec::Dnxhd | Codec::Mjpeg | Codec::Dv | Codec::Raw) {
+            return Ok(Some(bytes.to_vec()));
+        }
+        // An MPEG-4 Part 2 sample is one VOP (or a packed pair); the VOL header goes in front
+        // of a sync sample that has none, where the decoder may start.
+        if self.codec == Codec::Mpeg4 {
+            let mut au = Vec::with_capacity(self.parameter_sets.len() + bytes.len());
+            if is_sync && !has_vol(bytes) {
+                au.extend_from_slice(&self.parameter_sets);
+            }
+            au.extend_from_slice(bytes);
+            return Ok(Some(au));
         }
         // An AV1 one is a whole temporal unit, likewise unframed -- with the
         // sequence header in front of it where a decoder may start.
         if self.codec == Codec::Av1 {
-            let mut au = Vec::with_capacity(self.parameter_sets.len() + sample.bytes.len());
-            if sample.is_sync {
+            let mut au = Vec::with_capacity(self.parameter_sets.len() + bytes.len());
+            if is_sync {
                 au.extend_from_slice(&self.parameter_sets);
             }
-            au.extend_from_slice(&sample.bytes);
+            au.extend_from_slice(bytes);
             return Ok(Some(au));
         }
 
-        let mut au = Vec::with_capacity(self.parameter_sets.len() + sample.bytes.len() + 16);
-        if sample.is_sync {
+        let mut au = Vec::with_capacity(self.parameter_sets.len() + bytes.len() + 16);
+        if is_sync {
             au.extend_from_slice(&self.parameter_sets);
         }
-        append_annex_b(&sample.bytes, self.nal_length, &mut au)?;
+        append_annex_b(bytes, self.nal_length, &mut au)?;
         Ok(Some(au))
     }
 
@@ -1395,6 +3375,11 @@ pub struct MkvDemuxer {
     config: Vec<u8>,
     /// The `CodecPrivate` record verbatim; see [`MkvVideo::private`].
     private: Vec<u8>,
+    /// What the track's `Colour` element declared, exactly as the file wrote it
+    /// (unspecified fields left unspecified); see [`MkvDemuxer::colour_tags`].
+    tags: Tags,
+    /// The stated profile; see [`Demuxer::profile`].
+    profile: Option<&'static str>,
     /// Nanoseconds a timestamp tick is worth -- `TimestampScale`, a millisecond
     /// in every file anything writes. What turns a block's own timestamp into
     /// the nanoseconds a copy re-times it by.
@@ -1404,8 +3389,12 @@ pub struct MkvDemuxer {
     nal_length: usize,
     /// Bits per luma sample; see [`Demuxer::bit_depth`].
     bit_depth: u8,
+    /// The chroma format the stream states; see [`Demuxer::chroma`].
+    chroma: Option<Chroma>,
     /// How bright the track says it gets; see [`Demuxer::light`].
     light: ContentLight,
+    /// What an intra-only track's first sample states; see [`Demuxer::intra`].
+    intra: crate::decode::intra::IntraFacts,
     /// One block's bytes, reused across access units: a 4K HEVC keyframe is a
     /// megabyte and it is reframed, not handed over, so the read needs a
     /// landing place of its own.
@@ -1510,6 +3499,14 @@ impl MkvDemuxer {
             Some(ticks) => mkv_cues(&mut file, segment, video.number, ticks)?,
             None => Vec::new(),
         };
+        let chroma = bitstream_chroma(video.codec, &video.config);
+        let profile = match video.codec {
+            Codec::H264 => video_profile::h264(&video.config),
+            Codec::Hevc => video_profile::hevc_record(&video.private),
+            Codec::Av1 => video_profile::av1(&video.config),
+            Codec::Mpeg4 => video_profile::mpeg4(None, &video.config),
+            _ => None,
+        };
         let mut mkv = Self {
             file,
             path: path.to_path_buf(),
@@ -1517,10 +3514,14 @@ impl MkvDemuxer {
             codec: video.codec,
             config: video.config,
             private: video.private,
+            tags: video.tags,
             timestamp_scale: video.timestamp_scale,
             nal_length: video.nal_length,
             bit_depth: video.bit_depth,
+            profile,
+            chroma,
             light: video.light,
+            intra: crate::decode::intra::IntraFacts::default(),
             scratch: Vec::new(),
             next: 0,
             base: 0,
@@ -1617,10 +3618,15 @@ impl MkvDemuxer {
             // same way: the 720-line rule below is a guess about the material, and
             // the material is the picture as displayed -- a device-held `.mkv` is
             // 640 coded but 1280 shown, and the two sides of that rule disagree.
-            color: ColorDescription::resolve(
+            color: ColorDescription::resolve_sized(
                 video.tags,
                 bitstream_tags(video.codec, &mkv.config),
+                width,
                 height,
+            ),
+            matrix_assumed: ColorDescription::matrix_assumed(
+                video.tags,
+                bitstream_tags(video.codec, &mkv.config),
             ),
             // The turn off the track's `Projection` element ([`projection_rotation`]),
             // which is where a Matroska muxer states what an mp4 states with its
@@ -1706,7 +3712,7 @@ impl MkvDemuxer {
             if id != CLUSTER {
                 continue;
             }
-            mkv_cluster(file, body, stop, *number, blocks, track_bytes, &mut laced)?;
+            *reach = mkv_cluster(file, body, stop, *number, blocks, track_bytes, &mut laced)?;
             // Per window rather than per file, which is the one thing the two
             // paths do differently: the last lace of a window has no block after
             // it *yet*. Video is never laced -- lacing is a sound-track trick,
@@ -1894,13 +3900,25 @@ impl MkvDemuxer {
             unpack,
             ..
         } = self;
+        check_extent(file, block.at, block.len)?;
         scratch.resize(block.len, 0);
         read_exact_at(file, block.at, scratch)?;
         // What the muxer stripped or compressed, put back before anything reads
         // the bytes as a codec's: a stripped block is not a NAL and an inflated
         // one is not where it was read from.
         unpack.frame(scratch)?;
-        if matches!(self.codec, Codec::Av1 | Codec::Vp8 | Codec::Vp9) {
+        if self.codec == Codec::Mpeg4 {
+            let mut au = Vec::with_capacity(head + self.scratch.len());
+            if !has_vol(&self.scratch) {
+                au.extend_from_slice(&self.config[..head]);
+            }
+            au.extend_from_slice(&self.scratch);
+            return Ok(Some(au));
+        }
+        if matches!(
+            self.codec,
+            Codec::Av1 | Codec::Vp8 | Codec::Vp9 | Codec::ProRes | Codec::Dnxhd | Codec::Mjpeg | Codec::Dv
+        ) {
             let mut au = Vec::with_capacity(head + self.scratch.len());
             au.extend_from_slice(&self.config[..head]);
             au.extend_from_slice(&self.scratch);
@@ -2013,6 +4031,14 @@ impl MkvDemuxer {
         &self.private
     }
 
+    /// What the track's `Colour` element says, field by field, as the file
+    /// wrote it: a copy writes these back and nothing else, so a file that says
+    /// nothing copies out saying nothing, rather than the resolved guess
+    /// [`VideoMeta::color`] is.
+    pub fn colour_tags(&self) -> Tags {
+        self.tags
+    }
+
     /// How many coded blocks the picture track has -- the count
     /// [`crate::VideoMeta::frame_count`] is, indexed the same way every seek and
     /// every clip in point already indexes it.
@@ -2076,6 +4102,7 @@ impl MkvDemuxer {
             unpack,
             ..
         } = self;
+        check_extent(file, block.at, block.len)?;
         scratch.resize(block.len, 0);
         read_exact_at(file, block.at, scratch)?;
         unpack.frame(scratch)?;
@@ -2113,6 +4140,9 @@ pub struct CodedBlock<'a> {
 /// once per file (6.7 s on a 12.9 GB film, then a sidecar read of a few
 /// milliseconds -- [`MkvDemuxer::is_sync`]): ask it off a render thread.
 pub fn sync_points(path: &Path) -> Vec<u32> {
+    if ps::is_mpeg_system(path) && !is_matroska(path) {
+        return Vec::new();
+    }
     if !is_matroska(path) {
         return match Demuxer::open(path) {
             Ok((_, Demuxer::Mp4(mp4))) => mp4.sync_frames(),
@@ -2157,6 +4187,15 @@ pub struct MkvAudioTrack {
     pub language: String,
     /// `TrackName` -- "Japanese 5.1", "Commentary" -- empty when there is none.
     pub name: String,
+    /// The `Audio` element's `Channels`, `None` where the track states none.
+    pub channels: Option<u16>,
+    /// The `Audio` element's `SamplingFrequency` in Hz, `None` where unstated.
+    pub sample_rate: Option<u32>,
+    /// The `CodecPrivate` as the file holds it: an AAC track's AudioSpecificConfig.
+    /// Empty where the track carries none.
+    config: Vec<u8>,
+    /// The `Audio` element's `BitDepth`, `None` where unstated.
+    bit_depth: Option<u32>,
     /// What this track's blocks have to be put back through.
     unpack: Unpack,
 }
@@ -2184,7 +4223,8 @@ pub fn matroska_audio_tracks(path: &Path) -> crate::Result<Vec<MkvAudioTrack>> {
 pub struct MkvAudio {
     file: File,
     blocks: Vec<Block>,
-    /// The Matroska codec id these blocks are packets of: `ac3` or `eac3`.
+    /// The Matroska codec id these blocks are packets of: `ac3`, `eac3`,
+    /// `truehd` or `mlp`.
     pub codec: &'static str,
     /// Seconds one `TimestampScale` tick is worth, resolved once at open.
     secs_per_tick: f64,
@@ -2232,6 +4272,9 @@ impl MkvAudio {
         let codec = match codec.as_str() {
             "A_AC3" => "ac3",
             "A_EAC3" => "eac3",
+            "A_TRUEHD" => "truehd",
+            "A_MLP" => "mlp",
+            // DTS has its own door (`crate::extaudio`); its blocks are not read here.
             _ => return Ok(None),
         };
         // Named here rather than at the walk: a sound track this cannot put back
@@ -2265,6 +4308,7 @@ impl MkvAudio {
         let Some(&block) = self.blocks.get(index) else {
             return Ok(None);
         };
+        check_extent(&self.file, block.at, block.len)?;
         let mut bytes = vec![0u8; block.len];
         read_exact_at(&mut self.file, block.at, &mut bytes)?;
         self.unpack.frame(&mut bytes)?;
@@ -2360,7 +4404,7 @@ impl Unpack {
                 // keyframe at worst, and a crafted block must not be able to
                 // inflate into all the memory there is.
                 const LIMIT: usize = 64 << 20;
-                *buf = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(buf, LIMIT)
+                *buf = ec_inflate::inflate_zlib(buf, LIMIT)
                     .map_err(|e| format!("a zlib Matroska block did not inflate: {e}"))?;
             }
             Self::Refused(why) => return Err(why.clone().into()),
@@ -2478,6 +4522,7 @@ const PROJECTION_POSE_ROLL: u32 = 0x7675;
 const COLOUR: u32 = 0x55B0;
 const MATRIX_COEFFICIENTS: u32 = 0x55B1;
 const RANGE: u32 = 0x55B9;
+const PRIMARIES: u32 = 0x55BB;
 const TRANSFER_CHARACTERISTICS: u32 = 0x55BA;
 // ...and how bright it says its pictures get: two whole-nit integers beside the
 // code points, and a `MasteringMetadata` container whose ten children are EBML
@@ -2494,6 +4539,10 @@ const TRACK_LANGUAGE: u32 = 0x22B59C;
 /// whole BCP-47 tag (`en`, `pt-BR`, `zh-Hans`).
 const TRACK_LANGUAGE_BCP47: u32 = 0x22B59D;
 const TRACK_NAME: u32 = 0x536E;
+const AUDIO: u32 = 0xE1;
+const CHANNELS: u32 = 0x9F;
+const SAMPLING_FREQUENCY: u32 = 0xB5;
+const BIT_DEPTH: u32 = 0x6264;
 const CONTENT_ENCODINGS: u32 = 0x6D80;
 const CONTENT_ENCODING: u32 = 0x6240;
 const CONTENT_ENCODING_SCOPE: u32 = 0x5032;
@@ -2516,6 +4565,9 @@ const CUE_TRACK: u32 = 0xF7;
 const CUE_CLUSTER_POSITION: u32 = 0xF1;
 const CLUSTER: u32 = 0x1F43_B675;
 const CLUSTER_TIMESTAMP: u32 = 0xE7;
+/// `DiscardPadding`, inside a `BlockGroup`: signed nanoseconds the decoder
+/// drops from the block's end.
+const DISCARD_PADDING: u32 = 0x75A2;
 const SIMPLE_BLOCK: u32 = 0xA3;
 const BLOCK_GROUP: u32 = 0xA0;
 const BLOCK: u32 = 0xA1;
@@ -2533,6 +4585,17 @@ fn mkv_segment(file: &mut File, end: u64) -> crate::Result<(u64, u64)> {
     Err("no Segment element: not a Matroska file".into())
 }
 
+/// What [`mkv_tracks`] yields, in order: the video track, every audio track,
+/// the codec of a further video track (if any), the timestamp scale, and the
+/// duration in seconds.
+type MkvTracks = (
+    Option<MkvVideo>,
+    Vec<MkvAudioTrack>,
+    Option<String>,
+    u64,
+    Option<f64>,
+);
+
 /// The video track of `segment`, **every** audio track in file order, the codec
 /// id of a video track this cannot read, and the segment's `TimestampScale` in
 /// nanoseconds. The audio list is what [`MkvAudio`] reads a sound track from and
@@ -2542,16 +4605,7 @@ fn mkv_segment(file: &mut File, end: u64) -> crate::Result<(u64, u64)> {
 ///
 /// Header only: the walk stops at the first `Cluster`, so this costs a handful
 /// of seeks whatever the file weighs.
-fn mkv_tracks(
-    file: &mut File,
-    segment: (u64, u64),
-) -> crate::Result<(
-    Option<MkvVideo>,
-    Vec<MkvAudioTrack>,
-    Option<String>,
-    u64,
-    Option<f64>,
-)> {
+fn mkv_tracks(file: &mut File, segment: (u64, u64)) -> crate::Result<MkvTracks> {
     let (mut video, mut other) = (None, None);
     let mut audio = Vec::new();
     let mut timestamp_scale = 1_000_000;
@@ -2727,6 +4781,7 @@ fn mkv_track_entry(
     let (mut display_width, mut display_height, mut display_unit) = (0u64, 0u64, 0u64);
     let mut rotation = Rotation::None;
     let (mut language, mut name, mut bcp47) = (String::new(), String::new(), String::new());
+    let (mut channels, mut sample_rate, mut bit_depth) = (None, None, None);
     let mut tags = Tags::default();
     let mut light = ContentLight::default();
     let mut unpack = Unpack::None;
@@ -2746,6 +4801,26 @@ fn mkv_track_entry(
                 codec = String::from_utf8_lossy(&ebml_bytes(file, body, stop)?).into_owned()
             }
             CODEC_PRIVATE => config = ebml_bytes(file, body, stop)?,
+            AUDIO => {
+                let mut at = body;
+                while let Some(e) = ebml_element(file, at, stop)? {
+                    match e.0 {
+                        CHANNELS => channels = Some(ebml_uint(file, e.1, e.2)?).filter(|c| *c > 0),
+                        BIT_DEPTH => {
+                            bit_depth = u32::try_from(ebml_uint(file, e.1, e.2)?)
+                                .ok()
+                                .filter(|d| *d > 0)
+                        }
+                        SAMPLING_FREQUENCY => {
+                            sample_rate = Some(ebml_float(file, e.1, e.2)?)
+                                .filter(|f| *f > 0.0)
+                                .map(|f| f.round() as u32)
+                        }
+                        _ => {}
+                    }
+                    at = e.2;
+                }
+            }
             VIDEO => {
                 let mut at = body;
                 while let Some(e) = ebml_element(file, at, stop)? {
@@ -2805,7 +4880,8 @@ fn mkv_track_entry(
                         // is "unspecified" in every one of those tables and
                         // falls to the tier below (see [`crate::colorspace`]).
                         COLOUR => {
-                            let (mut matrix, mut transfer, mut range) = (0, 0, 0);
+                            let (mut matrix, mut transfer, mut range, mut primaries) =
+                                (0, 0, 0, 0);
                             let mut at = e.1;
                             while let Some(c) = ebml_element(file, at, e.2)? {
                                 match c.0 {
@@ -2814,6 +4890,7 @@ fn mkv_track_entry(
                                         transfer = ebml_uint(file, c.1, c.2)?
                                     }
                                     RANGE => range = ebml_uint(file, c.1, c.2)?,
+                                    PRIMARIES => primaries = ebml_uint(file, c.1, c.2)?,
                                     MAX_CLL => {
                                         light.max_cll = nits(ebml_uint(file, c.1, c.2)? as f64)
                                     }
@@ -2845,7 +4922,8 @@ fn mkv_track_entry(
                                 }
                                 at = c.2;
                             }
-                            tags = Tags::from_codes(matrix, transfer, range);
+                            tags = Tags::from_codes(matrix, transfer, range)
+                                .with_primaries(primaries);
                         }
                         _ => {}
                     }
@@ -2866,6 +4944,12 @@ fn mkv_track_entry(
     // is exhaustive over [`Codec`] for the other half of it -- a variant added to
     // the enum fails to compile here rather than falling through to a refusal.
     if kind == 2 {
+        // Matroska has no codec id for Speex: a muxer writes `A_MS/ACM` with the
+        // WAVEFORMATEX tag 0xA109 in the `CodecPrivate`. Name it by what it is,
+        // so it is refused (and warned about) as Speex rather than as "ACM".
+        if codec == "A_MS/ACM" && config.starts_with(&[0x09, 0xA1]) {
+            codec = String::from("A_SPEEX");
+        }
         return Ok(MkvEntry::Audio(MkvAudioTrack {
             number,
             codec,
@@ -2874,6 +4958,10 @@ fn mkv_track_entry(
             // walk gets, so a dual-audio remux and its subtitles agree.
             language: mkv_language(&language, &bcp47),
             name,
+            channels: channels.and_then(|c| u16::try_from(c).ok()),
+            sample_rate,
+            config,
+            bit_depth,
             unpack,
         }));
     }
@@ -2884,7 +4972,7 @@ fn mkv_track_entry(
     // fails to compile here rather than falling through to a refusal, which is
     // how a VP9 `.webm` came to be refused by a build whose VA-API VP9 decoder
     // was wired.
-    let Some(known) = mkv_codec(&codec) else {
+    let Some(known) = mkv_codec(&codec).or_else(|| mkv_private_codec(&codec, &config)) else {
         return Ok(MkvEntry::OtherVideo(codec));
     };
     // The record itself, before any of the arms below reads it apart.
@@ -2899,11 +4987,11 @@ fn mkv_track_entry(
             (Codec::Hevc, nal_length, sets, bit_depth)
         }
         // The `avcC` beside them, and the same story: length-prefixed blocks and
-        // the SPS/PPS out of the record. Taken as 8-bit, which is what the whole
-        // H.264 path here assumes of an mp4's `avc1` too.
+        // the SPS/PPS out of the record. The depth is the SPS's own ([`avc_bit_depth`]).
         Codec::H264 => {
             let (nal_length, sets) = parse_avcc(&config)?;
-            (Codec::H264, nal_length, sets, 8)
+            let bit_depth = avc_bit_depth(&sets)?;
+            (Codec::H264, nal_length, sets, bit_depth)
         }
         // A VP9 block is one self-contained (super)frame: no length prefixes to
         // strip and no configuration record to re-inject -- a `.webm` writes no
@@ -2918,6 +5006,25 @@ fn mkv_track_entry(
         // carries no record beside. 8 is not an assumption here but the
         // format itself: VP8 has no depth but 8.
         Codec::Vp8 => (Codec::Vp8, 0, Vec::new(), 8),
+        // Not a Matroska codec here: `V_MPEG2` is a named gap in [`UNSUPPORTED`].
+        Codec::Mpeg2 => return Err("MPEG-2 video is read from a transport stream only".into()),
+        // One whole picture per block, no configuration record to re-inject: Motion JPEG
+        // (`V_MJPEG`) and Avid DNxHD/DNxHR (`V_QUICKTIME` / `V_MS/VFW/FOURCC` with an
+        // `AVdn`/`AVdh` tag in `CodecPrivate`, which `private` keeps). Their depth and
+        // chroma are read off the first sample by [`Demuxer::fill_intra`].
+        Codec::Mjpeg => (Codec::Mjpeg, 0, Vec::new(), 8),
+        Codec::Dnxhd => (Codec::Dnxhd, 0, Vec::new(), 8),
+        // Not a Matroska codec here: `V_PRORES` is a named gap in [`UNSUPPORTED`].
+        Codec::ProRes => return Err("ProRes is read from QuickTime/MP4 only".into()),
+        // The VOL header: `CodecPrivate` of `V_MPEG4/ISO/*`, or the bytes after the
+        // BITMAPINFOHEADER of a `V_MS/VFW/FOURCC` XviD / DivX track.
+        Codec::Mpeg4 => {
+            let vol = if codec == "V_MS/VFW/FOURCC" { config.get(40..).unwrap_or_default().to_vec() } else { config };
+            (Codec::Mpeg4, 0, vol, 8)
+        }
+        // DV is not a Matroska codec here.
+        Codec::Dv => return Err("DV is read from QuickTime/MP4, AVI and raw .dv files only".into()),
+        Codec::MsMpeg4 | Codec::Raw => return Err("MS-MPEG4 and raw video are read from AVI only".into()),
     };
     Ok(MkvEntry::Video(MkvVideo {
         number,
@@ -2944,10 +5051,69 @@ fn mkv_track_entry(
     }))
 }
 
+/// The refusal for an H.264 shape above 8 bits that edith does not carry, in
+/// [`hevc_refusal`]'s words, with the conversion.
+fn avc_refusal(what: &str, profile: &str) -> crate::Error {
+    format!(
+        "{what} is not supported — edith decodes H.264 in 4:2:0, 4:2:2, 4:4:4 and monochrome at 8 and 9/10 bits (High, High 10, High 4:2:2, High 4:4:4 Predictive; progressive or interlaced) only ({profile}; convert to 4:2:0 8/10-bit with ffmpeg -pix_fmt yuv420p10le -c:v libx264 -profile:v high10)"
+    )
+    .into()
+}
+
+/// The luma bit depth the first SPS of an H.264 stream states: 8 for every
+/// profile but the High ones, whose SPS carries it. Above 8 bits only the shapes
+/// `ec-h264` decodes open (9 or 10 bits, one depth for luma and chroma); more
+/// than 10 bits, a luma/chroma depth mismatch and FMO are refused by name at
+/// open, where the 8-bit path is left exactly as it was. An SPS that does not parse reads as 8-bit.
+fn avc_bit_depth(sets: &[u8]) -> crate::Result<u8> {
+    let Some(nal) = AnnexBIter::new(sets).find(|n| n.first().is_some_and(|b| b & 0x1f == 7)) else {
+        return Ok(8);
+    };
+    let mut rbsp = Vec::new();
+    unescape_rbsp(&nal[1..], &mut rbsp);
+    let Ok(sps) = Sps::parse(&rbsp) else {
+        return Ok(8);
+    };
+    let (luma, chroma) = (sps.bit_depth_luma, sps.bit_depth_chroma);
+    let profile = format!("H.264 profile_idc {}", sps.profile_idc);
+    // FMO (several slice groups) needs the macroblock-to-slice-group map of
+    // clause 8.2.2, which `ec-h264` does not carry: named here, at open, instead
+    // of failing on the first picture.
+    for nal in AnnexBIter::new(sets).filter(|n| n.first().is_some_and(|b| b & 0x1f == 8)) {
+        let mut pps_rbsp = Vec::new();
+        unescape_rbsp(&nal[1..], &mut pps_rbsp);
+        if let Ok(pps) = Pps::parse(&pps_rbsp, |_| Some(&sps))
+            && pps.num_slice_groups > 1
+        {
+            return Err(avc_refusal(
+                &format!("H.264 FMO (flexible macroblock ordering, {} slice groups)", pps.num_slice_groups),
+                &profile,
+            ));
+        }
+    }
+    // Every shape `ec-h264` decodes opens: 4:2:0, 4:2:2, 4:4:4 (also with
+    // separate colour planes), monochrome (handed over as 4:2:0 with neutral
+    // chroma) and lossless, at 8 and 9/10 bits. Chroma depth is only stated for
+    // streams that have chroma.
+    let has_chroma = sps.chroma_format_idc != 0 && !sps.separate_colour_plane;
+    let chroma = if has_chroma { chroma } else { luma };
+    if luma <= 8 && chroma <= 8 {
+        return Ok(8);
+    }
+    if luma != chroma {
+        return Err(avc_refusal("H.264 with chroma at a different bit depth from luma", &profile));
+    }
+    if luma > 10 {
+        return Err(avc_refusal(&format!("{luma}-bit H.264"), &profile));
+    }
+    // Interlaced (PAFF and MBAFF) High 10 4:2:0 decodes on `ec-h264` like the
+    // progressive kind; only the shapes refused above are still refused.
+    Ok(10)
+}
+
 /// AVCDecoderConfigurationRecord (ISO 14496-15 §5.3.3.1) -> the NAL length
 /// prefix width and the SPS/PPS as one Annex-B blob, which is [`parse_hvcc`]'s
-/// job for HEVC. The mp4 path gets both out of `mp4 0.14`'s `AvcCBox`; a
-/// Matroska file carries the identical record in `CodecPrivate`, unparsed.
+/// job for HEVC. The mp4 path and a Matroska file carry the identical record.
 fn parse_avcc(rec: &[u8]) -> crate::Result<(usize, Vec<u8>)> {
     // 0 configurationVersion .. 4 lengthSizeMinusOne, 5 numOfSequenceParameterSets.
     let (&flags, &sps_count) = rec
@@ -2991,9 +5157,11 @@ fn parse_avcc(rec: &[u8]) -> crate::Result<(usize, Vec<u8>)> {
 /// low-overhead format the blocks are in, so it needs no reframing.
 ///
 /// Also the bits per luma sample, out of `high_bitdepth`/`twelve_bit` in byte 2:
-/// 10-bit decodes through the P010 pool HEVC Main 10 already goes through
-/// ([`crate::hw`]), 12-bit is refused by name because that pool is the only
-/// deeper one there is.
+/// 8, 10 or 12. The software seat narrows all three to the 8-bit planes the
+/// renderer takes ([`crate::decode::narrow_av1`]); the 10-bit and 12-bit ones
+/// stay at their depth for a 10-bit export.
+/// 4:2:2 and 4:4:4 are taken too (profiles 2 and 1): the seats average their
+/// chroma down to 4:2:0. Only the impossible 4:4:0 is refused, by name.
 ///
 /// An empty record is not an error -- an encoder that repeats its sequence
 /// header in-band needs none -- and is taken as 8-bit, which is what the depth
@@ -3007,79 +5175,72 @@ fn parse_av1c(rec: &[u8]) -> crate::Result<(Vec<u8>, u8)> {
         .ok_or("av1C record shorter than its fixed header")?;
     // `twelve_bit` only says anything when `high_bitdepth` is set (AV1 §5.5.1),
     // so it is read where the record means it and nowhere else.
+    // The seq_profile is the top three bits of byte 1 (AV1-ISOBMFF §2.3.3): 0 is
+    // 4:2:0 and monochrome, 1 is 4:4:4, 2 is 4:2:2 and 12-bit. Named in the refusal.
+    let profile = rec[1] >> 5;
     let bit_depth = match (flags & 0x40 != 0, flags & 0x20 != 0) {
-        (true, true) => {
-            return Err(
-                "12-bit AV1 is not supported — 8- and 10-bit are what the decoder carries".into(),
-            );
-        }
+        (true, true) => 12,
         (true, false) => 10,
         _ => 8,
     };
+    // The chroma format, out of the same byte: `monochrome`, then the two
+    // subsampling bits (AV1-ISOBMFF §2.3.3). 4:4:0 (x=0, y=1) is no AV1 format.
+    let (mono, sub_x, sub_y) = (flags & 0x10 != 0, flags >> 3 & 1, flags >> 2 & 1);
+    if !mono && (sub_x, sub_y) == (0, 1) {
+        return Err(av1_refusal("AV1 4:4:0", profile));
+    }
     Ok((rec.get(4..).unwrap_or_default().to_vec(), bit_depth))
 }
 
-/// The quarter turns an mp4 `tkhd` display matrix asks for, or an
-/// [`UnsupportedRotation`] where it asks for something else.
+/// The refusal for an AV1 format that does not exist, in the words a user is
+/// shown: what the stream is, then the profile it came in. Raised at open, so
+/// probe and import both show it before any export starts.
+fn av1_refusal(what: &str, profile: u8) -> crate::Error {
+    format!(
+        "{what} is not supported — AV1 has no such format (AV1 profile {profile})"
+    )
+    .into()
+}
+
+/// The quarter turn an mp4 `tkhd` display matrix asks for, as `ec-mp4` read it
+/// off the track, or an [`UnsupportedRotation`] where it asks for something else.
 ///
-/// The matrix is the ISO 14496-12 §8.3.2 3x3 affine, stored as nine 16.16
-/// fixed-point values in the order `a b u c d v x y w`; only the four linear
-/// ones matter here, and only as a rotation: the values are normalised by the
-/// matrix's own scale so a differently-scaled copy of a quarter turn still
-/// reads as one, and anything that is not a pure right-angle turn -- a mirror
-/// (a negative determinant), a shear, a 45-degree phone quirk -- is refused by
-/// name rather than shown sideways.
+/// `ec-mp4` does the reading (exact integer arithmetic, [`ec_core::Rotation`]),
+/// so this only names the turn and states the refusal, with the angle the matrix
+/// states: `-atan2(b, a)` over the turned x-axis, counter-clockwise as ffprobe
+/// reports it (the same convention [`rotation_of_roll`] states), or none for a
+/// mirror or a shear, where 0.0 would be a claim rather than a reading.
 ///
-/// The direction is this engine's: the linear part is `[[a, c], [b, d]]` (a
-/// point maps to `(a*x + c*y, b*x + d*y)`), so `atan2(b, a)` is the clockwise
-/// angle when `(a, b)` is the turned x-axis, and the quarter count it falls on
-/// is exactly what [`crate::scale::rotate_i420_90s`] applies. Measured against
-/// ffmpeg's own autorotate on the `test_rotation*.mp4` fixtures
-/// (`scripts/gen_fixtures.sh`): a `tkhd` matrix of `a=0, b=-65536, c=65536,
-/// d=0` -- what `-display_rotation 90` writes, and what a phone's portrait
-/// video carries -- is [`Rotation::Cw270`] here, the quarter turn that puts the
-/// coded left edge at the top.
-fn rotation_of_matrix(a: i32, b: i32, c: i32, d: i32) -> crate::Result<Rotation> {
-    let fixed = |raw: i32| f64::from(raw) / 65536.0;
-    let (a, b, c, d) = (fixed(a), fixed(b), fixed(c), fixed(d));
-    let scale = a.hypot(b);
-    let unsupported = || -> crate::Error {
-        crate::Error::from(UnsupportedRotation {
-            // The honest number where the matrix states one at all; a mirror or
-            // a shear has no angle, and 0.0 would be a claim rather than a
-            // reading.
-            degrees: (scale > 0.0).then(|| b.atan2(a).to_degrees()),
-        })
+/// The direction is `ec-mp4`'s: `-display_rotation 90` writes `a=0, b=-65536`,
+/// which is [`Rotation::Cw270`] here, the quarter turn that puts the coded left
+/// edge at the top. This is the quarter count
+/// [`crate::scale::rotate_i420_90s`] applies.
+fn rotation_of_track(rotation: ec_core::Rotation) -> crate::Result<Rotation> {
+    let (a, b) = match rotation {
+        ec_core::Rotation::None => return Ok(Rotation::None),
+        ec_core::Rotation::Cw90 => return Ok(Rotation::Cw90),
+        ec_core::Rotation::Cw180 => return Ok(Rotation::Cw180),
+        ec_core::Rotation::Cw270 => return Ok(Rotation::Cw270),
+        ec_core::Rotation::Other { a, b, .. } => (a, b),
     };
-    // Pure and isotropic: both columns the same length, and one the other's
-    // quarter turn (`d == a`, `-c == b` after normalising) -- no shear, no
-    // anisotropic scale.
-    if scale == 0.0
-        || (scale - c.hypot(d)).abs() > 1e-3
-        || ((a - d) / scale).abs() > 1e-3
-        || ((b + c) / scale).abs() > 1e-3
-    {
-        return Err(unsupported());
+    let fixed = |raw: i32| f64::from(raw) / 65536.0;
+    let (a, b) = (fixed(a), fixed(b));
+    Err(UnsupportedRotation {
+        // Counter-clockwise, as ffprobe's `rotation` side data states it. `+ 0.0`
+        // turns a negative zero into a zero, so the sentence never reads "-0.0".
+        degrees: (a.hypot(b) > 0.0).then(|| -b.atan2(a).to_degrees() + 0.0),
     }
-    let degrees = b.atan2(a).to_degrees();
-    let steps = (degrees / 90.0).round();
-    if (degrees - steps * 90.0).abs() > 0.5 {
-        return Err(unsupported());
-    }
-    Ok(match steps.rem_euclid(4.0) as u8 {
-        0 => Rotation::None,
-        1 => Rotation::Cw90,
-        2 => Rotation::Cw180,
-        _ => Rotation::Cw270,
-    })
+    .into())
 }
 
 /// The quarter turn a Matroska `ProjectionPoseRoll` asks for -- the mkv door's
-/// half of [`rotation_of_matrix`], with the same half-degree tolerance and the
-/// same refusal by name.
+/// half of the display-matrix reading (the mp4 door's is [`rotation_of_track`]),
+/// with the same half-degree tolerance and the same refusal by name. The angle it
+/// states in that refusal is the roll itself: counter-clockwise, as ffprobe
+/// reports the same turn, so the mp4 and mkv sentences for one matrix agree.
 ///
-/// **Measured against ffmpeg's own autorotate**, the same arbiter
-/// [`rotation_of_matrix`] was measured against: `test_rotation{90,180,270}.mkv`
+/// **Measured against ffmpeg's own autorotate**, the same arbiter the mp4 door's
+/// matrix was measured against: `test_rotation{90,180,270}.mkv`
 /// (`scripts/gen_fixtures.sh`) are the very quadrant source their `.mp4` twins
 /// are, remuxed with `-display_rotation` asked for, and ffmpeg 8.1.2's matroska
 /// muxer writes this element for it -- `+90.0`, `+180.0` and **`-90.0`**, an
@@ -3108,24 +5269,6 @@ fn rotation_of_roll(degrees: f64) -> crate::Result<Rotation> {
         _ => Rotation::Cw270,
     })
 }
-
-/// The turn a track's `Projection` asks for, or [`Rotation::None`] where it does
-/// not ask for a turn of the picture at all.
-///
-/// Only a **rectangular** projection has a pose that turns the *picture*, and
-/// rectangular (0) is what an absent `ProjectionType` means. On an
-/// equirectangular or cubemap one those same three elements state how the sphere
-/// is oriented, which is not a turn of anything 2D: the pose is left alone, as a
-/// flat player shows a 360° file, rather than refused -- refusing would cost a
-/// file that plays right now and would not show it any righter.
-///
-/// A rectangular projection whose **yaw or pitch** is off zero is refused by
-/// name, though, and that is mkvmerge's spelling to watch for: since v95 it
-/// translates an mp4 display matrix into roll *and* yaw, using yaw for a mirror.
-/// A picture mirrored, or turned out of its own plane, is the one thing no
-/// quarter turn here can make -- the same missing capability the mp4 door
-/// refuses a 45-degree matrix for, so it gets the same refusal rather than a
-/// sideways picture.
 
 /// The sample aspect ratio a Matroska `TrackEntry`'s `Video` element states,
 /// from its `DisplayWidth`/`DisplayHeight`/`DisplayUnit` children and the coded
@@ -3203,6 +5346,23 @@ fn pixel_aspect_of(
     }
 }
 
+/// The turn a track's `Projection` asks for, or [`Rotation::None`] where it does
+/// not ask for a turn of the picture at all.
+///
+/// Only a **rectangular** projection has a pose that turns the *picture*, and
+/// rectangular (0) is what an absent `ProjectionType` means. On an
+/// equirectangular or cubemap one those same three elements state how the sphere
+/// is oriented, which is not a turn of anything 2D: the pose is left alone, as a
+/// flat player shows a 360° file, rather than refused -- refusing would cost a
+/// file that plays right now and would not show it any righter.
+///
+/// A rectangular projection whose **yaw or pitch** is off zero is refused by
+/// name, though, and that is mkvmerge's spelling to watch for: since v95 it
+/// translates an mp4 display matrix into roll *and* yaw, using yaw for a mirror.
+/// A picture mirrored, or turned out of its own plane, is the one thing no
+/// quarter turn here can make -- the same missing capability the mp4 door
+/// refuses a 45-degree matrix for, so it gets the same refusal rather than a
+/// sideways picture.
 fn projection_rotation(kind: u64, yaw: f64, pitch: f64, roll: f64) -> crate::Result<Rotation> {
     if kind != 0 {
         return Ok(Rotation::None);
@@ -3224,20 +5384,16 @@ fn projection_rotation(kind: u64, yaw: f64, pitch: f64, roll: f64) -> crate::Res
 /// owner there is none sends them looking for a fault that is not in the file.
 /// [`UNSUPPORTED`]'s reason where the table has one, the fourcc itself where it
 /// does not.
-fn mp4_no_video<R>(path: &Path, reader: &Mp4Reader<R>) -> crate::Error {
-    let found = reader
-        .moov
-        .traks
+fn mp4_no_video(tracks: &[ec_mp4::TrackInfo]) -> crate::Error {
+    let found = tracks
         .iter()
-        .filter(|trak| {
-            matches!(
-                TrackType::try_from(&trak.mdia.hdlr.handler_type),
-                Ok(TrackType::Video)
-            )
-        })
-        .find_map(|trak| sample_entry(path, trak.tkhd.track_id).ok())
-        .map(|(kind, _)| String::from_utf8_lossy(&kind).trim().to_string());
+        .find(|t| matches!(t.media, Some(ec_core::MediaType::Video)))
+        .map(|t| String::from_utf8_lossy(&t.sample_entry).trim().to_string());
     match found {
+        Some(kind) if MP4_ONLY.iter().any(|(c, f)| *c == Codec::Raw && String::from_utf8_lossy(*f).trim() == kind) => format!(
+            "uncompressed {kind} video in this mp4 is not supported in this layout — raw RGB (16, 24 and 32 bit), 2vuy, yuvs, yuv2, v210, v410 and b16g are; convert it with ffmpeg -i in.mov -c:v libx264 -c:a aac out.mp4"
+        )
+        .into(),
         Some(kind) => match UNSUPPORTED.iter().find(|(id, _)| *id == kind) {
             Some((_, why)) => format!("{kind} video in this mp4 is not supported — {why}"),
             None => {
@@ -3254,61 +5410,91 @@ fn mp4_no_video<R>(path: &Path, reader: &Mp4Reader<R>) -> crate::Error {
     }
 }
 
-/// Bits per luma sample out of a VP9 keyframe's uncompressed header (VP9
-/// bitstream spec §6.2 `uncompressed_header` and §6.4.1 `color_config`), which is
-/// the one place a VP9 stream states its own depth -- see
+/// `count` bits, MSB first, from bit offset `at`. Up to 24 at a time, which is
+/// the frame sync code and the widest field read here.
+fn vp9_bits(au: &[u8], at: &mut usize, count: usize) -> Option<u32> {
+    let mut value = 0;
+    for _ in 0..count {
+        let byte = *au.get(*at / 8)?;
+        value = value << 1 | u32::from(byte >> (7 - *at % 8) & 1);
+        *at += 1;
+    }
+    Some(value)
+}
+
+/// The bit depth and chroma format of a VP9 keyframe, out of its uncompressed
+/// header (VP9 bitstream spec §6.2 `uncompressed_header` and §6.2.2
+/// `color_config`) -- the one place a VP9 stream states either. See
 /// [`Demuxer::fill_vp9_depth`] for why neither container is asked.
 ///
 /// `None` when this access unit cannot answer -- not a keyframe, a
 /// `show_existing_frame`, a truncated block -- which leaves the caller's 8-bit
 /// default standing rather than guessing; profile 0 and 1 *are* 8-bit by
-/// definition, and they are all a `.webm` off the web ever is.
-fn vp9_bit_depth(au: &[u8]) -> crate::Result<Option<u8>> {
-    /// `count` bits, MSB first, from bit offset `at`. Up to 24 at a time, which
-    /// is the frame sync code and the widest field read here.
-    fn bits(au: &[u8], at: &mut usize, count: usize) -> Option<u32> {
-        let mut value = 0;
-        for _ in 0..count {
-            let byte = *au.get(*at / 8)?;
-            value = value << 1 | u32::from(byte >> (7 - *at % 8) & 1);
-            *at += 1;
-        }
-        Some(value)
-    }
+/// definition, and they are all a `.webm` off the web ever is. The chroma is
+/// `None` on its own where the header ends inside the colour config, or where
+/// it names a subsampling [`Chroma`] has no name for.
+fn vp9_keyframe(au: &[u8]) -> crate::Result<Option<(u8, Option<Chroma>)>> {
     let at = &mut 0;
     // frame_marker, then the profile as two bits written low one first; profile 3
     // spends a reserved bit before the rest.
-    if bits(au, at, 2) != Some(2) {
+    if vp9_bits(au, at, 2) != Some(2) {
         return Ok(None);
     }
-    let (Some(low), Some(high)) = (bits(au, at, 1), bits(au, at, 1)) else {
+    let (Some(low), Some(high)) = (vp9_bits(au, at, 1), vp9_bits(au, at, 1)) else {
         return Ok(None);
     };
     let profile = high << 1 | low;
-    if profile == 3 && bits(au, at, 1).is_none() {
+    if profile == 3 && vp9_bits(au, at, 1).is_none() {
         return Ok(None);
     }
     // show_existing_frame: such a frame is a reference already decoded and its
     // header stops right here. Then frame_type (0 is a keyframe), show_frame and
     // error_resilient_mode, and only a keyframe carries the colour config.
-    if bits(au, at, 1) != Some(0) || bits(au, at, 1) != Some(0) {
+    if vp9_bits(au, at, 1) != Some(0) || vp9_bits(au, at, 1) != Some(0) {
         return Ok(None);
     }
-    if bits(au, at, 2).is_none() {
+    if vp9_bits(au, at, 2).is_none() {
         return Ok(None);
     }
-    if bits(au, at, 24) != Some(0x49_8342) {
+    if vp9_bits(au, at, 24) != Some(0x49_8342) {
         return Ok(None);
     }
-    if profile < 2 {
-        return Ok(Some(8));
+    let depth = match profile < 2 {
+        true => 8,
+        // A 12-bit stream is refused by name here, exactly as a 12-bit AV1 is in
+        // `parse_av1c`: the plugin has an NV12 pool and a P010 one and no third.
+        false => match vp9_bits(au, at, 1) {
+            Some(0) => 10,
+            Some(_) => {
+                return Err(
+                    "12-bit VP9 is not supported — 8- and 10-bit are what the decoder carries"
+                        .into(),
+                );
+            }
+            None => return Ok(None),
+        },
+    };
+    Ok(Some((depth, vp9_chroma(au, at, profile))))
+}
+
+/// The chroma format of a VP9 keyframe's `color_config` from the colour space
+/// on (§6.2.2): sRGB is 4:4:4 and writes nothing further; any other space is a
+/// colour range, and then the subsampling bits only profiles 1 and 3 code.
+/// Profiles 0 and 2 are 4:2:0 by definition.
+fn vp9_chroma(au: &[u8], at: &mut usize, profile: u32) -> Option<Chroma> {
+    const SRGB: u32 = 7;
+    if vp9_bits(au, at, 3)? == SRGB {
+        return Some(Chroma::C444);
     }
-    match bits(au, at, 1) {
-        Some(0) => Ok(Some(10)),
-        Some(_) => {
-            Err("12-bit VP9 is not supported — 8- and 10-bit are what the decoder carries".into())
-        }
-        None => Ok(None),
+    vp9_bits(au, at, 1)?; // color_range
+    if profile != 1 && profile != 3 {
+        return Some(Chroma::C420);
+    }
+    match (vp9_bits(au, at, 1)?, vp9_bits(au, at, 1)?) {
+        (1, 1) => Some(Chroma::C420),
+        (1, 0) => Some(Chroma::C422),
+        (0, 0) => Some(Chroma::C444),
+        _ => None,
     }
 }
 
@@ -3556,7 +5742,7 @@ fn mkv_walk_blocks(file: &mut File, segment: (u64, u64), number: u64) -> crate::
         if id != CLUSTER {
             continue;
         }
-        mkv_cluster(
+        at = mkv_cluster(
             file,
             body,
             stop,
@@ -3585,6 +5771,14 @@ fn mkv_walk_blocks(file: &mut File, segment: (u64, u64), number: u64) -> crate::
 /// walks a cluster by exactly the code the whole-segment walk does: two readers
 /// of one container that disagreed about what a block is would be two different
 /// files to seek in.
+/// Whether an element is one a Cluster's children never hold: a sibling of the
+/// Cluster, so the Cluster is over where it starts. An unknown-length Cluster
+/// has no end of its own -- a live recording writes none -- and is over where
+/// the next of these begins, which is how it is read.
+fn ends_cluster(id: u32) -> bool {
+    matches!(id, CLUSTER | CUES | TRACKS | INFO | SEEK_HEAD | SEGMENT)
+}
+
 fn mkv_cluster(
     file: &mut File,
     body: u64,
@@ -3593,10 +5787,13 @@ fn mkv_cluster(
     blocks: &mut Vec<Block>,
     track_bytes: &mut Vec<(u64, u64)>,
     laced: &mut Vec<(usize, usize)>,
-) -> crate::Result<()> {
+) -> crate::Result<u64> {
     let mut cluster_ts = 0i64;
     let mut child = body;
     while let Some((id, body, stop)) = ebml_element(file, child, end)? {
+        if ends_cluster(id) {
+            return Ok(child);
+        }
         child = stop;
         let (block, key) = match id {
             CLUSTER_TIMESTAMP => {
@@ -3664,7 +5861,7 @@ fn mkv_cluster(
         }
         laced.push((start, blocks.len() - start));
     }
-    Ok(())
+    Ok(end)
 }
 
 /// The lace fixup: a laced block writes one timestamp for all its frames, and
@@ -3700,7 +5897,7 @@ fn mkv_spread_laces(blocks: &mut [Block], laced: &[(usize, usize)]) {
 /// differ from the one that filled this directory will believe every stale
 /// record in it. This byte is the only thing standing there, and it is bumped by
 /// hand.
-const INDEX_MAGIC: &[u8; 8] = b"EDMKVIX2";
+const INDEX_MAGIC: &[u8; 8] = b"EDMKVIX3";
 
 /// What a sidecar index is valid for and nothing else: the file it was walked
 /// from, down to the byte and the modification time, and the track it indexes.
@@ -3751,7 +5948,7 @@ impl IndexKey {
     /// size-capped LRU sweep at open is the upgrade path if it ever matters.
     fn sidecar(&self) -> Option<PathBuf> {
         let dir = cache_dir(
-            std::env::var_os("XDG_CACHE_HOME"),
+            crate::envcfg::var_os("XDG_CACHE_HOME"),
             std::env::var_os("HOME"),
             "mkvindex",
         )?;
@@ -3981,7 +6178,7 @@ fn mkv_lace(file: &mut File, block: &BlockHeader) -> crate::Result<Vec<(u64, usi
         // Fixed: no sizes written at all, the frames divide the rest evenly.
         2 => {
             let rest = block.len - at;
-            if rest % count != 0 {
+            if !rest.is_multiple_of(count) {
                 return Err("a fixed-lace Matroska block that does not divide evenly".into());
             }
             sizes = vec![rest / count; count - 1];
@@ -4173,68 +6370,15 @@ fn read_exact_at(file: &mut File, at: u64, buf: &mut [u8]) -> std::io::Result<()
     std::os::unix::fs::FileExt::read_exact_at(file, buf, at)
 }
 
-/// Frames per second off the sample table. `mp4 0.14`'s own
-/// [`Mp4Track::frame_rate`] divides the sample count by whole *milliseconds*
-/// before the float cast (`track.rs:166`), so 24000/1001 reads back as a flat
-/// 23.0 -- with the audio clock as master that is 4 % of drift, five minutes of
-/// it by the end of a two-hour film.
-fn frame_rate(track: &Mp4Track) -> f64 {
-    fps_from_stts(stts_pairs(track), track.timescale())
-}
-
-/// Whole track over whole track: constant-delta tables (the common case) come
-/// out as exactly `timescale / delta`, and a table that spreads 3753/3754 ticks
-/// to average 3753.75 averages instead of truncating. All of it in `f64`, which
-/// is the bug the caller above exists to avoid.
-fn fps_from_stts(entries: impl IntoIterator<Item = (u32, u32)>, timescale: u32) -> f64 {
-    let (samples, ticks) =
-        entries
-            .into_iter()
-            .fold((0u64, 0u64), |(samples, ticks), (count, delta)| {
-                (
-                    samples + u64::from(count),
-                    ticks + u64::from(count) * u64::from(delta),
-                )
-            });
-    match ticks {
-        // No timing in the header at all; `mp4`'s own answer for that is 0.0 too.
-        0 => 0.0,
-        ticks => samples as f64 * f64::from(timescale) / ticks as f64,
+/// Refuses a `len`-byte block at `at` that runs past the end of `file`, before a
+/// buffer of that size is made: a length in the file is a claim the file may not
+/// back, and the allocation is the thing a crafted one is after.
+pub(crate) fn check_extent(file: &File, at: u64, len: usize) -> crate::Result<()> {
+    let end = file.metadata()?.len();
+    match at.checked_add(len as u64) {
+        Some(stop) if stop <= end => Ok(()),
+        _ => Err(format!("a {len}-byte block at {at} runs past the {end}-byte file").into()),
     }
-}
-
-/// What the edit list really trims off the front, in media ticks: its
-/// `media_time` less the first sample's own composition offset. A stream with
-/// B-frames carries a `ctts` delay, and every muxer writes `media_time` equal to
-/// exactly that delay -- which is not a trim at all, it is the container saying
-/// "sample 1 is still the first picture". Reading it as one drops real frames
-/// (`test_high.mp4` loses two, and so did the film this bug came from). What is
-/// left over after the delay is the genuine trim.
-///
-/// corner-cut: empty edits are ignored and `media_time` is otherwise taken at face
-/// value, which is exactly what [`crate::audio::edit_media_time`] gives the audio
-/// track -- symmetry between the two is the point, not a full edit-list engine.
-/// Their *empty* edits can differ (83 ms of video against 62 ms of audio in that
-/// film, so the picture stays 21 ms -- half a frame -- early); honouring those is
-/// the upgrade path, and it belongs to both tracks at once.
-fn trim_ticks(track: &Mp4Track) -> Option<u64> {
-    let delay = track
-        .trak
-        .mdia
-        .minf
-        .stbl
-        .ctts
-        .as_ref()
-        .and_then(|ctts| ctts.entries.first())
-        .map_or(0, |e| e.sample_offset.max(0) as u64);
-    edit_media_time(track).map(|t| t.saturating_sub(delay))
-}
-
-/// 1-based id of the sample the presentation starts on, for a track trimmed by
-/// `trim` media ticks ([`trim_ticks`]). `None` (no edit list) and zero are both
-/// "no trim", i.e. the first sample.
-fn first_frame_sample(entries: impl IntoIterator<Item = (u32, u32)>, trim: Option<u64>) -> u32 {
-    trim.map_or(1, |t| packet_at(entries, t, 0).0)
 }
 
 /// Every sync point of a track paired with the *display* index it is really at:
@@ -4263,37 +6407,6 @@ fn sync_display_order(times: &[i64], sync: impl Fn(usize) -> bool) -> Vec<(u32, 
         .filter(|&(_, decode)| sync(decode as usize))
         .map(|(display, decode)| (display as u32, decode))
         .collect()
-}
-
-/// Composition (presentation) time of every sample of an mp4 track, in decode
-/// order and media ticks: the `stts` decode times with the `ctts` offsets added
-/// on, which is the pair that says a B-frame is shown before the picture stored
-/// ahead of it. Both tables arrive as their `(sample_count, value)` runs, the
-/// shape [`stts_pairs`] already hands the `stts` over in; the `ctts` runs may
-/// cover fewer samples than exist, in which case the rest carry no offset.
-fn composition_times(
-    stts: impl IntoIterator<Item = (u32, u32)>,
-    ctts: impl IntoIterator<Item = (u32, i32)>,
-) -> Vec<i64> {
-    let mut times = Vec::new();
-    let mut decode = 0i64;
-    for (count, delta) in stts {
-        for _ in 0..count {
-            times.push(decode);
-            decode += i64::from(delta);
-        }
-    }
-    let mut sample = 0usize;
-    for (count, offset) in ctts {
-        for _ in 0..count {
-            match times.get_mut(sample) {
-                Some(t) => *t += i64::from(offset),
-                None => return times,
-            }
-            sample += 1;
-        }
-    }
-    times
 }
 
 /// Rank of the sample at 0-based decode index `sample` in presentation order,
@@ -4398,7 +6511,7 @@ fn colr_tags(path: &Path, track_id: u32) -> Option<Tags> {
         b"nclx" => colr.get(10).map_or(0, |b| 1 + u64::from(b >> 7)),
         _ => 0,
     };
-    Some(Tags::from_codes(code(8)?, code(6)?, range))
+    Some(Tags::from_codes(code(8)?, code(6)?, range).with_primaries(code(4).unwrap_or(0)))
 }
 
 /// The `pasp` box of `track_id`'s sample entry (ISO/IEC 14496-12 §6.2.3, the
@@ -4478,6 +6591,15 @@ pub(crate) fn sample_entry(path: &Path, track_id: u32) -> crate::Result<([u8; 4]
     Ok((*kind, payload.to_vec()))
 }
 
+/// The refusal for an HEVC shape edith does not carry, in the words
+/// [`av1_refusal`] uses for AV1's, with the profile and the conversion.
+fn hevc_refusal(what: &str, profile: u8) -> crate::Error {
+    format!(
+        "{what} is not supported — edith decodes HEVC Main, Main 10 and range extensions (4:0:0, 4:2:0, 4:2:2, 4:4:4 at 8 to 12 bits) only (HEVC profile {profile}; convert to 4:2:0 8/10-bit with ffmpeg -pix_fmt yuv420p)"
+    )
+    .into()
+}
+
 /// HEVCDecoderConfigurationRecord (ISO 14496-15 §8.3.3.1) -> the NAL length
 /// prefix width, the VPS/SPS/PPS arrays as one Annex-B blob, and the luma bit
 /// depth the plugin picks its surface pool from.
@@ -4487,16 +6609,24 @@ fn parse_hvcc(rec: &[u8]) -> crate::Result<(usize, Vec<u8>, u8)> {
         .get(21)
         .zip(rec.get(22))
         .ok_or("hvcC box shorter than its fixed header")?;
-    // 17 is bit_depth_luma_minus8 in its low 3 bits. 8-bit decodes into the
-    // plugin's NV12 pool and 10-bit (Main 10) into its P010 one; 12-bit has
-    // neither a pool here nor, on the hardware this was written against, a
-    // VA-API profile -- refused by name rather than shown as garbage.
+    // 17 is bit_depth_luma_minus8 in its low 3 bits, 18 the chroma one. The
+    // software seat carries 8, 10 and 12 bits, luma and chroma apart; the
+    // VA-API plugin only ever gets the 8-bit NV12 and 10-bit P010 ones
+    // (Main and Main 10), the rest are routed to software before it is asked.
     let bit_depth = 8 + (rec[17] & 0x7);
-    if bit_depth > 10 {
-        return Err(format!(
-            "{bit_depth}-bit HEVC is not supported — 8- and 10-bit are what the decoder carries"
-        )
-        .into());
+    let chroma_depth = 8 + (rec[18] & 0x7);
+    if bit_depth > 12 || chroma_depth > 12 {
+        return Err(hevc_refusal(
+            &format!("{}-bit HEVC", bit_depth.max(chroma_depth)),
+            rec[1] & 0x1f,
+        ));
+    }
+    // general_profile_idc in the low five bits of byte 1: 4 is RExt, which
+    // carries 4:0:0, 4:2:2 and 4:4:4 at up to 12 bits; 5 and up (high
+    // throughput, multiview, scalable, 3D and SCC) are not carried.
+    let profile = rec[1] & 0x1f;
+    if profile >= 5 {
+        return Err(hevc_refusal(&format!("HEVC profile {profile}"), profile));
     }
     let mut sets = Vec::new();
     let mut src = &rec[23..];
@@ -4519,7 +6649,7 @@ fn parse_hvcc(rec: &[u8]) -> crate::Result<(usize, Vec<u8>, u8)> {
             let nal = src.get(2..2 + len).ok_or("hvcC NAL past the box")?;
             // 32 VPS, 33 SPS, 34 PPS -- the rest (SEI) a decoder does not need
             // to start, and cros-codecs would only skip.
-            if matches!(head & 0x3f, 32 | 33 | 34) {
+            if matches!(head & 0x3f, 32..=34) {
                 sets.extend_from_slice(&START_CODE);
                 sets.extend_from_slice(nal);
             }
@@ -4552,7 +6682,9 @@ fn read_top_level(path: &Path, want: &[u8; 4]) -> crate::Result<Option<Vec<u8>>>
             }
             size => (u64::from(size), 8),
         };
-        if size < header_len || at + size > end {
+        // `size - at` rather than `at + size`: a 64-bit size near u64::MAX wraps
+        // the sum back into the file and the walk never advances.
+        if size < header_len || size > end - at {
             return Err("truncated box in the file's top level".into());
         }
         if &header[4..8] == want {
@@ -4622,9 +6754,9 @@ pub struct MkvSubtitle {
     /// `[Events]` `Format:` line) for `S_TEXT/ASS`, empty for `S_TEXT/UTF8`.
     pub private: Vec<u8>,
     /// Every cue block, in storage order, for the codecs [`crate::subtitle`]
-    /// reads: the `S_TEXT/*` ones and `S_HDMV/PGS`, whose blocks are display
-    /// sets of run-length pictures rather than lines. A codec neither of those
-    /// -- VobSub off a DVD -- comes back declared and empty.
+    /// reads: the `S_TEXT/*` ones, WebVTT (`D_WEBVTT/*`) and `S_HDMV/PGS`, whose
+    /// blocks are display sets of run-length pictures rather than lines. A codec
+    /// neither of those -- VobSub off a DVD -- comes back declared and empty.
     pub cues: Vec<MkvCue>,
     /// Why this track's blocks were not read at all: a `ContentEncodings` this
     /// cannot undo. Listed like a bitmap track rather than raised, so a film
@@ -4652,6 +6784,13 @@ pub struct MkvCue {
 /// The Matroska codec id of Blu-ray bitmap subtitles: run-length pictures in
 /// display sets, read by [`crate::subtitle`] as [`MkvCue`]s like any other.
 pub const PGS: &str = "S_HDMV/PGS";
+
+/// The Matroska codec id of DVD bitmap subtitles: one subpicture unit per block,
+/// the `.idx` text (palette, size) in `CodecPrivate`.
+pub const VOBSUB: &str = "S_VOBSUB";
+
+/// The Matroska codec id of DVB bitmap subtitles: one display set per block.
+pub const DVBSUB: &str = "S_DVBSUB";
 
 /// The subtitle tracks of a Matroska file, in file order. An mp4's are a
 /// different beast and are read by [`mp4_subtitles`]; anything that is not a
@@ -4694,7 +6833,12 @@ pub fn matroska_subtitles(path: &Path) -> crate::Result<Vec<MkvSubtitle>> {
     // The tracks something reads: see `MkvSubtitle::cues`.
     let wanted: Vec<u64> = tracks
         .iter()
-        .filter(|t| (t.codec.starts_with("S_TEXT") || t.codec == PGS) && t.unsupported.is_none())
+        .filter(|t| {
+            (t.codec.starts_with("S_TEXT") || t.codec.starts_with("D_WEBVTT/") || t.codec == PGS
+                || t.codec == VOBSUB
+                || t.codec == DVBSUB)
+                && t.unsupported.is_none()
+        })
         .map(|t| t.number)
         .collect();
     if !wanted.is_empty() {
@@ -4745,57 +6889,64 @@ pub struct Mp4TextSample {
 /// that makes an mp4 export of this project's own openable again, and reads a
 /// `mov_text` track ffmpeg muxed just the same.
 ///
-/// The samples come out of the `mp4` crate, which walks `stts`/`stsz`/`stco`
-/// for any track type; the *title* does not, because that crate's `TrakBox` has
-/// no `udta` field at all -- so the one box carrying it is read by hand out of
-/// the `moov`, the way [`sample_entry`] reads an `stsd` entry the crate drops.
+/// The samples come out of `ec-mp4`'s sample index, the same for any track type;
+/// the *title* is read by hand out of the `moov` ([`mp4_track_names`]), the way
+/// [`sample_entry`] reads an `stsd` entry.
 ///
 /// A file with no timed-text track comes back empty, never an error; a file that
 /// is not an mp4 at all is an error, as [`matroska_subtitles`] is for a
 /// non-Matroska.
 pub fn mp4_subtitles(path: &Path) -> crate::Result<Vec<Mp4Subtitle>> {
     let file = File::open(path)?;
-    let size = file.metadata()?.len();
-    let mut reader = Mp4Reader::read_header(BufReader::new(file), size)?;
-    let mut ids: Vec<u32> = reader
+    let mut reader =
+        ec_mp4::Mp4Demuxer::new(BufReader::new(file)).map_err(mp4_error)?;
+    // By track id, which is the order the tracks were written in: a row picks a
+    // track by its number out of a list a user saw.
+    let mut infos: Vec<ec_mp4::TrackInfo> = reader
         .tracks()
         .iter()
-        .filter(|(_, track)| matches!(track.track_type(), Ok(TrackType::Subtitle)))
-        .map(|(id, _)| *id)
+        .filter(|t| t.media == Some(ec_core::MediaType::Subtitle) && t.stream.is_some())
+        .cloned()
         .collect();
-    // By track id, which is the order the tracks were written in: a `HashMap`
-    // hands them over in whatever order it likes, and a row picks a track by
-    // its number out of a list a user saw.
-    ids.sort_unstable();
+    infos.sort_unstable_by_key(|t| t.track_id);
     let names = mp4_track_names(path)?;
-    let mut tracks = Vec::with_capacity(ids.len());
-    for id in ids {
-        let track = &reader.tracks()[&id];
-        // Off the borrow before the samples, which need the reader itself.
-        let language = track.language().to_owned();
-        let timescale = i128::from(track.timescale().max(1));
-        let count = track.sample_count();
-        let mut samples = Vec::with_capacity(count as usize);
-        for i in 1..=count {
-            // Sample ids count from 1. A sample the tables cannot reach is
-            // skipped rather than raised: the other cues of the track are still
-            // the words a viewer needs.
-            let Some(sample) = reader.read_sample(id, i)? else {
-                continue;
+    let mut tracks = Vec::with_capacity(infos.len());
+    for info in infos {
+        let Some(stream) = info.stream else {
+            continue;
+        };
+        // Ticks to microseconds, through the stream's own time base.
+        let (num, den) = reader
+            .streams()
+            .iter()
+            .find(|s| s.index == stream)
+            .map_or((1, 1000), |s| (s.time_base.num(), s.time_base.den()));
+        let us = move |ticks: i64| {
+            (i128::from(ticks) * i128::from(num) * 1_000_000 / i128::from(den.max(1))) as i64
+        };
+        let count = reader.samples(stream).len();
+        let mut samples = Vec::with_capacity(count);
+        for i in 0..count {
+            // A sample the tables cannot reach is skipped rather than raised: the
+            // other cues of the track are still the words a viewer needs.
+            let sample = reader.samples(stream)[i];
+            let packet = match reader.read_sample(stream, i) {
+                Ok(packet) => packet,
+                Err(ec_core::Error::Eof) => continue,
+                Err(e) => return Err(mp4_error(e)),
             };
-            let us = |ticks: u64| (i128::from(ticks) * 1_000_000 / timescale) as i64;
             samples.push(Mp4TextSample {
-                start_us: us(sample.start_time),
-                end_us: us(sample.start_time + u64::from(sample.duration)),
-                payload: sample.bytes.to_vec(),
+                start_us: us(sample.dts),
+                end_us: us(sample.dts + i64::from(sample.duration)),
+                payload: packet.data.to_vec(),
             });
         }
         tracks.push(Mp4Subtitle {
-            number: u64::from(id),
-            language,
+            number: u64::from(info.track_id),
+            language: info.language.clone().unwrap_or_else(|| "und".to_string()),
             name: names
                 .iter()
-                .find(|(track_id, _)| *track_id == id)
+                .find(|(track_id, _)| *track_id == info.track_id)
                 .map(|(_, name)| name.clone())
                 .unwrap_or_default(),
             samples,
@@ -4895,6 +7046,10 @@ fn mkv_subtitle_blocks(
         let mut cluster_ts = 0i64;
         let mut child = body;
         while let Some((id, body, stop)) = ebml_element(file, child, stop)? {
+            if ends_cluster(id) {
+                at = child;
+                break;
+            }
             child = stop;
             let (block, duration) = match id {
                 CLUSTER_TIMESTAMP => {
@@ -5002,8 +7157,208 @@ fn string_of(file: &mut File, body: u64, stop: u64) -> crate::Result<String> {
 }
 
 #[cfg(test)]
+mod zlib_tests;
+
+#[cfg(test)]
+/// Whole track over whole track: constant-delta tables (the common case) come
+/// out as exactly `timescale / delta`, and a table that spreads 3753/3754 ticks
+/// to average 3753.75 averages instead of truncating. All of it in `f64`, which
+/// is the bug the caller above exists to avoid.
+fn fps_from_stts(entries: impl IntoIterator<Item = (u32, u32)>, timescale: u32) -> f64 {
+    let (samples, ticks) =
+        entries
+            .into_iter()
+            .fold((0u64, 0u64), |(samples, ticks), (count, delta)| {
+                (
+                    samples + u64::from(count),
+                    ticks + u64::from(count) * u64::from(delta),
+                )
+            });
+    match ticks {
+        // No timing in the header at all; `mp4`'s own answer for that is 0.0 too.
+        0 => 0.0,
+        ticks => samples as f64 * f64::from(timescale) / ticks as f64,
+    }
+}
+
+#[cfg(test)]
+/// 1-based id of the sample the presentation starts on, for a track trimmed by
+/// `trim` media ticks ([`trim_ticks`]). `None` (no edit list) and zero are both
+/// "no trim", i.e. the first sample.
+fn first_frame_sample(entries: impl IntoIterator<Item = (u32, u32)>, trim: Option<u64>) -> u32 {
+    trim.map_or(1, |t| crate::audio::packet_at(entries, t, 0).0)
+}
+
+#[cfg(test)]
+/// Composition (presentation) time of every sample of an mp4 track, in decode
+/// order and media ticks: the `stts` decode times with the `ctts` offsets added
+/// on, which is the pair that says a B-frame is shown before the picture stored
+/// ahead of it. Both tables arrive as their `(sample_count, value)` runs, the
+/// shape [`stts_pairs`] already hands the `stts` over in; the `ctts` runs may
+/// cover fewer samples than exist, in which case the rest carry no offset.
+fn composition_times(
+    stts: impl IntoIterator<Item = (u32, u32)>,
+    ctts: impl IntoIterator<Item = (u32, i32)>,
+) -> Vec<i64> {
+    let mut times = Vec::new();
+    let mut decode = 0i64;
+    for (count, delta) in stts {
+        for _ in 0..count {
+            times.push(decode);
+            decode += i64::from(delta);
+        }
+    }
+    let mut sample = 0usize;
+    for (count, offset) in ctts {
+        for _ in 0..count {
+            match times.get_mut(sample) {
+                Some(t) => *t += i64::from(offset),
+                None => return times,
+            }
+            sample += 1;
+        }
+    }
+    times
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    /// MSB-first bit writer for the hand-made H.264 parameter sets below.
+    #[derive(Default)]
+    struct Bits(Vec<bool>);
+
+    impl Bits {
+        fn bits(&mut self, value: u32, n: u32) -> &mut Self {
+            (0..n).rev().for_each(|i| self.0.push(value >> i & 1 == 1));
+            self
+        }
+        fn ue(&mut self, value: u32) -> &mut Self {
+            let v = value + 1;
+            let len = 32 - v.leading_zeros();
+            self.bits(0, len - 1).bits(v, len)
+        }
+        fn se(&mut self, value: i32) -> &mut Self {
+            self.ue(if value > 0 { 2 * value as u32 - 1 } else { (-2 * value) as u32 })
+        }
+        /// The NAL (header byte `head`) with the stop bit, zero padding and
+        /// emulation prevention, behind an Annex-B start code.
+        fn nal(&mut self, head: u8) -> Vec<u8> {
+            self.0.push(true);
+            while !self.0.len().is_multiple_of(8) {
+                self.0.push(false);
+            }
+            let mut out = vec![0, 0, 0, 1, head];
+            let mut zeros = 0;
+            for byte in self.0.chunks(8).map(|c| c.iter().fold(0u8, |a, &b| a << 1 | u8::from(b))) {
+                if zeros >= 2 && byte <= 3 {
+                    out.push(3);
+                    zeros = 0;
+                }
+                zeros = if byte == 0 { zeros + 1 } else { 0 };
+                out.push(byte);
+            }
+            out
+        }
+    }
+
+    /// A High 4:4:4 Predictive SPS (progressive, 16x16 macroblocks) at `depth` bits.
+    fn hi444_sps(depth: u32) -> Vec<u8> {
+        let mut b = Bits::default();
+        b.bits(244, 8).bits(0, 8).bits(40, 8).ue(0); // profile, flags, level, sps id
+        b.ue(3).bits(0, 1).ue(depth - 8).ue(depth - 8).bits(0, 1).bits(0, 1);
+        b.ue(0).ue(2).ue(1).bits(0, 1); // frame num bits, poc type 2, refs, gaps
+        b.ue(0).ue(0).bits(1, 1).bits(1, 1).bits(0, 1).bits(0, 1); // size, frame_mbs_only, direct, crop, vui
+        b.nal(0x67)
+    }
+
+    fn pps(slice_groups: u32) -> Vec<u8> {
+        let mut b = Bits::default();
+        b.ue(0).ue(0).bits(0, 2).ue(slice_groups - 1);
+        if slice_groups > 1 {
+            b.ue(0); // slice_group_map_type 0: interleaved
+            (0..slice_groups).for_each(|_| {
+                b.ue(0);
+            });
+        }
+        b.ue(0).ue(0).bits(0, 1).bits(0, 2).se(0).se(0).se(0).bits(0, 3);
+        b.nal(0x68)
+    }
+
+    #[test]
+    fn avc_refuses_more_than_ten_bits_and_fmo_by_name_and_opens_the_rest() {
+        let sets = |depth, groups| [hi444_sps(depth), pps(groups)].concat();
+        assert_eq!(avc_bit_depth(&sets(8, 1)).expect("4:4:4 8-bit opens"), 8);
+        assert_eq!(avc_bit_depth(&sets(10, 1)).expect("4:4:4 10-bit opens"), 10);
+        for depth in [12, 14] {
+            let refused = avc_bit_depth(&sets(depth, 1)).expect_err("above ten bits").to_string();
+            assert!(refused.starts_with(&format!("{depth}-bit H.264 is not supported")), "{refused}");
+        }
+        let refused = avc_bit_depth(&sets(8, 3)).expect_err("FMO").to_string();
+        assert!(refused.starts_with("H.264 FMO (flexible macroblock ordering, 3 slice groups) is not supported"), "{refused}");
+        assert!(refused.contains("ffmpeg"), "{refused}");
+    }
+
+    #[test]
+    fn a_block_declared_past_the_file_is_refused_before_it_is_allocated() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fuzz/huge_block.mkv");
+        let file = File::open(&path).expect("the fixture");
+        // Within the file: fine. A declared 1 TiB: refused at once, with the sizes named.
+        check_extent(&file, 588, 1000).expect("a block the file backs");
+        let started = std::time::Instant::now();
+        let err = check_extent(&file, 588, 1 << 40).expect_err("past the end of the file");
+        assert!(started.elapsed() < std::time::Duration::from_millis(100));
+        assert!(err.to_string().contains("runs past"), "{err}");
+        // An offset that wraps when added to the length is refused too.
+        assert!(check_extent(&file, u64::MAX - 4, 16).is_err());
+    }
+
+    #[test]
+    fn aac_profile_reads_the_config_the_way_the_spec_states_it() {
+        // AOT 2, 44.1 kHz, stereo: the plain LC config ffmpeg writes.
+        assert_eq!(aac_profile_of_config(&[0x12, 0x10]), Some("LC"));
+        // A plain AOT 2 config (mono core): LC, its SBR being implicit in the bitstream.
+        assert_eq!(aac_profile_of_config(&[0x15, 0x08]), Some("LC"));
+        // AOT 2 whose sync extensions name SBR (0x2b7), then SBR and PS (0x548).
+        assert_eq!(aac_profile_of_config(&[0x13, 0x90, 0x56, 0xe5, 0xa0]), Some("HE-AAC"));
+        assert_eq!(
+            aac_profile_of_config(&[0x13, 0x88, 0x56, 0xe5, 0xa5, 0x48, 0x80]),
+            Some("HE-AACv2")
+        );
+        // AOT 5, explicit SBR: the HE-AAC v1 fixture's own config.
+        assert_eq!(aac_profile_of_config(&[0x2b, 0x92, 0x08, 0x00]), Some("HE-AAC"));
+        // AOT 29, explicit SBR and PS.
+        assert_eq!(aac_profile_of_config(&[0xeb, 0x8a, 0x10, 0x00]), Some("HE-AACv2"));
+        // An object type the list does not name, and an empty config.
+        assert_eq!(aac_profile_of_config(&[0x00, 0x00]), None);
+        assert_eq!(aac_profile_of_config(&[]), None);
+    }
+
+    #[test]
+    fn mkv_aac_profile_prefers_the_config_then_the_codec_id() {
+        assert_eq!(mkv_aac_profile("A_AAC", &[0x12, 0x10]), Some("LC"));
+        assert_eq!(mkv_aac_profile("A_AAC/MPEG4/LC", &[]), Some("LC"));
+        assert_eq!(mkv_aac_profile("A_AAC/MPEG4/LC/SBR", &[]), Some("HE-AAC"));
+        assert_eq!(mkv_aac_profile("A_AAC/MPEG2/MAIN", &[]), Some("Main"));
+        assert_eq!(mkv_aac_profile("A_AAC/MPEG4/LTP", &[]), Some("LTP"));
+        assert_eq!(mkv_aac_profile("A_OPUS", &[0x12, 0x10]), None);
+    }
+
+    #[test]
+    fn esds_config_reads_four_byte_descriptor_lengths() {
+        // ES_Descriptor (3) with a 4-byte length, flags 0; DecoderConfig (4) with
+        // 13 fixed bytes; DecoderSpecificInfo (5) carrying the two-byte config.
+        let dsi = [0x05, 0x80, 0x80, 0x80, 0x02, 0x12, 0x10];
+        let mut dc = vec![0x04, 0x80, 0x80, 0x80, (13 + dsi.len()) as u8];
+        dc.extend([0x40, 0x15, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        dc.extend(dsi);
+        let mut es = vec![0x03, 0x80, 0x80, 0x80, (3 + dc.len()) as u8, 0, 1, 0];
+        es.extend(dc);
+        let mut esds = vec![0, 0, 0, 0];
+        esds.extend(es);
+        assert_eq!(esds_config(&esds), Some(&[0x12, 0x10][..]));
+    }
 
     /// Both walks that scale a file's own clock: the subtitle one
     /// (microseconds, `per_tick` 1_000) and the block one a copy reads
@@ -5080,7 +7435,7 @@ mod tests {
 
         let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         let stopped = with_cancel(&flag, || mkv_walk_blocks(&mut file, segment, number));
-        let error = stopped.err().expect("a cancelled walk must not answer");
+        let error = stopped.expect_err("a cancelled walk must not answer");
         assert!(
             is_cancelled(&error),
             "{name}: a cancelled walk reported {error} -- a verdict about the file"
@@ -5494,6 +7849,12 @@ mod tests {
         assert_eq!(mkv_language("fra", ""), "fra");
         assert_eq!(mkv_language("und", ""), "und");
         assert_eq!(mkv_language("", ""), "und");
+        // An mp4 code that is not three letters says no language, as the Matroska
+        // path does for an untagged track: zero, and the 0x7fff some muxers write
+        // (which decodes to DELs, not letters).
+        assert_eq!(unpack_language(0), "und");
+        assert_eq!(unpack_language(0x7fff), "und");
+        assert_eq!(unpack_language(0x15c7), "eng");
         // The table is the standard's own: one entry per ISO 639-1 code, none
         // of them doubled, every code the two and three letters it is.
         let mut seen: Vec<&str> = ISO_639_1_TO_2.iter().map(|(two, _)| *two).collect();
@@ -5535,7 +7896,7 @@ mod tests {
     /// compile until it has been routed.
     #[test]
     fn every_codec_is_reachable_from_both_containers() {
-        for codec in [Codec::H264, Codec::Hevc, Codec::Vp9, Codec::Vp8, Codec::Av1] {
+        for codec in [Codec::H264, Codec::Hevc, Codec::Vp9, Codec::Vp8, Codec::Av1, Codec::Mjpeg, Codec::Mpeg4] {
             let row = CODEC_IDS
                 .iter()
                 .find(|(c, ..)| *c == codec)
@@ -5555,6 +7916,35 @@ mod tests {
         }
         // hev1 and hvc1 are one codec in two fourccs; both are HEVC.
         assert_eq!(mp4_codec(b"hev1"), Some(Codec::Hevc));
+        // The intra-only professional codecs: every sample entry is reachable from an mp4,
+        // and the Matroska half is a row, a `CodecPrivate` rule, or a documented gap.
+        for (codec, fourcc) in MP4_ONLY {
+            assert_eq!(mp4_codec(fourcc), Some(*codec), "{fourcc:?}");
+        }
+        // DNxHD in Matroska: a generic id, named by the tag in its private data.
+        let mut quicktime = vec![0u8; 8];
+        quicktime[4..8].copy_from_slice(b"AVdn");
+        assert_eq!(mkv_private_codec("V_QUICKTIME", &quicktime), Some(Codec::Dnxhd));
+        let mut vfw = vec![0u8; 24];
+        vfw[16..20].copy_from_slice(b"AVdh");
+        assert_eq!(mkv_private_codec("V_MS/VFW/FOURCC", &vfw), Some(Codec::Dnxhd));
+        vfw[16..20].copy_from_slice(b"xvid");
+        assert_eq!(mkv_private_codec("V_MS/VFW/FOURCC", &vfw), Some(Codec::Mpeg4));
+        vfw[16..20].copy_from_slice(b"DIV3");
+        assert_eq!(mkv_private_codec("V_MS/VFW/FOURCC", &vfw), None);
+        assert_eq!(mkv_private_codec("V_VP9", &vfw), None);
+        // DV (QuickTime entries) and H.263 (3GPP) are mp4 sample entries with no Matroska id; MPEG-4
+        // Part 2 has `mp4v` and three Matroska ids.
+        assert_eq!(mp4_codec(b"dvc "), Some(Codec::Dv));
+        assert_eq!(mp4_codec(b"dv5p"), Some(Codec::Dv));
+        assert_eq!(mp4_codec(b"dvh5"), Some(Codec::Dv));
+        assert_eq!(mp4_codec(b"s263"), Some(Codec::Mpeg4));
+        assert_eq!(mp4_codec(b"mp4v"), Some(Codec::Mpeg4));
+        assert!(has_vol(&[0, 0, 1, 0xB0, 1, 0, 0, 1, 0xB6]));
+        assert!(!has_vol(&[0, 0, 1, 0xB6, 0, 0, 1, 0x20]));
+        // ProRes has no Matroska route: a gap row, not a silent fall-through.
+        assert!(MP4_ONLY.iter().any(|(c, _)| *c == Codec::ProRes));
+        assert!(UNSUPPORTED.iter().any(|(id, _)| *id == "V_PRORES"));
 
         for (id, why) in UNSUPPORTED {
             assert_eq!(mkv_codec(id), None, "{id} is supported after all ({why})");
@@ -5568,8 +7958,32 @@ mod tests {
         }
         // ...and a codec nothing here reads is refused rather than mistaken for
         // its neighbour in the table.
-        assert_eq!(mkv_codec("V_MPEG4/ISO/ASP"), None);
-        assert_eq!(mp4_codec(b"jpeg"), None);
+        assert_eq!(mkv_codec("V_MPEG4/MS/V3"), None);
+        assert_eq!(mkv_codec("V_MPEG4/ISO/ASP"), Some(Codec::Mpeg4));
+        assert_eq!(mkv_codec("V_MPEG4/ISO/SP"), Some(Codec::Mpeg4));
+        // MJPEG-B and the QuickTime raw entries are mp4 sample entries with no Matroska id.
+        assert_eq!(mp4_codec(b"mjpb"), Some(Codec::Mjpeg));
+        assert_eq!(mp4_codec(b"v210"), Some(Codec::Raw));
+        assert_eq!(mp4_codec(b"2vuy"), Some(Codec::Raw));
+    }
+
+    /// Packs a string of `0` and `1` into bytes, MSB first, zero-padded at the
+    /// end: the way a header reads on the page, without the arithmetic.
+    fn packed(bits: &str) -> Vec<u8> {
+        bits.as_bytes()
+            .chunks(8)
+            .map(|chunk| {
+                chunk
+                    .iter()
+                    .enumerate()
+                    .fold(0u8, |byte, (i, &b)| byte | (u8::from(b == b'1') << (7 - i)))
+            })
+            .collect()
+    }
+
+    /// The depth alone, as the tests below read it.
+    fn vp9_depth(au: &[u8]) -> crate::Result<Option<u8>> {
+        Ok(vp9_keyframe(au)?.map(|(depth, _)| depth))
     }
 
     /// The one place a VP9 stream states its own depth. Byte-aligned by
@@ -5580,29 +7994,52 @@ mod tests {
         // frame_marker 10, profile bits, show_existing 0, frame_type 0 (key),
         // show_frame 1, error_resilient 0, then the sync code 49 83 42.
         let profile0 = [0b1000_0010, 0x49, 0x83, 0x42];
-        assert_eq!(vp9_bit_depth(&profile0).unwrap(), Some(8));
+        assert_eq!(vp9_depth(&profile0).unwrap(), Some(8));
         // profile 2 (low 0, high 1), then ten_or_twelve_bit = 0.
         let profile2 = [0b1001_0010, 0x49, 0x83, 0x42, 0b0000_0000];
-        assert_eq!(vp9_bit_depth(&profile2).unwrap(), Some(10));
+        assert_eq!(vp9_depth(&profile2).unwrap(), Some(10));
         // ...and with it set: 12-bit, which has no surface pool here and is
         // refused by name rather than decoded into garbage.
         let twelve = [0b1001_0010, 0x49, 0x83, 0x42, 0b1000_0000];
-        let refused = vp9_bit_depth(&twelve).unwrap_err().to_string();
+        let refused = vp9_depth(&twelve).unwrap_err().to_string();
         assert!(refused.contains("12-bit VP9"), "{refused}");
         // Nothing to answer with is not an answer: an inter frame, a
         // show_existing_frame, a truncated block and a non-VP9 payload all leave
         // the caller's default standing.
-        assert_eq!(
-            vp9_bit_depth(&[0b1000_0110, 0x49, 0x83, 0x42]).unwrap(),
-            None
-        );
-        assert_eq!(
-            vp9_bit_depth(&[0b1000_1010, 0x49, 0x83, 0x42]).unwrap(),
-            None
-        );
-        assert_eq!(vp9_bit_depth(&profile2[..3]).unwrap(), None);
-        assert_eq!(vp9_bit_depth(&[0, 0, 0, 1, 0x65]).unwrap(), None);
-        assert_eq!(vp9_bit_depth(&[]).unwrap(), None);
+        assert_eq!(vp9_depth(&[0b1000_0110, 0x49, 0x83, 0x42]).unwrap(), None);
+        assert_eq!(vp9_depth(&[0b1000_1010, 0x49, 0x83, 0x42]).unwrap(), None);
+        assert_eq!(vp9_depth(&profile2[..3]).unwrap(), None);
+        assert_eq!(vp9_depth(&[0, 0, 0, 1, 0x65]).unwrap(), None);
+        assert_eq!(vp9_depth(&[]).unwrap(), None);
+    }
+
+    /// The chroma format a VP9 keyframe's colour config codes, against the
+    /// profiles that spell it out: profile 0 and 2 are 4:2:0, profile 1 codes
+    /// its subsampling bits, and sRGB is 4:4:4 whatever the profile.
+    #[test]
+    fn a_vp9_keyframe_states_its_own_chroma_format() {
+        // The sync code 49 83 42 as bits, then the keyframe's fields: show_existing
+        // 0, frame_type 0, show_frame 1, error_resilient 0.
+        let sync = format!("{:024b}", 0x49_8342u32);
+        let key = "0010";
+        let chroma = |head: &str, colour: &str| {
+            let au = packed(&format!("{head}{key}{sync}{colour}"));
+            vp9_keyframe(&au).unwrap().map(|(_, c)| c)
+        };
+        // profile 0 (low 0, high 0): BT.601 (space 001), range 0 -- nothing more.
+        assert_eq!(chroma("1000", "0010"), Some(Some(Chroma::C420)));
+        // profile 2 (low 0, high 1): ten_or_twelve_bit 0, space 001, range 0.
+        assert_eq!(chroma("1001", "00010"), Some(Some(Chroma::C420)));
+        // profile 1 (low 1, high 0): space 001, range 0, then subsampling_x and
+        // subsampling_y, then a reserved bit. 1,0 is 4:2:2; 0,0 is 4:4:4.
+        assert_eq!(chroma("1010", "001010"), Some(Some(Chroma::C422)));
+        assert_eq!(chroma("1010", "001000"), Some(Some(Chroma::C444)));
+        // sRGB (space 111) in profile 1: no range, no subsampling bits, 4:4:4.
+        assert_eq!(chroma("1010", "111"), Some(Some(Chroma::C444)));
+        // A header that ends inside the colour config keeps the depth and
+        // leaves the chroma unanswered.
+        let au = packed(&format!("{}{key}{sync}", "1000"));
+        assert_eq!(vp9_keyframe(&au).unwrap(), Some((8, None)));
     }
 
     #[test]
@@ -5623,6 +8060,8 @@ mod tests {
     fn reads_parameter_sets_out_of_an_hvcc_record() {
         let mut rec = vec![0u8; 23];
         rec[0] = 1; // configurationVersion
+        rec[16] = 0xfc | 1; // chroma_format_idc 1: 4:2:0
+        rec[18] = 0xf8; // bit_depth_chroma_minus8 0: 8-bit chroma, as luma
         rec[21] = 0xf0 | 0x1; // lengthSizeMinusOne == 1, high bits reserved
         rec[22] = 4; // numOfArrays
         for (kind, nal) in [(32u8, 0xAAu8), (33, 0xBB), (39, 0xCC), (34, 0xDD)] {
@@ -5647,12 +8086,43 @@ mod tests {
         // surface pool over the NV12 one.
         let mut main10 = rec.clone();
         main10[17] = 0xf8 | 2;
+        main10[18] = 0xf8 | 2;
         assert_eq!(parse_hvcc(&main10).unwrap().2, 10);
-        // 12-bit has no pool and no profile here, and is refused by name.
+        // RExt shapes open: 12-bit, 4:4:4, 4:0:0 and mixed depths, with the
+        // depth the luma states.
         let mut main12 = rec.clone();
+        main12[1] = 4;
         main12[17] = 0xf8 | 4;
-        let refused = parse_hvcc(&main12).unwrap_err().to_string();
-        assert!(refused.contains("12-bit"), "{refused}");
+        main12[18] = 0xf8 | 4;
+        assert_eq!(parse_hvcc(&main12).unwrap().2, 12, "12-bit opens");
+        let mut s422 = rec.clone();
+        s422[1] = 4;
+        s422[16] = 0xfc | 2;
+        assert_eq!(parse_hvcc(&s422).unwrap().2, 8, "4:2:2 8-bit opens");
+        s422[17] = 0xf8 | 2;
+        s422[18] = 0xf8 | 2;
+        assert_eq!(parse_hvcc(&s422).unwrap().2, 10, "4:2:2 10-bit opens");
+        let mut s444 = rec.clone();
+        s444[1] = 4;
+        s444[16] = 0xfc | 3;
+        assert_eq!(parse_hvcc(&s444).unwrap().2, 8, "4:4:4 opens");
+        let mut s400 = rec.clone();
+        s400[1] = 4;
+        s400[16] = 0xfc;
+        assert_eq!(parse_hvcc(&s400).unwrap().2, 8, "4:0:0 opens");
+        let mut mixed = rec.clone();
+        mixed[1] = 4;
+        mixed[18] = 0xf8 | 2;
+        assert_eq!(parse_hvcc(&mixed).unwrap().2, 8, "mixed depths open");
+        let mut deep = rec.clone();
+        deep[1] = 4;
+        deep[17] = 0xf8 | 6;
+        let refused = parse_hvcc(&deep).unwrap_err().to_string();
+        assert!(refused.contains("14-bit"), "{refused}");
+        let mut high = rec.clone();
+        high[1] = 5;
+        let refused = parse_hvcc(&high).unwrap_err().to_string();
+        assert!(refused.contains("profile 5"), "{refused}");
         // Nothing is read past the end of a truncated box.
         assert!(parse_hvcc(&rec[..20]).is_err());
         assert!(parse_hvcc(&rec[..rec.len() - 1]).is_err());
@@ -5721,8 +8191,7 @@ mod tests {
 
     /// The `av1C` record: four fixed bytes and then the sequence header OBU,
     /// which is handed to the decoder as it stands, and the depth beside it --
-    /// 10-bit reads as 10 (the P010 pool, exactly as HEVC Main 10), 12-bit is
-    /// refused by name.
+    /// 10-bit reads as 10 and 12-bit as 12.
     #[test]
     fn reads_the_sequence_header_out_of_an_av1c_record() {
         // marker/version, profile 0 + level 5, 8-bit 4:2:0, no delay; then a
@@ -5743,12 +8212,7 @@ mod tests {
         assert_eq!(ten_config, config, "the OBUs are read the same either way");
         let mut twelve = ten.clone();
         twelve[2] |= 0x20; // twelve_bit
-        assert!(
-            parse_av1c(&twelve)
-                .unwrap_err()
-                .to_string()
-                .contains("12-bit")
-        );
+        assert_eq!(parse_av1c(&twelve).unwrap().1, 12);
         // `twelve_bit` without `high_bitdepth` says nothing, and an 8-bit
         // record reads as one whatever that bit holds.
         let mut stray = rec.clone();
@@ -5759,6 +8223,18 @@ mod tests {
         // at all, which is not an error; a truncated one is.
         assert!(parse_av1c(&[]).unwrap().0.is_empty());
         assert!(parse_av1c(&[0x81, 0x05]).is_err());
+
+        // The chroma format rides the same byte. Every real AV1 format is taken,
+        // 4:2:2 and 4:4:4 at 8, 10 and 12 bits included; only 4:4:0 is refused.
+        let read = |flags: u8| parse_av1c(&[0x81, 0x05, flags, 0x00]);
+        for flags in [0x08, 0x00, 0x40, 0x48, 0x60, 0x68, 0x6C] {
+            assert!(read(flags).is_ok(), "flags {flags:#x}");
+        }
+        assert_eq!(read(0x68).unwrap().1, 12, "12-bit 4:2:2");
+        let refused = read(0x04).unwrap_err().to_string();
+        assert!(refused.contains("AV1 4:4:0"), "{refused}");
+        assert_eq!(read(0x0C).unwrap().1, 8, "4:2:0 at 8-bit");
+        assert_eq!(read(0x4C).unwrap().1, 10, "4:2:0 at 10-bit");
     }
 
     #[test]
@@ -6020,5 +8496,41 @@ mod tests {
         assert!(append_annex_b(&[0, 0, 0, 9, 0x65], 4, &mut Vec::new()).is_err());
         assert!(append_annex_b(&[0, 0, 0], 4, &mut Vec::new()).is_err());
         assert!(append_annex_b(&[0, 0, 0, 0], 4, &mut Vec::new()).is_err());
+    }
+}
+
+#[cfg(test)]
+mod container_names {
+    use super::{container_from_brand, matroska_doctype};
+
+    #[test]
+    fn an_ftyp_brand_names_its_mp4_family_member() {
+        assert_eq!(container_from_brand(b"qt  "), "mov");
+        assert_eq!(container_from_brand(b"M4A "), "m4a");
+        assert_eq!(container_from_brand(b"M4V "), "m4v");
+        assert_eq!(container_from_brand(b"3gp5"), "3gp");
+        assert_eq!(container_from_brand(b"isom"), "mp4");
+        assert_eq!(container_from_brand(b"mp42"), "mp4");
+    }
+
+    #[test]
+    fn a_matroska_doctype_is_read_from_the_ebml_header() {
+        // EBML header with a DocType element: id 42 82, size 0x84, "webm".
+        let webm = [
+            0x1A, 0x45, 0xDF, 0xA3, 0x9F, 0x42, 0x82, 0x84, b'w', b'e', b'b', b'm',
+        ];
+        assert_eq!(matroska_doctype(&webm), Some("webm"));
+        let mkv = [
+            0x1A, 0x45, 0xDF, 0xA3, 0x8B, 0x42, 0x82, 0x88, b'm', b'a', b't', b'r', b'o', b's',
+            b'k', b'a',
+        ];
+        assert_eq!(matroska_doctype(&mkv), Some("matroska"));
+    }
+
+    #[test]
+    fn a_doctype_that_is_not_there_or_cut_short_is_none() {
+        assert_eq!(matroska_doctype(&[0x1A, 0x45, 0xDF, 0xA3]), None);
+        // The size claims four bytes and the file ends after two.
+        assert_eq!(matroska_doctype(&[0x42, 0x82, 0x84, b'w', b'e']), None);
     }
 }

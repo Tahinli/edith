@@ -30,8 +30,12 @@
 use gpui::{App, Font, FontFeatures, FontWeight, Pixels, SharedString, Styled, font, px};
 use std::borrow::Cow;
 
-/// Archivo: labels, verbs, section heads.
+/// Archivo: the previous UI face. Still registered (title clips and the
+/// engine's text renderer use it) but no longer the UI default.
 pub const ARCHIVO: &str = "Archivo";
+/// Inter 4.0 (REDESIGN §1.1): the UI face. Static instances 400/500/600 are
+/// bundled; every [`label`] / role below sets this family.
+pub const INTER: &str = "Inter";
 /// Spline Sans Mono: timecode, chords, readouts, metadata, names, the ledger.
 pub const SPLINE_SANS_MONO: &str = "Spline Sans Mono";
 
@@ -44,8 +48,8 @@ pub const LABEL_ROW_PX: f32 = 15.;
 pub const CHORD_METADATA_MAX_PX: f32 = 14.;
 pub const CHORD_METADATA_MIN_PX: f32 = 13.;
 pub const SECTION_HEAD_PX: f32 = 12.;
-/// The floor DESIGN §3 sets: nothing in the room reads smaller than this.
-pub const FLOOR_PX: f32 = 10.;
+/// The floor DESIGN §2.4 sets: nothing in the room reads smaller than this.
+pub const FLOOR_PX: f32 = 12.;
 
 /// A family, weight and size together -- what a call site needs to paint
 /// text with `.font(style.font).text_size(style.size)`, and nothing it has
@@ -82,15 +86,25 @@ impl WithWeight for Font {
     }
 }
 
-/// Archivo, at the given size and weight -- labels, verbs, section heads.
+/// Inter, at the given size and weight -- labels, verbs, section heads.
 /// No italics anywhere in the room (DESIGN §3), so this never offers one.
 pub fn label(size_px: f32, weight: FontWeight) -> TypeStyle {
     debug_assert!(
         size_px >= FLOOR_PX,
-        "below DESIGN §3's 10px floor: {size_px}"
+        "below DESIGN §2.4's 12px floor: {size_px}"
     );
     TypeStyle {
-        font: family_font(ARCHIVO, weight, false),
+        font: family_font(INTER, weight, false),
+        size: px(size_px),
+    }
+}
+
+/// [`label`] with tabular figures on: numbers in running prose that must not
+/// jitter as they change, without the mono face (which is for timecodes).
+pub fn label_tabular(size_px: f32, weight: FontWeight) -> TypeStyle {
+    debug_assert!(size_px >= FLOOR_PX, "below DESIGN §2.4's 12px floor: {size_px}");
+    TypeStyle {
+        font: family_font(INTER, weight, true),
         size: px(size_px),
     }
 }
@@ -100,7 +114,7 @@ pub fn label(size_px: f32, weight: FontWeight) -> TypeStyle {
 pub fn mono(size_px: f32, weight: FontWeight) -> TypeStyle {
     debug_assert!(
         size_px >= FLOOR_PX,
-        "below DESIGN §3's 10px floor: {size_px}"
+        "below DESIGN §2.4's 12px floor: {size_px}"
     );
     TypeStyle {
         font: family_font(SPLINE_SANS_MONO, weight, true),
@@ -120,6 +134,65 @@ pub fn mono(size_px: f32, weight: FontWeight) -> TypeStyle {
 /// the text content, not just its style).
 pub fn head() -> TypeStyle {
     label(SECTION_HEAD_PX, FontWeight::BOLD)
+}
+
+// -- REDESIGN §1.1 roles -------------------------------------------------------
+// Whole pixels, tabular figures on every role that can hold digits (Inter's
+// `tnum` does not change a letter). A label that acts is 500, one that
+// describes is 400; colour never carries the weight alone.
+
+/// Transport timecode: 22px Spline Sans Mono 500, the only mono in the UI.
+pub const TIMECODE_PX: f32 = 22.;
+/// Dialog / sheet titles, empty-state headline.
+pub const TITLE_PX: f32 = 16.;
+/// Dock tab labels, primary button text, palette input.
+pub const EMPH_PX: f32 = 14.;
+/// Menus, inspector labels, media names, lists, settings.
+pub const BODY_PX: f32 = 13.;
+/// Clip names, ruler labels, secondary lines, status bar, keys, field values.
+pub const CAPTION_PX: f32 = 12.;
+/// Line heights that go with the sizes (px), for rows that pin their height.
+pub const TIMECODE_LH: f32 = 28.;
+pub const TITLE_LH: f32 = 22.;
+pub const EMPH_LH: f32 = 20.;
+pub const BODY_LH: f32 = 18.;
+pub const CAPTION_LH: f32 = 16.;
+
+/// 16/22 Inter 600.
+pub fn title() -> TypeStyle {
+    label_tabular(TITLE_PX, FontWeight::SEMIBOLD)
+}
+/// 14/20 Inter 500.
+pub fn emph() -> TypeStyle {
+    label_tabular(EMPH_PX, FontWeight::MEDIUM)
+}
+/// 13/18 Inter 400 -- text that describes.
+pub fn body() -> TypeStyle {
+    label_tabular(BODY_PX, FontWeight::NORMAL)
+}
+/// 13/18 Inter 500 -- body text that acts (buttons, menu rows, toolbar words).
+pub fn body_strong() -> TypeStyle {
+    label_tabular(BODY_PX, FontWeight::MEDIUM)
+}
+/// 12/16 Inter 400.
+pub fn caption() -> TypeStyle {
+    label_tabular(CAPTION_PX, FontWeight::NORMAL)
+}
+/// 12/16 Inter 500 (clip names, active captions).
+pub fn caption_strong() -> TypeStyle {
+    label_tabular(CAPTION_PX, FontWeight::MEDIUM)
+}
+/// 12/16 Inter 600, sentence case: inspector section heads, card group labels.
+/// gpui 0.2.2 has no letter-spacing, so no uppercase and no tracking.
+pub fn section() -> TypeStyle {
+    label_tabular(CAPTION_PX, FontWeight::SEMIBOLD)
+}
+/// 22/28 Spline Sans Mono 500 with `tnum`: the transport timecode only.
+pub fn timecode() -> TypeStyle {
+    TypeStyle {
+        font: family_font(SPLINE_SANS_MONO, FontWeight::MEDIUM, true),
+        size: px(TIMECODE_PX),
+    }
 }
 
 /// Applies a [`TypeStyle`] to any styled element in one call --
@@ -148,6 +221,18 @@ const EMBEDDED: &[(&[u8], &str)] = &[
     (
         include_bytes!("../../../../assets/fonts/Archivo-Bold.ttf"),
         "Archivo-Bold.ttf",
+    ),
+    (
+        include_bytes!("../../../../assets/fonts/Inter-Regular.ttf"),
+        "Inter-Regular.ttf",
+    ),
+    (
+        include_bytes!("../../../../assets/fonts/Inter-Medium.ttf"),
+        "Inter-Medium.ttf",
+    ),
+    (
+        include_bytes!("../../../../assets/fonts/Inter-SemiBold.ttf"),
+        "Inter-SemiBold.ttf",
     ),
     (
         include_bytes!("../../../../assets/fonts/SplineSansMono-Medium.ttf"),
@@ -183,7 +268,7 @@ mod tests {
     use super::*;
     use gpui::FontStyle;
 
-    /// The scale never drifts below DESIGN §3's floor, and role sizes match
+    /// The scale never drifts below DESIGN §2.4's floor, and role sizes match
     /// the numbers §3 names -- a call site changing `18.` to `17.` for the
     /// hero timecode is the design contract silently moving.
     ///
@@ -200,7 +285,7 @@ mod tests {
         assert_eq!(CHORD_METADATA_MAX_PX, 14.);
         assert_eq!(CHORD_METADATA_MIN_PX, 13.);
         assert_eq!(SECTION_HEAD_PX, 12.);
-        assert_eq!(FLOOR_PX, 10.);
+        assert_eq!(FLOOR_PX, 12.);
         for size in [
             HERO_TIMECODE_PX,
             LABEL_ROW_PX,
@@ -233,7 +318,7 @@ mod tests {
         assert_eq!(m.font.style, FontStyle::Normal);
 
         let l = label(LABEL_ROW_PX, FontWeight::MEDIUM);
-        assert_eq!(l.font.family.as_ref(), ARCHIVO);
+        assert_eq!(l.font.family.as_ref(), INTER);
         assert!(l.font.features.tag_value_list().is_empty());
         assert_eq!(l.font.style, FontStyle::Normal);
     }
@@ -241,9 +326,9 @@ mod tests {
     /// `head()` is exactly what DESIGN §3 names for section heads: Archivo,
     /// 700, `SECTION_HEAD_PX`.
     #[test]
-    fn head_is_archivo_bold_at_section_head_size() {
+    fn head_is_inter_bold_at_section_head_size() {
         let h = head();
-        assert_eq!(h.font.family.as_ref(), ARCHIVO);
+        assert_eq!(h.font.family.as_ref(), INTER);
         assert_eq!(h.font.weight, FontWeight::BOLD);
         assert_eq!(h.size, px(SECTION_HEAD_PX));
     }
@@ -253,10 +338,35 @@ mod tests {
     /// without also landing in `assets/fonts/` is a build break, not a
     /// silent gap.
     #[test]
-    fn five_static_weights_are_embedded() {
-        assert_eq!(EMBEDDED.len(), 5);
+    fn eight_static_faces_are_embedded() {
+        assert_eq!(EMBEDDED.len(), 8);
         for (bytes, name) in EMBEDDED {
             assert!(!bytes.is_empty(), "{name} embedded empty");
+        }
+    }
+
+    /// REDESIGN §1.1: the role table, whole pixels, nothing under the floor,
+    /// Inter everywhere but the timecode.
+    #[test]
+    fn the_redesign_roles_match_the_spec() {
+        let roles = [
+            (title(), 16., FontWeight::SEMIBOLD),
+            (emph(), 14., FontWeight::MEDIUM),
+            (body(), 13., FontWeight::NORMAL),
+            (body_strong(), 13., FontWeight::MEDIUM),
+            (caption(), 12., FontWeight::NORMAL),
+            (caption_strong(), 12., FontWeight::MEDIUM),
+            (section(), 12., FontWeight::SEMIBOLD),
+        ];
+        for (style, size, weight) in roles {
+            assert_eq!(style.size, px(size));
+            assert_eq!(style.font.weight, weight);
+            assert_eq!(style.font.family.as_ref(), INTER);
+        }
+        let t = timecode();
+        assert_eq!((t.size, t.font.family.as_ref()), (px(22.), SPLINE_SANS_MONO));
+        for (px_, lh) in [(TITLE_PX, TITLE_LH), (EMPH_PX, EMPH_LH), (BODY_PX, BODY_LH), (CAPTION_PX, CAPTION_LH)] {
+            assert!(lh > px_ && lh.fract() == 0.);
         }
     }
 }

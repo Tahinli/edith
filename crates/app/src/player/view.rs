@@ -3,6 +3,14 @@
 
 use crate::*;
 
+/// The share of the bed a fit spreads the whole edit across: the rest is the
+/// margin on the right, so the last frame never sits against the bed's edge
+/// (DESIGN §7, about 2%).
+const FIT_SHARE: f32 = 0.98;
+
+/// The margin Zoom to selection leaves either side of the selected span, as a share of its length.
+const SELECTION_MARGIN: f64 = 0.05;
+
 impl Player {
     /// The one place a clip becomes *the* selected one: a plain click, a
     /// right-click that opens the menu, and every selection key go through
@@ -11,7 +19,15 @@ impl Player {
     /// because one click names one thing; [`Player::pick`] is the ctrl+click
     /// that grows the selection instead.
     pub(crate) fn select(&mut self, target: (Lane, usize), cx: &mut Context<Self>) {
+        // A locked lane refuses selection (DESIGN §7): the item stays where it
+        // is and the toast offers the unlock.
+        if self.lane_locked_refusal(target.0) {
+            return;
+        }
+        self.drop_title_selection(cx);
+        self.drop_sel_cue();
         self.selected.set_one(target);
+        self.gap = None;
         cx.notify();
     }
 
@@ -26,11 +42,31 @@ impl Player {
     /// `on_click`), which is why every box on the bed asks this one for the
     /// press and its own click listener for the collapse.
     pub(crate) fn pick(&mut self, target: (Lane, usize), ctrl: bool, cx: &mut Context<Self>) {
+        if self.lane_locked_refusal(target.0) {
+            return;
+        }
+        self.drop_title_selection(cx);
+        self.drop_sel_cue();
         match ctrl {
             true => self.selected.toggle(target),
             false if self.selected.contains(target) => {}
             false => self.selected.set_one(target),
         }
+        self.gap = None;
+        // A picked envelope key belongs to the clip it sits on; another clip takes it away.
+        if self.gain_pick.is_some_and(|(l, i, _)| (l, i) != target) {
+            self.gain_pick = None;
+        }
+        cx.notify();
+    }
+
+    /// Empties every kind of pick the timeline holds at once: clips, a picked gap, a title and a
+    /// caption. Escape does this, so the one thing left picked is always the one named last.
+    pub(crate) fn clear_picks(&mut self, cx: &mut Context<Self>) {
+        self.selected = Selection::new();
+        self.gap = None;
+        self.drop_title_selection(cx);
+        self.drop_sel_cue();
         cx.notify();
     }
 
@@ -55,7 +91,7 @@ impl Player {
     pub(crate) fn select_under_playhead(&mut self, cx: &mut Context<Self>) {
         let under = self.under_playhead();
         let Some(&first) = under.first() else {
-            self.notify_user("NOTHING UNDER THE PLAYHEAD".into());
+            self.notify_user("Nothing under the playhead".into());
             cx.notify();
             return;
         };
@@ -102,6 +138,11 @@ impl Player {
         };
         let mut selected = Selection::new();
         for lane in session.lanes() {
+            // A locked lane's items are not selectable, so Select All leaves
+            // them out rather than marking what the next edit would refuse.
+            if session.lane_locked(lane) {
+                continue;
+            }
             let len = match lane.kind {
                 LaneKind::Subtitle => session.sub_lane(lane).len(),
                 _ => session.lane_clips(lane).len(),
@@ -114,63 +155,48 @@ impl Player {
         if self.selected.is_empty() {
             // A key that does nothing looks broken: an empty timeline has
             // nothing to select, and that is a thing to say rather than skip.
-            self.notify_user("NOTHING TO SELECT — the timeline is empty".into());
+            self.notify_user("Nothing to select: the timeline is empty".into());
         }
         cx.notify();
     }
 
-    /// Cycles the fit policy of the clip the picture is coming from -- the
+    /// Opens the list of fit policies for the clip the picture is coming from -- the
     /// clicked one when it is a video clip, else the composite's own, exactly as
-    /// the colour card picks its target. A whole card for one four-valued
-    /// setting would be a card to close; a stroke that cycles it and says what
-    /// it landed on is the same setting with nothing to dismiss.
+    /// the colour card picks its target -- at `at`, the one in force ticked.
     ///
     /// Only means anything when the clip is not the project's size -- a clip
     /// that already fills the canvas looks the same under all four -- so the
-    /// notice says the size it is placing, not just the word.
-    pub(crate) fn cycle_fit(&mut self, cx: &mut Context<Self>) {
+    /// notice after a pick says the size it is placing, not just the word.
+    pub(crate) fn open_fit_list(&mut self, at: Point<Pixels>, cx: &mut Context<Self>) {
         if self.exporting().is_some() {
             return;
         }
-        let Some(session) = &mut self.session else {
-            self.notify_user("NOTHING TO FIT — no file open".into());
-            cx.notify();
-            return;
-        };
+        match self.fit_target() {
+            Ok((lane, idx)) => self.open_picker(Pick::Fit(lane, idx), at, cx),
+            Err(why) => {
+                self.notify_user(why.into());
+                cx.notify();
+            }
+        }
+    }
+
+    /// The clip the fit list is about, or why there is none.
+    pub(crate) fn fit_target(&self) -> Result<(Lane, usize), &'static str> {
+        let session = self.session.as_ref().ok_or("Nothing to fit: no file open")?;
         // A caption the hand is on names the clip it was pinned to, and the
         // policy is that clip's; one in no group has no picture to fit and it
         // says so, rather than fitting the playhead's clip behind the hand's
         // back.
         let target = match self.selected.anchor() {
-            // A caption the hand is on names the clip it was pinned to, and the
-            // policy is that clip's; one in no group has no picture to fit and
-            // it says so, rather than fitting the playhead's clip behind the
-            // hand's back.
             Some((lane, idx)) if lane.kind == LaneKind::Subtitle => {
-                match caption_media_half(session, (lane, idx), LaneKind::Video) {
-                    Some(half) => Some(half),
-                    None => {
-                        self.notify_user(
-                            "NOTHING TO FIT — a caption has no picture"
-                                .into(),
-                        );
-                        cx.notify();
-                        return;
-                    }
-                }
+                Some(caption_media_half(session, (lane, idx), LaneKind::Video).ok_or("Nothing to fit: a caption has no picture")?)
             }
             // A sound half has no picture of its own: the playhead's clip, as
             // it always was.
             Some((lane, _)) if lane.kind == LaneKind::Audio => session.video_clip_at(session.now()),
             other => other.or_else(|| session.video_clip_at(session.now())),
         };
-        let Some((lane, idx)) = target else {
-            self.notify_user("NOTHING TO FIT — no clip under the playhead".into());
-            cx.notify();
-            return;
-        };
-        let next = next_fit(session.fit_of(lane, idx));
-        self.apply_fit(lane, idx, next, cx);
+        target.ok_or("Nothing to fit: no clip under the playhead")
     }
 
     /// One clip's fit policy set, whichever asked: the stroke that steps to the
@@ -198,7 +224,7 @@ impl Player {
             // and the close gate itself ([`Player::act`]'s list is the action
             // doors only).
             self.mark_dirty();
-            self.notify_user(format!("FIT POLICY: {} on {w}x{h}", fit_label(fit)).into());
+            self.notify_user(format!("Fit to frame: {} on {w}x{h}", fit_label(fit)).into());
             self.reset_after_reseek();
         }
         cx.notify();
@@ -231,6 +257,9 @@ impl Player {
         // bed, so this is given back on the very next frame and only a zoom
         // that took the head off screen -- ctrl+wheel away from it -- holds.
         self.panned = true;
+        // A hand's zoom ends a fit that was following the bed: from here the
+        // scale is the hand's, and a resized window keeps it.
+        self.fitted_bed = None;
         cx.notify();
     }
 
@@ -238,8 +267,79 @@ impl Player {
     /// thing that reads the timeline's own length to decide how wide a second
     /// is drawn.
     pub(crate) fn zoom_fit(&mut self, cx: &mut Context<Self>) {
-        self.scale = self.view().fit();
+        // An unpainted bed has no width to fit into: the fit is asked for again
+        // on the first frame that has one ([`Render`]) rather than taken now
+        // against the default scale, which is the 40 px/s a first import used
+        // to land at.
+        match self.view().bed > 0. {
+            true => {
+                self.fit_to_bed();
+                self.fit_pending = false;
+            }
+            false => self.fit_pending = true,
+        }
         cx.notify();
+    }
+
+    /// View > Zoom to selection: the view fitted to the span the selected clips cover, with a
+    /// margin of [`SELECTION_MARGIN`] of that span either side. The oracle refuses it with
+    /// nothing selected, so the empty case here only leaves the view as it is.
+    pub(crate) fn zoom_to_selection(&mut self, cx: &mut Context<Self>) {
+        let Some((from, to)) = self.selection_span() else {
+            cx.notify();
+            return;
+        };
+        let view = self.view();
+        if view.bed <= 0. {
+            cx.notify();
+            return;
+        }
+        let margin = (to - from) * SELECTION_MARGIN;
+        let from = (from - margin).max(0.);
+        let len = (to + margin - from).max(1. / self.fps);
+        let pps = f64::from(view.bed) / len;
+        self.scale = View {
+            scale: Scale { pps, start: from },
+            ..view
+        }
+        .settled();
+        // A hand's fit, the same bookkeeping a zoom keeps: the scale is the view's own now.
+        self.panned = true;
+        self.fitted_bed = None;
+        cx.notify();
+    }
+
+    /// The seconds the selected placements cover, first start to last end, or `None` with no
+    /// placement picked.
+    fn selection_span(&self) -> Option<(f64, f64)> {
+        let session = self.session.as_ref()?;
+        let fps = self.fps;
+        let (picks, _) = self.marks();
+        let frames = picks.iter().filter_map(|&(lane, idx)| match lane.kind {
+            LaneKind::Subtitle => session.sub_lane(lane).get(idx).map(|s| (s.start, s.start + s.frames)),
+            _ => session.lane_clips(lane).get(idx).map(|c| (c.start, c.end())),
+        });
+        let (start, end) = frames.fold(None, |acc: Option<(u32, u32)>, (a, b)| match acc {
+            None => Some((a, b)),
+            Some((x, y)) => Some((x.min(a), y.max(b))),
+        })?;
+        Some((f64::from(start) / fps, f64::from(end) / fps))
+    }
+
+    /// The whole timeline across the bed, with the margin ([`FIT_SHARE`]), and
+    /// the bed width it was worked out for. That width is what keeps the fit
+    /// sticky: while it still matches the bed, nothing refits, and a window the
+    /// compositor resizes -- the first frame measures the initial size -- is
+    /// refitted by [`Render`] the next frame. Only a bed that has been measured
+    /// is fitted, so a zero width is never stored.
+    pub(crate) fn fit_to_bed(&mut self) {
+        let view = self.view();
+        self.scale = View {
+            bed: view.bed * FIT_SHARE,
+            ..view
+        }
+        .fit();
+        self.fitted_bed = Some(view.bed);
     }
 
     /// Slides the view along the timeline by `notches` of the wheel, later in
@@ -258,6 +358,8 @@ impl Player {
         // playhead: while playing it wins over the follow, which is what every
         // editor does with a scroll during playback.
         self.panned = true;
+        // A scroll is a hand's view too: it ends the sticky fit.
+        self.fitted_bed = None;
         cx.notify();
     }
 
@@ -266,24 +368,22 @@ impl Player {
     /// scroll answers to. No reseek, no worker -- the view is the only thing
     /// moving.
     pub(crate) fn scroll_drag_to(&mut self, x: Pixels, cx: &mut Context<Self>) {
+        let at = px_along(x, self.scroll_track.get());
+        self.pan_window_to(at, cx);
+    }
+
+    /// The window follows a drag held by `scroll_drag`: `at` is how far along
+    /// the bed the pointer is, in px. Shared by the scrollbar's thumb and the
+    /// overview's window box (`ui/bench_stance/overview.rs`), so both pan the
+    /// same way. A drag is a hand's view, so it holds against the follow and
+    /// ends the sticky fit.
+    pub(crate) fn pan_window_to(&mut self, at: f32, cx: &mut Context<Self>) {
         let Some(grab) = self.scroll_drag else {
             return;
         };
-        let view = self.view();
-        let at = px_along(x, self.scroll_track.get());
-        // The thumb's grabbed point under the pointer names the start, in the
-        // track's own proportion. `settled` owns the ends -- and on a timeline
-        // so long the thumb sits at its floor width, the last stretch of track
-        // is the clamp's to hold, exactly as every scrollbar's is.
-        let start = f64::from((at - grab).max(0.)) / f64::from(view.bed.max(1.)) * view.duration;
-        self.scale = View {
-            scale: Scale {
-                start,
-                ..view.scale
-            },
-            ..view
-        }
-        .settled();
+        self.scale = panned_view(self.view(), at, grab);
+        self.panned = true;
+        self.fitted_bed = None;
         cx.notify();
     }
 
@@ -317,9 +417,9 @@ impl Player {
 
     /// One notch of the wheel anywhere over the timeline -- the ruler or a
     /// lane's bed alike, since a hand aims at the clip it is working on and not
-    /// at the strip above it. Ctrl zooms about the pointer, bare scrolls the
-    /// view along: the mapping Premiere, Movavi and CapCut share, and the one
-    /// the user named.
+    /// at the strip above it. Ctrl zooms about the pointer, Shift (or a sideways
+    /// swipe) scrolls the view along, and a bare wheel scrolls the lanes when
+    /// more lie below -- else it runs the view along: the NLE convention.
     ///
     /// The anchor is measured off the ruler's probe wherever the pointer is,
     /// because that probe *is* the bed's x-to-time mapping ([`HEADER_W`]) and
@@ -333,17 +433,46 @@ impl Player {
             true => ZOOM_STEP,
             false => 1. / ZOOM_STEP,
         };
-        match event.modifiers.control {
-            true => {
-                let anchor = px_along(event.position.x, self.ruler.get());
-                self.zoom(factor, Some(anchor), cx);
-            }
-            // Up is back towards the head of the timeline, the way a wheel up
-            // is back towards the top of a page -- and wheel DOWN runs the
-            // film forward. Flipped to "up is later" earlier on 2026-08-21 and
-            // reverted the same day: the user drove it and wanted the page
-            // reading back.
-            false => self.scroll_view(-d.signum(), cx),
+        let (dx, dy) = match event.delta {
+            ScrollDelta::Lines(l) => (l.x, l.y),
+            ScrollDelta::Pixels(p) => (f32::from(p.x), f32::from(p.y)),
+        };
+        if event.modifiers.control {
+            // Ctrl zooms about the pointer, the NLE convention.
+            let anchor = px_along(event.position.x, self.ruler.get());
+            self.zoom(factor, Some(anchor), cx);
+        } else if event.modifiers.shift || dx.abs() > dy.abs() {
+            // Shift, or a sideways swipe on a trackpad, runs the view along the film. Up or
+            // left is back towards the head, the way a page reads.
+            self.scroll_view(-d.signum(), cx);
+        } else if f32::from(self.lanes_scroll.max_offset().height) > 0. {
+            // A plain wheel scrolls the stack of lanes when there are more than fit.
+            let by = match event.delta {
+                ScrollDelta::Lines(l) => l.y * 40.,
+                ScrollDelta::Pixels(p) => f32::from(p.y),
+            };
+            let to = self.lanes_taken(-f32::from(self.lanes_scroll.offset().y) - by);
+            self.lanes_scroll.set_offset(point(self.lanes_scroll.offset().x, px(-to)));
+            cx.notify();
+        } else {
+            // Nothing below to scroll to: the wheel runs the film, as it did before.
+            self.scroll_view(-d.signum(), cx);
         }
     }
+}
+
+/// The scale a window drag asks for: the start moves so the point `grab` px
+/// into the window sits under `at` (both px along the bed). `settled` owns
+/// the ends -- a window dragged past either one stops at it, and so does a
+/// thumb on a timeline so long it sits at its floor width.
+pub(crate) fn panned_view(view: View, at: f32, grab: f32) -> Scale {
+    let start = f64::from((at - grab).max(0.)) / f64::from(view.bed.max(1.)) * view.duration;
+    View {
+        scale: Scale {
+            start,
+            ..view.scale
+        },
+        ..view
+    }
+    .settled()
 }

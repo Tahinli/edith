@@ -36,9 +36,9 @@ fn asset(name: &str) -> PathBuf {
 /// rather than whatever the local VA-API driver does.
 fn pin_software() {
     static PIN: Once = Once::new();
-    PIN.call_once(|| unsafe {
-        std::env::set_var("VE_SW", "1");
-        std::env::set_var("VE_SW_ENC", "1");
+    PIN.call_once(|| {
+        engine::envcfg::set("VE_SW", "1");
+        engine::envcfg::set("VE_SW_ENC", "1");
     });
 }
 
@@ -235,10 +235,23 @@ fn the_mp4_copy_follows_the_lane_that_holds_the_sound() {
     pin_software();
     let source = asset("test_av.mp4");
     let clip = Clip {
+        speed_keys: Vec::new(),
+        reversed: false,
+        stabilise: None, deinterlace: Default::default(), mark: Default::default(),
+        angle: Default::default(),
         fade_in: 0,
         transition_out: 0,
+        transition_kind: Default::default(),
         visualizer: 0,
         viz_paint: 0,
+        gain_db: 0.0,
+        gain_keys: Vec::new(),
+        pan: 0,
+        pitch: 0,
+        transform_keys: Vec::new(),
+        opacity_keys: Vec::new(),
+        color_keys: Vec::new(),
+        effects: Vec::new(),
         fade_out: 0,
         start: 0,
         in_frame: 0,
@@ -254,9 +267,9 @@ fn the_mp4_copy_follows_the_lane_that_holds_the_sound() {
     let project = Project::from_parts(
         vec![Source::new(&source, 0)],
         vec![
-            (LaneKind::Video, vec![clip]),
+            (LaneKind::Video, vec![clip.clone()]),
             (LaneKind::Audio, Vec::new()),
-            (LaneKind::Audio, vec![clip]),
+            (LaneKind::Audio, vec![clip.clone()]),
         ],
         vec![],
         vec![],
@@ -303,11 +316,24 @@ fn two_audio_lanes_are_summed() {
     let one_lane = Project::single(asset("test_av.mp4"), TOTAL);
     let mut project = one_lane.clone();
     let doubled = Clip {
+        speed_keys: Vec::new(),
+        reversed: false,
+        stabilise: None, deinterlace: Default::default(), mark: Default::default(),
+        angle: Default::default(),
         fade_in: 0,
         fade_out: 0,
         transition_out: 0,
+        transition_kind: Default::default(),
         visualizer: 0,
         viz_paint: 0,
+        gain_db: 0.0,
+        gain_keys: Vec::new(),
+        pan: 0,
+        pitch: 0,
+        transform_keys: Vec::new(),
+        opacity_keys: Vec::new(),
+        color_keys: Vec::new(),
+        effects: Vec::new(),
         start: TOP_IN,
         in_frame: TOP_IN,
         out_frame: TOP_OUT,
@@ -334,11 +360,13 @@ fn two_audio_lanes_are_summed() {
         };
         let handle = engine::export::start(project, meta, &out, &settings, None);
         wait(&handle, Duration::from_secs(120)).expect("wav export");
-        let mut reader = hound::WavReader::open(&out).expect("reopen the wav");
+        let mut reader = ec_riff::WavReader::open(&out).expect("reopen the wav");
         let spec = reader.spec();
         let samples: Vec<f64> = reader
-            .samples::<i16>()
-            .map(|s| f64::from(s.expect("sample")))
+            .read_all_i32()
+            .expect("samples")
+            .into_iter()
+            .map(f64::from)
             .collect();
         std::fs::remove_file(&out).unwrap();
         (spec, samples)
@@ -499,9 +527,9 @@ fn a_subtitle_lane_is_a_peer_and_every_media_path_refuses_it() {
     assert!(!project.delete_in(s1, 0), "nothing to delete");
 
     // ...and the three doors that could still have put a picture on one.
-    let clip = *project.lane(Lane::V1).first().expect("V1 holds the film");
-    assert!(!project.place(s1, 0, clip), "a picture may not be placed on it");
-    assert!(!project.place_take(s1, 0, clip), "nor a whole take");
+    let clip = project.lane(Lane::V1).first().expect("V1 holds the film").clone();
+    assert!(!project.place(s1, 0, clip.clone()), "a picture may not be placed on it");
+    assert!(!project.place_take(s1, 0, clip.clone()), "nor a whole take");
     assert!(!project.move_clip(Lane::V1, 0, s1, 0), "nor dragged onto it");
     project.append_clip(0, 30);
     assert!(
@@ -511,7 +539,7 @@ fn a_subtitle_lane_is_a_peer_and_every_media_path_refuses_it() {
     assert!(project.undo(), "the import is one step");
     let refused = Project::from_parts(
         vec![Source::new(asset("test_av.mp4"), 0)],
-        vec![(LaneKind::Subtitle, vec![clip])],
+        vec![(LaneKind::Subtitle, vec![clip.clone()])],
         Vec::new(),
         Vec::new(),
         Vec::new(),
@@ -565,7 +593,7 @@ fn a_paste_never_touches_the_captions() {
         .expect("a caption over the first two seconds");
     let before = project.sub_lane(s1).to_vec();
 
-    let clip = *project.lane(Lane::V1).first().expect("V1 holds the film");
+    let clip = project.lane(Lane::V1).first().expect("V1 holds the film").clone();
     let pasted = Clip {
         fade_in: 0,
         fade_out: 0,
@@ -582,4 +610,46 @@ fn a_paste_never_touches_the_captions() {
     );
     assert!(project.undo(), "and the paste is one step for the lot");
     assert_eq!(project.sub_lane(s1), &before[..], "the caption never noticed");
+}
+
+/// One edit, by name, on a fresh session of `test_av.mp4`. Every one is a
+/// single history step; the depth it moves by is what this test pins down.
+fn edit_by_name(s: &mut PlaybackSession, name: &str) -> bool {
+    match name {
+        "cut_at" => s.cut_at(2.0),
+        "move_clip_to" => s.move_clip_to(Lane::V1, 0, Lane::V1, 150),
+        "trim_clip" => s.trim_clip(Lane::V1, 0, engine::project::Edge::End, 60),
+        "delete_clip" => s.delete_clip(Lane::V1, 0),
+        "set_fade_in" => s.set_fade_in(Lane::V1, 0, 10),
+        "set_lane_gain_db" => s.set_lane_gain_db(Lane::A1, -3.0),
+        other => panic!("no edit named {other}"),
+    }
+}
+
+#[test]
+fn undo_depth_counts_one_step_per_edit() {
+    let mut counts = Vec::new();
+    for name in [
+        "cut_at",
+        "move_clip_to",
+        "trim_clip",
+        "delete_clip",
+        "set_fade_in",
+        "set_lane_gain_db",
+    ] {
+        let mut s = PlaybackSession::open(asset("test_av.mp4")).expect("open");
+        s.set_gain(0.0);
+        assert_eq!((s.undo_depth(), s.redo_depth()), (0, 0), "{name}: fresh");
+        let before = s.undo_depth();
+        assert!(edit_by_name(&mut s, name), "{name} applied");
+        let pushed = s.undo_depth() - before;
+        counts.push((name, pushed));
+        assert_eq!(pushed, 1, "{name} pushes exactly one snapshot");
+        // An undo moves that one step onto the redo side, and a redo brings it back.
+        assert!(s.undo());
+        assert_eq!((s.undo_depth(), s.redo_depth()), (0, 1), "{name}: undone");
+        assert!(s.redo());
+        assert_eq!((s.undo_depth(), s.redo_depth()), (1, 0), "{name}: redone");
+    }
+    eprintln!("undo snapshots per edit: {counts:?}");
 }

@@ -1,364 +1,453 @@
-# edith — Design Language: The Darkroom
+# edith — Design
 
-This document is the binding design contract for edith's UI. It was distilled from the approved
-concept mock ("Darkroom", 2026-08-20) and it outlives that mock: every existing surface is being
-rebuilt to this language, and **every future feature must be designed inside it**. When a change
-cannot be expressed in this language, the language gets amended here first — in the same diff —
-never silently violated.
+This is the binding design contract for edith, a desktop video editor. It is written for the agents who implement it. Every rule is checkable. Where this document is silent, the reference artifact is the answer.
 
-Visual reference (playable mock, v16).
+**Reference artifact** (the approved visual reference). It has three tabs: "Main screen", "Panels" and "Keys".
+
+**Precedence:** where this document and the mock disagree, this document wins. Where this document is silent, the mock is the reference.
+
+Contents: 1 Thesis · 2 Tokens · 3 Identity elements · 4 Comfort rules · 5 Layout · 6 Regions · 7 Timeline behaviour · 8 Feedback · 9 Tool panels · 10 Keys · 11 Adding a feature · 12 Implementation plan
 
 ---
 
 ## 1. Thesis
 
-**The film paints the tool. The tool itself is achromatic.**
+edith is still the darkroom. Its chrome is colourless. The only colour comes from the footage, in the form of film inks. Pure white is the lamp: the playhead, its tab, and splice flashes.
 
-edith is a darkroom: a dim, stable, monochrome room whose only colors are extracted from the
-footage on the bench, and whose only pure white is the lamp — the playhead and the splices.
-The editor sits in this room for eight to twelve hours; everything below exists to keep that
-person in their groove.
+**What changed.** The previous design ("Darkroom", 2026-08, deleted 2026-10-15) was optimised for an expert who already knew every key. Round after round it removed visible controls. The result:
 
-Three laws derive everything else:
+- 48 of its 77 actions had no visible control.
+- Text was dim 13px (3.4:1 and 2.0:1 contrast).
+- Hit targets were 6–13px.
+- The timeline was a cramped 200px.
+- Feedback was invisible.
 
-1. **Chrome is achromatic.** No panel, button, tab, slider, or scrollbar carries a hue. Loudness
-   is luminance, never saturation.
-2. **Film-extracted inks are the only color.** Each source contributes one ink, quantized from
-   its own frames (hue kept; saturation/lightness clamped into the WCAG-passing band). Inks mark
-   *identity* — spines, waveforms, traces, dots — never chrome.
-3. **White is the lamp.** `#FFFFFF` is reserved for the playhead, its flag, and splice marks.
-   Nothing else may be pure white.
+The user found it "hard to use… not comfortable".
+
+**New thesis: keep the room, light the tools.** Every command is visible somewhere, readable, and big enough to hit. Keys are accelerators. They are never the only door.
+
+**Three laws**
+
+1. **Chrome is achromatic.** Film inks mark identity only: spines, waveforms, the overview strip, dots, meters and curves.
+2. **Comfort rules (§4) are hard floors, not taste.**
+3. **Identity is kept, not calmed.** The user explicitly chose the first draft over a "calmer" one ("first draft feels more original"). Do not tone down the identity elements listed in §3.
+
+---
 
 ## 2. Tokens
 
-Surfaces (dark-only; no light theme, ever):
+### 2.1 Surfaces and inks (default palette)
 
-| Token | Value | Role |
+These are the mock's values.
+
+| Token | Hex | Use |
 |---|---|---|
-| `canvas` | `#050607` | app ground, bench background |
-| `panel` | `#0E1013` | dock, ledger, plates' parent surfaces |
-| `raised` | `#14171B` – `#17191D` | hover fill step, active verb fill |
-| `hairline` | `#22262B` | 1px separations *within* a panel |
-| seam | `rgba(0,0,0,.7)` | 1px panel-to-panel boundary |
-| plate | `#050607` on `panel` | readout/notice/menu/cue body |
+| canvas | `#0B0C0E` | Window background, viewer surround |
+| panel | `#131518` | Dock, lane heads, status bar |
+| raised | `#1B1E22` | Buttons, fields, the Play button |
+| hover | `#24282D` | Hover fill |
+| hairline | `#2A2E34` | Dividers only (decorative; need not reach 3:1) |
+| edge | `#6E757D` | Boundary of a control that must read as a control (Export chip, fields, tracks). ≥3:1 on canvas, panel, raised and hover (WCAG 1.4.11) |
+| seam | `#000000` | Gaps between regions |
+| ink1 | `#E8EAED` | Primary text |
+| ink2 | `#B4BAC1` | Secondary text |
+| ink3 | `#8D959E` | Labels, keys, metadata. ≥4.5:1 on canvas and panel |
+| ink4 | `#777F88` | Disabled controls **only**. Never for information. Spec: ≥3.6:1 on canvas, panel, raised and hover (3.7 on hover, 5.0 on canvas). Disabled is exempt from WCAG 1.4.3, and staying below ink3 (≥4.9) keeps disabled distinguishable from enabled |
+| lamp | `#FFFFFF` | Playhead only |
+| warn | `#D1B564` | Warnings |
+| err | `#E07A7A` | Errors. ≥4.5:1 on every surface including hover (5.1) |
 
-Ink (text) ladder — four levels, all WCAG ≥4.5:1 on their surfaces:
+### 2.2 Film inks
 
-| Token | Value | Role |
+- Extracted per source at import. The hue is kept. Saturation and lightness are clamped so each ink passes 3:1 on canvas.
+- Reference inks: azure `#64B5D1`, magenta `#D164B5`, green `#64D19A`.
+- The colour wheel caps at 12 hues.
+
+### 2.3 Palettes
+
+- Other palettes in Settings stay selectable.
+- Every palette must pass the contrast numbers in §4. A palette that does not pass is a bug.
+- The guard test `no_colour_is_written_outside_the_theme` stays. No colour literal may appear at a call site.
+
+### 2.4 Type
+
+- **Archivo** is the UI voice (weights 400, 500, 700).
+- **Spline Sans Mono** is for data: timecode, keys, values and metadata.
+
+| Role | Size | Face |
 |---|---|---|
-| `ink1` | `#E6E9EC` | primary: values, active labels, timecode digits |
-| `ink2` | `#9BA3AC` | secondary: labels, resting verbs, cue text |
-| `ink3` | `#5E656D` | tertiary: chords at rest, metadata, section heads |
-| `ink4` | `#3C4249` | faintest: decaying notices, dimmed-room hints |
+| Transport timecode | 20px | Mono 500 |
+| Panel titles | 15px | Archivo 700 |
+| Body, labels, buttons | 14px | Archivo 500 |
+| Keys and values | 13px | Mono |
+| Section heads (uppercase, +0.08em, ink3) and ruler labels | 12px | — |
 
-Film inks: extracted per source at import (quantize dominant hues → clamp S/L into the contrast
-band). Reference extraction from the standing test frame: azure `#64B5D1`, magenta `#D164B5`,
-green `#64D19A`, violet `#7F64D1`, teal `#64D1D1`. The wheel caps at **12 hues**; beyond 12,
-hues repeat and the name plate carries identity (the dot was always the secondary cue).
-Selection uses the complement-leaning second ink (magenta against azure), not a chrome accent.
+- **12px is the floor.**
+- Whole pixels only.
+- Use tabular figures wherever digits align.
 
-**Ink demotion rule:** extraction is ambient — it just happens. Re-inking a source is a
-once-a-project act and lives behind right-click on the source's dot. Ink controls never occupy
-the Sources tab, a toolbar, or any burst-use surface.
+### 2.5 Radii and shadow
 
-**Safelight:** the empty room (no footage) is warm monochrome (`#0A0908` family) with amber
-`#FF9D57` on exactly one glyph. When footage lands, a 900ms skippable film-leader fade hands the
-room to the film's inks. The 12 legacy palettes survive only as safelight hue choices.
+- 0px: clips, lanes, regions.
+- 4px: buttons, chips, fields.
+- 6px: menus, sheets, toasts.
+- Shadow appears only on floating plates: menus, the command palette, sheets and toasts.
 
-Guard: the existing `no_colour_is_written_outside_the_theme` test remains the enforcement
-mechanism — every value above is a theme token, never a literal at a call site.
+---
 
-## 3. Type
+## 3. Identity elements
 
-Two faces, fixed roles (bundled, no runtime deps):
+Keep these exactly. Do not "clean them up".
 
-- **Archivo** — the room's voice: labels, verbs, section heads. Weights 400/500/700.
-- **Spline Sans Mono** — everything the film says: timecode, chords, readouts, metadata,
-  cue text, the ledger. Mono = data; if a string is *about the footage or a key*, it is mono.
+- **Overview strip.** A 14px band above the ruler. Each clip is drawn in its film ink across its span. Audio appears as thin translucent slivers. A white playhead tick sits on it. A draggable 1px ink1 window box marks the visible area.
+- **Words on the toolbar.** Every edit-toolbar button shows glyph, word and key, for example `✂ Split S`. Only zoom − and + are glyph-only.
+- **Typographic lane glyphs.** ◉ hides (video and subtitle), ♪ mutes (audio), ▣ locks. They are ink3 at rest. When off, the glyph is struck through in ink1. These are not SVG icons. The user chose them.
+- **Clip anatomy.**
+  - A 3px film-ink spine on the left edge.
+  - Film-tinted thumbnails for video, or a waveform in the clip's ink for audio.
+  - View > Audio waveforms (saved with the project's view) off: audio clips are a flat bar in their colour with the name only.
+  - A name plate top-left: mono 12px on a dim plate.
+  - 1px splice gaps between clips.
+- **One box per surface.** The bordered strong button is reserved for the commit action: Export, or Apply and Remove inside a tool. Small bordered `+ Add` buttons in the Media list are the one accepted secondary box. They are per-row, small and ink2.
+- Glyphs are hand-drawn or typographic. No icon asset packs.
 
-Scale: 18px hero timecode (700, colons in `ink3`) · 15px labels/rows (500) · 13–14px chords
-and metadata (500) · 12px section heads (Archivo 700, uppercase, +0.14em letter-spacing, `ink3`).
-Room/column heads are 15px Archivo 700 `ink1`; in-list section heads stay 12px `ink3`
-(2026-09-10 -- the settings columns read as body text and a person could not find them).
-Settings itself is a tab strip since 2026-09-19 (one section shows at a time), so its heads are
-gone: the tabs wear the dock's tab look instead -- 15px Archivo 500, the showing tab marked by a
-1px `ink1` top rule and `ink1` text, the resting one `ink3`.
-Nothing below 10px. Every size is a whole pixel (no half-pixel sizes -- they put glyph baselines
-off the pixel grid and blurred cosmic-text's AA). No italics. Tabular figures wherever digits
-align.
+---
 
-## 4. Ghost grammar — the control language
+## 4. Comfort rules
 
-- **Flow controls are ghosts:** borderless glyph + dim chord (`ink2` glyph, `ink3` chord).
-  Hover = one fill step (`raised`) + ink brighten. Active = `ink1` + fill. No borders, no boxes,
-  no icon assets — glyphs are hand-drawn/typographic.
-- **Boxes are commitments:** the single bordered chip is reserved for commit-class actions
-  (Export). If a second boxed control ever appears on one surface, one of them is wrong.
-- **Readouts are plates:** dark (`canvas`-on-`panel`) rectangles carrying mono text. Notices,
-  menus, chips, cues, and tooltips are all the same plate.
-- **Every command wears its chord**, everywhere it appears — right-click menus, regional verbs,
-  the ledger's room verbs, the KEYS tab. Nothing lives only in a menu; nothing lives only on a
-  key. (This kills the shortcut-sync defect class permanently: the UI *is* the shortcut sheet.)
-- **The most-read element anchors its region** — timecode leads the time band; the film leads
-  the room.
-- Radii: 0 for lanes/clips/room chrome · 2px plates · 3px verbs/controls · 4–6px floating
-  (menus, sheets). No pills, no circles except source dots.
-- Hover never adds hue. Selection ring = 1px `ink1` on the selected thing (lamp-adjacent, not colored); regions never draw a focus ring (user 2026-09-10).
+These are hard floors. Each one is testable.
 
-## 5. The stance — layout
+1. **Contrast.** Any text that carries information is ≥4.5:1 against its surface. ink4 is used only for disabled controls.
+   Non-text: a control's boundary is `edge` (≥3:1). The focus ring is 2px `ink1`, drawn outside the control (no layout shift) on every control that holds keyboard focus. The playhead is 2px at rest, 3px playing, with a 1px `seam` halo either side so it reads on every clip colour. The overview strip's window is a 2px `ink1` box with the film outside it dimmed by `seam`. The guard test `theme::tests::darkroom_token_pairs_meet_their_contrast_spec` fails if any pair drops below spec.
+2. **Size.** Nothing is below 12px. Body text and labels are 14px.
+3. **Targets.**
+   - Every pointer target is ≥24×24px. The hit area may exceed the drawn shape.
+   - Clip trim zones: a 24px invisible hit zone centred on every clip edge (12px inside, 12px outside), with an `ew-resize` cursor. Where two clips meet, the clip on the pointer's side wins. On a clip narrower than 48px, the inside half shrinks so the middle third of the clip stays a move target.
+   - The selected clip also shows solid 12px trim handles.
+   - Fade handles, grips and the playhead tab each have a ≥24px hit area.
+4. **Every action has a visible door.** It appears in the menu bar (§6) with its key. It can also be run from command search (Ctrl+K). The most frequent ~12 actions also sit on the edit toolbar or the transport. Right-click menus are a shortcut to the same verbs. They are never the only home.
+5. **Keys are shown.** Every visible command shows its key, in mono ink3, wherever it appears: toolbar, menus, tooltips and panels.
+6. **No hover-only controls.** Hover may brighten or fill. It never reveals a control that was not drawn.
+7. **Tooltips** appear after 500ms (gpui 0.2.2's fixed delay) and show the name and key. For a disabled control, the tooltip gives the reason it cannot run. Example: Split shows "Put the playhead over a clip".
+8. **Refused actions grey out.** The control is drawn in ink4; its reason is written in ink3, so the reason stays readable. They never vanish. Actions a media kind can never use (EQ on a picture, for example) are hidden in that context. That is a class refusal, not a momentary one.
+9. **Feedback for every action.** Each action produces a toast (§8). There are no silent no-ops.
+10. **Selection and focus.**
+    - A selected clip has a 2px ink1 outline and visible trim handles.
+    - Linked audio selects together with its picture.
+    - A focused region has a 1px ink2 top rule.
+11. **Words.** Use sentence case and plain language. No ALL-CAPS messages. Short hints of ≤6 words are allowed in empty states and empty lanes, for example "Drop a video here" or "Drag media here to layer it". Paragraphs of instruction are not allowed.
+12. **Occlusion.** Nothing covers the picture except menus and dropdowns, the command palette, and the centred Settings sheet. All of these are transient and close on Esc or on a click away. Nothing ever covers the timeline. Export is a dock tab, not a sheet.
 
-Fixed geography; nothing moves, nothing occludes the picture:
+---
+
+## 5. Layout
+
+The default reference size is 1440×860. Proportions scale with the window.
 
 ```
-┌─────────────────────────────────┬──────┐
-│             SCREEN              │      │
-│      (picture — top, never      │ dock │
-│           occluded)             │ Src/ │
-│                                 │ Clip │
-├─────────────────────────────────┤ KEYS │
-│ TIME BAND: timecode → |◂ ▶ ▸|   │ tabs │
-│  → cut 14/37 → contact strip    │      │
-│  (with the in/out grips)        │      │
-│  → [Export]                     │      │
-├─────────────────────────────────┤      │
-│ ruler · lanes  • V1  • A1  • S1  │      │
-├─────────────────────────────────┤      │
-│ name · saved | last action |    │      │
-│  room verbs · position          │      │
-└─────────────────────────────────┴──────┘
++----------------------------------------------------------------------------+
+| menu bar 32 (full width)                                                   |
++-------------------------------------------------------+--------------------+
+| viewer (flex)                                         | dock 320           |
+|                                                       | Media | Clip tabs  |
++-------------------------------------------------------+                    |
+| transport 44                                          |                    |
++-------------------------------------------------------+                    |
+| edit toolbar 44                                       |                    |
++-------------------------------------------------------+                    |
+| overview strip 14                                     |                    |
++-------------------------------------------------------+                    |
+| ruler 26                                              |                    |
++-------------------------------------------------------+                    |
+| lanes                                                 |                    |
++-------------------------------------------------------+--------------------+
+| status bar 30 (full width)                                                 |
++----------------------------------------------------------------------------+
 ```
 
-- **Screen**: the picture. Never covered — not by drawers, notices, drags, or menus. Two-up
-  OUT|IN judging renders *in* the screen at rest on a cut.
-- **Time band**: timecode leads; one transport (`|◂ ▶ ▸|` — frame back, play/pause, frame
-  forward); the cut odometer (`14/37`, and the word `roll` only while roll is armed); the
-  **contact strip** (whole-film motion-trace minimap, viewport bracket with grip notches — click
-  jumps, drag scrubs, the bracket's notches pan; the export range's **in/out marks are two `ink1`
-  grips on the strip at their own film positions**, draggable to set the mark, drawn only once a
-  mark exists and taking the pointer within ±6px); boxed **Export** at the end.
+- **Timeline block.** The block from the edit toolbar down to the lanes defaults to about 42% of window height. The seam between viewer and timeline is draggable, and its position is remembered.
+- **Dock.** It sits on the right. The default width is 320px. It is resizable from 280px up to ⅓ of the window width, and the width is remembered.
+- **Lane heads** are 156px wide. Each shows a 16px source-patch box first (V on video lanes, A on audio lanes; shown only while the source viewer has an item loaded, the slot is reserved otherwise), then a film dot, the name (14px ink1) and the glyph toggles. A lit box sends F9/F10 source edits to that lane.
+- **Lane heights.** Video 64px, audio 52px, subtitle 32px, empty layer 40px. Each is resizable from 28px to 120px by dragging its bottom edge. Double-click resets it.
+- **Scrolling.** Lanes beyond the visible area scroll under a pinned ruler and pinned lane heads.
+- **Clip degradation by width.**
+  - Under 60px: drop the name plate.
+  - Under 24px: drop thumbnails or waveform, leaving a solid ink fill and the spine.
+  - Names ellipsize. They are never cut mid-glyph.
+- **Continuity.** A project reopens exactly as it was left: playhead, selection, zoom, scroll, dock tab, lane heights and splits.
 
-**Amendment (2026-09-10), "cleanse round 2"** (user: "seems cool, let's apply"): the band holds
-five things and nothing else. The shuttle pair (`◀◀ ▶▶`), home/end, the sync points, the loop
-toggle, the monitoring cluster (mute, level slider, percent), the `I O ×` marks trio and `Save`
-all left it — each keeps its chord and its KEYS-tab row, the ruler menu keeps the verbs that act
-on the ruler, the marks became the strip's grips, and the ledger already says `saved`/`unsaved ·
-^s`. The picture's `scale 0.59` corner readout is deleted with them: fit is `^0`, and the number
-was a state nobody acts on.
-- **Bench**: the ruler row, then lanes. Clip anatomy = ink spine (3px left edge) + real
-  thumbnails/waveform in the source's ink + name plate + splice gaps in lamp white. A lane head
-  is a source dot and the lane's name (`• V1`, 60px) and nothing else; the name plate carries
-  the file's name without its extension (`files::stem`), and only once per source — the audio
-  half of a linked insert has no plate, because the picture plate directly above it and the
-  shared dot already say whose it is.
-- **Ledger**: project identity (`name · saved`, extension dropped), last action, export
-  progress, and at the
-  right end, before the position: the **room verbs** as ghosts (`CC t · settings ^, · keys ? ·
-  full f11`) — the four commands that act on the room itself and so have no thing under the
-  cursor to be right-clicked on. `ink3` + chord, hover raises to `ink2` with the room's own
-  plate, `CC` reads `ink1` + fill while subtitles are shown. State lives here, notices rise
-  from here. When the project is unsaved the state word is not a word but a door:
-  `unsaved ^s`, the same room-verb ghost, and clicking it saves — this is Save's home.
-- **Dock** (right, the only side panel): SOURCES tab and CLIP tab; the keys list is dock-body
-  state behind `?` / the ledger's `keys ?`, not a tab (user 2026-09-09).
-  **Cleanse round 2 (2026-09-10):** SOURCES is a filter and *one* list. The filter is the glass
-  alone (`⌕`, no placeholder word); the list holds every source together — picture, sound and
-  subtitle tracks — in arrival order, with no `Media / Audio / Text` sub-tabs, no sort row, no
-  `MEDIA` or `IMPORT` head. A row is: dot · name **without its extension** (ellipsized, ≥60% of
-  the width) · one right-edge ghost `+↵`; under it one metadata line, `H.264 · 01:39:18 · V1 A1`
-  — codec, length, the lanes that play it (no decoder seat, no use count), which is also where a
-  row says what kind it is. Preview is a double-click or the row menu's `Preview`; the stand-in
-  is that menu's `Proxy` plus Settings. The foot is one row, `Add ^o`, and it takes a `.srt`/
-  `.vtt` as readily as an `.mkv`; `Paste path ^l` and `Import subtitles ^i` keep their strokes,
-  their KEYS rows and the dock's own right-click menu. Empty list: the one noun `none`.
-  CLIP tab: the per-clip verbs (Speed / Colour / Transform / EQ / Silence / Mix / Fit) as plain
-  ghost rows — label + chord, no head styling — over the param rows they open.
+---
 
-**Amendment (2026-09-10), "cleanse round 2":** the `BENCH` and `LEDGER` section heads are
-deleted — the geography says what a region is, and a label above it is a second saying. The
-ruler row is the bench's own top edge (the seam's grab band no longer reaches past it, since the
-ruler answers presses itself), and the ledger's first word is the project. `all ^a` leaves the
-ruler's right edge for the ruler's own right-click menu; the lane head's `≋` mix and `×` remove
-leave the head for the head's own right-click menu, where they still act on the lane that was
-clicked. Every one of them keeps its chord and its KEYS row: nothing lost a door, each one moved
-to the thing it acts on, which is the "option C" rule below applied a second time. Save moves
-the same way: the time band's ghost — parked there only because the ledger was another
-builder's file at the time — is deleted, and the ledger's own state word is its door.
+## 6. Regions
 
-**Amendment (2026-09-09), user decision "option C":** there is no rail. The 56px spine — every
-command as a ghost glyph + chord down the left edge — is deleted, and the picture, time band,
-bench and ledger take its width. Nothing on screen lists the room's commands, because **the
-geography of a verb is the thing it acts on**: a verb reaches its target by right-click on that
-target, by its key, and says its own name through the hover plate under the pointer. The one
-list left is the dock's **KEYS** tab (§9), and the one exception is the ledger's room verbs
-above — those four act on the room, which is not a thing the cursor can be over.
+### 6.1 Menu bar
 
-Session continuity: a room reopens exactly as left — playhead, subject cut, viewport, dock tab.
+- Left: the `edith` wordmark, then File · Edit · Clip · Timeline · View · Help.
+- Right: the project name, then `Saved` or `Unsaved — Save Ctrl+S`. The latter is a button.
+- Menu rows are 28px tall: label on the left, key right-aligned. A disabled row shows its reason in place of the key. Toggles show checkmarks: Snap, Loop, Subtitles.
 
-## 6. Cut machinery — the interaction core
+Menu contents, exactly as in the mock:
 
-The cut is the subject. Grammar (implement before any cosmetics):
+| Menu | Entries |
+|---|---|
+| File | New project · New from template ▸ (the built-ins and saved templates) · Open project… · Import media… Ctrl+I · Paste path · Import subtitles… Ctrl+Shift+I · Save · Save as template… · Export… E · Export captions… (a sheet: name and SRT or WebVTT, no picker) · Export timeline as ▸ (OpenTimelineIO… · Final Cut Pro XML… · EDL…; written to the export folder, the path in a toast) · Import OpenTimelineIO… (a new sequence) · Settings… Ctrl+, |
+| Edit | Undo · Redo · Cut / Copy / Paste · Insert / Overwrite source F9 / F10 · Select all · Deselect |
+| Clip | Split S · Delete · Lift ; · Ripple start to playhead Q · Ripple end to playhead W · Trim start / end to playhead Alt+Q / Alt+W · Speed… · Colour… · Transform… · Equalizer… · Silence… · Fit policy… (Alt+1…) · Group · Detach audio |
+| Timeline | Mark in / out · Clear marks · Record voice-over… (a sheet: input, lane, level meter, Record and Stop) · Zoom in / out / Fit · Snap · Add track / Remove track |
+| View | Play/Pause · J/K/L · Loop · Go to start / end · Subtitles · Audio scrubbing · Full screen |
+| Help | Command search Ctrl+K · Keyboard shortcuts ? |
 
-- `,` `.` — walk cuts (shift = stride 10). The cut readout is the odometer.
-- `[` `]` — no-aim trim of the subject cut, frame detents, works at any zoom (even 4px clips).
-- `ctrl+{` `ctrl+}` — trim-to-playhead (debt #42): snaps the subject cut's in/out edge straight to
-  the playhead, one press, one undo step -- the keyboard's own version of dragging the edge to a
-  spot instead of nudging it a detent at a time. Needs a subject cut with the playhead resting on
-  it, same as the pair above.
-- `/` — loop-trim: loop around the subject cut while trimming (the modernized Avid trim mode).
-- Two-up OUT|IN on the screen when resting on a cut.
-- `j k l` — shuttle; `s` — split; `↵` context-dependent commit; `esc` always retreats.
-- Param rows: drag while playing; value ghosts on the frame; `r` resets; live row takes the ink.
-- Colour verb: `v` holds previous shot beside current (matching is comparative).
-- Subtitle cues: cue edge is a cut — the same `,` `.` `[` `]` grammar applies; text edits on the
-  picture where subtitles live.
+A template keeps the frame rate, size, lanes, lane names, caption style and export preset of a project; "Keep clips" (off by default) keeps the clips too. The welcome screen's From template opens the same list as a dropdown beside New project.
 
-## 7. Scale — the degradation ladder
+### 6.2 Viewer
 
-Clips degrade **by width, one layer per threshold**, never all at once:
-full anatomy (thumbnails, trace, plates, chips) → drop chips → drop labels (<48px; labels never
-truncate into soup) → spine + trace only → sliver fill + splice gaps (film scale). Navigation
-never depends on pixels: `,` `.` + contact strip work identically at 100 clips. Lanes compress
-evenly to 5, then scroll behind the pinned ruler and track heads.
+- The picture is letterboxed and centred, with 12px padding.
+- Compare grade (View menu, or the Compare row on the Colour card) shows the picture as shot beside the graded one. Split is a vertical wipe at the centre of the picture: as shot on the left, graded on the right, with a light divider the picture's height. Side by side fits each half in its own side of the viewer. Each view has a "Before" and an "After" caption inside the picture, at the bottom left of its half, and the picture shows no selection box or handles while it is on. Compare is for looking only and is never exported.
+- Nothing is drawn over the picture and nothing appears under it: no info chip, no OUT | IN strip, so selecting a clip never resizes or crops the picture. the timecode is the transport's, and the clip's name is the status bar's.
 
-## 8. Notices — how the room speaks
+### 6.3 Transport
 
-No full-width bars, no covering the picture, ever. A notice is a plate rising above the ledger,
-one at a time; severity is a **3px left spine**, not a color flood:
+- Left: the big timecode. Its colons are ink3.
+- Centre: Go to start · Back one frame · Play/Pause (raised button) · Forward one frame · Go to end.
+- Right: Loop, and a volume slider.
+- There is no viewer "Fit" control. It duplicated the timeline Fit.
 
-- grey `#5E656D` — *told you* (self-fades)
-- amber `#D1B564` — *worth a look* (carries a jump action: `go to cut ,31`)
-- red `#C85050` — *needs a decision* (the decision is on the plate: `relink ↵ / later esc`)
+### 6.4 Edit toolbar
 
-Every failure names its remedy, and the wound stays visible where it lives (dark clips in the
-lane). **A refusal string is a claim:** shipping "cannot be decoded" requires a test proving the
-capability is genuinely absent — otherwise it is a bug, not a message. A verb the current *state*
-refuses (in menus) greys out with its reason on hover; it never disappears. A verb the selected
-clip's *media kind* can never use (a grade on sound, an equalizer on a picture) is hidden outright
-instead — a class refusal, not a moment's answer the next click could change (user 2026-08-27).
+Groups, left to right:
 
-**Hide-until-hover for controls/verbs is rejected (user 2026-08-27: "simplify it not hide the
-things").** A control's visibility never gates on pointer position — hover may brighten or fill a
-control already on screen, but a verb group that needs thinning gets thinned by subtraction
-(compact rows, plain always-visible group labels, smaller type) or dropped outright, never hidden
-behind a hover/expand/collapse.
+- [✂ Split S · ⌫ Delete · ⇤ Lift ;]
+- [↶ Undo Ctrl+Z · ↷ Redo Ctrl+Y]
+- [⧉ Snap N (toggle) · [ Mark in I · ] Mark out O]
+- then, pushed right: [− zoom slider + · Fit Ctrl+0]
+- then [Export E], the commit box.
 
-**No instructional copy (rejected pattern, user 2026-08-27).** The room never explains itself in
-prose: no "pick a verb above", no "type to filter — name, codec, unused…", no "Import, or drop a
-file on the window". Empty states are empty (or a single noun); placeholders are one word or
-absent; a control's use is taught by its chord and its geography (§4, §9), never by a sentence.
-Telling the editor what to do is the keys overlay's job on request — not ambient text. Any new
-string over ~4 words that instructs rather than reports state is a defect.
+### 6.5 Overview strip and ruler
 
-## 9. Menus and the keys overlay
+- The overview strip is described in §3.
+- The ruler uses adaptive ticks. Labels are at least 80px apart. Steps run from 1 frame to 1 minute. Labels are mono 12px ink3.
+- The playhead's lamp tab on the ruler is grabbable, with a 24px hit area.
+- The playhead line is 1px at rest and 2px while playing.
+- Render bar: a 3px strip along the ruler's top edge, laid over it so no height changes. Green where a render preview matches the timeline; amber where a clip with effects, colour, transform, speed, fades or transitions has none yet. Nothing is drawn elsewhere. Timeline menu: Render preview (in to out) (Enter), Render preview (whole timeline), Cancel render preview, Delete render files. While a render runs, its stretch fills green from the left as it goes, and Cancel render preview is enabled; the result comes back as a notice.
 
-- **Right-click = verbs of the thing under the cursor** (clip menu: clip verbs; lane head: lane
-  verbs; source dot: ink acts). Plate styling, chords on every row, destructive verbs below a
-  rule line. Never a junk drawer.
+### 6.6 Lanes
 
-  **Amendment (2026-09-09), R4:** the floor a menu is kept below is the picture's **painted
-  edge**, not the screen region's bottom. The region letterboxes — with a 3840x1608 film in a
-  2560x1440 window ~99px of the region's bottom is black bar, not picture, and §5's "nothing
-  occludes the picture" has nothing to say about black. A menu takes that room (and may open
-  *above* its pointer to use it), never a pixel of the frame; still too tall for what is left, it
-  scrolls inside its own plate as before.
+Described in §5 and §7.
 
-- **`?` held** dims the room one fill step and surfaces chords *in place* beside their controls;
-  release restores, and a click on the scrim also dismisses it. Hold-to-peek, not a latch;
-  learning stays geographic. The film keeps playing.
+### 6.7 Dock: Media tab
 
-  **Amendment (2026-08-20), explicit per this section's own rule:** the geographic reading above
-  is only partly built and edith currently ships the fallback instead — named here rather than
-  silently violated.
+- A search field at the top.
+- Rows are 56px tall. Each row holds: a dot, the name without its extension, a mono meta line such as `H.264 · 00:09:15 · 1080p`, and a `+ Add` button.
+- Double-click adds the item at the playhead.
+- Right-click opens the source menu: Add to timeline ↵ · Add at playhead · Preview Space · Make proxy · Reveal in files · Properties · — · Remove from library · Remove with its clips (shown in err on hover).
+- Footer: `+ Import media… Ctrl+I`.
+- Empty state: "No media yet", followed by the import button.
 
-  Fifteen of the keymap's 71 actions already have a geographic home in the darkroom stance today,
-  and every one of those wears its chord **permanently**, not gated on `?` (spine glyphs, the
-  time band's transport and Export chip, the dock's four Clip verbs) — a stronger reading of "the
-  UI *is* the shortcut sheet" (§4) than "surfaces on hold" asks for, so nothing further was owed
-  those fifteen. The other 56 actions (`,` `.` `[` `]` shuttle strides, marks, clipboard, delete,
-  lift/detach/group/regroup, fit/resolution/zoom, subtitle add/style, silence, project cards,
-  etc.) have **no widget anywhere in the room** — burst-use surfaces (screen, bench, time band)
-  are the checklist's most expensive land (§11.1), and giving each of the 56 a geographic
-  placement is that many individual placement decisions across the bench, time band and dock, not
-  one fix. Until that lands, `?` held keeps opening `ui::stance::keys_overlay`: a single scrolling
-  plate (plate styling per §4, positioned over the bench+ledger footprint so it never reaches the
-  screen — §11.6's occlusion check holds) listing every action by [`keymap::Category`]. It is a
-  cheat-sheet, and it is modal for as long as the key is held; both are accepted here rather than
-  hidden.
+### 6.8 Dock: Clip tab
 
-  Ceiling to close this amendment: walk the 56 down to zero by giving each a home next to the
-  control it already has no visual presence beside (marks and clipboard on the time band's cut
-  readout row; lift/detach/group/regroup as bench lane-head ghosts; fit/resolution/zoom on the
-  screen's own corner; subtitle/silence/project verbs into the dock next to the tab they already
-  belong to) — at which point the list deletes and `?` becomes pure dim, no list.
+- Nothing selected: "Select a clip to adjust it", with "or press Tab" in ink3.
+- Selected: a header (name, then the mono span), then tool rows.
+  - Each tool row is 44px tall. The name is on the left and the current value on the right. The value is ink3 at default and ink1 when changed.
+  - Rows expand in place. Several may be open at once. Open state is remembered.
+- Bottom: `Delete clip`.
+- Cards (Speed, Colour, Transform, EQ, Silence, Mix, Markers, History, Tools): History lists the undo steps newest first, the current step marked with a dot; clicking a step jumps to it.
+- Cards (Speed, Colour, Transform, EQ, Silence, Mix, Markers, Tools): the verb list is the tab's home. Opening a card replaces the list in the same place, always. One shared frame: a head row (`←` back to the list, the title with the clip name, `Reset all` where it applies, `✕` close), then the body at the same padding, 6px section gap, label column and type scale. No card floats over the viewer or the timeline; Esc and `←` return to the list. A tooltip is shown only where it adds something (a chord, a reason).
+- Effects card: the stack runs top to bottom, one row per effect with its on switch, move arrows and remove. A rect or ellipse mask's position and size rows (Centre across, Centre down, Width, Height) sit under a keyframe diamond: clicking it keys the mask at the playhead, and the diamond shows green while the playhead is on a key. Keyed masks show their keys as marks on the clip's ruler. A mask's last row is a Track row: "Track backward" and "Track forward" follow the picture under the mask from the playhead; while it runs the row reads "Tracking N%" with a Cancel, and the finished path lands as keys.
 
-  **Amendment (2026-09-09), explicit per this section's own rule:** the plate is deleted. The
-  user asked why the spine ended in `?` over `?` and said of the plate it opened "it's not good,
-  I mean probably location problem" — a surface that appears out of nowhere over the bench, holds
-  the keyboard, and covers work. The list is now the **dock's third tab, `KEYS`, beside SOURCES
-  and CLIP**: stable geography, occluding nothing, scrolling like its neighbours, with the same
-  registry-driven rows (`keys_rows`, section head per `keymap::Category`, label left, mono chord
-  `ink3` right) and no heading prose, since the tab strip itself is the way back. An action the
-  room would refuse right now greys to `ink4` like any refused verb (§8) rather than vanishing.
-  `?` swings the dock to that tab and a second `?` (or `escape`, or a press on another tab)
-  swings it back — a toggle, not a hold and not a modal: nothing about the KEYS tab owns the
-  keyboard, so the film keeps playing and every other stroke keeps meaning what the keymap says
-  it means. The ledger's `keys ?` ghost is the tab's pointer door and wears no second `?`,
-  because its chord *is* its own name — the rule the deleted rail's last glyph was given.
+### 6.9 Status bar
 
-  **Amendment (2026-09-09), user decision "option C":** the rail the fifteen chord-wearing
-  glyphs stood on is deleted (§5). The ceiling above is unchanged in *count* but changes in
-  *shape*: a homeless action's geographic home is now the right-click menu of the thing it acts
-  on, its key, and the hover plate — not a widget parked on a rail. The KEYS tab is what every
-  action still reads from.
+- Left: the selected clip or gap readout, such as `city_dusk · 00:00:00:00 → 00:00:09:15 · 9.5s`. During an export, `Exporting N%` shows on the left too.
+- Right: `1920×1080 · 30 fps` · `Ctrl+K Commands` · `? Shortcuts`.
+- The project name and Saved or Unsaved are in the menu bar (§6.1), not here.
 
-## 10. The joy layer
+---
 
-Game-feel, not gamification. All specs ≤150ms, ease-out, tied to real actions, honor
-`prefers-reduced-motion`; all sound behind one toggle, −30dB, and **always silent while the
-film's own audio plays**.
+## 7. Timeline behaviour
 
-- Split: 80ms white splice flash + dry mechanical tick.
-- Trim nudge: 60ms detent per frame (rotary-encoder feel); held key = ratchet.
-- Cut jump: 2-frame snap flash on arrival.
-- Drop: 80ms magnetic settle + 1-frame squash. Never a teleport.
-- JKL: optional pitch cue per speed step; blade leans 1px at 4×.
-- Export: breathing ribbon on the boxed chip; film-leader countdown on open.
+- **Zoom.** A new project opens at 60 px/s. Fit (Ctrl+0 or the button) fits the whole edit with about a 2% margin. The zoom keys are = and -. Ctrl+wheel zooms about the pointer. A plain wheel scrolls horizontally. A thin 8px scrollbar sits under the lanes.
+- **Imports.** The first import into an empty timeline lands on it and fits. Later imports go to Media.
+- **Insert.** Double-click, `+ Add` and ↵ insert at the playhead. Dragging and dropping onto a lane inserts at the drop point.
+- **Trim.** Drag an edge. A plate shows the delta and the new length, for example `+00:12 · 9.5s → 10.0s`. Trimming stops at the source's media limit, with a 120ms warn flash.
+- **Move.** While dragging, a translucent ghost shows the target and the original is dimmed. While snapping is active, a 1px ink1 guide runs through all lanes.
+- **Gaps.** Gaps are drawn hatched in ink4. Clicking a gap selects it (1px ink2 outline) and shows an inline `Close gap` button. Delete closes the gap.
+- **Right-click menus** exist for clips, gaps, lane heads, the ruler and Media rows. They use the same plate style, show keys, and place destructive verbs below a rule.
+- **Lanes.**
+  - Hide, mute and lock use the glyphs in §3.
+  - Hidden and muted lanes dim to 40%.
+  - Locked lanes refuse selection and edits. The refusal comes with a toast that offers Unlock.
+  - Tracks are added and removed from the lane-head menu or the Timeline menu.
+- **Subtitle cues.** They use the same trim and move behaviour as clips. Double-click edits the text inline. Enter commits and Esc cancels.
+- **Undo.** Undo covers every timeline edit, one step per gesture.
+- **Clip volume line.** On a selected audio clip the line is editable. Ctrl+click on the line adds a key where it is. Drag a key to move it in time and dB (a plate shows the dB while dragging). Drag the line between two keys to move both. Double-click a key, or pick it and press Delete, to remove it. Each gesture is one undo step. Keys are dots when the audio lane is tall. The cursor changes over the line and the keys.
+- **Audible scrub.** While the ruler is dragged and playback is paused, a short snippet plays at each new position. View > Audio scrubbing switches it, on by default, and the choice is saved with the view.
 
-**Never-list:** no badges, streaks, confetti, or celebration copy; nothing moves during playback
-except the blade; no sound over film audio; no animation as decoration (every motion reports a
-state change).
+---
 
-## 11. Adding a feature — the checklist
+## 8. Feedback
 
-Before any new surface merges, it answers:
+- **Toasts** rise above the status bar at the bottom-left of the timeline. They never cover the picture. At most 3 are stacked. Each has a 3px left stripe: ink3 for info, warn or err. The text is 14px ink1. An optional action may appear: Undo, Unlock, or Show in folder.
+- **Auto-hide.** Info and warn toasts hide after 5s. Errors stay until dismissed. Errors always name the remedy.
+- **Refusal strings are claims.** "cannot be decoded" may ship only together with a test that proves the capability is absent.
+- **Long work shows progress where it happens.**
+  - Import: status bar, with cancel.
+  - Export: sheet or status bar, with ETA and cancel. Cancel asks for an inline confirmation.
+  - Silence scan: the count updates live.
+  - Proxies: row meta reads "proxy 42%".
+- **Dropped frames.** While playing, the status bar's right edge says `Dropped N frames · try Half quality` once the picture has skipped frames (at full quality only). The slot is fixed-width and the words stay for 3 s after a stop.
 
-1. **Frequency row:** which editor task, done how many times per hour, justifies its pixels?
-   Burst-use surfaces (screen, bench, time band) are the most expensive land.
-2. **Grammar fit:** flow → ghost; commitment → the box (is it really commit-class?);
-   readout → plate; identity → ink; alarm → notice spine.
-3. **Chord:** it has one, wears it everywhere it appears, and joins the `?` overlay.
-4. **Scale:** define its degradation ladder step-by-width before merge.
-5. **Achromatic check:** zero new hues in chrome; film inks only for identity; white only if it
-   is literally the lamp.
-6. **Occlusion check:** the picture stays visible; nothing floats over the screen. Accepted
-   exceptions are named where they live: the held-`?` cheat-sheet (amendment above), and the
-   settings page, a centred modal since 2026-09-19 (user: the below-picture sheet covered the
-   timeline) — it floats over the screen while open, and closes on a click away or `esc`.
-7. **States:** empty (safelight-composed, never bare), refusing (reason named), failing
-   (notice plate with remedy).
-8. **Feel:** one ≤150ms motion spec from §10's vocabulary, or a stated reason for none.
-9. **Continuity:** its state survives room close/reopen.
+---
 
-If a feature fails the checklist, either the feature changes or this document does — explicitly.
+## 9. Tool panels
 
-## 12. Implementation order
+The Panels tab of the reference artifact is the reference.
 
-1. Token substrate in `crates/app/src/ui/theme.rs` (extend the 34-role system; keep the
-   `no_colour_is_written_outside_the_theme` guard green).
-2. The stance behind a flag (screen / time band / bench / ledger / dock skeleton).
-3. Cut machinery (`,` `.` `[` `]` `/`, two-up, readout) — before cosmetics.
-4. Dock (Sources assembly + Clip verbs).
-5. Ink extraction + grading pipeline; source dots; selection ink.
-6. Traces + contact strip.
-7. Notices, session continuity, safelight empty room, `?` overlay.
-8. Joy layer last — it polishes verbs that already work.
+### 9.1 Shared anatomy
+
+1. Header: clip name, plus `Reset all`.
+2. A picture of what the tool does: preview, histogram, curve, waveform or meters.
+3. At most 3–4 main controls.
+4. The rest folded under a `More …` section. It is closed by default, and its state is remembered.
+5. Commit actions: a box for the commit, a ghost button for the alternative.
+
+**Slider row.** The label is on the left and the value on the right, in mono. The value is ink3 at default and ink1 when changed. The track is 4px. The thumb is 14px, with a 24px hit area. A `Reset` ghost button appears only when the value is changed. Double-clicking the value resets it. Arrow keys step the value.
+
+### 9.2 Per tool
+
+- **Colour.** Live preview and a luma histogram. Controls: Brightness, Contrast, Saturation, Tint. An Auto colour button reads a correction off the clip as shot (grey-world white balance and a luma stretch to 2 % and 98 %) and writes it as one undo step; saturation, tint, lift, gamma, curves and the LUT are left as they are. A Look dropdown lists the eight built-in looks (Warm, Cool, Teal & orange, Bleach bypass, Black & white, Faded film, High contrast, Vintage) and the user's saved looks; picking one replaces the clip's colour as one undo step. Save current as look… opens a name field under the dropdown with Save and Cancel; saved looks are kept as plain text files in the user's data folder. A Compare row (Off, Split, Side by side) sets the viewer's compare view, which is preview only and never exported.
+- **Transform.** Position X and Y (px), Scale (%), Rotation (°) with −90, 0, +90 and 180 chips. A CROP section holds a live crop diagram and four sliders.
+- **Speed.** Chips for 0.25× to 4×. A log slider from 0.25× to 4×, which is the engine's real range. A readout shows the resulting length. Speed keeps pitch: the engine time-stretches the audio (WSOLA, `stretch.rs`), so a faster or slower clip keeps the voice and the notes at their original pitch.
+- **Silence.** A waveform with silences shaded and counted live. A draggable threshold line. Controls: Apply to (take, track or every track), Threshold, Minimum silence. A `More timing` section holds Keep around speech, Ignore kept bits under, Level unit and Speed-up rate. Buttons: `Remove silences ↵` (the box) and `Speed them up F`. An `Invert` switch.
+- **EQ.** A log-frequency graph (20 Hz to 20 kHz, ±18 dB view) with a live spectrum and draggable numbered bands.
+  - Drag adjusts frequency and gain. Wheel adjusts Q. Double-click resets a band. Clicking empty space adds a band.
+  - A band strip has type chips (Bell, Low shelf, High shelf, Low cut, High cut) and Freq, Gain and Q steppers.
+  - Buttons: Add A, Remove X, Flatten R, Spectrum S, Bypass B.
+- **Mix.** Channel strips: one per audio lane, plus Master. Each has a vertical fader (double-click sets 0 dB) and a meter with peak hold (warn above −6 dBFS, err above −1 dBFS). Each has Mute and Solo. Mute is saved with the project and exported. Solo is for listening only: it is not saved, and export ignores it. Master also holds the limiter toggle and the ceiling.
+  - On a selected audio clip, the Mix card also has a **Pitch** row: a typed value in semitones (`+3 semitones`, `0 semitones`) and a centred slider from −12 to +12 with a notch at 0. Pitch keeps the clip's length.
+- **Visualizer.** A live preview. Style chips: Fill, Ribbon, Ring, Waveform, and Fast. Colour and Strand swatches, each with an inline hue ring and a hex value. Strands and Glow sliders. Visualizer colours may be any hue, because they are footage content, not chrome.
+- **Subtitle style.** A live preview. A font list, where each name is shown in its own face. Size. Outline (None, Thin, Thick). Background box. Position (Bottom, Top). A note reads "Saved for all projects. The preview shows the look only. Export writes soft subtitles (tx3g in MP4, S_TEXT/UTF8 in MKV), and the viewer's player draws them, so the look may differ slightly."
+- **Title animation.** On the Title card, two dropdowns below the presets: Entrance and Exit (None, Fade, Typewriter, Slide up, Slide left, Pop, Word by word), then Animation length in seconds (a typed or dragged number, greyed until an animation is picked). Picking one moves the playhead to the title's start so the animation shows in the viewer.
+- **Export (dock tab).** The dock's third tab, Media | Clip | Export. Opened by the Export key (E), File › Export…, the toolbar Export button or the tab itself. Leaving it is picking another tab (or Esc). There is no centred sheet and no scrim: the panel is in flow in the dock, so nothing covers the viewer or the timeline.
+  - Layout: a scrolling body (wheel, and Up/Down/PageUp/PageDown/Home/End) over a fixed footer holding one full-width `Export` button. Every control is reachable by scrolling; a short window only scrolls more.
+  - Settings state, top to bottom:
+    - Presets, as compact two-line rows grouped Web video, Phones and social, Sound only, Archive, then Custom. Each row shows the name, a one-line spec (`1080p · H.264 · 8 Mb/s`, `M4A · 128 kbps`) and a ✓ plus a raised fill on the chosen one. The rows come from the engine's preset table (`export_presets`); the GUI keeps no copy of it. Custom is chosen whenever the settings match no preset.
+    - Range: Whole film or In–Out, each with its duration. In–Out is greyed with the reason when there are no valid marks.
+    - Save as: Name and Folder fields, typed in place; the extension follows the format. `Choose… d` opens the desktop save dialog.
+    - Summary in plain words (duration, size, time), for example `1920×1080 · 30 fps · H.264 · 256 kbps sound · about 180 MB · about 1 min 40 s to export`. Warnings follow: upscaling, a very low bitrate, a sound-only file that drops the picture, no sound, WebM without subtitles.
+    - `▸ More settings`, closed by default and remembered, disclosed inline. It holds every detailed setting as visible lists or segmented choices: format, picture size, picture bitrate, bit depth (AV1), sound quality, loudness, the encoder seat, and what travels with the file.
+    - Picture formats (PNG still, numbered PNG pictures, GIF) have no sound and no video rows. The summary says `PNG · 1280×720`, `PNG · 1280×720 · one per frame` or `GIF · 480×270 · 15 fps · loops`, with `Audio  None`. A GIF adds Width (320, 480, 640 or 720 px), Frame rate (10, 15, 20 or 30 fps) and Loop as segmented or list choices. A numbered run's Name is the folder name, with no extension.
+    - The footer `Export ↵` is the one primary button. A refused format greys it and says why.
+  - Honest estimates. The size is "about X", or a span where a quality-driven encoder decides (GPU AV1). The time comes from a measured pace (a one-second software-seat trial write when the tab opens, deleted afterwards); until then it reads "estimating export time…", never a made-up number.
+  - Encoder seat: Software is the default and is listed first. Auto and Hardware are named "GPU encoder…" and are used only when picked.
+  - Overwrite state: when the file exists and this window did not write it, the footer becomes "name already exists in this folder" with `Cancel Esc`, `Keep both k` and `Replace ↵`, inline in the panel.
+  - Progress state, in the same panel: the file name, a bar, `N% · elapsed · about M left`, the encoders in use, and `Cancel export` with an inline confirmation. Switching tab leaves the export running; the status bar keeps `Exporting N%`.
+  - Done state: the file, its folder, size and time taken, with `Open folder`, `Play` and `Done ↵`.
+  - Failed state: the engine's reason, with `Retry`, `Back to settings` and `Close`.
+- **Settings (centred sheet).**
+  - Left-hand tabs: Project, Editor, Export defaults, Keys.
+  - Each section states where its values are saved: "Saved in this project" or "Saved on this computer".
+  - Any non-obvious setting has a one-line description beneath it.
+  - The Keys tab lists shortcuts and lets the user rebind them.
+- **Properties (plate).** FILE: name, path with a Copy button, size, container. STREAMS: codec, size, rate, bit depth and bitrate for each stream. For a timeline clip, also THIS CLIP: source range and speed.
+
+---
+
+## 10. Keys
+
+### 10.1 Principles
+
+- Cross-editor conventions come first. Premiere, Resolve, Shotcut and FCP mostly agree.
+- Single letters are used only for frequent, non-destructive verbs.
+- Nothing destructive sits on a bare letter. Delete and Backspace delete. `x` no longer does.
+- No chord may mean something else on a Linux desktop. Ctrl+Q (quit), Ctrl+W (close), Ctrl+T, Ctrl+L, Ctrl+M and Ctrl+H stay free or keep their usual meaning.
+- No two actions share a chord.
+- Keys are rebindable in Settings → Keys.
+
+### 10.2 Key table
+
+| Action | Key |
+|---|---|
+| Play/Pause | Space |
+| Shuttle reverse / pause / forward | J / K / L |
+| Frame back / forward | ← / → |
+| Previous / next cut | ↑ / ↓ (also `,` / `.`) |
+| Start / End | Home / End |
+| Mark in / out | I / O (on a previewed library item: the source's marks) |
+| Insert / Overwrite the previewed source at the playhead | F9 / F10 |
+| Clear marks | Ctrl+U |
+| Split | S |
+| Delete | Delete / Backspace |
+| Lift | ; |
+| Trim start / end to playhead | Q / W |
+| Nudge trim | [ / ] |
+| Undo | Ctrl+Z |
+| Redo | Ctrl+Y (Ctrl+Shift+Z once Shift chords exist) |
+| Snap | N |
+| Zoom in / out | = / - (also Ctrl+= / Ctrl+-) |
+| Fit | \ or Ctrl+0 |
+| Copy / Paste | Ctrl+C / Ctrl+V |
+| Select all | Ctrl+A |
+| Deselect | Esc |
+| Speed / Colour / Transform / EQ / Silence / Visualizer / Fit policy (clip tools) | Alt+1 / Alt+2 / Alt+3 / Alt+4 / Alt+5 / Alt+6 / Alt+7 |
+| Mix | F |
+| Mute | M |
+| Volume down / up | PageDown / PageUp |
+| Subtitles | T |
+| Subtitle style | Y |
+| Import media | Ctrl+I |
+| Import subtitles | Ctrl+Shift+I |
+| Save | Ctrl+S |
+| Export | E |
+| Command search | Ctrl+K |
+| Shortcuts | ? / F1 |
+| Settings | Ctrl+, |
+| Full screen | F11 |
+| Screenshot | F12 |
+
+Keys printed inside a tool panel (EQ's A/X/R/S/B, Silence's ↵ and F) act only while that panel has focus, and override the global key there.
+
+The full 80-row mapping (today's 77 actions plus the three new J/K/L shuttle actions), from today's keys to the proposed ones with reasons, is the Keys tab of the reference artifact. Implementation updates `crates/app/src/keymap.rs` from it.
+
+### 10.3 Engineering prerequisites
+
+1. `Chord` must support Shift with letters. Today gpui drops Shift, and the parser refuses uppercase. This must land before Ctrl+Shift+I or Ctrl+Shift+Z can work.
+2. J/K/L shuttle is a new action.
+   - L plays forward. Each further press speeds it up: 1×, 2×, 4×, 8×.
+   - J plays in reverse at 1×. A second press makes it 2×.
+   - K stops.
+   - Sound is muted above 1× and in reverse.
+   - While reversing, L slows the reverse down.
+
+---
+
+## 11. Adding a feature
+
+Before a new surface merges, it must answer each of these:
+
+1. Which task is it, and how often is it used? That decides where it lives. It goes on the toolbar only if it is used many times an hour.
+2. Its menu-bar entry and key (§4.4 and §4.5).
+3. Contrast, size and target floors (§4.1 to §4.3).
+4. Achromatic chrome. Film ink only for identity.
+5. Empty, refused and failed states, with words (§4.8 and §8).
+6. Degradation by width, if it lives on the timeline (§5).
+7. A feedback toast (§8).
+8. Continuity across reopen (§5).
+9. A screenshot from the headless display, placed next to the reference artifact in the PR or commit description.
+
+If a feature cannot pass, change the feature, or amend this document in the same diff. Either way, state the change explicitly and give the reason.
+
+---
+
+## 12. Implementation plan
+
+Phases run from cheapest and biggest-win first. Each phase ends with headless screenshots compared against the reference artifact.
+
+- **A — Comfort floors.** Tokens and contrast (§2, §4.1 and §4.2). Hit targets (§4.3). Toasts (§8). Selection and focus (§4.10). Import lands on the timeline. Double-click adds.
+- **B — Doors.** Menu bar with every action. Edit toolbar. Command search (Ctrl+K). Tooltips with keys and reasons. Keymap update (§10), including Shift chords.
+- **C — Timeline.** Lane heads with glyphs, and lock, mute and hide. Lane resize. Adaptive ruler. Playhead tab. Trim plate and media limit. Move ghost and snap guides. Gaps. Right-click menus. Inline cue edit. Overview strip window box. Layout proportions.
+- **D — Panels.** The §9 redesigns, plus new capabilities: Mix mute and solo, EQ low-cut and high-cut bands, subtitle outline, box and position, and J/K/L shuttle.
+
+Code comments that cite the old DESIGN.md's section numbers (49 of them) are updated to this document's sections as each phase touches their files.
+
+## Video output window (View menu)
+
+View > Video output window opens a second window that shows only the program picture, full-bleed on black and letterboxed, with no chrome. It reuses the viewer's own frame (`Player::image`), so there is no second decode, and it repaints with the main window. Esc or a double-click closes it. The window is session state only and is not saved in the project. View > Output display (a ✓ list of screens, shown only when there are two or more) moves it to a screen. On Wayland, gpui now fullscreens a window that names a display on that output (third_party gpui patch).

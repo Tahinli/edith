@@ -16,6 +16,8 @@
 //! conversion and before the equalizer, exactly where the resample used to
 //! sit; see [`TimeStretch`] for the buffering contract it keeps there.
 
+use crate::project::SpeedRamp;
+
 /// Analysis window, in frames: long enough that a window holds several
 /// periods of anything a person calls a pitch (at 48 kHz, 1024 frames is
 /// 21 ms -- four periods of a 187 Hz tone), short enough that a placement
@@ -30,6 +32,14 @@ const HS: usize = N / 2;
 /// compromise between finding the good overlap and keeping the search cheap
 /// (it is O(N·SEARCH) per frame, and this keeps it under a million adds).
 const SEARCH: usize = N / 2;
+/// How far past a window's own span a transient may sit and still be pulled in to
+/// the ramp's mapping ([`TimeStretch::locked`]).
+const LOCK_REACH: usize = N / 4;
+/// Frames either side of a transient's peak left out of "the rest of the window".
+const LOCK_SKIP: usize = 128;
+/// How many times the peak's power the rest of the window's mean power must stay
+/// under for the peak to be a transient: amplitude 8 over the surroundings.
+const LOCK_CREST: f32 = 64.;
 
 /// One speeded segment's time-stretch: interleaved f32 in, interleaved f32
 /// out, at the timeline's own sample rate and channel count, paced to the
@@ -87,13 +97,29 @@ pub(crate) struct TimeStretch {
     /// as the decoder read it, padded to its promise in silence: the honest
     /// degenerate, rather than a stretched half-window of nothing.
     started: bool,
+    /// A speed ramp to follow, with the samples one timeline frame is: the read
+    /// position of every window then comes off the ramp's integral instead of a
+    /// fixed hop. `None` is a constant `speed`.
+    ramp: Option<(SpeedRamp, f64)>,
+    /// Windows placed so far -- the output position of the next one is `window * HS`.
+    window: usize,
 }
 
 impl TimeStretch {
     /// `speed` is source frames per output frame, as [`crate::project::Stretch`]
     /// states it; `owed` is the segment's whole promise in output frames, the
     /// same number [`crate::audio::Resample`] paces to when it works alone.
-    pub(crate) fn new(speed: f64, owed: u64, channels: usize) -> Self {
+    ///
+    /// `ramp` makes the read position follow a speed ramp ([`SpeedRamp`], and the
+    /// samples per timeline frame): `speed` is then only the mean, kept for the
+    /// hop that is unused. The pitch holds as at a constant speed, because only the
+    /// windows' read positions move -- each is still copied whole.
+    pub(crate) fn new(
+        speed: f64,
+        owed: u64,
+        channels: usize,
+        ramp: Option<(SpeedRamp, f64)>,
+    ) -> Self {
         // The classic Hann, in the half-open form the overlap-add wants: 0 at
         // either end, so a window never snaps the seam it is pasting over.
         let hann = (0..N)
@@ -101,7 +127,7 @@ impl TimeStretch {
                 (std::f64::consts::PI * i as f64 / N as f64).sin().powi(2) as f32
             })
             .collect();
-        Self {
+        let mut t = Self {
             ha: (HS as f64 * speed).round().max(1.) as usize,
             channels,
             owed,
@@ -112,7 +138,82 @@ impl TimeStretch {
             prev: None,
             overlap: vec![0.; (N - HS) * channels],
             started: false,
+            ramp,
+            window: 0,
+        };
+        t.anext = t.nominal();
+        t
+    }
+
+    /// The nominal read position of the window about to be placed. A constant
+    /// speed advances by `ha` from 0; a ramp reads each window where the ramp has
+    /// carried the source by the middle of its output span, less half a window --
+    /// so the sound at an output instant is the source the ramp names for it, not
+    /// a window late.
+    fn nominal(&self) -> usize {
+        match &self.ramp {
+            None => self.window * self.ha,
+            Some((ramp, spf)) => {
+                let mid = (self.window * HS + N / 2) as f64 / spf;
+                (ramp.source_frames(mid) * spf - (N / 2) as f64).round().max(0.0) as usize
+            }
         }
+    }
+
+    /// Where to read the window about to be placed so that a sharp transient in
+    /// reach lands on the ramp's mapping, when there is one; `None` for the usual
+    /// search (and always at a constant speed).
+    ///
+    /// A window copies its input at real time, so a click inside it lands off the
+    /// mapping by its distance from the window's centre times how far the ramp's
+    /// rate is from 1 -- milliseconds at 2x -- and two overlapping windows that
+    /// both hold it would put it down twice, at two such offsets. A transient has
+    /// no pitch to keep in phase, so every window that holds one is read so that
+    /// its loudest sample lands exactly where the ramp says it plays: the copies
+    /// then coincide, and the click is neither late nor doubled. "A transient" is a
+    /// peak that stands [`LOCK_CREST`] times over the rest of the window in power.
+    fn locked(&self) -> Option<usize> {
+        let (ramp, spf) = self.ramp.as_ref()?;
+        let at = |i: usize| -> f32 {
+            if self.has(i) && i >= self.base {
+                self.input[(i - self.base) * self.channels].abs()
+            } else {
+                0.
+            }
+        };
+        let lo = self.anext.saturating_sub(LOCK_REACH);
+        let hi = self.anext + N + LOCK_REACH;
+        let (mut m, mut peak) = (lo, 0f32);
+        for i in lo..hi {
+            if at(i) > peak {
+                (m, peak) = (i, at(i));
+            }
+        }
+        if peak < 0.05 {
+            return None;
+        }
+        let rest: f32 = (self.anext..self.anext + N)
+            .filter(|i| i.abs_diff(m) > LOCK_SKIP)
+            .map(|i| at(i).powi(2))
+            .sum::<f32>()
+            / N as f32;
+        if peak * peak < LOCK_CREST * rest {
+            return None;
+        }
+        let there = (ramp.timeline_frames(m as f64 / spf) * spf).round() as i64;
+        let u = there - (self.window * HS) as i64;
+        if !(16..N as i64 - 16).contains(&u) {
+            return None;
+        }
+        let read = m as i64 - u;
+        let shift = (read - self.anext as i64).unsigned_abs() as usize;
+        (read >= self.base as i64 && shift <= N / 2).then_some(read as usize)
+    }
+
+    /// Moves to the next window.
+    fn advance(&mut self) {
+        self.window += 1;
+        self.anext = self.nominal();
     }
 
     /// Frames of input the stretcher holds, stream-indexed -- every question
@@ -127,11 +228,11 @@ impl TimeStretch {
     fn natural(&self, at: usize) -> Vec<f32> {
         (0..HS)
             .map(|i| {
-                self.has(at + i)
-                    .then(|| {
-                        self.input[((at + i - self.base) * self.channels)..][0]
-                    })
-                    .unwrap_or(0.)
+                if self.has(at + i) {
+                    self.input[((at + i - self.base) * self.channels)..][0]
+                } else {
+                    0.
+                }
             })
             .collect()
     }
@@ -141,11 +242,12 @@ impl TimeStretch {
     /// amplitude-free so a loud passage does not win on loudness alone.
     fn match_at(&self, at: usize, target: &[f32]) -> f32 {
         let (mut dot, mut ea, mut eb) = (0f32, 0f32, 0f32);
-        for i in 0..HS {
-            let a = self.has(at + i)
-                .then(|| self.input[((at + i - self.base) * self.channels)..][0])
-                .unwrap_or(0.);
-            let b = target[i];
+        for (i, &b) in target[..HS].iter().enumerate() {
+            let a = if self.has(at + i) {
+                self.input[((at + i - self.base) * self.channels)..][0]
+            } else {
+                0.
+            };
             dot += a * b;
             ea += a * a;
             eb += b * b;
@@ -197,14 +299,16 @@ impl TimeStretch {
         self.input.append(buf);
         let mut out: Vec<f32> = Vec::new();
         while self.owed > 0 && self.ready() {
+            let reach = SEARCH;
             let want = self
                 .anext
-                .saturating_sub(SEARCH)
+                .saturating_sub(reach)
                 .max(self.prev.map_or(0, |p| p + HS - SEARCH));
             // The best continuation in the search range: every offset is
-            let at = match self.prev {
-                None => self.anext,
-                Some(p) => {
+            let at = match (self.locked(), self.prev) {
+                (Some(at), _) => at,
+                (None, None) => self.anext,
+                (None, Some(p)) => {
                     let target = self.natural(p + HS);
                     // A silent continuation says nothing about where the next
                     // window belongs: every offset matches it equally (which
@@ -220,7 +324,7 @@ impl TimeStretch {
                         // that re-measured both sides of every comparison is
                         // a search squared, and this search already is the
                         // module's cost.
-                        (want..=self.anext + SEARCH)
+                        (want..=self.anext + reach)
                             .map(|at| (self.match_at(at, &target), at))
                             .max_by(|(a, _), (b, _)| a.total_cmp(b))
                             .map_or(self.anext, |(_, at)| at)
@@ -235,7 +339,7 @@ impl TimeStretch {
             out.extend_from_slice(&frames[..pays]);
             self.owed -= (pays / self.channels) as u64;
             self.prev = Some(at);
-            self.anext += self.ha;
+            self.advance();
             self.started = true;
         }
         // Consumed input is everything before the next window's search range
@@ -293,8 +397,9 @@ impl TimeStretch {
             // The windows the buffer still completes, placed nominally; the
             // zero-padding in `place` finishes the last of them.
             while self.owed > 0 && self.anext < self.base + self.input.len() / self.channels + N {
-                let frames = self.place(self.anext);
-                self.anext += self.ha;
+                let at = self.locked().unwrap_or(self.anext);
+                let frames = self.place(at);
+                self.advance();
                 let pays = (self.owed as usize).min(frames.len() / channels) * channels;
                 self.owed -= (pays / channels) as u64;
                 if !send(frames[..pays].to_vec()) {
@@ -321,7 +426,7 @@ mod tests {
     /// Runs a stretcher over a whole signal the way the emit path does: one
     /// packet-shaped buffer at a time, whatever comes out collected, then the
     fn stretched(speed: f64, owed: u64, samples: &[f32]) -> Vec<f32> {
-        let mut s = TimeStretch::new(speed, owed, 1);
+        let mut s = TimeStretch::new(speed, owed, 1, None);
         let mut out = Vec::new();
         for chunk in samples.chunks(1024) {
             let mut buf = chunk.to_vec();
@@ -429,7 +534,7 @@ mod tests {
             .zip(&right)
             .flat_map(|(&l, &r)| [l, r])
             .collect();
-        let mut s = TimeStretch::new(2.0, 48_000, 2);
+        let mut s = TimeStretch::new(2.0, 48_000, 2, None);
         let mut out = Vec::new();
         for chunk in input.chunks(2048) {
             let mut buf = chunk.to_vec();
@@ -486,7 +591,7 @@ mod tests {
         let input = sine(440., 600. / 48_000.);
         let out = stretched(2.0, 400, &input);
         assert_eq!(out.len(), 400);
-        assert_eq!(out[..600.min(400)], input[..600.min(400)], "the frames as they were");
+        assert_eq!(out[..400], input[..400], "the frames as they were");
     }
 
     #[test]

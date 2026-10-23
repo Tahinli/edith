@@ -4,7 +4,7 @@
 //! reading the graph, and the RT callback is allocation-free either way.
 //!
 //! Coefficients follow the Audio EQ Cookbook (Robert Bristow-Johnson,
-//! <https://www.w3.org/TR/audio-eq-cookbook/>), peaking and shelving sections,
+//! <https://www.w3.org/TR/audio-eq-cookbook/>), peaking, shelving and cut sections,
 //! run as transposed direct form II: two state words per band per channel, one
 //! multiply-add chain per sample, nothing to allocate.
 //!
@@ -17,12 +17,18 @@
 use std::f64::consts::PI;
 
 /// Shape of one band's response. Shelves tilt everything past their corner;
-/// a peak is local.
+/// a peak is local; a cut removes everything past its corner. A cut is a
+/// second-order filter at the band's frequency with the band's Q, and ignores
+/// the band's gain -- it has no level to set, only a corner to put.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BandKind {
     LowShelf,
     Peak,
     HighShelf,
+    /// High-pass: removes what is below the corner (rumble, mic handling).
+    LowCut,
+    /// Low-pass: removes what is above the corner (hiss, air).
+    HighCut,
 }
 
 /// One band. Plain data with no invariants of its own: out-of-range values are
@@ -64,8 +70,13 @@ impl EqParams {
     }
 
     /// True when no band moves anything, so processing can be skipped outright.
+    /// A cut always moves something, whatever its gain says, so it is never
+    /// identity: a cut band the listener put down is not a flat curve.
     pub fn is_identity(&self) -> bool {
-        self.bands.iter().all(|b| b.gain_db.abs() < 1e-4)
+        self.bands.iter().all(|b| match b.kind {
+            BandKind::LowCut | BandKind::HighCut => false,
+            _ => b.gain_db.abs() < 1e-4,
+        })
     }
 
     /// How much the cascade moves a sine at `freq_hz`, in dB — the curve a UI
@@ -116,7 +127,7 @@ pub const MAX_BAND_GAIN_DB: f32 = 40.0;
 pub const MIN_BAND_GAIN_DB: f32 = -40.0;
 
 impl Coeffs {
-    /// Cookbook peaking/shelving section for `band` at `sample_rate`.
+    /// Cookbook peaking, shelving or cut section for `band` at `sample_rate`.
     fn new(band: &Band, sample_rate: u32) -> Self {
         // A frequency at or past Nyquist has no cookbook answer (sin(w0) folds),
         // Q of zero divides by zero, and a gain of a few hundred dB walks the
@@ -158,6 +169,23 @@ impl Coeffs {
                 (a + 1.0) - (a - 1.0) * cos_w0 + two_sqrt_a_alpha,
                 2.0 * ((a - 1.0) - (a + 1.0) * cos_w0),
                 (a + 1.0) - (a - 1.0) * cos_w0 - two_sqrt_a_alpha,
+            ),
+            // RBJ high-pass and low-pass; the gain never enters them.
+            BandKind::LowCut => (
+                (1.0 + cos_w0) / 2.0,
+                -(1.0 + cos_w0),
+                (1.0 + cos_w0) / 2.0,
+                1.0 + alpha,
+                -2.0 * cos_w0,
+                1.0 - alpha,
+            ),
+            BandKind::HighCut => (
+                (1.0 - cos_w0) / 2.0,
+                1.0 - cos_w0,
+                (1.0 - cos_w0) / 2.0,
+                1.0 + alpha,
+                -2.0 * cos_w0,
+                1.0 - alpha,
             ),
         };
         Self {
@@ -449,7 +477,7 @@ mod tests {
         eq.process(&mut buf);
 
         assert!(buf[2] != 0.0, "the left channel should be ringing");
-        for (frame, pair) in buf.chunks_exact(2).enumerate() {
+        for (frame, pair) in buf.as_chunks::<2>().0.iter().enumerate() {
             assert_eq!(
                 pair[1], 0.0,
                 "frame {frame}: right channel picked up {pair:?}"
@@ -522,8 +550,8 @@ mod tests {
             let mut out = vec![0.0f32; 48_000 * 2];
             // A full-scale 1 kHz burst for a tenth of a second, then silence:
             // whatever the section rings into is what shows up after it.
-            for i in 0..4_800 * 2 {
-                out[i] = (TAU * 1000.0 * (i / 2) as f32 / FS as f32).sin();
+            for (i, o) in out.iter_mut().enumerate().take(4_800 * 2) {
+                *o = (TAU * 1000.0 * (i / 2) as f32 / FS as f32).sin();
             }
             EqState::new(&peak(1000.0, gain, 1.0), FS, 2).process(&mut out);
             let peak = out.iter().fold(0.0f32, |m, v| m.max(v.abs()));
@@ -533,5 +561,103 @@ mod tests {
                  +40 dB, a linear gain of 100, and 200x that is a section ringing, not a band"
             );
         }
+    }
+
+    fn cut(kind: BandKind, freq_hz: f32) -> EqParams {
+        EqParams {
+            bands: vec![Band {
+                freq_hz,
+                gain_db: 0.0,
+                q: 0.707,
+                kind,
+            }],
+        }
+    }
+
+    /// A second-order cut attenuates well past its corner and passes well
+    /// above it (high-pass) or below it (low-pass): the response curve, not the
+    /// samples, so the corner and the slope are checked without transients.
+    #[test]
+    fn a_cut_attenuates_past_its_corner_and_passes_the_other_side() {
+        let low = cut(BandKind::LowCut, 1000.0);
+        assert!(
+            low.response_db(100.0, FS) < -30.0,
+            "high-pass at 1 kHz, 100 Hz"
+        );
+        assert!(
+            low.response_db(10_000.0, FS).abs() < 0.1,
+            "high-pass passes 10 kHz"
+        );
+
+        let high = cut(BandKind::HighCut, 1000.0);
+        assert!(
+            high.response_db(10_000.0, FS) < -30.0,
+            "low-pass at 1 kHz, 10 kHz"
+        );
+        assert!(
+            high.response_db(100.0, FS).abs() < 0.1,
+            "low-pass passes 100 Hz"
+        );
+
+        // Butterworth (Q 0.707) is -3 dB at the corner for either side.
+        for kind in [BandKind::LowCut, BandKind::HighCut] {
+            let at_corner = cut(kind, 1000.0).response_db(1000.0, FS);
+            assert!(
+                (at_corner + 3.0).abs() < 0.2,
+                "{kind:?} at its corner measured {at_corner:+.2} dB, want -3"
+            );
+        }
+    }
+
+    /// The same claim through the samples: a 50 Hz tone through a 1 kHz
+    /// high-pass is nearly gone, and a 10 kHz tone through a 1 kHz low-pass is.
+    #[test]
+    fn a_cut_removes_the_tone_it_names_from_the_samples() {
+        for (kind, freq, want_below) in [
+            (BandKind::LowCut, 50.0, -30.0),
+            (BandKind::HighCut, 10_000.0, -30.0),
+        ] {
+            let input = sine(freq, 48_000, 1);
+            let mut out = input.clone();
+            EqState::new(&cut(kind, 1000.0), FS, 1).process(&mut out);
+            let measured = db(rms(&out), rms(&input));
+            assert!(
+                measured < want_below,
+                "{kind:?} at 1 kHz left {freq} Hz at {measured:+.2} dB"
+            );
+        }
+    }
+
+    /// The gain is not a parameter of a cut: the same corner at +12 dB and at
+    /// -12 dB draws the same curve, and the drawn curve is what the samples get.
+    #[test]
+    fn a_cut_ignores_its_gain() {
+        for kind in [BandKind::LowCut, BandKind::HighCut] {
+            let flat = cut(kind, 1000.0);
+            let mut loud = flat.clone();
+            loud.bands[0].gain_db = 12.0;
+            let mut quiet = flat.clone();
+            quiet.bands[0].gain_db = -12.0;
+            for freq in [50.0, 300.0, 1000.0, 3000.0, 15_000.0] {
+                let want = flat.response_db(freq, FS);
+                assert_eq!(loud.response_db(freq, FS), want, "{kind:?} at {freq} Hz");
+                assert_eq!(quiet.response_db(freq, FS), want, "{kind:?} at {freq} Hz");
+            }
+        }
+    }
+
+    /// A cut is never identity, whatever gain it carries, so processing runs
+    /// and the samples do change. A peak at 0 dB still is.
+    #[test]
+    fn a_cut_band_is_never_identity() {
+        for kind in [BandKind::LowCut, BandKind::HighCut] {
+            let params = cut(kind, 1000.0);
+            assert!(!params.is_identity(), "{kind:?} at 0 dB reads as flat");
+            let input = sine(50.0, 4800, 1);
+            let mut out = input.clone();
+            EqState::new(&params, FS, 1).process(&mut out);
+            assert_ne!(out, input, "{kind:?} left the samples untouched");
+        }
+        assert!(peak(1000.0, 0.0, 1.0).is_identity());
     }
 }

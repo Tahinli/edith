@@ -33,6 +33,56 @@ pub const BLACK_Y: u8 = 16;
 /// Neutral chroma: 128 in both planes.
 pub const NEUTRAL_C: u8 = 128;
 
+/// A sample of a planar picture: 8 bits for every picture the engine's own paths
+/// compose, or 10 bits in a `u16` for a 10-bit export. The arithmetic is the same
+/// at either depth, so it is written once: only the black, the neutral chroma and
+/// the largest code change between the two.
+pub trait Sample: Copy + Default + Send + Sync + 'static {
+    /// Limited-range black, luma.
+    const BLACK: Self;
+    /// Neutral chroma.
+    const NEUTRAL: Self;
+    /// The largest code: 255, or 1023 for a 10-bit `u16`.
+    const MAX: u32;
+    /// The sample's code, widened to `u32`.
+    fn code(self) -> u32;
+    /// A code already in range, as a sample (truncating, as `as` does).
+    fn from_code(code: u32) -> Self;
+    /// A float rounded to the nearest code and clamped to the sample's range.
+    fn from_f32(v: f32) -> Self;
+}
+
+impl Sample for u8 {
+    const BLACK: Self = BLACK_Y;
+    const NEUTRAL: Self = NEUTRAL_C;
+    const MAX: u32 = 255;
+    fn code(self) -> u32 {
+        u32::from(self)
+    }
+    fn from_code(code: u32) -> Self {
+        code as u8
+    }
+    fn from_f32(v: f32) -> Self {
+        v.round().clamp(0.0, 255.0) as u8
+    }
+}
+
+/// The 10-bit sample: the same limited-range codes at four times the depth.
+impl Sample for u16 {
+    const BLACK: Self = 64;
+    const NEUTRAL: Self = 512;
+    const MAX: u32 = 1023;
+    fn code(self) -> u32 {
+        u32::from(self)
+    }
+    fn from_code(code: u32) -> Self {
+        code as u16
+    }
+    fn from_f32(v: f32) -> Self {
+        v.round().clamp(0.0, 1023.0) as u16
+    }
+}
+
 /// A rectangle on one plane, in luma samples. Always inside the plane it
 /// describes; `fit_rect` never hands back one that is not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,11 +227,21 @@ pub fn chroma_dims(w: usize, h: usize) -> (usize, usize) {
 
 /// A `w` x `h` I420 canvas filled with limited-range black.
 pub fn black_i420(w: usize, h: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    black_planes(w, h)
+}
+
+/// [`black_i420`] at 10 bits: luma 64, chroma 512.
+pub fn black_i420_wide(w: usize, h: usize) -> (Vec<u16>, Vec<u16>, Vec<u16>) {
+    black_planes(w, h)
+}
+
+/// [`black_i420`] at either sample type: a 10-bit canvas is black at 64 and 512.
+fn black_planes<T: Sample>(w: usize, h: usize) -> (Vec<T>, Vec<T>, Vec<T>) {
     let (cw, ch) = chroma_dims(w, h);
     (
-        vec![BLACK_Y; w * h],
-        vec![NEUTRAL_C; cw * ch],
-        vec![NEUTRAL_C; cw * ch],
+        vec![T::BLACK; w * h],
+        vec![T::NEUTRAL; cw * ch],
+        vec![T::NEUTRAL; cw * ch],
     )
 }
 
@@ -197,15 +257,15 @@ pub fn black_i420(w: usize, h: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
 /// caller bug, not a runtime condition, and every alternative silently produces
 /// a sheared picture.
 #[allow(clippy::too_many_arguments)]
-pub fn scale_i420(
-    src_y: &[u8],
-    src_u: &[u8],
-    src_v: &[u8],
+pub fn scale_i420<T: Sample>(
+    src_y: &[T],
+    src_u: &[T],
+    src_v: &[T],
     src_w: usize,
     src_h: usize,
-    dst_y: &mut [u8],
-    dst_u: &mut [u8],
-    dst_v: &mut [u8],
+    dst_y: &mut [T],
+    dst_u: &mut [T],
+    dst_v: &mut [T],
     dst_w: usize,
     dst_h: usize,
 ) {
@@ -257,7 +317,7 @@ fn taps(dst_len: usize, src_len: usize) -> Vec<(u32, u32, u32)> {
 }
 
 /// Bilinear resample of one tightly packed 8-bit plane.
-fn plane(src: &[u8], src_w: usize, src_h: usize, dst: &mut [u8], dst_w: usize, dst_h: usize) {
+fn plane<T: Sample>(src: &[T], src_w: usize, src_h: usize, dst: &mut [T], dst_w: usize, dst_h: usize) {
     if dst_w == 0 || dst_h == 0 || src_w == 0 || src_h == 0 {
         return;
     }
@@ -273,9 +333,9 @@ fn plane(src: &[u8], src_w: usize, src_h: usize, dst: &mut [u8], dst_w: usize, d
             let inv_wx = ONE - wx;
             let (x0, x1) = (x0 as usize, x1 as usize);
             // Each stage stays under 255 * 65536 + 32768, well inside u32.
-            let a = (u32::from(top[x0]) * inv_wx + u32::from(top[x1]) * wx + HALF) >> 16;
-            let b = (u32::from(bottom[x0]) * inv_wx + u32::from(bottom[x1]) * wx + HALF) >> 16;
-            *o = ((a * inv_wy + b * wy + HALF) >> 16) as u8;
+            let a = (top[x0].code() * inv_wx + top[x1].code() * wx + HALF) >> 16;
+            let b = (bottom[x0].code() * inv_wx + bottom[x1].code() * wx + HALF) >> 16;
+            *o = T::from_code((a * inv_wy + b * wy + HALF) >> 16);
         }
     }
 }
@@ -292,15 +352,15 @@ fn plane(src: &[u8], src_w: usize, src_h: usize, dst: &mut [u8], dst_w: usize, d
 /// would put the frame's chroma half a sample off its own grid, so it is
 /// floored to even here rather than silently smeared.
 #[allow(clippy::too_many_arguments)]
-pub fn compose_i420(
-    canvas_y: &mut [u8],
-    canvas_u: &mut [u8],
-    canvas_v: &mut [u8],
+pub fn compose_i420<T: Sample>(
+    canvas_y: &mut [T],
+    canvas_u: &mut [T],
+    canvas_v: &mut [T],
     canvas_w: usize,
     canvas_h: usize,
-    frame_y: &[u8],
-    frame_u: &[u8],
-    frame_v: &[u8],
+    frame_y: &[T],
+    frame_u: &[T],
+    frame_v: &[T],
     rect: Rect,
 ) {
     let x = (rect.x & !1) as usize;
@@ -498,14 +558,14 @@ pub fn nearest_90_steps(degrees: f32) -> u8 {
 /// shape, `1` and `3` swap it -- the chroma planes rotate the same way at
 /// their own `(w+1)/2` x `(h+1)/2` size, which stays exact because it is
 /// exactly the luma size's, swapped the same way.
-pub fn rotate_i420_90s(
-    y: &[u8],
-    u: &[u8],
-    v: &[u8],
+pub fn rotate_i420_90s<T: Sample>(
+    y: &[T],
+    u: &[T],
+    v: &[T],
     w: u32,
     h: u32,
     steps: u8,
-) -> (Vec<u8>, Vec<u8>, Vec<u8>, u32, u32) {
+) -> (Vec<T>, Vec<T>, Vec<T>, u32, u32) {
     let mut out = (Vec::new(), Vec::new(), Vec::new());
     let (rw, rh) = rotate_i420_90s_into(y, u, v, w, h, steps, &mut out);
     (out.0, out.1, out.2, rw, rh)
@@ -516,14 +576,14 @@ pub fn rotate_i420_90s(
 /// three plane allocations are a steady-state cost to pay once rather than a
 /// per-frame one. The output is exactly what the allocating form returns; the
 /// scratch tuple is resized and refilled, never appended to.
-pub fn rotate_i420_90s_into(
-    y: &[u8],
-    u: &[u8],
-    v: &[u8],
+pub fn rotate_i420_90s_into<T: Sample>(
+    y: &[T],
+    u: &[T],
+    v: &[T],
     w: u32,
     h: u32,
     steps: u8,
-    out: &mut (Vec<u8>, Vec<u8>, Vec<u8>),
+    out: &mut (Vec<T>, Vec<T>, Vec<T>),
 ) -> (u32, u32) {
     let steps = steps % 4;
     if steps == 0 || w == 0 || h == 0 {
@@ -545,10 +605,10 @@ pub fn rotate_i420_90s_into(
 /// One tightly packed plane, rotated `steps` (1..=3) quarter turns clockwise,
 /// written into `out` -- resized to the turned size, which is the source's
 /// swapped at 90 and 270 and its own at 180.
-fn rotate_plane_into(src: &[u8], w: usize, h: usize, steps: u8, out: &mut Vec<u8>) {
+fn rotate_plane_into<T: Sample>(src: &[T], w: usize, h: usize, steps: u8, out: &mut Vec<T>) {
     match steps {
         1 => {
-            out.resize(h * w, 0);
+            out.resize(h * w, T::default());
             for yp in 0..w {
                 for xp in 0..h {
                     out[yp * h + xp] = src[(h - 1 - xp) * w + yp];
@@ -556,7 +616,7 @@ fn rotate_plane_into(src: &[u8], w: usize, h: usize, steps: u8, out: &mut Vec<u8
             }
         }
         2 => {
-            out.resize(w * h, 0);
+            out.resize(w * h, T::default());
             for yp in 0..h {
                 for xp in 0..w {
                     out[yp * w + xp] = src[(h - 1 - yp) * w + (w - 1 - xp)];
@@ -564,7 +624,7 @@ fn rotate_plane_into(src: &[u8], w: usize, h: usize, steps: u8, out: &mut Vec<u8
             }
         }
         3 => {
-            out.resize(h * w, 0);
+            out.resize(h * w, T::default());
             for yp in 0..w {
                 for xp in 0..h {
                     out[yp * h + xp] = src[xp * w + (w - 1 - yp)];
@@ -618,28 +678,41 @@ pub struct Composer {
     width: u32,
     height: u32,
     policy: FitPolicy,
-    /// The `src` rect of [`fit_rect`], gathered tightly packed. Only `Fill` and
-    /// `Center` ever crop, so this stays empty for a letterboxed project.
-    crop: (Vec<u8>, Vec<u8>, Vec<u8>),
-    /// The crop resampled to the placement rect.
-    scaled: (Vec<u8>, Vec<u8>, Vec<u8>),
-    /// The canvas itself, refilled with black every frame -- a memset against a
-    /// decode, and the only way a policy change cannot leave last frame's bars
-    /// showing through.
-    canvas: (Vec<u8>, Vec<u8>, Vec<u8>),
+    /// The 8-bit buffers that [`place`](Composer::place) works in.
+    narrow: Scratch<u8>,
+    /// The 10-bit buffers of [`place_wide`](Composer::place_wide).
+    wide: Scratch<u16>,
+}
+
+/// The three planes of an I420 picture at one sample type.
+type Triple<T> = (Vec<T>, Vec<T>, Vec<T>);
+
+/// One sample type's buffers for a [`Composer`]: the `src` rect of [`fit_rect`],
+/// gathered tightly packed (only `Fill` and `Center` ever crop, so it stays empty
+/// for a letterboxed project); the crop resampled to the placement rect; and the
+/// canvas itself, refilled with black every frame.
+#[derive(Default)]
+struct Scratch<T> {
+    crop: Triple<T>,
+    scaled: Triple<T>,
+    canvas: Triple<T>,
 }
 
 impl Composer {
     pub fn new(width: u32, height: u32, policy: FitPolicy) -> Self {
-        let empty = || (Vec::new(), Vec::new(), Vec::new());
         Self {
             width,
             height,
             policy,
-            crop: empty(),
-            scaled: empty(),
-            canvas: empty(),
+            narrow: Scratch::default(),
+            wide: Scratch::default(),
         }
+    }
+
+    /// A composer with the same canvas and fit as this one and none of its scratch:
+    /// what a second decode of the same clip is placed with.
+    pub(crate) fn fresh(&self) -> Self {
+        Self::new(self.width, self.height, self.policy)
     }
 
     /// A composer that places nothing: every picture passes through at its own
@@ -702,41 +775,23 @@ impl Composer {
         if self.is_passthrough(src_w, src_h) {
             return (y, u, v, src_w, src_h);
         }
-        let (dst, src) = fit_rect(src_w, src_h, self.width, self.height, self.policy);
-        let (sw, sh) = (src_w as usize, src_h as usize);
+        place_in(self.width, self.height, self.policy, &mut self.narrow, y, u, v, src_w, src_h)
+    }
 
-        // Crop first, so the scaler only ever sees a tightly packed plane. Fit
-        // and Stretch never crop, which is the whole cost of the common case.
-        let (src_y, src_u, src_v) = if (src.w, src.h) == (src_w, src_h) {
-            (y, u, v)
-        } else {
-            crop_i420(&mut self.crop, y, u, v, sw, sh, src);
-            (&self.crop.0[..], &self.crop.1[..], &self.crop.2[..])
-        };
-        // ...then resample it to the placement, unless it already is that size
-        // (`Center` never resamples, and neither does an exact-fit upscale).
-        let (cw, ch) = (src.w as usize, src.h as usize);
-        let (dw, dh) = (dst.w as usize, dst.h as usize);
-        let (pic_y, pic_u, pic_v) = if (cw, ch) == (dw, dh) {
-            (src_y, src_u, src_v)
-        } else {
-            let (ccw, cch) = chroma_dims(dw, dh);
-            let (sy, su, sv) = &mut self.scaled;
-            sy.resize(dw * dh, 0);
-            su.resize(ccw * cch, 0);
-            sv.resize(ccw * cch, 0);
-            scale_i420(src_y, src_u, src_v, cw, ch, sy, su, sv, dw, dh);
-            (&sy[..], &su[..], &sv[..])
-        };
-
-        let (w, h) = (self.width as usize, self.height as usize);
-        let (canvas_cw, canvas_ch) = chroma_dims(w, h);
-        let (ky, ku, kv) = &mut self.canvas;
-        fill(ky, w * h, BLACK_Y);
-        fill(ku, canvas_cw * canvas_ch, NEUTRAL_C);
-        fill(kv, canvas_cw * canvas_ch, NEUTRAL_C);
-        compose_i420(ky, ku, kv, w, h, pic_y, pic_u, pic_v, dst);
-        (ky, ku, kv, self.width, self.height)
+    /// [`place`](Self::place) for a picture at 10 bits a sample: the same fit, the
+    /// same canvas, black at 64 and 512, composed at 10 bits.
+    pub fn place_wide<'a>(
+        &'a mut self,
+        y: &'a [u16],
+        u: &'a [u16],
+        v: &'a [u16],
+        src_w: u32,
+        src_h: u32,
+    ) -> (&'a [u16], &'a [u16], &'a [u16], u32, u32) {
+        if self.is_passthrough(src_w, src_h) {
+            return (y, u, v, src_w, src_h);
+        }
+        place_in(self.width, self.height, self.policy, &mut self.wide, y, u, v, src_w, src_h)
     }
 
     /// [`place`](Self::place) with a per-clip [`TransformParams`] applied on
@@ -769,125 +824,199 @@ impl Composer {
             let (y, u, v, w, h) = self.place(y, u, v, src_w, src_h);
             return (y.to_vec(), u.to_vec(), v.to_vec(), w, h);
         }
-        // A pass-through canvas still has a picture to place a transform on;
-        // treat it as a canvas the exact size of the incoming picture, so a
-        // transformed clip at the project's own resolution still crops,
-        // rotates and moves instead of skipping straight through.
-        let (canvas_w, canvas_h) = if self.width == 0 || self.height == 0 {
-            (src_w, src_h)
-        } else {
-            (self.width, self.height)
-        };
+        transform_in(self.width, self.height, self.policy, y, u, v, src_w, src_h, t)
+    }
 
-        let crop = crop_rect(src_w, src_h, t);
-        let mut buf1 = (Vec::new(), Vec::new(), Vec::new());
-        let (cy, cu, cv) = if (crop.w, crop.h) == (src_w, src_h) {
-            (y, u, v)
-        } else {
-            crop_i420(&mut buf1, y, u, v, src_w as usize, src_h as usize, crop);
-            (&buf1.0[..], &buf1.1[..], &buf1.2[..])
-        };
-
-        // No rotation is the overwhelmingly common case (a move or a scale,
-        // never a quarter turn); `rotate_i420_90s` always copies its whole
-        // picture even at zero steps, so that copy -- three full-resolution
-        // planes, every decoded frame -- is skipped here rather than paid on
-        // a transform that never rotates. This is the settle-lag fix: it is
-        // what made a plain position/scale edit visibly slower to catch up
-        // to than a colour grade, which never copies the picture at all.
-        let steps = nearest_90_steps(t.rotate);
-        let rot_buf;
-        let (ry, ru, rv, rw, rh) = if steps == 0 {
-            (cy, cu, cv, crop.w, crop.h)
-        } else {
-            rot_buf = rotate_i420_90s(cy, cu, cv, crop.w, crop.h, steps);
-            (
-                &rot_buf.0[..],
-                &rot_buf.1[..],
-                &rot_buf.2[..],
-                rot_buf.3,
-                rot_buf.4,
-            )
-        };
-
-        let (dst, src) = fit_rect(rw, rh, canvas_w, canvas_h, self.policy);
-        let (dst, src) = transformed_dst_rect(dst, src, rw, rh, t, canvas_w, canvas_h);
-        let (rw_u, rh_u) = (rw as usize, rh as usize);
-        let mut buf2 = (Vec::new(), Vec::new(), Vec::new());
-        let (fy, fu, fv) = if (src.w, src.h) == (rw, rh) {
-            (ry, ru, rv)
-        } else {
-            crop_i420(&mut buf2, ry, ru, rv, rw_u, rh_u, src);
-            (&buf2.0[..], &buf2.1[..], &buf2.2[..])
-        };
-
-        let (sw, sh) = (src.w as usize, src.h as usize);
-        let (dw, dh) = (dst.w as usize, dst.h as usize);
-        let mut scaled = (Vec::new(), Vec::new(), Vec::new());
-        let (py, pu, pv) = if (sw, sh) == (dw, dh) {
-            (fy, fu, fv)
-        } else {
-            let (ccw, cch) = chroma_dims(dw, dh);
-            scaled.0.resize(dw * dh, 0);
-            scaled.1.resize(ccw * cch, 0);
-            scaled.2.resize(ccw * cch, 0);
-            scale_i420(
-                fy,
-                fu,
-                fv,
-                sw,
-                sh,
-                &mut scaled.0,
-                &mut scaled.1,
-                &mut scaled.2,
-                dw,
-                dh,
-            );
-            (&scaled.0[..], &scaled.1[..], &scaled.2[..])
-        };
-
-        let (w, h) = (canvas_w as usize, canvas_h as usize);
-        let mut canvas = black_i420(w, h);
-        compose_i420(
-            &mut canvas.0,
-            &mut canvas.1,
-            &mut canvas.2,
-            w,
-            h,
-            py,
-            pu,
-            pv,
-            dst,
-        );
-        (canvas.0, canvas.1, canvas.2, canvas_w, canvas_h)
+    /// [`place_transformed`](Self::place_transformed) for a 10-bit picture.
+    pub fn place_transformed_wide(
+        &mut self,
+        y: &[u16],
+        u: &[u16],
+        v: &[u16],
+        src_w: u32,
+        src_h: u32,
+        t: &TransformParams,
+    ) -> (Vec<u16>, Vec<u16>, Vec<u16>, u32, u32) {
+        if t.is_identity() {
+            let (y, u, v, w, h) = self.place_wide(y, u, v, src_w, src_h);
+            return (y.to_vec(), u.to_vec(), v.to_vec(), w, h);
+        }
+        transform_in(self.width, self.height, self.policy, y, u, v, src_w, src_h, t)
     }
 }
 
-/// Per-byte lerp of two same-sized I420 frames: `out = a + (b - a) * t`, on
-/// every plane. `t` is clamped to `[0, 1]` -- a caller ramping across a
-/// cross-dissolve window hands back an in-range fraction already, this is the
-/// backstop. `a`/`b`'s planes must be the same length pairwise (Y with Y, U
-/// with U, V with V); a mismatched pair panics rather than silently
-/// truncating a picture.
-pub fn blend_i420(
-    a: (&[u8], &[u8], &[u8]),
-    b: (&[u8], &[u8], &[u8]),
+/// [`Composer::place`] at one sample type: the picture fitted onto a `width` x
+/// `height` canvas under `policy`, the canvas and its scratch in `s`.
+#[allow(clippy::too_many_arguments)]
+fn place_in<'a, T: Sample>(
+    width: u32,
+    height: u32,
+    policy: FitPolicy,
+    s: &'a mut Scratch<T>,
+    y: &'a [T],
+    u: &'a [T],
+    v: &'a [T],
+    src_w: u32,
+    src_h: u32,
+) -> (&'a [T], &'a [T], &'a [T], u32, u32) {
+    let (dst, src) = fit_rect(src_w, src_h, width, height, policy);
+    let (sw, sh) = (src_w as usize, src_h as usize);
+
+    // Crop first, so the scaler only ever sees a tightly packed plane. Fit and
+    // Stretch never crop, which is the whole cost of the common case.
+    let (src_y, src_u, src_v) = if (src.w, src.h) == (src_w, src_h) {
+        (y, u, v)
+    } else {
+        crop_i420(&mut s.crop, y, u, v, sw, sh, src);
+        (&s.crop.0[..], &s.crop.1[..], &s.crop.2[..])
+    };
+    // ...then resample it to the placement, unless it already is that size.
+    let (cw, ch) = (src.w as usize, src.h as usize);
+    let (dw, dh) = (dst.w as usize, dst.h as usize);
+    let (pic_y, pic_u, pic_v) = if (cw, ch) == (dw, dh) {
+        (src_y, src_u, src_v)
+    } else {
+        let (ccw, cch) = chroma_dims(dw, dh);
+        let (sy, su, sv) = &mut s.scaled;
+        sy.resize(dw * dh, T::default());
+        su.resize(ccw * cch, T::default());
+        sv.resize(ccw * cch, T::default());
+        scale_i420(src_y, src_u, src_v, cw, ch, sy, su, sv, dw, dh);
+        (&sy[..], &su[..], &sv[..])
+    };
+
+    let (w, h) = (width as usize, height as usize);
+    let (canvas_cw, canvas_ch) = chroma_dims(w, h);
+    let (ky, ku, kv) = &mut s.canvas;
+    fill(ky, w * h, T::BLACK);
+    fill(ku, canvas_cw * canvas_ch, T::NEUTRAL);
+    fill(kv, canvas_cw * canvas_ch, T::NEUTRAL);
+    compose_i420(ky, ku, kv, w, h, pic_y, pic_u, pic_v, dst);
+    (ky, ku, kv, width, height)
+}
+
+/// [`Composer::place_transformed`] at one sample type, for a picture that is not
+/// the identity transform. The canvas is the picture's own size on a pass-through
+/// composer.
+#[allow(clippy::too_many_arguments)]
+fn transform_in<T: Sample>(
+    width: u32,
+    height: u32,
+    policy: FitPolicy,
+    y: &[T],
+    u: &[T],
+    v: &[T],
+    src_w: u32,
+    src_h: u32,
+    t: &TransformParams,
+) -> (Vec<T>, Vec<T>, Vec<T>, u32, u32) {
+    // A pass-through canvas still has a picture to place a transform on; treat it
+    // as a canvas the exact size of the incoming picture.
+    let (canvas_w, canvas_h) = if width == 0 || height == 0 {
+        (src_w, src_h)
+    } else {
+        (width, height)
+    };
+
+    let crop = crop_rect(src_w, src_h, t);
+    let mut buf1 = (Vec::new(), Vec::new(), Vec::new());
+    let (cy, cu, cv) = if (crop.w, crop.h) == (src_w, src_h) {
+        (y, u, v)
+    } else {
+        crop_i420(&mut buf1, y, u, v, src_w as usize, src_h as usize, crop);
+        (&buf1.0[..], &buf1.1[..], &buf1.2[..])
+    };
+
+    // No rotation is the overwhelmingly common case (a move or a scale, never a
+    // quarter turn): `rotate_i420_90s` always copies its picture, so that copy is
+    // skipped when there is nothing to turn.
+    let steps = nearest_90_steps(t.rotate);
+    let rot_buf;
+    let (ry, ru, rv, rw, rh) = if steps == 0 {
+        (cy, cu, cv, crop.w, crop.h)
+    } else {
+        rot_buf = rotate_i420_90s(cy, cu, cv, crop.w, crop.h, steps);
+        (&rot_buf.0[..], &rot_buf.1[..], &rot_buf.2[..], rot_buf.3, rot_buf.4)
+    };
+
+    let (dst, src) = fit_rect(rw, rh, canvas_w, canvas_h, policy);
+    let (dst, src) = transformed_dst_rect(dst, src, rw, rh, t, canvas_w, canvas_h);
+    let (rw_u, rh_u) = (rw as usize, rh as usize);
+    let mut buf2 = (Vec::new(), Vec::new(), Vec::new());
+    let (fy, fu, fv) = if (src.w, src.h) == (rw, rh) {
+        (ry, ru, rv)
+    } else {
+        crop_i420(&mut buf2, ry, ru, rv, rw_u, rh_u, src);
+        (&buf2.0[..], &buf2.1[..], &buf2.2[..])
+    };
+
+    let (sw, sh) = (src.w as usize, src.h as usize);
+    let (dw, dh) = (dst.w as usize, dst.h as usize);
+    let mut scaled = (Vec::new(), Vec::new(), Vec::new());
+    let (py, pu, pv) = if (sw, sh) == (dw, dh) {
+        (fy, fu, fv)
+    } else {
+        let (ccw, cch) = chroma_dims(dw, dh);
+        scaled.0.resize(dw * dh, T::default());
+        scaled.1.resize(ccw * cch, T::default());
+        scaled.2.resize(ccw * cch, T::default());
+        scale_i420(fy, fu, fv, sw, sh, &mut scaled.0, &mut scaled.1, &mut scaled.2, dw, dh);
+        (&scaled.0[..], &scaled.1[..], &scaled.2[..])
+    };
+
+    let (w, h) = (canvas_w as usize, canvas_h as usize);
+    let mut canvas = black_planes::<T>(w, h);
+    compose_i420(&mut canvas.0, &mut canvas.1, &mut canvas.2, w, h, py, pu, pv, dst);
+    // A single clip's opacity is its fade toward the black canvas it sits on.
+    // Layers above a picture take it as their coverage instead (see
+    // `export::LayerStack`), so they are placed with opacity 1 there.
+    if t.opacity < 1.0 {
+        fade_canvas_to_black(&mut canvas, t.opacity.max(0.0));
+    }
+    (canvas.0, canvas.1, canvas.2, canvas_w, canvas_h)
+}
+
+/// Fades an I420 picture drawn on a black canvas toward that black by `k`
+/// (`0.0` is all black, `1.0` leaves it), per code value: luma toward black,
+/// chroma toward neutral, rounded to the nearest code.
+pub fn fade_canvas_to_black<T: Sample>(planes: &mut (Vec<T>, Vec<T>, Vec<T>), k: f32) {
+    let k = k.clamp(0.0, 1.0);
+    let toward = |plane: &mut [T], black: T| {
+        for p in plane {
+            let v = black.code() as f32 + (p.code() as f32 - black.code() as f32) * k;
+            *p = T::from_f32(v);
+        }
+    };
+    toward(&mut planes.0, T::BLACK);
+    toward(&mut planes.1, T::NEUTRAL);
+    toward(&mut planes.2, T::NEUTRAL);
+}
+
+/// Per-code lerp of two same-sized I420 frames: `out = a + (b - a) * t`, on
+/// every plane. `t` is clamped to `[0, 1]`. A mismatched pair panics rather than
+/// silently truncating a picture.
+pub fn blend_i420<T: Sample>(
+    a: (&[T], &[T], &[T]),
+    b: (&[T], &[T], &[T]),
     t: f32,
-) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+) -> (Vec<T>, Vec<T>, Vec<T>) {
     let t = t.clamp(0.0, 1.0);
-    let plane = |a: &[u8], b: &[u8]| -> Vec<u8> {
+    let plane = |a: &[T], b: &[T]| -> Vec<T> {
         assert_eq!(a.len(), b.len(), "blend_i420: mismatched plane sizes");
         a.iter()
             .zip(b)
-            .map(|(&av, &bv)| (av as f32 + (bv as f32 - av as f32) * t).round() as u8)
+            .map(|(&av, &bv)| {
+                let (av, bv) = (av.code() as f32, bv.code() as f32);
+                T::from_f32(av + (bv - av) * t)
+            })
             .collect()
     };
     (plane(a.0, b.0), plane(a.1, b.1), plane(a.2, b.2))
 }
 
-/// Resizes `plane` to `len` and sets every byte to `value` -- a canvas reused
+/// Resizes `plane` to `len` and sets every code to `value` -- a canvas reused
 /// across frames is refilled, not reallocated.
-fn fill(plane: &mut Vec<u8>, len: usize, value: u8) {
+fn fill<T: Sample>(plane: &mut Vec<T>, len: usize, value: T) {
     plane.clear();
     plane.resize(len, value);
 }
@@ -895,11 +1024,11 @@ fn fill(plane: &mut Vec<u8>, len: usize, value: u8) {
 /// Gathers `rect` out of a tightly packed I420 frame into another tightly packed
 /// one. `rect` comes from [`fit_rect`], so its offsets are even and the chroma
 /// crop is exactly half of it.
-fn crop_i420(
-    out: &mut (Vec<u8>, Vec<u8>, Vec<u8>),
-    y: &[u8],
-    u: &[u8],
-    v: &[u8],
+fn crop_i420<T: Sample>(
+    out: &mut (Vec<T>, Vec<T>, Vec<T>),
+    y: &[T],
+    u: &[T],
+    v: &[T],
     src_w: usize,
     src_h: usize,
     rect: Rect,
@@ -923,6 +1052,84 @@ fn crop_i420(
     }
     debug_assert_eq!(oy.len(), w * h);
     debug_assert_eq!(ou.len(), cw * ch);
+}
+
+/// Where a clip's picture lands on the canvas, worked out once from the same
+/// helpers [`transform_in`] composes with: the crop, the quarter turn, the fit and
+/// the placement's own move, scale and fit-crop.
+struct Placed {
+    crop: Rect,
+    steps: u8,
+    dst: Rect,
+    src: Rect,
+}
+
+fn placed(src: (u32, u32), t: &TransformParams, canvas: (u32, u32), fit: FitPolicy) -> Placed {
+    let crop = crop_rect(src.0, src.1, t);
+    let steps = nearest_90_steps(t.rotate) % 4;
+    let (rw, rh) = if steps % 2 == 1 { (crop.h, crop.w) } else { (crop.w, crop.h) };
+    let (dst, srcr) = fit_rect(rw, rh, canvas.0.max(1), canvas.1.max(1), fit);
+    let (dst, srcr) = transformed_dst_rect(dst, srcr, rw, rh, t, canvas.0.max(1), canvas.1.max(1));
+    Placed { crop, steps, dst, src: srcr }
+}
+
+/// A point of the clip's source picture, in picture fractions (`0..=1` each), mapped
+/// to where it shows on the canvas, in canvas fractions, under the placement `t`:
+/// the inverse of [`canvas_to_picture`]. `src` is the picture's own size. A placement
+/// that shows nothing returns the point unchanged.
+pub fn picture_to_canvas(
+    src: (u32, u32),
+    t: &TransformParams,
+    canvas: (u32, u32),
+    fit: FitPolicy,
+    p: (f32, f32),
+) -> (f32, f32) {
+    let pl = placed(src, t, canvas, fit);
+    if pl.dst.is_empty() || pl.src.is_empty() || src.0 == 0 || src.1 == 0 {
+        return p;
+    }
+    let (cw, ch) = (f64::from(pl.crop.w), f64::from(pl.crop.h));
+    let x = f64::from(p.0) * f64::from(src.0) - f64::from(pl.crop.x);
+    let y = f64::from(p.1) * f64::from(src.1) - f64::from(pl.crop.y);
+    let (qx, qy) = match pl.steps {
+        0 => (x, y),
+        1 => (ch - y, x),
+        2 => (cw - x, ch - y),
+        _ => (y, cw - x),
+    };
+    let sx = f64::from(pl.dst.w) / f64::from(pl.src.w);
+    let sy = f64::from(pl.dst.h) / f64::from(pl.src.h);
+    let cx = f64::from(pl.dst.x) + (qx - f64::from(pl.src.x)) * sx;
+    let cy = f64::from(pl.dst.y) + (qy - f64::from(pl.src.y)) * sy;
+    ((cx / f64::from(canvas.0.max(1))) as f32, (cy / f64::from(canvas.1.max(1))) as f32)
+}
+
+/// A canvas point (canvas fractions) mapped back to the clip's source picture, in
+/// picture fractions: the inverse of [`picture_to_canvas`]. A point off the placed
+/// picture comes back outside `0..=1`.
+pub fn canvas_to_picture(
+    src: (u32, u32),
+    t: &TransformParams,
+    canvas: (u32, u32),
+    fit: FitPolicy,
+    c: (f32, f32),
+) -> (f32, f32) {
+    let pl = placed(src, t, canvas, fit);
+    if pl.dst.is_empty() || pl.src.is_empty() || src.0 == 0 || src.1 == 0 {
+        return c;
+    }
+    let (cw, ch) = (f64::from(pl.crop.w), f64::from(pl.crop.h));
+    let sx = f64::from(pl.dst.w) / f64::from(pl.src.w);
+    let sy = f64::from(pl.dst.h) / f64::from(pl.src.h);
+    let qx = f64::from(pl.src.x) + (f64::from(c.0) * f64::from(canvas.0.max(1)) - f64::from(pl.dst.x)) / sx;
+    let qy = f64::from(pl.src.y) + (f64::from(c.1) * f64::from(canvas.1.max(1)) - f64::from(pl.dst.y)) / sy;
+    let (x, y) = match pl.steps {
+        0 => (qx, qy),
+        1 => (qy, ch - qx),
+        2 => (cw - qx, ch - qy),
+        _ => (cw - qy, qx),
+    };
+    (((x + f64::from(pl.crop.x)) / f64::from(src.0)) as f32, ((y + f64::from(pl.crop.y)) / f64::from(src.1)) as f32)
 }
 
 #[cfg(test)]
@@ -1461,6 +1668,7 @@ mod tests {
     /// Not asserted: only the release number means anything. Run with
     /// `cargo test -p engine --release scale::tests::perf -- --nocapture`.
     #[test]
+    #[ignore = "perf: run with --ignored"]
     fn perf_720p_to_1080p() {
         let src = gradient(1280, 720);
         let (cw, ch) = chroma_dims(1920, 1080);
@@ -1484,6 +1692,7 @@ mod tests {
     /// scale and blit -- which is what the playback budget has to hold. Printed,
     /// not asserted, like every other perf test here.
     #[test]
+    #[ignore = "perf: run with --ignored"]
     fn perf_compose_720p_onto_1080p() {
         let src = gradient(1280, 720);
         let mut canvas = Composer::new(1920, 1080, FitPolicy::Fit);

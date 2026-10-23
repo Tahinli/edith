@@ -9,7 +9,12 @@ pub(crate) const GHOST_MIN: f32 = 2.;
 
 /// Fixed so the video region takes every pixel the window gains and the controls
 /// never clip at 640x360.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const HEADER_H: f32 = 32.;
+
+/// The menu bar across the top of the room, above the dock and the centre alike
+/// (DESIGN §6.1). The room below it is the window less this.
+pub(crate) const MENU_BAR_H: f32 = 28.;
 // 28 button row + 24 scrub strip + two 48 lanes + the timecode line + the gaps
 // between them, with a few px of slack so a taller text line cannot push a lane
 // off the bottom. The window measures itself from [`timeline_h`] now, so this
@@ -82,14 +87,6 @@ pub(crate) const KEYS_ROW_H: f32 = HIT_MIN;
 /// the whole file. At `KEYS_W` every one of those wrapped to two lines, which is
 /// the card the user called unfriendly. Still inside the 640 px floor with the
 /// scrim showing either side of it.
-/// The export moment's height (the approved artboard's 200px): three rows,
-/// never a scroll -- the card it replaced grew a capped, scrolling list.
-/// Unchanged by the picture and sound readouts row 3 now carries (user
-/// 2026-09-09: "resolution and audio bitrate should be seen in export menu
-/// too"): measured at 1280 wide, the whole line still fits on one line, so
-/// the row wraps only below this editor's own 640px floor.
-pub(crate) const EXPORT_MOMENT_H: f32 = 200.;
-
 pub(crate) const EXPORT_W: f32 = 420.;
 
 /// The column a key is printed in, wide enough for `0-9` -- the width the
@@ -98,8 +95,8 @@ pub(crate) const EXPORT_KEY_W: f32 = 26.;
 /// The menu a right-click on a clip opens: wide enough for the longest label
 /// beside the stroke that does the same thing, with the click targets `HIT_MIN`
 /// binds like every other list here.
-pub(crate) const MENU_W: f32 = 260.;
-pub(crate) const MENU_ROW_H: f32 = HIT_MIN;
+pub(crate) const MENU_W: f32 = 280.;
+pub(crate) const MENU_ROW_H: f32 = 28.;
 pub(crate) const MENU_PAD: f32 = 6.;
 /// The breathing room a hanging menu keeps against every window edge. Without
 /// it `menu_at`'s clamp let a menu sit flush on the bottom edge -- the last row
@@ -208,10 +205,37 @@ pub(crate) const TIMELINE_FIXED_H: f32 = 16. + 18. + 8. + RULER_HIT_H + 8. + 4.;
 /// with it, out of every budget at once: a height still carrying the row would
 /// hand it to the lane column as a bonus at exactly the zoom where the hand is
 /// least expecting the bed to move.
+// The strip's hit area is the one thing that must stay a target (WCAG 2.5.8),
+// however thin its bar is drawn. Checked here because layout is where it is
+// spent against the bar, and nothing else reads it at build time.
+const _: () = assert!(SCROLL_HIT >= HIT_MIN && SCROLL_HIT > SCROLL_BAR_H);
+
+/// The scrollbar strip's whole row: 12px with the bar centred in it, so the
+/// thumb's drawn bar and the layout's pixels are one number. Taller than the
+/// bar needs so the hit band below can stand on the row and the bench's own
+/// bottom padding, and never reach the ledger seam under the bench.
+pub(crate) const SCROLL_ROW_H: f32 = 12.;
+const _: () = assert!(SCROLL_ROW_H >= SCROLL_BAR_H);
+
+/// How far the strip's hit band reaches above the row, into the bottom of the
+/// lanes. The most a scrollbar may take from them: 8px.
+pub(crate) const SCROLL_HIT_UP: f32 = 8.;
+/// How far it reaches below the row: the 4px bottom padding `ui::stance::bench`
+/// gives the bench's content, which nothing else hits. The band never goes
+/// past the bench's own bottom edge.
+pub(crate) const SCROLL_HIT_DOWN: f32 = 4.;
+// Together the band is a WCAG 2.5.8 target, and it takes no more than 8px
+// from the lanes above the row.
+const _: () = assert!(
+    SCROLL_ROW_H + SCROLL_HIT_UP + SCROLL_HIT_DOWN >= HIT_MIN
+        && SCROLL_HIT_UP <= 8.
+        && SCROLL_HIT_DOWN <= 4.
+);
+
 pub(crate) fn timeline_fixed_h(scroll: bool) -> f32 {
     TIMELINE_FIXED_H
         + match scroll {
-            true => 8. + SCROLL_HIT,
+            true => SCROLL_ROW_H,
             false => 0.,
         }
 }
@@ -225,9 +249,24 @@ pub(crate) fn timeline_fixed_h(scroll: bool) -> f32 {
 /// is left, which leaves the picture a region rather than a letterbox stripe.
 pub(crate) const TIMELINE_SHARE: f32 = 171. / 360.;
 
-/// The edit toolbar directly above the timeline: one control's height in its
-/// own padding, fixed so nothing in it can push the timeline down.
-pub(crate) const TOOLBAR_H: f32 = CONTROL_H + 16.;
+/// One edit-toolbar button's height: a 32px target, above the 24px floor
+/// ([`HIT_MIN`]) with room for the word and its key (DESIGN §6.4).
+pub(crate) const TOOLBAR_BTN_H: f32 = 32.;
+
+/// The edit toolbar directly above the timeline: a button row and 6px of air
+/// either side of it. Fixed, and spent once: `stance::bench()` takes it out of
+/// the bench's own box, so the lanes get the rest and nothing is reserved twice.
+pub(crate) const TOOLBAR_ROW_H: f32 = TOOLBAR_BTN_H + 8.;
+
+/// The strip of sequence tabs under the toolbar row (NLE-style): always there, so
+/// opening a second sequence moves nothing. Part of [`TOOLBAR_H`].
+pub(crate) const SEQ_BAR_H: f32 = 28.;
+/// One sequence tab's height, inside the strip.
+pub(crate) const SEQ_TAB_H: f32 = HIT_MIN;
+
+/// The whole region above the lanes: the button row and the sequence strip. Fixed, and spent
+/// once: `stance::bench()` takes it out of the bench's own box, so the lanes get the rest.
+pub(crate) const TOOLBAR_H: f32 = TOOLBAR_ROW_H + SEQ_BAR_H;
 
 /// One press of a zoom key, or one notch of ctrl+wheel.
 pub(crate) const ZOOM_STEP: f32 = 1.25;
@@ -255,10 +294,10 @@ pub(crate) const PPS_MIN: f64 = 1.;
 pub(crate) const ZOOM_OUT_MARGIN: f64 = 1.05;
 
 /// How wide a second of timeline is drawn before anyone zooms: a five second
-/// import is 200 px of a bed several times that, so a short clip reads as
+/// import is 300 px of a bed several times that, so a short clip reads as
 /// short -- the thing a bed scaled to the content's own length cannot say.
 /// [`View::fit`] is the one way back to "the whole timeline across the bed".
-pub(crate) const PPS_DEFAULT: f64 = 40.;
+pub(crate) const PPS_DEFAULT: f64 = 60.;
 
 // -- the seams between the regions, and where a hand has dragged them ---------
 
@@ -310,23 +349,24 @@ pub(crate) const SPLIT_W: f32 = 6.;
 
 /// How wide the same seam is *aimed at*. The strip above is what the layout
 /// spends and the hairline is what the eye is given; this is the band the hand
-/// gets, centred on the strip and overlaid on the two panels it parts, so
-/// growing it moves nothing. 6 px asked the hand for precision it does not
+/// gets, hung one row above the strip and overlaid on the two panels it parts,
+/// so growing it moves nothing. 6 px asked the hand for precision it does not
 /// have -- the lead's own press one row into the bench missed the seam by 5 px
 /// and focused the bench instead ("panes should be enlargable and shrinkable",
-/// of panes that already resized). 12 px is the ±6 px of aim every editor's
-/// dividers allow, and it is hung one row above the strip rather than centred
-/// on it: what a hand aims at is the line it can see (the panel's own edge at
-/// the strip's far side), not the six transparent pixels in front of it.
-pub(crate) const GRAB_W: f32 = 14.;
+/// of panes that already resized). 24 px is [`HIT_MIN`] (WCAG 2.5.8), the same
+/// floor every pointer target holds (DESIGN §4.3). It is hung one row above the
+/// strip rather than centred on it: what a hand aims at is the line it can see
+/// (the panel's own edge at the strip's far side), not the transparent pixels
+/// in front of it.
+pub(crate) const GRAB_W: f32 = HIT_MIN;
 
 /// The bench seam's own band. It used to be deeper than [`GRAB_W`] because
 /// what lay under the seam was `ui::stance::bench`'s own section head -- 24 px
 /// with nothing in it to press, so the band reached down through it. That head
 /// is gone (cleanse round 2): the ruler row is the bench's top edge now, and
-/// the ruler *is* pressable (it scrubs), so a band reaching into it would take
-/// presses meant for the film. Back to every other seam's reach: `-1 .. +13`
-/// of strip, `-7 .. +7` of the seam.
+/// the ruler *is* pressable (it scrubs). Every seam now takes the same
+/// [`GRAB_W`] band, so the bench reaches exactly as far as every other seam
+/// does: `-1 .. +23` of strip, `-7 .. +17` of the seam.
 pub(crate) const BENCH_GRAB_H: f32 = GRAB_W;
 
 /// The most of the window one side column may be dragged to. A third each, so
@@ -334,6 +374,25 @@ pub(crate) const BENCH_GRAB_H: f32 = GRAB_W;
 /// [`inspector_w`] already lay an untouched window out by, kept once the hand
 /// takes over.
 pub(crate) const SIDE_MAX_FRAC: f32 = 1. / 3.;
+
+/// The least the dock may be dragged to (DESIGN §5: 280px). Its own floor,
+/// not the legacy inspector's [`INSPECTOR_MIN_W`]: the two columns share a
+/// ceiling but not a minimum.
+pub(crate) const DOCK_MIN_W: f32 = 280.;
+
+/// The timeline block's untouched share of the window's height (DESIGN §5:
+/// "about 42%"), from the edit toolbar down to the lanes. Clamped by
+/// [`split_bounds`] like any other default, and a remembered hand still wins.
+pub(crate) const BENCH_SHARE: f32 = redesign::TIMELINE_SHARE;
+
+/// The same, on a window shorter than 800 px (REDESIGN §2.2, §10): the picture keeps what the
+/// 240 px floor leaves it and the timeline takes the rest, so four lanes show with the title row.
+pub(crate) const BENCH_SHARE_SHORT: f32 = 0.55;
+
+/// The untouched timeline share for a window `h` px tall.
+pub(crate) fn bench_share(h: f32) -> f32 {
+    if h < 800. { BENCH_SHARE_SHORT } else { BENCH_SHARE }
+}
 
 /// The most of the window the timeline may be dragged to. Past
 /// [`TIMELINE_SHARE`], which is what it is *given*: a hand asking for a tall
@@ -371,20 +430,19 @@ const LEDGER_SEAM_CLEARANCE: f32 = 1.;
 /// `bench-lanes` column asks for more height than `bench-content`'s flex_1
 /// gives it, and since that column scrolls rather than clips visibly, the
 /// shortfall comes off the bottom row's own pixels unscrolled -- A1's
-/// clip-bar border and status dot, first. `LANE_MIN_H` itself is derived
-/// from what a lane head actually draws (its own doc comment), not a number
-/// copied from nowhere: an earlier floor of `82.` used a `LANE_MIN_H` of
-/// `18.` that fit only the lane label and let every lane's status dot
-/// overflow into the row beneath it, invisible everywhere but the last
-/// lane, which has no next row to spill into and clipped straight into the
-/// ledger instead.
+/// clip-bar border and status dot, first. Lanes are not even rows any more:
+/// each has its own height (`bench_stance::lane_height`), and a stack taller
+/// than the box just scrolls. The floor still gives the default two lanes
+/// their minimum, so V1 and A1 are whole at the least the bench may be.
+/// `LANE_MIN_H` is checked against what a lane head actually draws
+/// (`a_lane_row_fits_what_its_own_head_draws`).
 ///
 /// With the 18/15/14-13/12/10px type scale, the same derivation uses a 24px
-/// chrome block and two 27px lane floors:
-/// `24 + 22 + 2 + 54 + 2 + 1` = `105.`.
+/// chrome block and two 28px lane floors:
+/// `24 + 22 + 2 + 56 + 2 + 1` = `107.`.
 pub(crate) const BENCH_MIN_H: f32 = crate::ui::stance::BENCH_CHROME_H
-    + crate::ui::bench_stance::RULER_H
-    + crate::ui::bench_stance::ROW_GAP
+    + TOOLBAR_H
+    + crate::ui::bench_stance::overview::chrome_h(true)
     + 2. * crate::ui::bench_stance::LANE_MIN_H
     + crate::ui::bench_stance::ROW_GAP
     + LEDGER_SEAM_CLEARANCE;
@@ -521,10 +579,9 @@ pub(crate) fn split_bounds(
     match split {
         Split::Library => (LIBRARY_MIN_W, w * SIDE_MAX_FRAC),
         Split::Inspector => (INSPECTOR_MIN_W, w * SIDE_MAX_FRAC),
-        // The dock is the darkroom's one side column -- same shape as the
-        // legacy inspector's, so it takes the legacy inspector's own floor
-        // and ceiling rather than a second pair that would only ever agree.
-        Split::Dock => (INSPECTOR_MIN_W, w * SIDE_MAX_FRAC),
+        // The dock is the darkroom's one side column: the same ceiling as the
+        // legacy inspector, but its own floor ([`DOCK_MIN_W`]).
+        Split::Dock => (DOCK_MIN_W, w * SIDE_MAX_FRAC),
         // The bench is the darkroom's own timeline, but its ceiling is not
         // [`Split::Timeline`]'s window-share one: a bench that swallows
         // `TIMELINE_MAX_SHARE` of a 720p window leaves the screen and its
@@ -582,7 +639,7 @@ pub(crate) fn split_size(
         Split::Inspector => inspector_w(w),
         Split::Timeline => timeline_h(lanes, scroll).min(h * TIMELINE_SHARE),
         Split::Dock => crate::ui::stance::DOCK_W,
-        Split::Bench => crate::ui::stance::BENCH_H,
+        Split::Bench => h * bench_share(h),
     };
     // The floor wins a window too small to honour both ends: a panel at its
     // floor is still a panel, and `clamp` panics outright on a ceiling under
@@ -631,5 +688,75 @@ impl Player {
         let view = self.view();
         let scroll = view.duration > view.span();
         split_size(split, self.splits.get(split), lanes, window, scroll)
+    }
+}
+
+/// REDESIGN §1.2 / §2 geometry, the numbers later phases adopt region by region.
+/// New names beside the old ones on purpose: P1 only defines them, P2 (timeline)
+/// and P3 (chrome) switch their layouts over and then delete the legacy twins.
+#[allow(dead_code, reason = "defined by P1, adopted by P2/P3")]
+pub(crate) mod redesign {
+    /// Grid and the spacers it allows.
+    pub(crate) const GRID: f32 = 4.;
+    pub(crate) const SPACERS: [f32; 7] = [2., 4., 8., 12., 16., 24., 32.];
+    /// Control heights: field/scrub/chip/small button, default button/dropdown/tab,
+    /// toolbar/primary button, hero button and the dock tab strip.
+    pub(crate) const CONTROL_S: f32 = 24.;
+    pub(crate) const CONTROL_M: f32 = 28.;
+    pub(crate) const CONTROL_L: f32 = 32.;
+    pub(crate) const CONTROL_XL: f32 = 36.;
+    /// Radii: clips and thumbnails, buttons and fields, cards/menus/tooltips, sheets and palette.
+    pub(crate) const R_CLIP: f32 = 3.;
+    pub(crate) const R_CONTROL: f32 = 4.;
+    pub(crate) const R_CARD: f32 = 6.;
+    pub(crate) const R_SHEET: f32 = 8.;
+    /// Shell regions, top to bottom (§2).
+    pub(crate) const MENU_BAR_H: f32 = 28.;
+    pub(crate) const VIEWER_HDR_H: f32 = 28.;
+    /// Viewer header on a window shorter than 800 px.
+    pub(crate) const VIEWER_HDR_H_SHORT: f32 = 24.;
+    pub(crate) const TRANSPORT_H: f32 = 44.;
+    pub(crate) const TRANSPORT_H_SHORT: f32 = 40.;
+    pub(crate) const TOOLBAR_H: f32 = 40.;
+    pub(crate) const SEQ_TABS_H: f32 = 28.;
+    pub(crate) const OVERVIEW_H: f32 = 12.;
+    pub(crate) const RULER_H: f32 = 24.;
+    pub(crate) const STATUS_H: f32 = 24.;
+    /// The timeline panel's own chrome: toolbar + sequence tabs + overview + ruler.
+    pub(crate) const TIMELINE_CHROME_H: f32 = TOOLBAR_H + SEQ_TABS_H + OVERVIEW_H + RULER_H;
+    /// Lane heights: video / audio, and on a window shorter than 800 px.
+    pub(crate) const LANE_H_V: f32 = 52.;
+    pub(crate) const LANE_H_A: f32 = 40.;
+    pub(crate) const LANE_H_V_SHORT: f32 = 40.;
+    pub(crate) const LANE_H_A_SHORT: f32 = 30.;
+    /// Dock width (min 280), the default timeline share of the window and its clamps.
+    pub(crate) const DOCK_W: f32 = 320.;
+    pub(crate) const DOCK_MIN_W: f32 = 280.;
+    pub(crate) const TIMELINE_SHARE: f32 = 0.46;
+    pub(crate) const TIMELINE_MIN_H: f32 = 280.;
+    pub(crate) const TIMELINE_MAX_SHARE: f32 = 0.70;
+    pub(crate) const VIEWER_MIN_H: f32 = 240.;
+    /// Popup rows: menus, command palette; menu width.
+    pub(crate) const MENU_ROW_H: f32 = 28.;
+    pub(crate) const PALETTE_ROW_H: f32 = 36.;
+    pub(crate) const MENU_W: f32 = 280.;
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// §2: the timeline's own chrome is 104 px, every height sits on the 4 px grid,
+        /// and the 1080p split leaves room for 3 video + 3 audio lanes.
+        #[test]
+        fn the_spec_heights_add_up() {
+            assert_eq!(TIMELINE_CHROME_H, 104.);
+            for h in [CONTROL_S, CONTROL_M, CONTROL_L, CONTROL_XL, MENU_BAR_H, VIEWER_HDR_H, TRANSPORT_H, TOOLBAR_H, SEQ_TABS_H, OVERVIEW_H, RULER_H, STATUS_H] {
+                assert_eq!(h % GRID, 0., "{h} is off the grid");
+            }
+            let timeline = (1080. * TIMELINE_SHARE).round();
+            let lanes = timeline - TIMELINE_CHROME_H - STATUS_H;
+            assert!(lanes >= 3. * LANE_H_V + 3. * LANE_H_A - 80., "{lanes}");
+            assert!((TIMELINE_MIN_H..=1080. * TIMELINE_MAX_SHARE).contains(&timeline));
+        }
     }
 }

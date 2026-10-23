@@ -1,35 +1,80 @@
 //! Video engine: demux -> decode -> pixel convert. No UI dependencies.
 
+#![forbid(unsafe_code)]
+
 pub mod ao;
+pub mod auto_color;
 pub mod audio;
 pub mod caps;
+pub mod captionanim;
 pub mod clock;
+pub mod collect;
 pub mod color;
 pub mod colorspace;
+pub mod cube;
+pub mod looks;
 pub mod convert;
 pub mod decode;
+pub mod deinterlace;
+pub mod ivtc;
 pub mod demux;
+pub mod duck;
 pub mod edith;
+pub mod effects;
+pub(crate) mod extaudio;
+pub mod editkeys;
+pub mod envcfg;
 pub mod eq;
+mod adts;
 pub mod export;
+pub mod export_presets;
+pub mod flac_write;
+pub mod generate;
+pub mod interchange;
+pub mod opus_write;
 pub mod hw;
 pub mod hwproc;
 pub mod limiter;
+pub mod loudness;
+pub mod normalize;
 pub(crate) mod map;
 pub mod mux;
+pub(crate) mod mp4track;
 pub mod playback;
 pub mod project;
 pub mod proxy;
+pub mod render_cache;
+pub mod pulse;
+mod prores_out;
 pub mod real_library;
+pub(crate) mod reverse;
 pub mod scale;
+pub mod scenes;
+pub mod scopes;
 pub mod scratch;
+pub mod sequence;
+pub mod multisync;
+pub mod beats;
 pub mod silence;
+pub mod speech;
+pub mod recorder;
+pub mod reframe;
+pub mod stabilise;
 pub(crate) mod stretch;
 pub mod subtitle;
 #[cfg(test)]
 mod sweep;
+mod video_profile;
+pub mod text;
+pub mod titleanim;
 pub mod tonemap;
+pub mod track;
 pub mod transform;
+pub mod transitions;
+pub mod templates;
+pub mod versions;
+pub mod voice;
+pub mod tts;
 pub mod waveform;
 
 pub use audio::{
@@ -39,11 +84,14 @@ pub use clock::PlaybackClock;
 pub use decode::{
     DecodeFailure, DecodeSession, Frame, UnsupportedStillOrientation, image_orientation, image_size,
 };
-pub use demux::{Codec, MediaBitrate, Rotation, UnsupportedRotation, VideoMeta, probe_bitrate};
+pub use demux::{
+    Codec, MediaBitrate, MediaFacts, Rotation, StreamFacts, StreamKind, UnsupportedRotation,
+    VideoFacts, VideoMeta, probe_bitrate, probe_media,
+};
 pub use export::ExportHandle;
 pub use mux::{AudioParams, Mp4Muxer, VideoParams};
-pub use playback::{ImportGate, ImportProbe, PlaybackSession};
-pub use project::{Clip, Project, Rate, Speed};
+pub use playback::{AngleSync, MulticamJob, MulticamPlan, ImportGate, ImportProbe, Levels, MulticamReport, MulticamSync, PlaybackSession};
+pub use project::{Bin, Clip, GainKey, Project, Rate, SourceEdit, Speed, Title};
 
 /// Whether a path names a standalone audio file -- a source with no picture,
 /// which belongs on the audio lane and nowhere else. Extension only, lowercased:
@@ -63,15 +111,15 @@ pub use project::{Clip, Project, Rate, Speed};
 /// called it: those two are the *standard's* name -- what a voice note or a
 /// tagged download off the web wears -- where `.mp3` is the codec's. Symphonia's
 /// `mp3` reader is what reads them, the same reader an `.mp3` goes through, and
-/// it skips the ID3v2 tag and any cover picture muxed into one. A `.mpeg` that
-/// is really an MPEG *program stream* with a picture in it is still no picture
-/// here -- nothing demuxes one, and it is symphonia's refusal that says so
-/// rather than the mp4 crate's. (MPEG's other two layers, `.mp1`/`.mp2`, are
+/// it skips the ID3v2 tag and any cover picture muxed into one. A `.mpeg`/`.mpg` that
+/// is really an MPEG *program stream* with a picture in it is read by the program
+/// stream demuxer ([`demux::is_mpegps`]) and is no audio file: those two spellings
+/// are the one place the bytes are looked at. (MPEG's other two layers, `.mp1`/`.mp2`, are
 /// deliberately absent: this build compiles the mp3 bundle without its `mp1`/
 /// `mp2` features, so a layer II stream is a codec nothing here decodes, and
 /// admitting the spelling would be a promise the reader cannot keep.)
 pub fn is_audio(path: &std::path::Path) -> bool {
-    path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+    let named = path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
         matches!(
             e.to_ascii_lowercase().as_str(),
             "mp3"
@@ -85,8 +133,20 @@ pub fn is_audio(path: &std::path::Path) -> bool {
                 | "mka"
                 | "m4a"
                 | "aac"
+                | "dts"
+                | "dtshd"
+                | "amr"
+                | "awb"
         )
-    })
+    });
+    // `.mpg`/`.mpeg` also name an MPEG program stream with a picture (a DVD's, a camcorder's),
+    // which belongs on a video lane: the bytes decide those two spellings, when the file exists.
+    named
+        && !(path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("mpg") || e.eq_ignore_ascii_case("mpeg"))
+            && demux::carries_picture(path))
 }
 
 /// Whether a path names a still image -- a source with a picture and no sound
@@ -98,12 +158,22 @@ pub fn is_audio(path: &std::path::Path) -> bool {
 /// JPEG and WebP. A `.gif` or a `.tif` is refused by the same door that refuses
 /// a `.txt`, which is the honest answer until a decoder for it is compiled in.
 pub fn is_image(path: &std::path::Path) -> bool {
-    path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+    // A generator ([`generate`]) is a picture with no file behind it.
+    generate::is_generated(path)
+        || path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
         matches!(
             e.to_ascii_lowercase().as_str(),
             "png" | "jpg" | "jpeg" | "webp"
         )
     })
+}
+
+/// Whether a source's file is there to read: a real file, or a generator, which has none to miss.
+pub fn source_present(path: &std::path::Path) -> bool {
+    generate::is_generated(path)
+        || path.exists()
+        // A numbered run's spelling is not a file: it is there when its first frame is.
+        || sequence::Run::parse(path).is_some_and(|run| run.frame(0).exists())
 }
 
 /// The largest picture this engine composes onto, either way: 7680, which is
@@ -143,7 +213,7 @@ mod tests {
     fn is_audio_admits_the_containers_the_decoder_reads() {
         for name in [
             "song.mp3", "a.WAV", "b.flac", "c.ogg", "d.oga", "e.m4a", "f.aac", "g.opus", "h.OPUS",
-            "i.mka", "j.MPEG", "k.mpg",
+            "i.mka", "j.MPEG", "k.mpg", "l.dts", "m.DTSHD", "n.amr", "o.awb",
         ] {
             assert!(super::is_audio(Path::new(name)), "{name}");
         }
@@ -154,7 +224,6 @@ mod tests {
             "take.MP4",
             "cut.edith",
             "y.ac3",
-            "z.dts",
             "notes",
             "mp3",
         ] {

@@ -64,43 +64,16 @@ fn main() {
 /// The edit list and sample counts of an mp4, per track.
 fn mp4_boxes(path: &std::path::Path) {
     let file = std::fs::File::open(path).expect("open");
-    let size = file.metadata().expect("stat").len();
-    let reader =
-        mp4::Mp4Reader::read_header(std::io::BufReader::new(file), size).expect("read header");
-    for (id, track) in reader.tracks() {
-        let elst: Vec<(u64, u64)> = track
-            .trak
-            .edts
-            .as_ref()
-            .and_then(|e| e.elst.as_ref())
-            .map(|e| {
-                e.entries
-                    .iter()
-                    .map(|e| (e.segment_duration, e.media_time))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let ctts: Vec<(u32, u32)> = track
-            .trak
-            .mdia
-            .minf
-            .stbl
-            .ctts
-            .as_ref()
-            .map(|c| {
-                c.entries
-                    .iter()
-                    .take(3)
-                    .map(|e| (e.sample_count, e.sample_offset as u32))
-                    .collect()
-            })
-            .unwrap_or_default();
-        println!("  ctts (first entries): {ctts:?}");
+    let reader = ec_mp4::Mp4Demuxer::new(std::io::BufReader::new(file)).expect("read header");
+    for track in reader.tracks() {
+        let samples = track.stream.map_or(0, |s| reader.samples(s).len());
         println!(
-            "  track {id}: {:?}, timescale {}, {} samples, elst (segment_duration, media_time) {elst:?}",
-            track.media_type(),
-            track.timescale(),
-            track.sample_count(),
+            "  track {}: {:?}, {samples} samples, media_time {:?}, {} edit entries, rotation {:?}",
+            track.track_id,
+            track.media,
+            track.media_time,
+            track.edits.len(),
+            track.rotation,
         );
     }
 }

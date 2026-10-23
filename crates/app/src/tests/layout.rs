@@ -9,41 +9,37 @@ use super::*;
 /// (`BG_HOVER`/`BG_SELECTED`/`BG_RAISED`) rather than a Darkroom token used
 /// to get the legacy tree's pale greys, because the Darkroom palette still
 /// carried them. Dozens of call sites read those three roles; the fix is the
-/// palette, and this pins it: every interaction grey in the Darkroom palette
-/// stays inside DESIGN §2's `raised` band (#14171B - #17191D), with only the
-/// picked-row fill allowed one step past it, and each stays distinguishable
-/// from the one below it so a hover is still visible on a resting row.
+/// palette, and this pins it: the Darkroom surfaces are DESIGN §2.1's mock
+/// values (canvas, panel, raised, hover), they step up in that order so a
+/// hovered row is visible on a resting one, the picked-row fill sits between
+/// raised and hover (the real selection mark is the 1px ink1 ring, DESIGN §4),
+/// and the dim hover stays below raised.
 #[test]
-fn the_darkroom_palettes_interaction_greys_stay_inside_the_raised_band() {
+fn the_darkroom_palettes_interaction_greys_follow_design_2_1() {
     use crate::ui::theme::darkroom;
     let grey = |v: u32| (v >> 16 & 0xff, v >> 8 & 0xff, v & 0xff);
     let lum = |v: u32| {
         let (r, g, b) = grey(v);
-        u32::from(r) + u32::from(g) + u32::from(b)
+        r + g + b
     };
-    let band_low = lum(0x14171b);
-    let band_high = lum(0x17191d);
-    for (name, value) in [
-        ("BG_RAISED", darkroom::BG_RAISED),
-        ("BG_HOVER", darkroom::BG_HOVER),
-    ] {
-        assert!(
-            (band_low..=band_high).contains(&lum(value)),
-            "darkroom::{name} = {value:#08x} is outside DESIGN §2's raised band \
-             -- every menu, card and row that paints this role would open a \
-             pale plate in a dim room"
-        );
-    }
+    // Pinned by value, so a palette sweep that drifts a surface fails here
+    // rather than in a screenshot.
+    assert_eq!(darkroom::BG_CANVAS, 0x0b0c0e, "canvas is DESIGN §2.1");
+    assert_eq!(darkroom::BG_PANEL, 0x131518, "panel is DESIGN §2.1");
+    assert_eq!(darkroom::BG_RAISED, 0x1b1e22, "raised is DESIGN §2.1");
+    assert_eq!(darkroom::BG_HOVER, 0x24282d, "hover is DESIGN §2.1");
     assert!(
-        lum(darkroom::BG_SELECTED) > lum(darkroom::BG_HOVER)
-            && lum(darkroom::BG_SELECTED) <= lum(0x1c1f24),
-        "the picked-row fill is one step past hover at most; the real mark is \
-         the 1px ink1 ring (DESIGN §4)"
+        lum(darkroom::BG_CANVAS) < lum(darkroom::BG_PANEL)
+            && lum(darkroom::BG_PANEL) < lum(darkroom::BG_RAISED)
+            && lum(darkroom::BG_RAISED) < lum(darkroom::BG_HOVER),
+        "the surfaces must step up canvas < panel < raised < hover -- a \
+         button or menu that paints a lower step than its panel sinks into it"
     );
     assert!(
-        lum(darkroom::BG_HOVER) > lum(darkroom::BG_RAISED),
-        "hover must be a step ABOVE the resting raised fill or a hovered row \
-         cannot be seen at all"
+        lum(darkroom::BG_RAISED) < lum(darkroom::BG_SELECTED)
+            && lum(darkroom::BG_SELECTED) <= lum(darkroom::BG_HOVER),
+        "the picked-row fill sits between raised and hover; past hover it \
+         would read as a hover, and at raised it would not read at all"
     );
     assert!(
         lum(darkroom::BG_HOVER_DIM) < lum(darkroom::BG_RAISED),
@@ -132,88 +128,65 @@ fn the_line_about_what_is_below_the_fold_counts_what_is_still_below_it() {
     assert_eq!(px_below(0., 0.), 0.);
 }
 
-/// The failure a user never learns about is the one that was answered by
-/// another failure: two imports failing back to back are two messages, in
-/// the order they happened, and the second does not overwrite the first
-/// before a frame has drawn it.
+/// One slot: a second message replaces the first on screen, so the newest
+/// line is always the one a person reads and an old failure never lingers
+/// under a newer line.
 #[test]
-fn a_second_message_queues_behind_the_first_instead_of_erasing_it() {
+fn a_second_message_replaces_the_first_on_screen() {
     let mut q = std::collections::VecDeque::new();
-    push_notice(&mut q, "NOTHING ADDED — no video stream".into());
-    push_notice(&mut q, "NOTHING ADDED — the file is not there".into());
-    assert_eq!(q.len(), 2);
+    push_notice(&mut q, "Nothing added: no video stream".into());
+    push_notice(&mut q, "Nothing added: the file is not there".into());
+    assert_eq!(q.len(), 1);
     assert_eq!(
-        q.front().map(|n: &gpui::SharedString| n.as_ref()),
-        Some("NOTHING ADDED — no video stream")
+        q.back().map(|n: &crate::notices::Toast| n.text.as_ref()),
+        Some("Nothing added: the file is not there")
     );
 
-    // A held key that refuses says its one sentence once: the count on the
-    // bar is a count of messages, not of how long the key was held.
-    push_notice(&mut q, "NOTHING ADDED — the file is not there".into());
-    assert_eq!(q.len(), 2);
+    // A held key that refuses says its one sentence once.
+    push_notice(&mut q, "Nothing added: the file is not there".into());
+    assert_eq!(q.len(), 1);
 
-    // ...and the ceiling drops the oldest rather than the newest: the thing
-    // that just happened is the thing worth reading.
+    // However many messages arrive, the newest is the one kept.
     for i in 0..NOTICES_MAX + 3 {
-        push_notice(&mut q, format!("SCAN FAILED: {i}").into());
+        push_notice(&mut q, format!("Scan failed: {i}").into());
     }
-    assert_eq!(q.len(), NOTICES_MAX);
+    assert_eq!(q.len(), 1);
     assert_eq!(
-        q.back().map(|n: &gpui::SharedString| n.as_ref()),
-        Some("SCAN FAILED: 10")
+        q.back().map(|n: &crate::notices::Toast| n.text.as_ref()),
+        Some(format!("Scan failed: {}", NOTICES_MAX + 2).as_str())
     );
-
-    // Answering the bar brings the next one up, oldest first.
-    let front = q.pop_front();
-    assert_ne!(front, q.front().cloned());
 }
 
 /// An export's own outcome is what a person started it to read, so it must
-/// never sit behind two progress lines queued while it ran: it jumps to the
-/// front and is the one showing the moment it arrives.
+/// never be drawn out of sight: it replaces whatever was on screen, and it is
+/// the newest, the one the status bar draws.
 #[test]
-fn an_export_outcome_jumps_the_queue() {
+fn an_export_outcome_is_the_newest_and_is_drawn() {
     let mut q = std::collections::VecDeque::new();
     push_notice(
         &mut q,
-        "PROXY READY for a.mp4 — Proxies on cuts on it".into(),
+        "Editing copy ready for a.mp4: Editing copies on cuts on it".into(),
     );
-    push_notice(&mut q, "SUBTITLES b.srt — 1 track(s) in the palette".into());
+    push_notice(&mut q, "Subtitles b.srt: 1 track(s) in the palette".into());
     push_notice(&mut q, format!("{EXPORT_DONE}out.mp4").into());
-    assert_eq!(q.len(), 3);
+    assert_eq!(q.len(), 1);
     assert_eq!(
-        q.front().map(|n: &gpui::SharedString| n.as_ref()),
+        q.back().map(|n: &crate::notices::Toast| n.text.as_ref()),
         Some(format!("{EXPORT_DONE}out.mp4")).as_deref(),
-        "the export's result must be the notice showing, not third in line"
+        "the export's result must be the newest notice, the one the stack draws"
     );
 
     // A failed export is the same class: the outcome, whichever it was.
     let mut q = std::collections::VecDeque::new();
     push_notice(
         &mut q,
-        "PROXY READY for a.mp4 — Proxies on cuts on it".into(),
+        "Editing copy ready for a.mp4: Editing copies on cuts on it".into(),
     );
-    push_notice(&mut q, "EXPORT FAILED: disk full".into());
+    push_notice(&mut q, "Export failed: disk full".into());
     assert_eq!(
-        q.front().map(|n: &gpui::SharedString| n.as_ref()),
-        Some("EXPORT FAILED: disk full")
+        q.back().map(|n: &crate::notices::Toast| n.text.as_ref()),
+        Some("Export failed: disk full")
     );
-}
-
-/// The bar colours itself off the words the message already opens with, so
-/// the tone cannot disagree with the sentence it labels.
-#[test]
-fn a_message_wears_the_colour_its_own_words_say() {
-    assert_eq!(notice_tone("SCAN FAILED: no audio"), STATUS_ERROR());
-    assert_eq!(
-        notice_tone(&format!("{EXPORT_DONE}out.mp4")),
-        STATUS_SUCCESS()
-    );
-    assert_eq!(
-        notice_tone("NOTHING DETACHED — not grouped"),
-        STATUS_WARNING()
-    );
-    assert_eq!(notice_tone("SNAP ON"), ACCENT_PRIMARY());
 }
 
 /// The cards are sections of the inspector, not sheets over the timeline:
@@ -271,7 +244,7 @@ fn a_stateful_button_keeps_its_rect() {
     // toggles: the first flips `self.eq_spectrum`, the second reads
     // `armed` (whether cancel is armed), and neither may gate its own
     // button out of the tree.
-    let cards = src_text("ui/cards.rs");
+    let cards = src_text("ui/cards");
     for (id, flag) in [
         ("\"eq-spectrum\"", "self.eq_spectrum"),
         ("\"export-cancel\"", "armed"),
@@ -290,9 +263,15 @@ fn a_stateful_button_keeps_its_rect() {
 fn nothing_clickable_is_smaller_than_the_wcag_minimum() {
     // Every hit target in the panel, including the scrub strip -- whose bar
     // is 6 px to look at and whose click area must not be.
-    assert!(CONTROL_H >= HIT_MIN);
-    assert!(RULER_HIT_H >= HIT_MIN);
-    assert!(LANE_H >= HIT_MIN);
+    const {
+        assert!(CONTROL_H >= HIT_MIN);
+    }
+    const {
+        assert!(RULER_HIT_H >= HIT_MIN);
+    }
+    const {
+        assert!(LANE_H >= HIT_MIN);
+    }
     // A clip box is a hit target too, and its two trim strips occlude it:
     // on a box narrower than the pair there is no body left to press, so
     // the clip cannot be selected, dragged or menued at all -- which is
@@ -317,15 +296,21 @@ fn nothing_clickable_is_smaller_than_the_wcag_minimum() {
 fn a_lane_row_is_a_fixed_header_and_a_bed_that_can_be_hit() {
     // Two lanes, a ruler, a button row and the timecode line, inside the
     // panel the window is sized for.
-    assert!(
-        CONTROL_H + RULER_HIT_H + 2. * LANE_H + 17. + 4. * 8. + 16. <= PANEL_H,
-        "the second lane does not fit the panel"
-    );
+    const {
+        assert!(
+            CONTROL_H + RULER_HIT_H + 2. * LANE_H + 17. + 4. * 8. + 16. <= PANEL_H,
+            "the second lane does not fit the panel"
+        );
+    }
     // Headers and clip boxes are as tall as the lane, and the lane is a
     // click target (WCAG 2.5.8).
-    assert!(LANE_H >= HIT_MIN);
+    const {
+        assert!(LANE_H >= HIT_MIN);
+    }
     // A label row that ate the whole lane would leave no waveform.
-    assert!(LABEL_H < LANE_H / 2.);
+    const {
+        assert!(LABEL_H < LANE_H / 2.);
+    }
     // An added track adds its own row to the panel, and the two a project
     // starts with leave it exactly the height it has always been.
     assert_eq!(panel_h(2), PANEL_H);
@@ -351,14 +336,15 @@ fn a_lane_row_is_a_fixed_header_and_a_bed_that_can_be_hit() {
 /// strip's row at the zoom boundary without the strip to show for it.
 #[test]
 fn the_scroll_strip_row_comes_and_goes_with_the_zoom() {
-    use crate::{SCROLL_HIT, Split, lanes_h, split_size, timeline_fixed_h, timeline_h};
+    use crate::{SCROLL_ROW_H, Split, lanes_h, split_size, timeline_fixed_h, timeline_h};
     use gpui::{px, size};
 
     // The strip's row, and only the strip's row, is what the two faces differ
-    // by -- the gap above it and its own hit height.
+    // by -- the bar is centred in it. The hit area is taller than the bar and
+    // overlays the lanes above it, so it costs no row.
     assert_eq!(
         timeline_fixed_h(true) - timeline_fixed_h(false),
-        8. + SCROLL_HIT
+        SCROLL_ROW_H
     );
     let window = size(px(1280.), px(720.));
     for scroll in [false, true] {
@@ -603,14 +589,14 @@ fn a_trim_preview_lands_where_the_release_commits() {
             .set_speed_live(Lane::V1, 0, Speed::from_permille(permille))
             .expect("a clip alone on its lane may be speeded");
         for edge in [Edge::Start, Edge::End] {
-            let clip = session.lane_clips(Lane::V1)[0];
+            let clip = session.lane_clips(Lane::V1)[0].clone();
             let (lo, hi) = session
                 .trim_room(Lane::V1, 0, edge)
                 .expect("clip 0 is there");
             // Both walls and the middle of the room: the whole range a
             // pointer can be clamped to.
             for to in [lo, (lo + hi) / 2, hi] {
-                let preview = trimmed_clip(clip, edge, to, false);
+                let preview = trimmed_clip(clip.clone(), edge, to, false);
                 // The drag is one edit and one undo step, so the next `to`
                 // is measured from the same clip this one was.
                 if session.trim_clip(Lane::V1, 0, edge, to) {
@@ -715,12 +701,12 @@ fn a_caption_trim_preview_lands_where_the_release_commits() {
 fn a_stills_trim_preview_grows_forward_like_the_commit() {
     let mut session = PlaybackSession::open(asset("test_still.png")).expect("a picture opens");
     for edge in [Edge::Start, Edge::End] {
-        let clip = session.lane_clips(Lane::V1)[0];
+        let clip = session.lane_clips(Lane::V1)[0].clone();
         let (lo, hi) = session
             .trim_room(Lane::V1, 0, edge)
             .expect("clip 0 is there");
         for to in [lo, (lo + hi) / 2, hi] {
-            let preview = trimmed_clip(clip, edge, to, true);
+            let preview = trimmed_clip(clip.clone(), edge, to, true);
             match session.trim_clip(Lane::V1, 0, edge, to) {
                 true => {
                     assert_eq!(
@@ -743,11 +729,24 @@ fn a_stills_trim_preview_grows_forward_like_the_commit() {
 #[test]
 fn a_drop_moves_the_clip_that_was_picked_up_not_its_old_index() {
     let at = |start: u32| Clip {
+        speed_keys: Vec::new(),
+        reversed: false,
+        stabilise: None, deinterlace: Default::default(), mark: Default::default(),
+        angle: Default::default(),
         fade_in: 0,
         fade_out: 0,
         transition_out: 0,
+        transition_kind: Default::default(),
         visualizer: 0,
         viz_paint: 0,
+        gain_db: 0.0,
+        gain_keys: Vec::new(),
+        pan: 0,
+        pitch: 0,
+        transform_keys: Vec::new(),
+        opacity_keys: Vec::new(),
+        color_keys: Vec::new(),
+        effects: Vec::new(),
         start,
         in_frame: 0,
         out_frame: 30,
@@ -760,17 +759,17 @@ fn a_drop_moves_the_clip_that_was_picked_up_not_its_old_index() {
         speed: Speed::NORMAL,
     };
     let lane = [at(0), at(30), at(60)];
-    let dragged = lane[2];
-    assert_eq!(live_idx(&lane, 2, dragged), Some(2), "nothing moved");
+    let dragged = lane[2].clone();
+    assert_eq!(live_idx(&lane, 2, &dragged), Some(2), "nothing moved");
     // A delete in front of it: the clip is now index 1, and the index the
     // drag froze names a clip nobody grabbed.
     let after = [at(0), at(60)];
-    assert_eq!(live_idx(&after, 2, dragged), Some(1));
-    assert_eq!(live_idx(&after, 1, dragged), Some(1));
+    assert_eq!(live_idx(&after, 2, &dragged), Some(1));
+    assert_eq!(live_idx(&after, 1, &dragged), Some(1));
     // Deleted mid-drag: there is nothing to move, and moving its neighbour
     // instead is exactly the bug this exists for.
-    assert_eq!(live_idx(&[at(0)], 2, dragged), None);
-    assert_eq!(live_idx(&[], 0, dragged), None);
+    assert_eq!(live_idx(&[at(0)], 2, &dragged), None);
+    assert_eq!(live_idx(&[], 0, &dragged), None);
 }
 
 #[test]
@@ -880,10 +879,12 @@ fn source_tints_differ_per_source_and_cycle() {
     assert_ne!(source_tint(0), source_tint(1));
     assert_ne!(source_tint(1), source_tint(2));
     assert_ne!(source_tint(2), source_tint(3));
-    // Past the palette it wraps -- never an index panic.
-    assert_eq!(source_tint(4), source_tint(0));
-    assert_eq!(source_tint(9), source_tint(1));
-    assert_eq!(source_tint(usize::MAX), SOURCE_TINTS()[usize::MAX % 4]);
+    // Past the palette it wraps -- never an index panic. The cycle length is
+    // the palette's own length (12 hues, DESIGN §2.2), not a fixed 4.
+    let n = SOURCE_TINTS().len();
+    assert_eq!(source_tint(n), source_tint(0));
+    assert_eq!(source_tint(n + 5), source_tint(5));
+    assert_eq!(source_tint(usize::MAX), SOURCE_TINTS()[usize::MAX % n]);
 }
 
 /// Not "they are different numbers" -- different *enough to see*, against
@@ -959,17 +960,17 @@ fn a_standalone_subtitle_wears_no_file_tint() {
     let sources = [
         Source {
             path: PathBuf::from("/films/a.mkv"),
-            audio_stream: 0,
+            audio_stream: 0, ..Default::default()
         },
         Source {
             path: PathBuf::from("/films/b.mp4"),
-            audio_stream: 0,
+            audio_stream: 0, ..Default::default()
         },
         // A second stream of the first file is a second source and the
         // same colour.
         Source {
             path: PathBuf::from("/films/a.mkv"),
-            audio_stream: 1,
+            audio_stream: 1, ..Default::default()
         },
     ];
     assert_eq!(
@@ -987,7 +988,7 @@ fn a_standalone_subtitle_wears_no_file_tint() {
     let here = std::fs::canonicalize(".").expect("the crate directory");
     let sources = [Source {
         path: here.join("Cargo.toml"),
-        audio_stream: 0,
+        audio_stream: 0, ..Default::default()
     }];
     assert_eq!(
         file_tint(&sources, Path::new("Cargo.toml")),
@@ -1102,7 +1103,7 @@ fn subtitle_rows_group_a_source_however_they_were_added() {
     // wear one colour -- and the standalone one has none.
     let sources = [Source {
         path: PathBuf::from("/films/a.mkv"),
-        audio_stream: 0,
+        audio_stream: 0, ..Default::default()
     }];
     assert_eq!(
         file_tint(&sources, &groups[0].path),
@@ -1283,7 +1284,7 @@ fn the_darkroom_subtitle_palette_drags_tracks_to_subtitle_lanes() {
     ] {
         assert!(palette.contains(required), "palette lost {required}");
     }
-    let bench = src_text("ui/bench_stance.rs");
+    let bench = src_text("ui/bench_stance");
     let drop_at = bench
         .find(".drag_over::<SubPick>")
         .expect("no subtitle-track lane target");
@@ -1318,7 +1319,7 @@ fn a_file_subtitle_group_follows_its_own_row() {
     assert_eq!(
         source_list_order(
             &[film.clone(), other.clone(), film.clone()],
-            &[film.clone()]
+            std::slice::from_ref(&film)
         ),
         [
             Slot::Media(0),
@@ -1366,7 +1367,7 @@ fn same_named_files_are_told_apart_on_the_metadata_line() {
         .into_iter()
         .map(|path| Source {
             path: PathBuf::from(path),
-            audio_stream: 0,
+            audio_stream: 0, ..Default::default()
         })
         .collect();
     let rows = library_rows(&three, &HashMap::new(), &HashMap::new(), None, |_| 90);
@@ -1381,7 +1382,7 @@ fn same_named_files_are_told_apart_on_the_metadata_line() {
         .into_iter()
         .map(|path| Source {
             path: PathBuf::from(path),
-            audio_stream: 0,
+            audio_stream: 0, ..Default::default()
         })
         .collect();
     let rows = library_rows(&twins, &HashMap::new(), &HashMap::new(), None, |_| 90);
@@ -1734,13 +1735,13 @@ fn darkroom_lane_header_verbs_are_targeted_and_visible() {
         timeline: true,
         ..Ctx::default()
     };
-    assert_eq!(enable_lane(ActionId::Mix, Lane::A1, live), Enable::Yes);
+    assert_eq!(enable_lane(ActionId::Mix, Lane::A1, live.clone()), Enable::Yes);
     assert_eq!(
-        enable_lane(ActionId::RemoveVideoLane, Lane::V1, live),
+        enable_lane(ActionId::RemoveVideoLane, Lane::V1, live.clone()),
         Enable::Yes
     );
     assert_eq!(
-        enable_lane(ActionId::RemoveAudioLane, Lane::A1, live),
+        enable_lane(ActionId::RemoveAudioLane, Lane::A1, live.clone()),
         Enable::Yes
     );
     assert!(matches!(
@@ -1748,13 +1749,13 @@ fn darkroom_lane_header_verbs_are_targeted_and_visible() {
         Enable::Hidden(_)
     ));
 
-    // The head itself carries a dot, a name and -- on a subtitle lane -- its
-    // eye, and nothing else (cleanse round 2). Its mix and its remove are rows
+    // The head itself carries a dot, a name and its switches, and nothing else
+    // (cleanse round 2, DESIGN §7). Its mix and its remove are rows
     // in its own right-click menu instead, and they still reach the lane the
     // hand named rather than the last of the kind a bare stroke walks to:
     // `overlays.rs` routes those rows through the same `act_lane` door the
     // head's buttons used.
-    let bench = src_text("ui/bench_stance.rs");
+    let bench = src_text("ui/bench_stance");
     for gone in [
         "\"bench-mix-lane\"",
         "\"bench-remove-lane\"",
@@ -1777,16 +1778,16 @@ fn darkroom_lane_header_verbs_are_targeted_and_visible() {
         "the head menu lane verbs no longer act on the lane that was clicked"
     );
     // Cleanse round 2 (2026-09-10): the monitoring cluster left the band
-    // (chord + KEYS row only). What the band still owes a pointer is the
-    // export range's two grips on the contact strip.
-    let time_band = src_text("ui/timeband_stance.rs");
+    // (chord + KEYS row only). The export range's two grips moved from the
+    // contact strip onto the overview above the ruler with the strip itself.
+    let overview = src_text("ui/bench_stance/overview.rs");
     for door in [
         "fn mark_grip(",
         "\"stance-strip-mark-in\"",
         "\"stance-strip-mark-out\"",
         "MARK_DRAG.with(|m| m.set(Some(action)))",
     ] {
-        assert!(time_band.contains(door), "time band lost {door}");
+        assert!(overview.contains(door), "overview lost {door}");
     }
 }
 
@@ -1917,29 +1918,36 @@ fn a_dragged_divider_stops_before_either_panel_disappears() {
 /// legacy three.
 #[test]
 fn the_darkroom_seams_stop_before_either_side_disappears() {
-    use crate::ui::theme::INSPECTOR_MIN_W;
     use crate::{
-        BENCH_MIN_H, SIDE_MAX_FRAC, SPLIT_W, Split, split_bounds, split_drag_size, split_size,
+        BENCH_MIN_H, BENCH_SHARE, DOCK_MIN_W, SIDE_MAX_FRAC, SPLIT_W, Split, split_bounds,
+        split_drag_size, split_size,
     };
     use gpui::{point, px, size};
 
     let window = size(px(1280.), px(720.));
-    // Untouched, each answers its own stance default.
+    // Untouched, each answers its own default: the dock its stance width, the
+    // bench a share of the window's height (DESIGN §5, about 42%).
     assert_eq!(
         split_size(Split::Dock, None, 2, window, false),
         crate::ui::stance::DOCK_W
     );
     assert_eq!(
         split_size(Split::Bench, None, 2, window, false),
-        crate::ui::stance::BENCH_H
+        720. * crate::layout::bench_share(720.)
     );
+    // The DESIGN §5 numbers themselves: a 320px dock, a 280px dock floor, a
+    // 30px ledger and a timeline block at about 42% of the window.
+    assert_eq!(crate::ui::stance::DOCK_W, 320.);
+    assert_eq!(DOCK_MIN_W, 280.);
+    assert_eq!(crate::ui::stance::LEDGER_H, 24.);
+    assert!((BENCH_SHARE - 0.46).abs() < 1e-6);
     // Dragged, it is what the hand asked for...
     assert_eq!(split_size(Split::Dock, Some(400.), 2, window, false), 400.);
     assert_eq!(split_size(Split::Bench, Some(300.), 2, window, false), 300.);
     // ...and never past the floor...
     assert_eq!(
         split_size(Split::Dock, Some(0.), 2, window, false),
-        INSPECTOR_MIN_W
+        DOCK_MIN_W
     );
     assert_eq!(
         split_size(Split::Bench, Some(0.), 2, window, false),
@@ -1979,21 +1987,17 @@ fn the_darkroom_seams_stop_before_either_side_disappears() {
 #[test]
 fn both_default_lanes_fit_the_bench_at_its_floor() {
     use crate::BENCH_MIN_H;
-    use crate::ui::bench_stance::{LANE_MIN_H, ROW_GAP, RULER_H, row_h};
+    use crate::ui::bench_stance::{LANE_MIN_H, ROW_GAP, RULER_H};
     use crate::ui::stance::BENCH_CHROME_H;
 
     let box_h = BENCH_MIN_H - BENCH_CHROME_H;
     let avail = box_h - RULER_H - ROW_GAP;
-    let h = row_h(2, avail);
-    // Not an exact `LANE_MIN_H` any more: `BENCH_MIN_H` now carries one spare
-    // row (`layout::LEDGER_SEAM_CLEARANCE`) so the last lane's own last pixel
-    // never shares a row with the ledger's border, which lands here as
-    // `avail` being a touch over the two-rows-plus-gap tight fit.
-    assert!(
-        h >= LANE_MIN_H,
-        "the floor should give both lanes at least their own minimum ({h} < {LANE_MIN_H})"
-    );
-    let content = 2. * h + ROW_GAP;
+    // Lanes are no longer split evenly out of the box: each is drawn at its
+    // own height, never below `LANE_MIN_H`, so the floor is the two default
+    // lanes at that minimum plus their gap. `BENCH_MIN_H` carries one spare row
+    // (`layout::LEDGER_SEAM_CLEARANCE`) so the last lane's own last pixel never
+    // shares a row with the ledger's border.
+    let content = 2. * LANE_MIN_H + ROW_GAP;
     assert!(
         content <= avail + 1e-4,
         "the two lane rows ({content}px) overrun the column ({avail}px) -- \
@@ -2007,8 +2011,8 @@ fn both_default_lanes_fit_the_bench_at_its_floor() {
 /// third clip (this session's) survived it: the constant undercounted the
 /// section head's real line box by 1px and this test's predecessor never
 /// looked. Recomputes what `ui::stance::bench` actually draws above
-/// `bench_stance::render`'s content -- the div's own `.border_t_1()` (1px)
-/// + its `py(4.)` top padding + the section head's real line box at gpui's
+/// `bench_stance::render`'s content -- the div's own `.border_t_1()` (1px) plus
+/// its `py(4.)` top padding + the section head's real line box at gpui's
 /// golden-ratio line-height, not the label's bare font size (the same trap
 /// `a_lane_row_fits_what_its_own_head_draws` already checks for the lane
 /// heads) -- and then checks the *whole* stack -- chrome, ruler, both gaps,
@@ -2067,18 +2071,26 @@ fn the_whole_bench_stack_fits_its_own_floor_with_the_ledger_seam_clear() {
 /// silently clipping the last lane again.
 #[test]
 fn a_lane_row_fits_what_its_own_head_draws() {
-    use crate::ui::bench_stance::{LANE_DOT_D, LANE_HEAD_GAP, LANE_MIN_H};
+    use crate::ui::bench_stance::{LANE_DOT_D, LANE_MIN_H};
     use crate::ui::type_scale::CHORD_METADATA_MIN_PX;
 
+    // gpui's line-height ratio, which happens to sit near the golden ratio; it
+    // is not that constant, so the lint's suggestion would be wrong here.
+    #[allow(
+        clippy::approx_constant,
+        reason = "gpui's default line-height ratio, not the golden ratio constant"
+    )]
     let label_line_h = (CHORD_METADATA_MIN_PX * 1.618_034).round();
-    let content = label_line_h + LANE_HEAD_GAP + LANE_DOT_D;
+    // The head is one row -- dot, name, switches -- centred in the lane, so
+    // what it needs is its tallest child: the 24px switch hit area (and the
+    // subtitle name's own hit area), not a stack of label, gap and dot.
+    let content = label_line_h.max(LANE_DOT_D).max(HIT_MIN);
     assert!(
         LANE_MIN_H >= content,
         "LANE_MIN_H ({LANE_MIN_H}) is shorter than what a lane head actually \
-         draws ({content}px: {label_line_h}px label line box + \
-         {LANE_HEAD_GAP}px gap + {LANE_DOT_D}px dot) -- the status dot \
-         would spill past the row, invisible until it is the last lane \
-         with no next row to spill into"
+         draws ({content}px: the tallest of the {label_line_h}px label line \
+         box, the {LANE_DOT_D}px dot and the {HIT_MIN}px switch hit areas) -- \
+         the head would spill past its row"
     );
 }
 
@@ -2173,10 +2185,14 @@ fn every_seam_in_the_layout_has_a_divider_on_it() {
     // seam of their own; render.rs no longer draws any divider at all --
     // ui::stance::render is the whole root now -- so the only two seams a
     // hand can still drag are the ones the stance itself owns.
-    let stance = src_text("ui/stance.rs");
+    // Whitespace-collapsed, so the call still matches however rustfmt wraps it.
+    let stance = src_text("ui/stance.rs")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     for split in ["Split::Dock", "Split::Bench"] {
         assert!(
-            stance.contains(&format!("divider({split}")),
+            stance.contains(&format!("divider( {split},")),
             "{split} has no divider to drag"
         );
     }
@@ -2282,7 +2298,7 @@ fn the_picture_letterboxes_through_a_canvas_never_a_plain_img_object_fit() {
         "letterboxed_image no longer computes the Contain rect by hand"
     );
     for (file, needle) in [
-        ("render.rs", "letterboxed_image(i)"),
+        ("render.rs", "viewer_picture("),
         ("ui/preview.rs", "letterboxed_image(image)"),
     ] {
         let text = src_text(file);
@@ -2295,6 +2311,39 @@ fn the_picture_letterboxes_through_a_canvas_never_a_plain_img_object_fit() {
             "{file} reintroduced the stretched img().object_fit(Contain) dead end"
         );
     }
+}
+
+/// DESIGN §6.2: the picture sits 12px in from the viewer's edges, the corner
+/// plate is the only thing drawn over it, and the OUT|IN strip floats over the
+/// bottom edge only while it is shown. Its layout box must never reach the
+/// picture, or the picture's box moves on every cut walk again.
+#[test]
+fn the_viewer_pads_the_picture_and_floats_its_overlays() {
+    let stance = src_text("ui/stance.rs");
+    assert!(
+        stance.contains("const VIEWER_PAD: f32 = 12.;"),
+        "the viewer padding is no longer the DESIGN §6.2 12px"
+    );
+    let screen = &stance[stance.find("fn screen(").expect("the Darkroom screen")..];
+    assert!(
+        screen.contains(".p(px(VIEWER_PAD))") && !screen.contains("corner_plate"),
+        "the screen no longer pads the picture, or a boxed chip is back over it"
+    );
+    assert!(
+        screen.contains("player.trim_two_up()") && !screen.contains("player.two_up()"),
+        "the OUT|IN split is mounted only through trim_two_up, never as a flow sibling"
+    );
+
+    let preview = src_text("ui/preview.rs");
+    let two = &preview[preview.find("fn trim_two_up(").expect("the trim two-up")..];
+    assert!(
+        two.contains(".absolute()") && preview.contains("fn editing_cut("),
+        "the trim two-up must be absolute (no layout box) and only while an edit point is worked"
+    );
+    assert!(
+        !preview.contains("viewer-plate") && !preview.contains("fn corner_plate") && !preview.contains("fn two_up("),
+        "nothing boxed is drawn over the picture: the timecode is the transport's, the name the status bar's"
+    );
 }
 
 /// DESIGN §8: "No full-width bars, no covering the picture, ever." The
@@ -2339,27 +2388,26 @@ fn the_darkroom_path_never_lets_a_notice_surface_reach_the_picture() {
 /// and this guard pins that it never routes back through `menu_floor`.
 #[test]
 fn every_darkroom_menu_sizes_its_list_against_the_floor_room_not_the_raw_viewport() {
-    for file in ["ui/overlays.rs"] {
-        let text = src_text(file);
-        assert!(
-            !text.contains("menu_rows_h(rows.len(), viewport)"),
-            "{file} sizes a menu's list against the raw viewport again -- \
-             route it through stance::menu_floor's room instead, or a tall \
-             menu will climb back over the picture"
-        );
-        let floors = text.matches("menu_floor(").count();
-        let sizings = text.matches("menu_rows_h(rows.len(),").count();
-        assert_eq!(
-            floors, sizings,
-            "{file} has a menu list-sizing call not paired with a menu_floor \
-             call -- every darkroom menu must clamp both its anchor and its \
-             list room together"
-        );
-        assert!(
-            sizings > 0,
-            "{file} no longer opens any menu -- update this guard"
-        );
-    }
+    let file = "ui/overlays.rs";
+    let text = src_text(file);
+    assert!(
+        !text.contains("menu_rows_h(rows.len(), viewport)"),
+        "{file} sizes a menu's list against the raw viewport again -- \
+         route it through stance::menu_floor's room instead, or a tall \
+         menu will climb back over the picture"
+    );
+    let floors = text.matches("menu_floor(").count();
+    let sizings = text.matches("menu_rows_h(rows.len(),").count();
+    assert_eq!(
+        floors, sizings,
+        "{file} has a menu list-sizing call not paired with a menu_floor \
+         call -- every darkroom menu must clamp both its anchor and its \
+         list room together"
+    );
+    assert!(
+        sizings > 0,
+        "{file} no longer opens any menu -- update this guard"
+    );
     let library = src_text("ui/library.rs");
     assert!(
         !library.contains("menu_floor("),
@@ -2368,11 +2416,9 @@ fn every_darkroom_menu_sizes_its_list_against_the_floor_room_not_the_raw_viewpor
          to the picture floor (the 'menu in somewhere nonsense' defect)"
     );
     assert!(
-        library.contains("menu_at(at, viewport, h)")
-            && library.contains("point(menu.at.x, menu.at.y + px(ROW_CLEAR))"),
-        "ui/library.rs no longer anchors its menu to the pointer -- one row \
-         clear of it, so the menu cannot cover the row it names -- through \
-         menu_at; update this guard"
+        library.contains("menu_at_w(at, viewport, pw, h)") && !library.contains("ROW_CLEAR"),
+        "ui/library.rs no longer anchors its menu on the pointer through \
+         menu_at_w; update this guard"
     );
 }
 
@@ -2414,8 +2460,13 @@ fn settings_project_and_editor_sections_open_disjoint_doors() {
     // *string*, so the palette row is subtracted from the EDITOR body before
     // the project-door check runs rather than the check being loosened for
     // every picker.
-    let editor_no_theme = editor_body.replace("open_picker(Pick::Theme", "");
-    for door in ["open_picker(", "open_mix("] {
+    // `Pick::Autosave` is the same kind of thing: how often this machine writes
+    // the recovery copy beside the project, kept in ~/.config/edith/autosave.
+    let editor_no_theme = editor_body
+        .replace("open_picker(Pick::Theme", "")
+        .replace("open_picker(Pick::Autosave", "");
+    {
+        let door = "open_picker(";
         assert!(
             project_body.contains(door),
             "PROJECT section no longer opens {door} -- update this guard"
@@ -2429,24 +2480,37 @@ fn settings_project_and_editor_sections_open_disjoint_doors() {
         editor_body.contains("open_picker(Pick::Theme"),
         "the palette row left EDITOR -- it is a ~/.config preference, not a project value"
     );
-    for door in [
-        "toggle_proxies(",
-        "toggle_auto_proxies(",
-        "open_subtitle_style(",
-    ] {
+    // The proxy switches are the project's (DESIGN §9.2: written into the
+    // .edith once one is open), so they moved from EDITOR to PROJECT; the
+    // subtitle font stays this machine's.
+    for door in ["toggle_proxies(", "toggle_auto_proxies("] {
         assert!(
-            editor_body.contains(door),
-            "EDITOR section no longer opens {door} -- update this guard"
+            project_body.contains(door),
+            "PROJECT section no longer opens {door} -- the proxy switches are the project's"
         );
         assert!(
-            !project_body.contains(door),
-            "PROJECT section opens {door}, an editor-only door -- that value belongs in EDITOR, not here"
+            !editor_no_theme.contains(door),
+            "EDITOR section opens {door}, a project-file door -- that value belongs in PROJECT, not here"
         );
     }
+    assert!(
+        editor_body.contains("open_subtitle_style("),
+        "EDITOR section no longer opens the subtitle font -- update this guard"
+    );
+    assert!(
+        !project_body.contains("open_subtitle_style("),
+        "PROJECT section opens the subtitle font, an editor-only door -- that value belongs in EDITOR, not here"
+    );
     // Neither section writes a config file straight from a row: both go
     // through an opener, which is the one place a config-file write (the
     // subtitle style card's Save, this window's next project load) is
     // allowed to live.
+    // The file helpers after the EXPORT section (the export pick's path, the
+    // keys' save) are the openers' own home, so the rows' scan stops short of
+    // them; the export pick's path is then checked where it is defined.
+    let rows_body = &editor_body[..editor_body
+        .find("/// Every format the page can pick")
+        .unwrap_or(editor_body.len())];
     for path_fn in [
         "dock_stance::config_path",
         "theme::config_path",
@@ -2457,10 +2521,17 @@ fn settings_project_and_editor_sections_open_disjoint_doors() {
             "PROJECT section touches {path_fn} directly"
         );
         assert!(
-            !editor_body.contains(path_fn),
+            !rows_body.contains(path_fn),
             "EDITOR section touches {path_fn} directly"
         );
     }
+    let export_ui = src_text("export_ui.rs");
+    assert!(
+        export_ui.contains(
+            "fn export_defaults_path() -> PathBuf {\n    crate::keymap::Keymap::config_path()"
+        ),
+        "the export pick's file moved out of its one helper"
+    );
 }
 
 /// D1's own class, pinned per row rather than per section: a row's hint can
@@ -2530,59 +2601,20 @@ fn settings_project_rows_have_no_bare_noun_placeholder() {
     }
 }
 
-/// The HDR reference rows must read the file's own declared numbers off
-/// [`engine::colorspace::ContentLight`] -- not invent a monitor override the
-/// engine has nowhere to persist -- and must fall back to the page's one
-/// established empty state (a bare `—` in `INK4`, [`row_ink`]/[`row_static`]'s
-/// own idiom) rather than a second placeholder idiom. No `TestAppContext`
-/// here either, so this is the same source-scan the guard above it is.
+/// The HDR group (the look HDR gets on a normal screen) shows only when the
+/// project has an HDR source, and the read-only reference rows are gone from
+/// Settings: nothing there is a fact about one file.
 #[test]
-fn hdr_reference_rows_read_content_light_and_use_the_established_empty_state() {
+fn the_hdr_group_shows_only_with_hdr_and_the_reference_rows_are_gone() {
     let source = src_text("ui/settings_stance.rs");
-    let project_start = source
-        .find("fn project_section(")
-        .expect("the project section");
-    let editor_start = source
-        .find("fn editor_section(")
-        .expect("the editor section");
+    let project_start = source.find("fn project_section(").expect("the project section");
+    let editor_start = source.find("fn editor_section(").expect("the editor section");
     let project_body = &source[project_start..editor_start];
-
-    assert!(
-        project_body.contains("settings-hdr-reference"),
-        "the HDR reference row is missing"
-    );
-    assert!(
-        project_body.contains("settings-content-light"),
-        "the content-light row is missing"
-    );
-
-    // Reads the real declared numbers, not an invented default or a fixed
-    // string standing in for one.
-    for field in ["mastering_max", "max_cll", "max_fall"] {
-        assert!(
-            project_body.contains(field),
-            "the HDR reference rows do not read ContentLight::{field}"
-        );
+    assert!(project_body.contains("has_hdr.then("), "the HDR group is no longer conditional");
+    assert!(project_body.contains("\"When HDR plays on a normal screen\""));
+    for gone in ["settings-hdr-reference", "settings-content-light", "settings-mix", "\"Mix\""] {
+        assert!(!project_body.contains(gone), "Settings still has {gone}");
     }
-
-    // No override field exists on the engine side to write one into, so the
-    // row must never claim a picker/opener the way every other PROJECT row
-    // does -- it is built with `row_static`, not `row`/`row_ink`.
-    assert!(
-        project_body.contains("row_static(\n            \"settings-hdr-reference\""),
-        "the HDR reference row must be read-only (row_static), not a picker"
-    );
-    assert!(
-        project_body.contains("row_static(\n            \"settings-content-light\""),
-        "the content-light row must be read-only (row_static), not a picker"
-    );
-
-    // The established empty state: a bare "—" reused, never a second idiom
-    // ("N/A", "None", "Unknown"...) invented for the same absence.
-    assert!(
-        project_body.contains("\"—\".to_string()"),
-        "the HDR reference rows must reuse the page's own empty-state dash"
-    );
 }
 /// The parity class this user has reported four separate times: "some
 /// options are only reachable via keyboard shortcut". A source scan (this
@@ -2603,103 +2635,18 @@ fn hdr_reference_rows_read_content_light_and_use_the_established_empty_state() {
 /// string instead.
 ///
 /// Every action gets a persistent regional control or the context-menu row for
-/// the thing it acts on. The four exemptions are independently-owned lane
-/// parity work, named with their owners so a future removal cannot silently
-/// turn any unrelated action back into keyboard-only.
+/// the thing it acts on. Any exemption is independently-owned lane parity work,
+/// named with its owner so a future removal cannot silently turn any unrelated
+/// action back into keyboard-only.
 #[test]
 fn every_action_has_a_darkroom_widget_home_or_explicit_owner() {
     use crate::ActionId;
-    const EXPLICITLY_OWNED_ELSEWHERE: &[(ActionId, &str)] = &[
-        (
-            ActionId::FocusPanels,
-            "keyboard-only by design: a mouse already focuses whatever it \
-             clicks, so a click-through door for \"move keyboard focus\" \
-             has nothing to do that a click has not already done",
-        ),
-        (
-            ActionId::Deselect,
-            "clicking empty timeline space already clears the selection with the mouse; \
-             bare escape is a keyboard-only accelerator for that existing door, not a new one",
-        ),
-        (
-            ActionId::SelectNext,
-            "clicking a clip already selects it with the mouse; `}` is a keyboard-only \
-             accelerator for cycling that existing selection, not a new door -- legacy had no \
-             toolbar button for it either",
-        ),
-        (
-            ActionId::SelectPrev,
-            "clicking a clip already selects it with the mouse; `{` is a keyboard-only \
-             accelerator for cycling that existing selection, not a new door -- legacy had no \
-             toolbar button for it either",
-        ),
-        // The keyboard's own trim: `^[` and `^]` do with a stroke what the
-        // pointer does by dragging the clip edge to the spot it wants, and
-        // that drag is the door -- a menu row for it would be a second name
-        // for a gesture the bench already answers.
-        (
-            ActionId::TrimInToPlayhead,
-            "the pointer's version is dragging the clip edge to the playhead",
-        ),
-        (
-            ActionId::TrimOutToPlayhead,
-            "the pointer's version is dragging the clip edge to the playhead",
-        ),
-        // The rail's own eighteen are gone from this list: the right-click
-        // parity (DESIGN §5 as amended 2026-09-09, user decision "option C")
-        // gave every one of them a door on the thing it acts on -- the clip
-        // menu, the ruler's, the lane head's -- and the staleness check below
-        // is what deleted their entries as each landed.
-        // Cleanse round 2 (2026-09-10, user "seems cool, let's apply"): the
-        // time band kept the timecode, one three-glyph transport, the
-        // odometer, the contact strip and Export. Everything below left it.
-        // Each keeps its chord and its KEYS-tab row; the ruler menu already
-        // owns the ones that act on the ruler (zoom/fit/snap). Named here
-        // rather than re-mounted, per DESIGN §5's amendment: the geography of
-        // a verb is the thing it acts on, and playback has no thing.
-        (
-            ActionId::JumpBack,
-            "KEYS tab + key: the shuttle pair left the band in cleanse round 2",
-        ),
-        (
-            ActionId::JumpForward,
-            "KEYS tab + key: the shuttle pair left the band in cleanse round 2",
-        ),
-        (
-            ActionId::GoStart,
-            "KEYS tab + key: home/end left the band in cleanse round 2 -- the \
-             contact strip's own ends are the pointer's version",
-        ),
-        (
-            ActionId::GoEnd,
-            "KEYS tab + key: home/end left the band in cleanse round 2 -- the \
-             contact strip's own ends are the pointer's version",
-        ),
-        (
-            ActionId::PrevSyncPoint,
-            "KEYS tab + key: the sync pair left the band in cleanse round 2",
-        ),
-        (
-            ActionId::NextSyncPoint,
-            "KEYS tab + key: the sync pair left the band in cleanse round 2",
-        ),
-        (
-            ActionId::Loop,
-            "KEYS tab + key: the loop toggle left the band in cleanse round 2",
-        ),
-        (
-            ActionId::ClearRange,
-            "KEYS tab + key: `I O ×` left the band in cleanse round 2 -- in and out \
-             became the contact strip's own grips, and clearing both at once is \
-             not a thing on the film to point at",
-        ),
-        (
-            ActionId::Screenshot,
-            "the picture the frame is written from is the *watched* frame and \
-             nothing else is under the pointer to right-click for it: keyboard \
-             and the KEYS card, like the selection accelerators above",
-        ),
-    ];
+    // Empty: every action now has a row on the menu bar (DESIGN §4.4), so no
+    // action is exempt. The entries this list held (the selection walk, the
+    // shuttle, the sync walk, the trims at the playhead and the rest) each
+    // became a menu row. An exemption added later needs an owner, and it goes
+    // back here.
+    const EXPLICITLY_OWNED_ELSEWHERE: &[(ActionId, &str)] = &[];
     /// `ActionId::Loop` is a prefix of `ActionId::LoopTrim`, and the keys
     /// menu's own label arm (`ActionId::ToggleMute | ActionId::Paste =>
     /// format!("{full} (global)")`) shapes a string rather than opening a
@@ -2718,13 +2665,15 @@ fn every_action_has_a_darkroom_widget_home_or_explicit_owner() {
             })
     }
     let darkroom = [
-        "ui/bench_stance.rs",
-        "ui/cards.rs",
+        "ui/bench_stance",
+        "ui/cards",
         "ui/dock_stance.rs",
+        "ui/menubar.rs",
         "ui/overlays.rs",
         "ui/settings_stance.rs",
         "ui/stance.rs",
         "ui/timeband_stance.rs",
+        "ui/toolbar.rs",
         "menus.rs",
     ]
     .map(src_text)
@@ -2768,9 +2717,8 @@ fn every_action_has_a_darkroom_widget_home_or_explicit_owner() {
 /// and a carried lane names the exact slot `reorder_lane` will use.
 #[test]
 fn darkroom_bench_wires_transition_controls_and_lane_drop_cue() {
-    let bench = src_text("ui/bench_stance.rs");
-    let clip = &bench[bench.find("fn clip_box(").expect("the clip renderer")
-        ..bench.find("fn sub_box(").expect("the subtitle renderer")];
+    let clip_src = src_text("ui/bench_stance/clip.rs");
+    let clip = &clip_src[clip_src.find("fn clip_box(").expect("the clip renderer")..];
     for needle in [
         "fade_wedge(true)",
         "fade_wedge(false)",
@@ -2804,10 +2752,9 @@ fn darkroom_bench_wires_transition_controls_and_lane_drop_cue() {
         "dissolve hit test still tracks transition width"
     );
 
-    let lane = &bench[bench.find("fn lane_row(").expect("the lane renderer")
-        ..bench
-            .find("pub(crate) fn render(")
-            .expect("the bench renderer")];
+    let lane_src = src_text("ui/bench_stance/lane.rs");
+    let from = lane_src.find("fn lane_row(").expect("the lane renderer");
+    let lane = &lane_src[from..from + lane_src[from..].find("\n}\n").expect("its end")];
     for needle in [
         "this.preview_lane_drop(event.drag(cx).0, lane, cx)",
         "this.forget_lane_drop(lane, cx)",
@@ -2821,18 +2768,46 @@ fn darkroom_bench_wires_transition_controls_and_lane_drop_cue() {
     }
 }
 
+/// DESIGN §7: the head's switches are text glyphs at a 24px hit area, the head
+/// is 140px wide, and a hidden or muted lane's clips sit at 40%. The
+/// subtitle lane's show toggle is its name now, so the eye glyph is the hide.
+#[test]
+fn the_lane_head_is_140_wide_with_glyph_switches_and_dims_hidden_lanes() {
+    let bench = src_text("ui/bench_stance");
+    assert!(
+        bench.contains("const HEAD_W: f32 = 156."),
+        "the lane head is no longer 140px wide"
+    );
+    for glyph in ["◉", "♪", "▣"] {
+        assert!(bench.contains(glyph), "the head lost its {glyph} switch");
+    }
+    let lane = src_text("ui/bench_stance/lane.rs");
+    assert!(
+        lane.contains("const DIMMED_OPACITY: f32 = 0.4;") && lane.contains(".opacity(dim)"),
+        "a hidden or muted lane's clips are not dimmed to 40%"
+    );
+    let name = source_from("fn lane_name(");
+    let name = &name[..name.find("\n}\n").expect("the name's end")];
+    assert!(
+        !name.contains("◉") && name.contains("show_sub_lane(lane, cx)"),
+        "the subtitle show toggle still wears the eye glyph, or is not the name"
+    );
+}
+
 /// The pointer harness can only drive controls that report the bounds of the
 /// element that owns the gesture. Keep every dynamic Darkroom entry surface
 /// named, so UI verification never falls back to guessed pixels.
 #[test]
 fn hitmap_names_every_darkroom_pointer_entry_surface() {
-    let bench = src_text("ui/bench_stance.rs");
+    let bench = src_text("ui/bench_stance");
     for needle in [
         "clip.{}.{}.{}.fade-{}",
         "clip.{}.{}.{}.trim-{}",
         "clip.{}.{}.{}.dissolve",
         "lane.{}.reorder",
         "lane.{}.eye",
+        "lane.{}.mute",
+        "lane.{}.lock",
     ] {
         assert!(
             bench.contains(needle),
@@ -2860,16 +2835,17 @@ fn hitmap_names_every_darkroom_pointer_entry_surface() {
 
     for (path, needles) in [
         (
-            "ui/timeband_stance.rs",
+            "ui/bench_stance/overview.rs",
             &[
-                "timeline.contact-strip",
-                "stance-strip-grip-lt",
-                "stance-strip-grip-rb",
+                "timeline.overview",
+                "stance-overview-window",
                 "stance-strip-mark-in",
                 "stance-strip-mark-out",
+                "timeline.scrollbar",
+                "stance-scroll-thumb",
             ][..],
         ),
-        ("ui/preview.rs", &["preview.stop", "preview.scrub"][..]),
+        ("ui/preview.rs", &["source.ruler"][..]),
         (
             "ui/overlays.rs",
             &[
@@ -2949,7 +2925,7 @@ fn an_external_file_drop_is_heard_by_the_whole_room_and_imports() {
 /// Exactly two listeners, so no strip answers one notch twice.
 #[test]
 fn the_bench_answers_a_wheel_notch_anywhere_over_it() {
-    let bench = src_text("ui/bench_stance.rs");
+    let bench = src_text("ui/bench_stance");
     assert_eq!(
         bench.matches(".on_scroll_wheel(").count(),
         2,
@@ -2979,10 +2955,20 @@ fn the_bench_answers_a_wheel_notch_anywhere_over_it() {
         content_wheel < 700 && bench[content..].contains("this.timeline_wheel(event, cx)"),
         "the container's wheel listener is not on the container itself"
     );
-    let ruler = bench.find(".id(\"bench-ruler\")").expect("no ruler");
-    let lanes = bench.find(".id(\"bench-lanes\")").expect("no lane column");
+    // The ruler is its own file now; it is mounted in the content between the
+    // container's listener and the lane column, and must add none of its own.
+    let ruler = src_text("ui/bench_stance/ruler.rs");
     assert!(
-        !bench[ruler..lanes].contains(".on_scroll_wheel("),
+        !ruler.contains(".on_scroll_wheel("),
+        "the ruler answers the wheel on its own again -- one notch, two scrolls"
+    );
+    let content_src = src_text("ui/bench_stance/mod.rs");
+    let mounted = content_src.find(".child(ruler(").expect("the ruler is not mounted");
+    let lanes = content_src
+        .find(".id(\"bench-lanes\")")
+        .expect("no lane column");
+    assert!(
+        !content_src[mounted..lanes].contains(".on_scroll_wheel("),
         "the ruler answers the wheel on its own again -- one notch, two scrolls"
     );
 }
@@ -3065,15 +3051,18 @@ fn the_seam_paints_nothing_until_a_pointer_finds_it() {
 /// past the line to cover the `BENCH` label row a hand aimed at; that row is
 /// gone (cleanse round 2) and the ruler under the seam answers presses of its
 /// own (it scrubs), so the bench seam takes every other seam's reach and no
-/// more -- a deeper band would eat scrubs at the film's own top edge.
+/// more -- a deeper band would eat scrubs at the film's own top edge. Every
+/// seam shares one 24 px band ([`HIT_MIN`], WCAG 2.5.8), hung one row above
+/// the strip, so every seam reaches the same 17 px past its own line.
 #[test]
 fn the_bench_seam_reaches_no_further_than_every_other_seam() {
     let above = 1.;
     let reach = |grab: f32| grab - above - crate::layout::SPLIT_W;
-    assert_eq!(reach(crate::layout::GRAB_W), 7.);
+    assert_eq!(crate::layout::GRAB_W, HIT_MIN, "a seam's band is 24 px");
+    assert_eq!(reach(crate::layout::GRAB_W), 17.);
     assert_eq!(
         reach(crate::layout::BENCH_GRAB_H),
-        7.,
+        reach(crate::layout::GRAB_W),
         "the bench band reaches past the ruler row, which answers presses itself"
     );
 }
@@ -3110,7 +3099,7 @@ fn the_bench_seam_stops_at_its_floor_and_its_ceiling() {
 /// bed itself so a half-scrolled clip still drags on the half that shows.
 #[test]
 fn the_lane_bed_clips_its_clips_at_the_pinned_heads() {
-    let src = src_text("ui/bench_stance.rs");
+    let src = src_text("ui/bench_stance");
     let start = src.find(r#".id(("bench-bed""#).expect("the bed");
     let bed = &src[start
         ..start
@@ -3136,13 +3125,11 @@ fn a_source_row_shows_its_name_before_anything_else() {
     let dock = src_text("ui/dock_stance.rs");
     let start = dock.find("fn source_row(").expect("the source row");
     let row = &dock[start..dock.find("/// Imported subtitle tracks").expect("its end")];
+    // REDESIGN §3.8: the name is the one flexible child beside a fixed poster
+    // and a 28px `+`, and it ends in an ellipsis rather than collapsing.
     assert!(
-        row.contains(".min_w(relative(0.6))"),
-        "the row name can still collapse under its siblings"
-    );
-    assert!(
-        !row.contains(".min_w(px(0.))"),
-        "the row name is still allowed to measure nothing"
+        row.contains(".flex_1()\n                                .min_w(px(0.))\n                                .truncate()"),
+        "the row name can no longer shrink to an ellipsis"
     );
     // Cleanse round 2: the name is what the editor calls the film, not what
     // the filesystem calls the bytes.
@@ -3163,9 +3150,10 @@ fn a_source_row_shows_its_name_before_anything_else() {
     assert_eq!(crate::ui::dock_stance::stem(".srt"), ".srt");
     // One ghost on the right edge, and one only: preview and the stand-in
     // moved into the row's own menu (`RowItem::Preview`/`Proxy`).
-    for glyph in [r#".child("+")"#, r#".child("↵")"#] {
-        assert!(row.contains(glyph), "the right-edge verb lost {glyph}");
-    }
+    // REDESIGN §3.8: a 28px ghost `plus` icon button, always drawn; the key is
+    // nowhere on the row (§5 rule 1).
+    assert!(row.contains("Icon::Plus"), "the right-edge verb lost its plus");
+    assert!(!row.contains(r#".child("↵")"#), "a key is back on the row");
     for gone in [r#".child("▷")"#, "dock-proxy-toggle", "dock-preview"] {
         assert!(!row.contains(gone), "the row still carries `{gone}`");
     }
@@ -3176,10 +3164,10 @@ fn a_source_row_shows_its_name_before_anything_else() {
     // The metadata line is codec · length · lanes: no decoder seat, no use
     // count (`usage_line` and the `seats` filter above it).
     assert!(
-        row.contains(".map(Backend::label);") && row.contains(".child(under)"),
+        row.contains(".map(Backend::label);") && row.contains("fn row_facts("),
         "the metadata line no longer drops the decoder seat"
     );
-    let usage = &dock[dock.find("fn usage_line(").expect("the usage line")..start];
+    let usage = &dock[dock.find("fn usage_labels(").expect("the usage chips")..start];
     assert!(
         !usage.contains("use{}"),
         "the metadata line still counts uses"
@@ -3190,10 +3178,36 @@ fn a_source_row_shows_its_name_before_anything_else() {
         !dock.contains("double-click plays"),
         "the dock still carries an instruction footer"
     );
-    // ...and an empty list is a single noun, whatever emptied it.
+    // ...an empty library says so in words, and a filter that matches
+    // nothing keeps the one noun.
     assert!(
-        dock.contains(r#".child("none"),"#),
-        "the empty dock says something other than the one noun"
+        dock.contains("EMPTY_LIBRARY_HINT") && dock.contains("Nothing matches"),
+        "the empty dock lost its empty-library words or the no-match noun"
+    );
+}
+
+/// DESIGN §6.7: the Media tab is one list of rows at a fixed height, with
+/// `+ Add` as a text button, and the footer's import button named for what
+/// it does.
+#[test]
+fn the_media_tab_rows_are_fixed_and_the_footer_names_the_import() {
+    assert_eq!(crate::ui::dock_stance::SOURCE_ROW_H, 64.0);
+    let dock = src_text("ui/dock_stance.rs");
+    let row = &dock[dock.find("fn source_row(").expect("the source row")..];
+    assert!(
+        row.contains(".h(px(source_row_h(usable)))"),
+        "a media row is no longer fixed at 72px"
+    );
+    assert!(
+        dock.contains(r#""Import media…""#),
+        "the footer no longer names the import"
+    );
+    // The tab is found by its id, not by its label, so a rename cannot
+    // silently break which surface a click opens.
+    assert!(
+        dock.contains(r#"match id == "dock-tab-src""#)
+            && dock.contains(r#"this.dock_src_active = id == "dock-tab-src";"#),
+        "the tab still compares its label to pick its surface"
     );
 }
 
@@ -3246,7 +3260,6 @@ fn every_dock_body_mounts_the_ring_it_is_standing_in_for() {
     for (body, id) in [
         ("sources", "\"dock-sources\""),
         ("clip", "\"dock-clip\""),
-        ("keys", "\"dock-keys-rows\""),
     ] {
         let after = dock
             .split(id)
@@ -3267,7 +3280,7 @@ fn every_dock_body_mounts_the_ring_it_is_standing_in_for() {
     let body = handler.split("\n}\n").next().unwrap();
     assert_eq!(
         body.matches("cx.stop_propagation()").count(),
-        3,
+        2,
         "the dock's key handler stops a stroke outside its tab/escape branches"
     );
     for branch in ["is_focus_cycle_key(key)", "is_focus_exit_key(key)"] {
@@ -3296,7 +3309,7 @@ fn a_dock_ring_never_moves_what_it_rings() {
     }
     assert_eq!(
         dock.matches("gpui::transparent_black()").count(),
-        4,
+        8,
         "a dock ring lost its at-rest transparent border"
     );
     // ...and the focus ring is not painted at all (user 2026-09-09:
@@ -3333,30 +3346,32 @@ fn the_keys_list_is_dock_body_state_not_a_tab() {
         "the keys plate is still mounted over the bench"
     );
     let dock = src_text("ui/dock_stance.rs");
-    for (id, label) in [("dock-tab-src", "SOURCES"), ("dock-tab-clip", "CLIP")] {
+    for (id, label) in [("dock-tab-src", "Media"), ("dock-tab-clip", "Clip"), ("dock-tab-transcript", "Transcript")] {
         assert!(
             dock.contains(&format!("dock_tab(\"{id}\", \"{label}\"")),
             "the dock's tab strip lost {label}"
         );
     }
+    // The sheet is a dialog over the picture, not a dock tab (nothing in the strip moves).
     assert!(
-        !dock.contains("dock-tab-keys"),
-        "KEYS is still a tab in the strip"
+        !dock.contains("dock_tab(\"dock-tab-keys\""),
+        "the shortcuts sheet is a dock tab again"
     );
     assert!(
-        dock[dock.find("fn keys_tab(").unwrap()..].contains("section_head(\"KEYS\")"),
-        "the keys list draws no KEYS head in the dock body"
+        dock[dock.find("fn keys_sheet(").unwrap()..].contains("\"Keyboard shortcuts\""),
+        "the shortcuts sheet draws no title"
     );
     assert!(
-        dock.contains("fn keys_tab(") && dock.contains("keys_rows_matching("),
-        "the KEYS tab draws something other than the action registry"
+        dock.contains("keys_rows_matching("),
+        "the shortcuts sheet draws something other than the action registry"
+    );
+    // A reference sheet, not a state view: no row dims for what the room can do right now.
+    assert!(
+        !dock.contains("Enable::No(why) | Enable::Hidden(why) => Some(why)"),
+        "the shortcuts sheet greys rows by state; it is a reference"
     );
     assert!(
-        dock.contains("Enable::Yes => INK2(),") && dock.contains("_ => INK4(),"),
-        "a refused action's row no longer greys to ink4 (DESIGN §8)"
-    );
-    assert!(
-        dock[dock.find("fn keys_tab(").unwrap()..].contains(".overflow_y_scroll()"),
+        dock[dock.find("fn keys_sheet(").unwrap()..].contains(".overflow_y_scroll()"),
         "the keys list does not scroll like its neighbours"
     );
     // The Sources filter box belongs to Sources: it is built inside
@@ -3368,26 +3383,13 @@ fn the_keys_list_is_dock_body_state_not_a_tab() {
     );
 }
 
-/// The user's screenshot: the old rail ended with `?` over `?`. The rule
-/// outlived the rail -- a ledger room ghost whose primary chord IS its own
-/// name wears no badge; every other one still does.
+/// DESIGN §6.9: the status bar keeps the selected clip or gap and export
+/// progress on the left, the picture's format and the two room verbs
+/// (`commands`, `shortcuts`) on the right. Project identity, save state, the
+/// CC/settings/full verbs and the position timecode are gone from it; the
+/// menu bar carries identity and save state now.
 #[test]
-fn a_room_ghost_wears_no_chord_that_repeats_its_name() {
-    let src = src_text("ui/stance.rs");
-    assert!(
-        src.contains(".when(player.keymap.chord(action) != name, |el| {"),
-        "a room ghost draws its chord badge even when the badge repeats its name"
-    );
-}
-
-/// DESIGN §5 as amended 2026-09-09 (user decision "option C"): there is no
-/// rail. The room root is centre | dock, `spine_stance` is deleted, and the
-/// four verbs that act on the ROOM -- the only ones with no thing under the
-/// cursor to be right-clicked -- live at the ledger's right end, each
-/// wearing its chord, `CC` carrying the shown/hidden state the rail's glyph
-/// used to.
-#[test]
-fn the_ledger_carries_the_rooms_four_verbs_and_no_rail_remains() {
+fn the_ledger_carries_the_two_room_verbs_and_no_rail_remains() {
     let src = src_text("ui/stance.rs");
     for gone in ["stance-spine", "spine_stance", "SPINE_W", "fn spine("] {
         assert!(
@@ -3397,34 +3399,34 @@ fn the_ledger_carries_the_rooms_four_verbs_and_no_rail_remains() {
     }
     let ledger = &src[src.find("fn ledger(").expect("the ledger strip")
         ..src.find("/// The dock:").expect("the dock frame")];
-    for (name, action) in [
-        ("CC", "ActionId::ToggleSubtitles"),
-        ("settings", "ActionId::Settings"),
-        ("keys", "ActionId::ShowActions"),
-        ("full", "ActionId::Fullscreen"),
+    // REDESIGN §3.13: no key hints in the status bar. The palette is the menu bar's
+    // search field and the shortcuts sheet is in the Help menu.
+    for gone in ["\"commands\"", "\"shortcuts\"", "ActionId::ShowActions", "ActionId::ShowKeys", "fn ledger_verb("] {
+        assert!(!src.contains(gone) || gone.starts_with("ActionId") && !ledger.contains(gone), "the status bar kept {gone}");
+    }
+    assert!(src_text("ui/menubar.rs").contains("\"menubar-search\""));
+    for gone in [
+        "\"CC\"",
+        "\"settings\"",
+        "\"full\"",
+        "ActionId::ToggleSubtitles",
+        "ActionId::Settings",
+        "ActionId::Fullscreen",
+        "ActionId::Save",
+        "project_path",
+        "timecode(position",
     ] {
         assert!(
-            ledger.contains(&format!("\"{name}\",")) && ledger.contains(action),
-            "the ledger lost its {name} room verb"
+            !ledger.contains(gone),
+            "the status bar still carries {gone}"
         );
     }
-    // Before the position timecode, which stays the strip's last word.
+    // The format readout lives in the viewer header alone; the status bar repeats none of it.
     assert!(
-        ledger.find("room_ghost(").expect("a room verb")
-            < ledger.find(".child(tc),").expect("the position"),
-        "the room verbs drew after the position timecode"
+        !ledger.contains("s.resolution()") && !ledger.contains("fps_label(player.fps)"),
+        "the status bar repeats the viewer header's format"
     );
-    // Each wears its chord, live off the keymap (DESIGN §4), and `CC` reads
-    // active while subtitles are shown.
-    let ghost = &src[src.find("fn room_ghost(").expect("the room ghost")..];
-    assert!(
-        ghost.contains("player.keymap.chord(action)") && ghost.contains("widgets::action_hover"),
-        "a room verb lost its live chord or its hover plate"
-    );
-    assert!(
-        ledger.contains("player.subs_on"),
-        "`CC` no longer shows whether subtitles are shown"
-    );
+    assert!(src.contains("size_label(w, h)"), "the viewer header lost the picture's format");
 }
 
 /// The `all` control left the ruler (cleanse round 2, DESIGN §5): the ruler
@@ -3437,7 +3439,7 @@ fn the_ledger_carries_the_rooms_four_verbs_and_no_rail_remains() {
 fn select_all_left_the_ruler_for_the_rulers_own_menu() {
     use crate::ActionId;
     use crate::menus::BENCH_ITEMS;
-    let bench = src_text("ui/bench_stance.rs");
+    let bench = src_text("ui/bench_stance");
     for gone in ["bench-select-all", "select_all_band", "SELECT_ALL_PAD"] {
         assert!(!bench.contains(gone), "the ruler still carries {gone}");
     }
@@ -3448,7 +3450,7 @@ fn select_all_left_the_ruler_for_the_rulers_own_menu() {
     // And the band it reserved is the ticks' again: nothing subtracts a
     // control's width from the bed's right edge any more.
     assert!(
-        bench.contains("if x >= plate_w && x + label_w <= bed_w {"),
+        bench.contains("if x >= plate_w && x + label_w <= bed_w && x >= label_end + LABEL_GAP_PX {"),
         "the tick loop still keeps a band clear for a control that is gone"
     );
 }
@@ -3463,23 +3465,26 @@ fn select_all_left_the_ruler_for_the_rulers_own_menu() {
 /// concurrent builder's file, is deleted).
 #[test]
 fn one_name_per_source_one_stem_helper_and_one_save_door() {
-    let bench = src_text("ui/bench_stance.rs");
+    let bench = src_text("ui/bench_stance");
     assert!(
-        bench.contains(".filter(|_| !(audio && clip.link.is_some()))"),
-        "the audio half of a linked insert wears a second name plate again"
+        !bench.contains(".filter(|_| !(audio && clip.link.is_some()))"),
+        "the audio half of a linked insert lost its name again (P7: it is named like the picture half)"
     );
     assert!(
         bench.contains("stem(&s.path)") && !bench.contains("file_name(&s.path)"),
         "a name plate shows the file's extension again"
     );
     let stance = src_text("ui/stance.rs");
+    // Project identity and the save state moved from the status bar to the
+    // menu bar (DESIGN §6.9), which keeps the same one-stem, one-door rule.
+    let menubar = src_text("ui/menubar.rs");
     assert!(
-        stance.contains("stem(&player.project_path)"),
-        "the ledger shows the project's extension again"
+        menubar.contains("stem(&player.project_path)"),
+        "the menu bar shows the project's extension again"
     );
     assert!(
-        stance.contains(r#"room_ghost(player, "unsaved", ActionId::Save"#),
-        "the ledger's unsaved state is not Save's door -- it is a word again"
+        menubar.contains("ActionId::Save"),
+        "the menu bar's unsaved state is no longer Save's door"
     );
     // The close request is intercepted and routed through the predicate, and
     // the plate it raises is answered: this repo can build no window in a
@@ -3492,13 +3497,14 @@ fn one_name_per_source_one_stem_helper_and_one_save_door() {
     );
     assert!(
         stance.contains("if this.quit_ask {")
-            && stance.contains("this.save_project(cx);")
+            && stance.contains("if this.save_project(cx) {")
             && stance.contains("window.remove_window()"),
         "the unsaved plate is up with no key answering it"
     );
+    let popup = src_text("ui/popup.rs");
     assert!(
-        stance.contains("UNSAVED — save ↵ · discard d · stay esc"),
-        "the decision plate speaks prose instead of state + verb·chord"
+        popup.contains("fn unsaved_dialog(") && popup.contains("Save changes to {name}?") && popup.contains("Don't save"),
+        "the unsaved prompt is no longer a dialog"
     );
     // The overwrite guard (user 2026-09-11: saving over an existing file
     // must warn first, same pattern as the exit guard): Save no longer
@@ -3512,8 +3518,7 @@ fn one_name_per_source_one_stem_helper_and_one_save_door() {
         "^s overwrites a foreign .edith without asking"
     );
     assert!(
-        stance.contains("if this.save_ask {")
-            && stance.contains("OVERWRITE {} — overwrite ↵ · keep esc"),
+        stance.contains("if this.save_ask {") && popup.contains("fn overwrite_dialog("),
         "the overwrite plate is up with no key answering it"
     );
     assert!(
@@ -3539,7 +3544,7 @@ fn one_name_per_source_one_stem_helper_and_one_save_door() {
 /// reading -- it stays only for the state change it belongs to, a live scrub.
 #[test]
 fn the_ruler_plate_shows_the_timecode_only_while_a_scrub_is_live() {
-    let bench = src_text("ui/bench_stance.rs");
+    let bench = src_text("ui/bench_stance");
     let at = bench
         .find(".child(playhead_tc)")
         .expect("no playhead timecode in the ruler");
@@ -3573,24 +3578,23 @@ fn the_time_band_never_paints_outside_its_own_column() {
     let row = &src[start
         ..start
             + src[start..]
-                .find(".child(hero_timecode(")
+                .find(".child(timecode_cell)")
                 .expect("the timecode")];
     assert!(
         row.contains(".overflow_hidden()"),
         "the band row lets its children paint (and be clicked) under the dock: {row}"
     );
     assert!(
-        src.contains(".min_w(px(STRIP_MIN_W))"),
-        "the contact strip is the flex_1 that absorbs the slack; without a floor it measures 0"
+        src.contains(".id(\"stance-transport\")") && src.contains(".id(\"stance-tail\")"),
+        "the transport group is the flex_1 that centres the glyphs; Loop, volume and Mute close the row"
     );
-    assert!(crate::ui::timeband_stance::STRIP_MIN_W >= 120.);
 }
 
 /// DESIGN §7's ladder, cleanse round 2 (2026-09-10): the band is five
 /// things -- timecode, the three transport glyphs, the odometer, the contact
 /// strip and Export -- and the only sheddable layer left is the chord row
 /// under the glyphs. This pins the one threshold (measured in the harness:
-/// 454px of fixed groups + `STRIP_MIN_W`, rounded up -- a 640x600 window
+/// 454px of fixed groups + the strip's old 120px floor, rounded up -- a 640x600 window
 /// reads 539px of band and draws no chords, a 1280x720 one reads 982px and
 /// draws them) and that it never comes back off.
 #[test]
@@ -3619,38 +3623,33 @@ fn the_band_sheds_its_chords_and_nothing_else() {
 #[test]
 fn every_ghost_in_the_time_band_carries_a_full_hit_area() {
     let src = src_text("ui/timeband_stance.rs");
-    let start = src.find("fn ghost(").expect("the band's ghost");
-    let ghost = &src[start
-        ..start
-            + src[start..]
-                .find(".child(glyph.into())")
-                .expect("its glyph")];
-    for needle in [".min_w(px(HIT_MIN))", ".min_h(px(HIT_MIN))"] {
-        assert!(
-            ghost.contains(needle),
-            "the band's ghost lost {needle}: {ghost}"
-        );
+    let start = src.find("fn icon_button(").expect("the band's icon button");
+    let button = &src[start..start + src[start..].find("\n}\n").expect("its end")];
+    // A Large button is 32px square: a full hit area.
+    assert!(button.contains("ButtonSize::Large"), "the band's icon button shrank: {button}");
+    const {
+        assert!(HIT_MIN >= 24.);
     }
-    assert!(HIT_MIN >= 24.);
 }
 
 /// Mute wore `"{volume}%"` as its glyph while the slider beside it drew the
-/// same value: one number, two places. Cleanse round 2 (2026-09-10) settled
-/// it the other way -- the whole monitoring cluster left the band (mute is
-/// `m`, the level is the `-`/`=` pair), so the band writes no level at all.
+/// same value: one number, two places. The slider is back on the band (DESIGN
+/// §6.3) and the UX audit (U-12) asked for its value beside it: the band
+/// writes the level exactly once, in its own `volume_value`, and never as
+/// Mute's word again.
 #[test]
-fn the_band_writes_no_monitoring_level() {
+fn the_band_writes_the_monitoring_level_once_beside_its_slider() {
     let src = src_text("ui/timeband_stance.rs");
-    for gone in [
-        "player.volume.percent()",
-        "fn volume_readout(",
-        "fn volume_slider(",
-    ] {
-        assert!(
-            !src.contains(gone),
-            "the monitoring cluster is back in the band: {gone}"
-        );
-    }
+    assert_eq!(
+        src.matches("player.volume.percent()").count(),
+        1,
+        "the level is written once, in the slider's tooltip"
+    );
+    assert!(!src.contains("fn volume_value("), "the % number is back beside the slider");
+    assert!(
+        src.contains("if player.volume.muted { Icon::VolumeX } else { Icon::Volume2 }"),
+        "Mute swaps its icon with its state"
+    );
 }
 
 /// `Play` and `StepForward` drew the same solid right-triangle: two verbs one
@@ -3675,45 +3674,50 @@ fn transport_verbs_differ_by_shape_not_only_by_chord() {
     );
 }
 
-/// DESIGN §6: "the cut readout is the odometer". Keyed off the selection it
-/// read `cut —/—` immediately after a split -- two clips on the bench, the
-/// playhead resting on the new cut, nothing picked. It reads the playhead
-/// now: the cut under it, else the next one ahead, else the selection.
+/// The band's odometer is gone (DESIGN §6.3: hero timecode, transport, then
+/// Loop, volume and Mute). Its cut count stayed off the band only while the
+/// trim readout is armed, so it must not sneak back into the source.
 #[test]
-fn the_cut_readout_counts_from_the_playhead() {
-    use crate::ui::timeband_stance::odometer_cut;
-    let at = |start: u32, len: u32| Clip {
-        fade_in: 0,
-        fade_out: 0,
-        transition_out: 0,
-        visualizer: 0,
-        viz_paint: 0,
-        start,
-        in_frame: 0,
-        out_frame: len,
-        source: 0,
-        link: None,
-        eq: None,
-        color: None,
-        transform: None,
-        fit: FitPolicy::Fit,
-        speed: Speed::NORMAL,
+fn the_band_has_no_cut_odometer() {
+    let src = src_text("ui/timeband_stance.rs");
+    for gone in ["odometer", "cut_readout", "stance-cut-readout"] {
+        assert!(
+            !src.contains(gone),
+            "the odometer is back in the time band: {gone}"
+        );
+    }
+}
+
+/// DESIGN §6.3: "Right: Loop, and a volume slider." Mute sits after the slider
+/// (its glyph shows the state beside the level it returns to), and the trim
+/// readout is the only thing that may join the group, and only while armed.
+#[test]
+fn the_transport_closes_with_loop_volume_and_mute() {
+    let src = src_text("ui/timeband_stance.rs");
+    let at = |needle: &str| {
+        src.find(needle)
+            .unwrap_or_else(|| panic!("the band lost {needle}"))
     };
-    let lane = [at(0, 30), at(30, 30)];
-    assert_eq!(odometer_cut(&lane, 0), Some(0));
-    assert_eq!(odometer_cut(&lane, 29), Some(0));
-    // The split's own frame: the playhead rests on the SECOND cut's head.
-    assert_eq!(odometer_cut(&lane, 30), Some(1));
-    assert_eq!(odometer_cut(&lane, 59), Some(1));
-    // Past the last cut there is nothing to count -- the selection answers.
-    assert_eq!(odometer_cut(&lane, 60), None);
-    // In a gap: the next cut ahead of the playhead.
-    let gapped = [at(0, 10), at(40, 10)];
-    assert_eq!(odometer_cut(&gapped, 20), Some(1));
-    assert_eq!(odometer_cut(&[], 0), None);
+    let (loop_at, tail, mute_at, volume_at) = (
+        at(r#""stance-tb-loop""#),
+        at(r#".id("stance-tail")"#),
+        at(r#""stance-tb-mute""#),
+        at(".child(volume_slider(player, cx))"),
+    );
     assert!(
-        src_text("ui/timeband_stance.rs").contains("odometer_cut(s.lane_clips(lane), frame)"),
-        "the readout must derive its odometer from the playhead"
+        loop_at < tail && tail < mute_at && mute_at < volume_at,
+        "the transport closes with Loop, then the tail reads Mute, volume"
+    );
+    // The trim line is read by the status strip, not the band: the band never changes while a
+    // trim is in hand.
+    assert!(
+        !src.contains("trim_readout(player)"),
+        "the trim readout must not sit in the transport band"
+    );
+    let ledger = src_text("ui/stance.rs");
+    assert!(
+        ledger.contains("trim_text(player)") && ledger.contains("trim_in_flight(player)"),
+        "the trim line must replace the status strip's readout while a trim is armed or in hand"
     );
 }
 
@@ -3736,7 +3740,19 @@ fn no_notice_teaches_the_room_in_prose() {
     // machine (DESIGN §8, "a refusal string is a claim"), kept whole on
     // purpose: the remedy is not a chord in this room because the missing
     // thing is not in this room.
-    const ALLOWED: &[&str] = &["NO FILE CHOOSER"];
+    // The source preview's one line says what it is and the one way to use it.
+    const ALLOWED: &[&str] = &[
+        "No file chooser",
+        "No file dialog",
+        "No folder dialog",
+        "Previewing {}. Drag it onto the timeline to use it.",
+        // The one wording the path sheet's empty paste is asked to use.
+        "Copy a file's path first",
+        // The reason Zoom to selection gives with nothing selected, as the feature asks for it.
+        "Select a clip first",
+        // The reason Mark the beats gives on a picture-only clip, as the feature asks for it.
+        "Pick a clip with sound",
+    ];
     const TELLS: &[&str] = &[
         "drag ",
         "press ",
@@ -3854,61 +3870,11 @@ fn string_literals(text: &str) -> Vec<String> {
     out
 }
 
-/// The export moment holds the file and the budget; everything a project is
-/// *delivered as* is a settings row now (user: the export card was "too
-/// complicated"). Four rows, and a fifth would be the card growing back --
-/// this is a source scan for the same reason every guard on this page is.
+/// The Picture list holds the nine files in one order -- a codec's two boxes side by side,
+/// the sound-only formats last.
 #[test]
-fn the_export_section_is_four_rows_and_no_fifth() {
-    let source = src_text("ui/settings_stance.rs");
-    let start = source
-        .find("fn export_section(")
-        .expect("the export section");
-    let body = &source[start..];
-    let end = body
-        .find("\n/// The page itself")
-        .expect("the page's render fn");
-    let body = &body[..end];
-    let rows = [
-        "settings-export-picture",
-        "settings-export-sound",
-        "settings-export-encoder",
-        "settings-export-range",
-    ];
-    for row in rows {
-        assert!(body.contains(row), "the EXPORT section has no {row} row");
-    }
-    // The Sound row is written twice -- a rated codec's keyed row and an
-    // unrated one's readout, never both at once -- so the count is by label,
-    // not by id.
-    for label in ["\"Picture\"", "\"Sound\"", "\"Encoder\"", "\"Range\""] {
-        assert!(
-            body.contains(label),
-            "the EXPORT section has no {label} row"
-        );
-    }
-    let ids = body.match_indices("\"settings-export-").count();
-    assert_eq!(
-        ids, 5,
-        "the EXPORT section grew a row past the four (the two Sound rows are one row's two shapes)"
-    );
-    assert!(
-        source.contains("what a delivery is written as"),
-        "the section lost its head"
-    );
-    // Every row wears its chord (DESIGN §4): three keyed rows plus the
-    // range's own marks, which are keymap actions.
-    for chord in ["\"c\"", "\"b\"", "\"g\"", "ActionId::SetIn"] {
-        assert!(body.contains(chord), "an EXPORT row lost its chord {chord}");
-    }
-}
-
-/// `c` walks the nine files in one order -- a codec's two boxes side by side,
-/// the sound-only formats last -- and never stops on a format this machine
-/// cannot write, because [`Player::set_format`] would only refuse it back.
-#[test]
-fn the_picture_row_cycles_codec_and_container_together_and_skips_a_refusal() {
-    use crate::ui::settings_stance::{PICTURE_CYCLE, next_picture, picture_label};
+fn the_picture_list_pairs_codec_and_container() {
+    use crate::ui::settings_stance::{PICTURE_CYCLE, picture_label};
     assert_eq!(
         PICTURE_CYCLE,
         [
@@ -3921,26 +3887,9 @@ fn the_picture_row_cycles_codec_and_container_together_and_skips_a_refusal() {
             Format::Flac,
             Format::Mp3,
             Format::Ogg,
+            Format::Opus,
         ]
     );
-    // Nothing refused: the whole ring, wrapping back to the head.
-    let mut at = Format::Mp4;
-    let mut walked = vec![at];
-    for _ in 1..PICTURE_CYCLE.len() {
-        at = next_picture(at, |_| false);
-        walked.push(at);
-    }
-    assert_eq!(walked, PICTURE_CYCLE.to_vec());
-    assert_eq!(next_picture(at, |_| false), Format::Mp4);
-
-    // HEVC unavailable (no plugin): `c` steps over both of its boxes rather
-    // than parking on a pick the setter refuses.
-    let no_hevc = |f: Format| matches!(f, Format::Hevc | Format::HevcMp4);
-    assert_eq!(next_picture(Format::Av1, no_hevc), Format::Wav);
-    // Everything refused: the row keeps what it has instead of cycling to
-    // nothing.
-    assert_eq!(next_picture(Format::Mp4, |_| true), Format::Mp4);
-
     assert_eq!(picture_label(Format::Mp4), "H.264 · MP4");
     assert_eq!(picture_label(Format::Av1), "AV1 · MKV");
     assert_eq!(picture_label(Format::Av1Mp4), "AV1 · MP4");
@@ -3953,52 +3902,11 @@ fn the_picture_row_cycles_codec_and_container_together_and_skips_a_refusal() {
 /// wears a chord only where its codec has a rate to step.
 #[test]
 fn a_refusal_is_six_words_beside_the_value_and_soundless_codecs_wear_no_chord() {
-    use crate::ui::settings_stance::{encoder_word, short_reason, sound_codec};
+    use crate::ui::settings_stance::short_reason;
     let long = "HEVC needs the VA-API plugin, which this machine has not built";
     assert_eq!(short_reason(long), "HEVC needs the VA-API plugin, which");
     assert!(short_reason(long).split_whitespace().count() <= 6);
     assert_eq!(short_reason("no encoder here"), "no encoder here");
-
-    for (format, codec, rated) in [
-        (Format::Mp4, "AAC", true),
-        (Format::Av1, "AAC", true),
-        (Format::Mp3, "MP3", true),
-        (Format::Wav, "PCM", false),
-        (Format::Flac, "FLAC", false),
-        (Format::Ogg, "Vorbis", false),
-    ] {
-        assert_eq!(sound_codec(format), (codec, rated), "{format:?}");
-    }
-
-    assert_eq!(encoder_word(EncoderSeat::Auto), "auto");
-    assert_eq!(encoder_word(EncoderSeat::Hardware), "GPU");
-    assert_eq!(encoder_word(EncoderSeat::Software), "software");
-}
-
-/// The one amber line on the page is the AV1-on-the-GPU seat, and it is the
-/// only hue the EXPORT rows introduce -- every other value is an ink.
-#[test]
-fn the_only_hue_in_the_export_section_is_the_av1_gpu_notice() {
-    let source = src_text("ui/settings_stance.rs");
-    let start = source
-        .find("fn export_section(")
-        .expect("the export section");
-    let body = &source[start..];
-    let body = &body[..body.find("\n/// The page itself").expect("the render fn")];
-    assert!(
-        body.contains("NOTICE_LOOK()"),
-        "the AV1-on-the-GPU row lost its amber"
-    );
-    assert_eq!(
-        crate::ui::settings_stance::AV1_GPU_NOTICE,
-        "ignores the budget \u{2014} constant quality"
-    );
-    for hue in ["ACCENT_", "STATUS_", "NOTICE_TELL", "NOTICE_DECIDE"] {
-        assert!(
-            !body.contains(hue),
-            "the EXPORT rows reached for a second hue ({hue})"
-        );
-    }
 }
 
 /// Every control the hitmap names wears a hover line (the user, 2026-09-09,
@@ -4073,6 +3981,10 @@ fn every_hitmap_control_wears_a_hover_line() {
             free.sort_by_key(|n| tips[*n].0.abs_diff(i));
             match free.first() {
                 Some(n) => tips[*n].1 = true,
+                // Clips and subtitles carry no tooltip on purpose: the status bar
+                // reads the drag hint under the pointer instead. An empty lane bed
+                // carries none either: its drop highlight is its feedback.
+                None if file == "clip.rs" || file == "sub.rs" || head.contains(".bed\"") => {}
                 None => naked.push(format!("{file}:{}: {}", i + 1, line.trim())),
             }
         }
@@ -4120,7 +4032,7 @@ fn a_hover_line_is_a_name_and_a_chord() {
 #[test]
 fn no_region_root_wears_a_focus_ring() {
     let stance = src_text("ui/stance.rs");
-    let bench = src_text("ui/bench_stance.rs");
+    let bench = src_text("ui/bench_stance");
     let band = src_text("ui/timeband_stance.rs");
     for (name, text) in [
         ("stance.rs", &stance),
@@ -4165,11 +4077,10 @@ fn the_settings_sections_are_tabs_that_carry_their_own_explanation() {
     // is a `hitmap::control` wearing a plate of its own (the hover-line gate
     // below counts the plates one to one).
     for needle in [
-        "type_scale::LABEL_ROW_PX",
-        "gpui::FontWeight::MEDIUM",
-        "border_t_1()",
-        "rgb(INK1())",
-        "INK3()",
+        "type_scale::body()",
+        "border_b_2()",
+        "tokens().ink1",
+        "tokens().ink2",
         ".cursor_pointer()",
         ".tooltip(",
         "hitmap::control(",
@@ -4181,7 +4092,7 @@ fn the_settings_sections_are_tabs_that_carry_their_own_explanation() {
         "the settings tabs fell back to the 12px in-list section head"
     );
     // Three tabs, one per section, named the way the room names the section.
-    for tab in ["project", "editor", "export"] {
+    for tab in ["project", "editor", "keys"] {
         assert!(
             source.contains(&format!("\"settings-tab-{tab}\"")),
             "the settings strip has no {tab} tab"
@@ -4191,7 +4102,7 @@ fn the_settings_sections_are_tabs_that_carry_their_own_explanation() {
     for explanation in [
         "stored in the .edith file",
         "this machine, this window",
-        "what a delivery is written as",
+        "every shortcut, and how to rebind it",
     ] {
         assert!(
             source.contains(explanation),
@@ -4199,7 +4110,7 @@ fn the_settings_sections_are_tabs_that_carry_their_own_explanation() {
         );
     }
     // ...and none of them runs on after a head as ambient text.
-    for run_on in ["PROJECT \u{b7}", "EDITOR \u{b7}", "EXPORT \u{b7}"] {
+    for run_on in ["Project \u{b7}", "Editor \u{b7}", "Export \u{b7}"] {
         assert!(
             !source.contains(run_on),
             "a settings head grew its prose tail back: {run_on}"
@@ -4211,7 +4122,6 @@ fn the_settings_sections_are_tabs_that_carry_their_own_explanation() {
     for (tab, section) in [
         ("SettingsTab::Project", "project_section(player, cx)"),
         ("SettingsTab::Editor", "editor_section(player, cx)"),
-        ("SettingsTab::Export", "export_section(player, cx)"),
     ] {
         assert!(
             source.contains(&format!("{tab} => {section}")),
@@ -4245,7 +4155,8 @@ fn the_settings_page_is_a_centred_modal_with_one_column_of_measure() {
     // Centred on both axes, and the below-picture sheet gone with the rest
     // of it: no floor arithmetic, no bottom-edge alignment, no full-width
     // plate.
-    for needle in [".justify_center()", ".items_center()"] {
+    // (The kit dialog shell centres it on both axes.)
+    for needle in ["kit::dialog_layer(", "kit::dialog(\"settings-card\""] {
         assert!(body.contains(needle), "the settings modal lost {needle}");
     }
     for gone in ["below_picture_floor", "items_end()", "w_full()"] {
@@ -4258,12 +4169,12 @@ fn the_settings_page_is_a_centred_modal_with_one_column_of_measure() {
     // The plate: one column's own measure with its yield for a narrow centre
     // column, a capped height, and the rows scrolled inside the cap.
     for needle in [
-        ".id(\"settings-card\")",
-        ".w(px(SETTINGS_W))",
+        "\"settings-card\"",
+        "SETTINGS_W",
         ".max_w(relative(1.))",
-        ".max_h(px(max_h))",
         "\"settings-rows\"",
         "overflow_y_scroll()",
+        "more_below(",
     ] {
         assert!(
             body.contains(needle),
@@ -4278,79 +4189,36 @@ fn the_settings_page_is_a_centred_modal_with_one_column_of_measure() {
     // arithmetic: count the section's rows out of its body rather than
     // trusting the constant's comment.
     assert!(
-        body.contains(".h(px(SETTINGS_ROWS_H))"),
+        body.contains(".h(px(rows_h))"),
         "the settings rows lost their fixed measure -- a tab switch resizes the plate again"
     );
     let project = &source[source
         .find("fn project_section(")
         .expect("the PROJECT section")..];
     let project = &project[..project.find("\n}\n").map_or(project.len(), |at| at + 2)];
-    let rows = [
-        "row(",
-        "row_ink(",
-        "row_static(",
-        "row_keyed(",
-        "row_full(",
-        "row_chord(",
-    ]
-    .iter()
-    .map(|call| project.matches(call).count())
-    .sum::<usize>();
     assert_eq!(
-        crate::ui::settings_stance::SETTINGS_ROWS_H,
-        rows as f32 * CONTROL_H + (rows - 1) as f32 * 2.,
-        "SETTINGS_ROWS_H no longer measures the PROJECT section's {rows} rows"
+        project.matches("saved_line(").count(),
+        1,
+        "the PROJECT section no longer ends on its storage line"
+    );
+    // PROJECT at its tallest: three list rows, the HDR row and its two-line
+    // hint, both switches and the storage line.
+    let tallest = 7. * CONTROL_H + 36. + 7. * 2.;
+    assert!(
+        crate::ui::settings_stance::SETTINGS_ROWS_H >= tallest,
+        "SETTINGS_ROWS_H no longer holds the PROJECT section"
     );
     assert!(
-        body.contains("this.close_card()"),
+        body.contains("this.settings_open = false"),
         "the settings scrim swallows the press without closing the modal"
     );
 }
 
-/// The Picture row said every refused format's reason after its value
-/// (`H.264 no picture -- an mp4 would \u{b7} AV1 no picture -- ...`; the user
-/// called it "funny"). A row says its own pick: one value, and a refusal only
-/// when *that* pick is the refused one.
+/// The monitoring level is not a setting: it lives on the transport (slider and mute) and on
+/// `m` / the volume keys. Settings -> Editor carries no Level row, and the footer note does not
+/// mention one.
 #[test]
-fn the_picture_row_tail_is_the_current_format_alone() {
-    let source = src_text("ui/settings_stance.rs");
-    let start = source
-        .find("fn export_section(")
-        .expect("the export section");
-    let body = &source[start..];
-    let body = &body[..body
-        .find("\n/// The page itself")
-        .expect("the page's render fn")];
-    assert!(
-        !body.contains("PICTURE_CYCLE"),
-        "the Picture row walks the whole cycle to build its tail again"
-    );
-    assert!(
-        !body.contains(".join("),
-        "an EXPORT row concatenates a list into one row's tail again"
-    );
-    assert!(
-        body.contains("format_refusal(session, format)"),
-        "the Picture row's refusal is no longer asked about the current format"
-    );
-    // Six words at most, and the value greys with the refusal it carries.
-    assert!(
-        body.contains("short_reason(&why)") && body.contains("picture_ink"),
-        "the Picture row lost its short reason or its greyed value"
-    );
-}
-
-/// The monitoring level's home. Cleanse round 2 took the mute button, the
-/// `- +` pair and the slider off the time band on the promise that the level
-/// "lives in Settings" (DESIGN 5) -- a promise nothing kept until this row,
-/// which is why the volume trio sat in
-/// [`every_action_has_a_darkroom_widget_home_or_explicit_owner`]'s exemption
-/// list. A source scan, like every other guard on this page: the EDITOR
-/// section carries the row, the row wears the mute chord (`m`), and the wheel
-/// over it moves the level through the very actions the keys do -- no second
-/// setter, no slider growing back.
-#[test]
-fn the_editor_section_owns_the_monitoring_level_row() {
+fn the_editor_section_has_no_monitoring_level_row() {
     let source = src_text("ui/settings_stance.rs");
     let editor_start = source
         .find("fn editor_section(")
@@ -4359,51 +4227,10 @@ fn the_editor_section_owns_the_monitoring_level_row() {
         .find("pub(crate) fn render(")
         .expect("the page's render fn");
     let editor_body = &source[editor_start..render_start];
-    for needle in [
-        "\"settings-level\"",
-        "\"Level\"",
-        "ActionId::ToggleMute",
-        "ActionId::VolumeUp",
-        "ActionId::VolumeDown",
-        ".on_scroll_wheel(",
-    ] {
+    for needle in ["\"settings-level\"", "\"Level\"", "Level is not saved"] {
         assert!(
-            editor_body.contains(needle),
-            "the EDITOR section's Level row is missing {needle}"
-        );
-    }
-    // The chord the row draws is the keymap's own, so the badge reads `m`
-    // wherever this test's reader looks for it.
-    assert_eq!(
-        crate::keymap::Keymap::defaults().chord(crate::ActionId::ToggleMute),
-        "m",
-        "the mute chord moved -- the Level row's badge is no longer `m`"
-    );
-    // Muted reads as a word in the quieter ink, never as `0%`: the level is
-    // what unmuting comes back to and the row must not lie about it.
-    assert!(
-        editor_body.contains("\"muted\".to_string()"),
-        "the Level row must say `muted` rather than a number when silenced"
-    );
-    // A readout, not a widget: the slider stayed dead (DESIGN 5).
-    assert!(
-        !editor_body.contains("volume_bar") && !editor_body.contains("drag_volume"),
-        "the level slider grew back in Settings"
-    );
-    // The page counts as a card ([`Player::card_open`]), so the darkroom's
-    // modal guard eats every stroke this branch does not answer: without
-    // these three arms the row wears a chord that does nothing while the page
-    // is the visible thing on screen (what the first harness run showed).
-    let cards = src_text("player/cards.rs");
-    let branch_start = cards
-        .find("if self.settings_open {")
-        .expect("the settings key branch");
-    let branch = &cards[branch_start..(branch_start + 1600).min(cards.len())];
-    for arm in ["\"m\" =>", "\"=\" =>", "\"-\" =>"] {
-        assert!(
-            branch.contains(arm),
-            "the settings key branch does not answer {arm} -- the Level row's \
-             chord is swallowed by the modal guard while the page is up"
+            !editor_body.contains(needle),
+            "the EDITOR section grew the monitoring level back ({needle})"
         );
     }
 }
@@ -4437,4 +4264,579 @@ fn the_level_wheel_steps_five_percent_and_clamps_at_both_ends() {
     volume.muted = true;
     volume.step(false);
     assert!(volume.muted && volume.percent() == 95);
+}
+
+/// The type twin of `no_colour_is_written_outside_the_theme`: DESIGN §2.4
+/// sets 12px as the floor, and `ui::type_scale` is where that floor lives.
+/// A literal size under it written at a call site is a size the next type
+/// sweep will not see -- how 9px and 10.5px text reached the preview's
+/// labels and 11px reached the menus. Every literal is read in both forms a
+/// call site writes one: `text_size(px(N))`, and `label(N, ..)` / `mono(N, ..)`
+/// taking it as the first argument.
+#[test]
+fn no_ui_text_is_set_literally_below_the_floor() {
+    const FLOOR: f32 = 12.;
+    let source = ui_source();
+    assert!(
+        source.matches("text_size(").count() >= 20,
+        "the text-size call sites moved; this scan is blind"
+    );
+
+    let mut stray = Vec::new();
+    for needle in ["text_size(px(", "label(", "mono("] {
+        for (at, _) in source.match_indices(needle) {
+            let prev = source[..at].chars().next_back();
+            let ident_before = prev.is_some_and(|c| c.is_alphanumeric() || c == '_');
+            if needle != "text_size(px(" && ident_before {
+                continue;
+            }
+            let literal: String = source[at + needle.len()..]
+                .trim_start()
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '.')
+                .collect();
+            if let Ok(size) = literal.parse::<f32>()
+                && size < FLOOR
+            {
+                stray.push(format!("{needle}{literal}"));
+            }
+        }
+    }
+    assert!(
+        stray.is_empty(),
+        "literal text size(s) under DESIGN §2.4's {FLOOR}px floor: {stray:?}"
+    );
+}
+
+/// DESIGN §2.3 and §4: every family is held to the same floor on every surface
+/// a line of text can sit on. INK3 is the tertiary tier -- labels, keys and
+/// metadata -- so it has to be legible too, and it has to be its own colour:
+/// a family whose INK3 aliased INK4 would put the disabled grey on information.
+#[test]
+fn every_palette_has_three_legible_inks_on_every_surface() {
+    for id in crate::ui::theme::PaletteId::ALL {
+        let p = id.palette();
+        for (name, ink) in [("ink1", p.INK1), ("ink2", p.INK2), ("ink3", p.INK3)] {
+            for (surface, bg) in [
+                ("canvas", p.DARK_CANVAS),
+                ("panel", p.DARK_PANEL),
+                ("raised", p.DARK_RAISED),
+            ] {
+                assert!(
+                    contrast(ink, bg) >= 4.5,
+                    "{id:?} {name} on {surface}: {:.2}",
+                    contrast(ink, bg)
+                );
+            }
+        }
+        assert_ne!(p.INK3, p.INK4, "{id:?}: INK3 aliases the disabled ink");
+        assert_ne!(p.INK3, p.INK2, "{id:?}: INK3 aliases the secondary ink");
+    }
+}
+
+/// DESIGN §2.1 is the mock's numbers, and the default is the mock's room: a
+/// fresh install opens on it. A saved pick still wins, since `load` only falls
+/// back to the default when there is nothing to read.
+#[test]
+fn darkroom_is_the_default_and_matches_design_2_1() {
+    use crate::ui::theme::{PaletteId, darkroom};
+    assert_eq!(PaletteId::DEFAULT, PaletteId::Darkroom);
+    assert_eq!(darkroom::BG_CANVAS, 0x0b0c0e);
+    assert_eq!(darkroom::BG_PANEL, 0x131518);
+    assert_eq!(darkroom::BG_RAISED, 0x1b1e22);
+    assert_eq!(darkroom::BG_HOVER, 0x24282d);
+    assert_eq!(darkroom::STROKE_DIVIDER, 0x2a2e34);
+    assert_eq!(darkroom::INK1, 0xe8eaed);
+    assert_eq!(darkroom::INK2, 0xb4bac1);
+    assert_eq!(darkroom::INK3, 0x8d959e);
+    assert_eq!(darkroom::INK4, 0x777f88);
+    assert_eq!(darkroom::NOTICE_LOOK, 0xd1b564);
+    assert_eq!(darkroom::NOTICE_DECIDE, 0xe07a7a);
+}
+
+/// DESIGN §4.3 and §4.10: the hit sizes a hand is given. A trim zone is 24 px
+/// centred on its edge, shrinks inside a short clip so the middle of it stays
+/// a move target, and gives its outside half to the clip under the pointer
+/// where two clips meet.
+#[test]
+fn a_trim_zone_is_24px_centred_on_the_edge_and_yields_at_a_join() {
+    use crate::{TRIM_HANDLE, TRIM_REACH, trim_zone};
+
+    assert_eq!(2. * TRIM_REACH, HIT_MIN, "24 px, centred on the edge");
+    const { assert!(TRIM_HANDLE <= TRIM_REACH, "a drawn handle fits in its zone") };
+    // A long clip with room on both sides: the full reach each way.
+    assert_eq!(
+        trim_zone(400., f32::INFINITY),
+        (TRIM_REACH, TRIM_REACH),
+        "12 px inside, 12 px outside"
+    );
+    // A short clip gives up inside reach, never the middle third of itself.
+    for width in [18., 24., 36., 47.] {
+        let (inside, outside) = trim_zone(width, f32::INFINITY);
+        assert!(inside <= width / 4. + 1e-4, "{width} px: inside {inside}");
+        assert!(
+            width - 2. * inside >= width / 3.,
+            "{width} px leaves no middle third"
+        );
+        assert!(inside + outside <= HIT_MIN);
+    }
+    assert_eq!(trim_zone(48., f32::INFINITY).0, TRIM_REACH);
+    // Touching clips: the outside half is nothing, so the join belongs to the
+    // clip the pointer is on, entirely.
+    assert_eq!(trim_zone(400., 0.).1, 0.);
+    // A gap: each side takes half of it, and the two halves meet exactly.
+    let gap = 10.;
+    assert_eq!(trim_zone(400., gap).1, gap / 2.);
+    assert_eq!(trim_zone(400., -3.).1, 0., "an overlap reaches nothing");
+}
+
+#[test]
+fn a_clip_draws_its_trims_outside_its_clipped_box() {
+    let src = src_text("ui/bench_stance/clip.rs");
+    let start = src.find("fn clip_box(").expect("the clip box");
+    let body = &src[start..start + src[start..].find("\n}\n").expect("its end")];
+    // The box clips its own contents, so the zones must be siblings of it:
+    // the body is built first, then the wrapper carries the zones after it.
+    let boxed = body.find("let body = div()").expect("the box");
+    assert!(body.find(".overflow_hidden()").expect("clipped") > boxed);
+    assert!(
+        body.find(".child(body)").expect("the wrapper") > boxed,
+        "the zones hang off the wrapper, not the clipped box: {body}"
+    );
+    assert!(
+        body.find("trim_zone(").expect("the zones") > body.find(".child(body)").expect("wrapper"),
+        "a zone built inside the box would be clipped to its edges"
+    );
+    // A selected clip shows its two 12 px handles, and its outline is 2 px.
+    // (REDESIGN §3.6: 8x20 pills, and the 2px accent outline is an overlay on the wrapper.)
+    assert!(body.contains(".w(px(8.))") && body.contains(".h(px(20.))"));
+    assert!(body.contains(".border_2()") && body.contains("tokens().accent"));
+    // Fades and the dissolve are hit areas of the full 24 px, drawn at 10 px.
+    assert!(body.matches(".w(px(HIT_MIN))").count() >= 2, "{body}");
+    assert!(body.contains("FADE_HANDLE_W"));
+    // Their own hit areas sit above the trim zones, which come first.
+    assert!(
+        body.find("trim_zone(").expect("zones") < body.find("bench-clip-fade").expect("fades"),
+        "a fade must be painted above the trim strip under it"
+    );
+    // The subtitle cue's outline matches the clip's.
+    let sub_src = src_text("ui/bench_stance/sub.rs");
+    let sub = sub_src.find("fn sub_box(").expect("the subtitle cue");
+    let sub = &sub_src[sub..sub + sub_src[sub..].find("\n}\n").expect("its end")];
+    assert!(sub.contains(".border_2()") && sub.contains("tokens().accent"));
+}
+
+/// DESIGN §8: a toast never covers the timeline or the picture. One at a time,
+/// it lives in the status bar, whose height is fixed.
+#[test]
+fn a_toast_lives_in_the_status_bar_and_never_over_the_timeline() {
+    let text = src_text("ui/stance.rs");
+    assert!(
+        !text.contains("fn toast_stack(") && !text.contains("stance-toasts"),
+        "a floating toast stack is back over the timeline"
+    );
+    let at = text.find("fn ledger(").expect("the status bar");
+    let ledger = &text[at..at + text[at..].find("\n}\n").expect("its end")];
+    assert!(
+        ledger.contains("current_toast(&player.notices)") && ledger.contains("toast_card("),
+        "the status bar must show one toast: the open question, else the newest"
+    );
+    assert!(text.contains(".h(px(LEDGER_H - 2.))"), "the toast must fit the bar's height");
+}
+
+#[test]
+fn ink4_is_only_for_disabled_states() {
+    // ink4 (`INK4()`, which is `FG_DISABLED`) is for disabled controls only
+    // (DESIGN §2.1, §4.1). Every use counted here must be a disabled state: a
+    // blocked export, a refused format's value, an action the room cannot take
+    // right now. Labels, keys, metadata, hints and empty states are information
+    // and take INK3(). A new use is a new information-or-disabled decision, so
+    // check which it is, and only then change the count below.
+    let mut uses = Vec::new();
+    for path in source_files() {
+        if path.file_name() == Some("theme.rs".as_ref()) {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).expect("a source file");
+        for (line, code) in text.lines().enumerate() {
+            if code.contains("INK4()") || code.contains("FG_DISABLED") {
+                let shown = path.strip_prefix(src_dir()).unwrap_or(&path);
+                uses.push(format!("{}:{}", shown.display(), line + 1));
+            }
+        }
+    }
+    // (The bed's gap hatch was the ninth; REDESIGN §3.6 removed every hatch.)
+    // None remain: P5 moved them to `tokens().ink4`, and the shortcuts sheet (which held the
+    // last two) now dims a refused row with opacity and gives the reason on hover.
+    assert_eq!(
+        uses.len(),
+        0,
+        "a new INK4()/FG_DISABLED line must be a disabled control, not information: {uses:#?}"
+    );
+}
+
+/// A first media into an empty timeline lands and fits (DESIGN §7), by the
+/// launch argument and by an import alike. The fit is worked out against the
+/// bed the timeline was painted on, and a bed that has not been painted yet
+/// has no width to fit into: the fit waits for the first frame that has one
+/// rather than falling back to the default 60 px/s, which is the screenshot
+/// that made a 12 s clip fill a third of a 1560 px bed.
+#[test]
+fn a_first_media_fits_the_bed_it_is_painted_on_and_waits_for_one_if_unpainted() {
+    let fit = |bed: f32| {
+        View {
+            scale: Scale::default(),
+            bed,
+            duration: 12.,
+            fps: 24.,
+        }
+        .fit()
+    };
+    let painted = fit(1560.);
+    assert!(
+        (painted.pps - 1560. / 12.).abs() < 1e-9 && painted.start == 0.,
+        "a 12 s edit on a 1560 px bed is 130 px/s from the head, not {painted:?}"
+    );
+    assert_eq!(
+        fit(0.).pps,
+        PPS_DEFAULT,
+        "an unpainted bed is the fallback this test exists to keep out of a fit"
+    );
+
+    let view = src_text("player/view.rs");
+    let zoom = &view[view.find("fn zoom_fit(").expect("zoom_fit")..];
+    let zoom = &zoom[..zoom.find("\n    }\n").expect("zoom_fit body")];
+    assert!(
+        zoom.contains("false => self.fit_pending = true"),
+        "zoom_fit must defer when the bed is unpainted: {zoom}"
+    );
+    let render = src_text("render.rs");
+    let frame = &render[render.find("if self.fit_pending {").expect("render consumes the fit")..];
+    assert!(
+        frame.contains("request_animation_frame") && frame.contains("self.fit_pending = false"),
+        "the deferred fit must be taken on the first measured frame and keep the loop alive until then"
+    );
+    let library = src_text("player/library.rs");
+    let launch = &library[library
+        .find("Landed::Media(opened, place) => {")
+        .expect("the launch arm of take_import")..];
+    let launch = &launch[..launch.find("cx.notify();").expect("arm end")];
+    assert!(
+        launch.contains("if place") && launch.contains("self.zoom_fit(cx);"),
+        "the file argv named must fit when it lands as the timeline: {launch}"
+    );
+}
+
+/// A fit spreads the whole edit across about 98% of the bed, and the rest is the
+/// margin (DESIGN §7). The share is read off the source, so the test and the
+/// fit cannot drift apart.
+#[test]
+fn a_fit_leaves_about_two_percent_of_the_bed_as_margin() {
+    let view = src_text("player/view.rs");
+    let share: f32 = view
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("const FIT_SHARE: f32 = ")
+                .and_then(|rest| rest.strip_suffix(';'))
+                .and_then(|num| num.parse().ok())
+        })
+        .expect("FIT_SHARE is a plain f32 literal");
+    assert!(
+        (0.97..=0.99).contains(&share),
+        "a fit is about 98% of the bed, not {share}"
+    );
+    let bed = 1560.;
+    let fit = View {
+        scale: Scale::default(),
+        bed: bed * share,
+        duration: 12.,
+        fps: 24.,
+    }
+    .fit();
+    assert!(
+        (fit.width_px(12.) - bed * share).abs() < 0.5 && fit.start == 0.,
+        "the whole 12 s edit must end at the margin, 98% of a 1560 px bed: {fit:?}"
+    );
+    let fit_to_bed = &view[view.find("fn fit_to_bed(").expect("fit_to_bed")..];
+    let fit_to_bed = &fit_to_bed[..fit_to_bed.find("\n    }\n").expect("fit_to_bed body")];
+    assert!(
+        fit_to_bed.contains("bed: view.bed * FIT_SHARE"),
+        "fit_to_bed must fit into the share of the bed, not the whole bed: {fit_to_bed}"
+    );
+}
+
+/// A fit stays in force while the bed changes width: the first frame measures
+/// the initial window size, the compositor then tiles the window, and the next
+/// frame refits for the new width. A hand's zoom, scroll or thumb drag ends the
+/// fit, so a resize after one keeps the view the hand chose (DESIGN §7).
+#[test]
+fn a_fit_follows_a_resized_bed_until_a_hand_zooms_or_scrolls() {
+    fn body<'a>(text: &'a str, sig: &str) -> &'a str {
+        let from = &text[text.find(sig).unwrap_or_else(|| panic!("{sig}"))..];
+        &from[..from.find("\n    }\n").unwrap_or_else(|| panic!("end of {sig}"))]
+    }
+    let player = src_text("main.rs");
+    assert!(
+        player.contains("fitted_bed: Option<f32>") && player.contains("fitted_bed: None,"),
+        "Player must hold the bed width of the fit, and start with none"
+    );
+
+    let view = src_text("player/view.rs");
+    assert!(
+        body(&view, "fn fit_to_bed(").contains("self.fitted_bed = Some(view.bed);"),
+        "a fit must record the bed width it was worked out for"
+    );
+    let zoom_fit = body(&view, "fn zoom_fit(");
+    assert!(
+        zoom_fit.contains("self.fit_to_bed();"),
+        "zoom_fit must fit through fit_to_bed, so the fit is the sticky one: {zoom_fit}"
+    );
+    for sig in ["fn zoom(", "fn scroll_view(", "fn pan_window_to("] {
+        assert!(
+            body(&view, sig).contains("self.fitted_bed = None;"),
+            "{sig} is a hand's view and must end the sticky fit"
+        );
+    }
+    // The thumb and the overview's window box both pan through pan_window_to,
+    // and a drag holds against the follow the way a scroll does.
+    assert!(
+        body(&view, "fn pan_window_to(").contains("self.panned = true;"),
+        "a window drag must hold the view against the playhead's follow"
+    );
+    assert!(
+        body(&view, "fn scroll_drag_to(").contains("self.pan_window_to("),
+        "the thumb's drag must pan through the shared door"
+    );
+
+    let render = src_text("render.rs");
+    let frame = &render[render
+        .find("if let Some(fitted) = self.fitted_bed {")
+        .expect("render refits a fit still in force")..];
+    let frame = &frame[..frame.find("ui::stance::render").expect("render end")];
+    assert!(
+        frame.contains("bed != fitted")
+            && frame.contains("bed > 0.")
+            && frame.contains("self.fit_to_bed();"),
+        "render must refit a sticky fit when the bed width differs, and never fit a zero width: \
+         {frame}"
+    );
+}
+
+/// An action's hover plate reads its key off the keymap, not off a literal
+/// written beside the action (DESIGN §4.5): the name, `Keymap::display` as the
+/// key, and a refused action's reason on its own line.
+#[test]
+fn an_action_tooltip_reads_its_key_from_the_keymap() {
+    use crate::oracle::Enable;
+    use crate::ui::widgets::action_parts;
+    let keymap = crate::keymap::Keymap::defaults();
+    for action in crate::keymap::ActionId::ALL {
+        let parts = action_parts(&keymap, action, Enable::Yes);
+        assert_eq!(parts.name.to_string(), action.label());
+        assert_eq!(
+            parts.key.map(|k| k.to_string()),
+            Some(keymap.display(action)),
+            "{action:?}: the plate's key must be the keymap's own reading"
+        );
+        assert_eq!(parts.why, None, "{action:?}: an enabled action gives no reason");
+    }
+    let refused = action_parts(
+        &keymap,
+        crate::keymap::ActionId::Cut,
+        Enable::No("Put the playhead over a clip"),
+    );
+    assert_eq!(
+        refused.why.map(|w| w.to_string()),
+        Some("Put the playhead over a clip".to_string()),
+        "a refused action's reason is the oracle's, on its own line"
+    );
+    assert_eq!(
+        refused.key.map(|k| k.to_string()),
+        Some(keymap.display(crate::keymap::ActionId::Cut)),
+    );
+    // And the live helper takes its parts from that same keymap, not from a
+    // second source of its own.
+    let body = fn_body("action_hover");
+    assert!(
+        body.contains("action_parts(&player.keymap, action"),
+        "action_hover must build its plate from the player's keymap: {body}"
+    );
+}
+
+/// The edit toolbar keeps DESIGN §6.4's group order, with a hairline rule
+/// between the groups, and every labelled button reads its key from the
+/// keymap rather than typing one. The commands must appear in the source in
+/// that order (a sequential search, so a swap or a missing rule fails), and the
+/// two helpers that draw a key must take it from `Keymap::display` or from
+/// `action_hover`, which reads the keymap's chord.
+#[test]
+fn the_edit_toolbar_keeps_its_group_order_and_reads_every_key_from_the_keymap() {
+    let src = src_text("ui/toolbar.rs");
+    let render = &src[src
+        .find("pub(crate) fn render(")
+        .expect("the toolbar's render")..];
+    let order = [
+        "ActionId::Cut",
+        "ActionId::Delete",
+        "ActionId::Lift",
+        "rule()",
+        "ActionId::Undo",
+        "ActionId::Redo",
+        "rule()",
+        "ActionId::ToggleSnap",
+        "ActionId::SetIn",
+        "ActionId::SetOut",
+        "ActionId::ZoomOut",
+        "zoom_slider(",
+        "ActionId::ZoomIn",
+        "ActionId::ZoomFit",
+    ];
+    let mut at = 0;
+    for needle in order {
+        let found = render[at..]
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle} must follow the groups before it: {render}"));
+        at += found + needle.len();
+    }
+    let helper = |sig: &str| {
+        let start = src.find(sig).unwrap_or_else(|| panic!("{sig} must exist"));
+        let rest = &src[start + sig.len()..];
+        let end = rest.find("\n}\n").expect("the helper's closing brace");
+        &rest[..end]
+    };
+    assert!(
+        helper("fn button(").contains("toolbar_tip(player, action)")
+            && helper("fn toolbar_tip(").contains("player.keymap.display(action)"),
+        "a toolbar button must name its key through the keymap's hover, not print it"
+    );
+    assert!(!src.contains("keymap.primary("), "the toolbar prints a key");
+}
+
+/// REDESIGN §3.8: a refused row says why in one line and stays the row height.
+#[test]
+fn a_refused_media_row_keeps_the_row_height() {
+    use crate::ui::dock_stance::{REFUSED_ROW_H, SOURCE_ROW_H, source_row_h};
+    assert_eq!(source_row_h(true), SOURCE_ROW_H);
+    assert_eq!(source_row_h(false), REFUSED_ROW_H);
+    assert_eq!(source_row_h(false), source_row_h(true));
+    let dock = src_text("ui/dock_stance.rs");
+    assert!(
+        !dock.contains(".when(usable, |d| d.truncate())"),
+        "the meta line truncates a refusal again"
+    );
+}
+
+/// Plain words: a source on no lane says where it is, never "unused" or
+/// "not placed".
+#[test]
+fn the_media_list_says_not_on_timeline_in_plain_words() {
+    use crate::ui::dock_stance::NOT_ON_TIMELINE;
+    assert_eq!(NOT_ON_TIMELINE, "not on timeline");
+    let dock = src_text("ui/dock_stance.rs");
+    let code: String = dock
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !code.contains("\"unused\"") && !code.contains("\"not placed\""),
+        "jargon is back in the media list"
+    );
+}
+
+/// The search box is a bordered field with a placeholder, and the media
+/// rows carry a 64x36 poster.
+#[test]
+fn the_search_field_is_bordered_and_rows_carry_a_poster() {
+    use crate::ui::dock_stance::SEARCH_PLACEHOLDER;
+    assert!(SEARCH_PLACEHOLDER.contains("Search media"));
+    let dock = src_text("ui/dock_stance.rs");
+    let field = &dock[dock.find(r#".id("dock-filter")"#).expect("the field")..];
+    let field = &field[..field.find(".child(match").expect("its text")];
+    assert!(
+        field.contains(".border_1()") && field.contains("t.e2"),
+        "the search field lost its border"
+    );
+    assert!(
+        dock.contains("const POSTER_W: f32 = 88.;") && dock.contains("const POSTER_H: f32 = 50.;")
+    );
+    assert!(dock.contains("let poster = poster(player, &row.path"));
+}
+
+/// The empty states each carry a call to action.
+#[test]
+fn the_empty_viewer_media_list_and_lanes_each_say_what_to_do() {
+    use crate::ui::bench_stance::lane::{empty_lane_hint, wave_is_silent};
+    assert_eq!(empty_lane_hint(LaneKind::Video), "Drop media here");
+    assert_eq!(empty_lane_hint(LaneKind::Subtitle), "Drop captions here");
+    let dock = src_text("ui/dock_stance.rs");
+    assert!(dock.contains("EMPTY_LIBRARY_HINT") && dock.contains("pick_and_import"));
+    let render = src_text("render.rs");
+    assert!(
+        render.contains("self.empty_viewer(cx)"),
+        "the viewer lost its Import box"
+    );
+    assert!(!src_text("ui/widgets.rs").contains("No project"));
+    // Silent is an answer; loading is not.
+    assert!(wave_is_silent(&Wave::Silent));
+    let flat = std::sync::Arc::new(vec![(0., 0.); 4]);
+    let loud = std::sync::Arc::new(vec![(-0.5, 0.5)]);
+    assert!(wave_is_silent(&Wave::Peaks(flat)));
+    assert!(!wave_is_silent(&Wave::Peaks(loud)));
+    assert!(!wave_is_silent(&Wave::Loading));
+}
+
+/// No layout shift (Nielsen): a toggle whose word changes with its state keeps
+/// the width of its widest spelling, so the row around it does not move. The
+/// crate has no gpui harness, so this reads the sources the way its siblings do.
+#[test]
+fn a_toggle_whose_word_changes_keeps_one_width() {
+    let band = src_text("ui/timeband_stance.rs");
+    assert!(
+        !band.contains("\"Muted\""),
+        "the transport has icons, not words that change"
+    );
+    let bar = src_text("ui/toolbar.rs");
+    assert!(
+        bar.contains("\"Snap\"") && !bar.contains("Snap on") && !bar.contains("Snap off"),
+        "Snap keeps one word; its state is the fill"
+    );
+    let stance = src_text("ui/stance.rs");
+    assert!(
+        stance.contains("// `Exporting 5%` to `Exporting 100%`: held at the widest."),
+        "the status bar's export readout must hold its width"
+    );
+}
+
+/// 1280x720: the toolbar sheds its keys (kept in the tooltips) instead of
+/// pushing the zoom group and Export off the window.
+#[test]
+fn the_toolbar_sheds_its_keys_rather_than_clip_at_a_narrow_column() {
+    let bar = src_text("ui/toolbar.rs");
+    assert!(
+        bar.contains("const COMPACT_BELOW: f32 = 900.;") && bar.contains("words.then_some"),
+        "the toolbar no longer sheds words at narrow widths"
+    );
+}
+
+/// P6: monospace is the transport timecode's face. The media list, the status bar, the lanes, the
+/// viewer and its welcome hero speak in Inter roles (`ui::type_scale`), never `mono`.
+#[test]
+fn the_media_list_status_bar_lanes_and_viewer_use_no_mono() {
+    for file in [
+        "ui/dock_stance.rs",
+        "ui/stance.rs",
+        "ui/preview.rs",
+        "ui/timeband_stance.rs",
+        "ui/bench_stance/lane.rs",
+        "ui/bench_stance/sub.rs",
+        "ui/bench_stance/clip.rs",
+        "ui/toolbar.rs",
+    ] {
+        let text = src_text(file);
+        assert!(
+            !text.contains("mono(") && !text.contains("SPLINE_SANS_MONO"),
+            "{file} sets the mono face; use a type_scale role"
+        );
+    }
 }

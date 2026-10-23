@@ -47,11 +47,19 @@ type Shared = std::sync::RwLockReadGuard<'static, ()>;
 fn pin_software() -> Shared {
     let borrowed = SEAT.read().unwrap_or_else(|poisoned| poisoned.into_inner());
     static PIN: Once = Once::new();
-    PIN.call_once(|| unsafe {
-        std::env::set_var("VE_SW", "1");
-        std::env::set_var("VE_SW_ENC", "1");
+    PIN.call_once(|| {
+        engine::envcfg::set("VE_SW", "1");
+        engine::envcfg::set("VE_SW_ENC", "1");
     });
     borrowed
+}
+
+/// Whether the VA-API plugin is here. `probe` is no answer for this: `pin_software`
+/// pins `VE_SW` for the whole binary, and a pinned probe says "software" on any box.
+/// The HEVC export tests need the plugin to read their source back, so this is
+/// the question they ask.
+fn plugin_here() -> bool {
+    engine::hw::caps().is_some()
 }
 
 fn wait(handle: &engine::ExportHandle, limit: Duration) -> engine::Result<()> {
@@ -140,7 +148,8 @@ fn the_container_aspect_is_probed_off_both_doors() {
     // fixture carries a REAL display matrix (a `-display_rotation 90` remux,
     // the gen_fixtures pattern), because a `setsar`-only file asserts nothing
     // about the turn -- the case this whole block exists for.
-    let turned = asset(".anamorphic_turned.mp4");
+    let fixtures = Scratch::dir("ve_anamorphic_turned");
+    let turned = fixtures.join("turned.mp4");
     let made = std::process::Command::new("ffmpeg")
         .args(["-y", "-v", "error", "-f", "lavfi", "-i"])
         .arg("testsrc2=size=1440x1080:rate=30:duration=1")
@@ -159,7 +168,7 @@ fn the_container_aspect_is_probed_off_both_doors() {
         .is_ok_and(|s| s.success());
     if made {
         // The same file with a 90-degree display matrix asked of it.
-        let matrix_on = asset(".anamorphic_turned90.mp4");
+        let matrix_on = fixtures.join("turned90.mp4");
         let remuxed = std::process::Command::new("ffmpeg")
             .args(["-y", "-v", "error", "-display_rotation", "90", "-i"])
             .arg(&turned)
@@ -235,7 +244,7 @@ fn the_preview_shows_the_drawn_picture() {
     let _seat = pin_software();
     for file in ["test_anamorphic.mp4", "test_anamorphic.mkv"] {
         let (_, frames, _) =
-            engine::DecodeSession::open_at(&asset(file), 0).expect("open for a frame");
+            engine::DecodeSession::open_at(asset(file), 0).expect("open for a frame");
         let frame = frames.recv().expect("a first frame");
         assert_eq!(
             (frame.width, frame.height),
@@ -327,8 +336,9 @@ fn an_export_of_an_anamorphic_file_is_drawn_and_square() {
     // real display matrix, the probe declares 1080x1920, and the export must
     // be that shape with the picture the preview showed -- the case a
     // turn-then-stretch render filled with 1440x1440 and baked bars into.
-    let plain = asset(".anamorphic_export_src.mp4");
-    let matrix_on = asset(".anamorphic_export_rot.mp4");
+    let fixtures = Scratch::dir("ve_anamorphic_export_fixtures");
+    let plain = fixtures.join("src.mp4");
+    let matrix_on = fixtures.join("rot.mp4");
     let made = std::process::Command::new("ffmpeg")
         .args(["-y", "-v", "error", "-f", "lavfi", "-i"])
         .arg("testsrc2=size=1440x1080:rate=30:duration=1")
@@ -401,14 +411,16 @@ fn an_export_of_an_anamorphic_file_is_drawn_and_square() {
 /// 4/3 off the same elements the probe reads.
 #[test]
 fn a_matroska_copy_keeps_the_pixel_aspect() {
-    // The copy itself decodes nothing, but opening the HEVC source and
-    // reopening the copy do -- there is no software HEVC decoder, so both
-    // need the plugin. A machine without it skips, exactly as
-    // `video_copy`'s decode-back test does.
-    let Ok(session) = PlaybackSession::open(asset("test_anamorphic_hevc.mkv")) else {
+    // The copy itself decodes nothing, but the export that writes it reads the
+    // HEVC source back through the plugin, and a machine without the plugin skips
+    // on that read, as `video_copy`'s decode-back test does. (Playback and export
+    // both decode HEVC in software now; the skip is kept as it was.)
+    if !plugin_here() {
         println!("no VA-API plugin: skipping the copy-keeps-aspect test");
         return;
-    };
+    }
+    let session = PlaybackSession::open(asset("test_anamorphic_hevc.mkv"))
+        .expect("open test_anamorphic_hevc.mkv");
     let out = Scratch::file("ve_anamorphic_copy", "mkv");
     let handle = session.export_to_with(
         &out,
@@ -453,12 +465,14 @@ fn a_matroska_copy_keeps_the_pixel_aspect() {
 #[test]
 fn an_mp4_copy_of_an_anamorphic_source_refuses_in_words() {
     let _seat = pin_software();
-    // The refusal is decided at the header read, but the session must open
-    // the HEVC source first -- plugin on this machine or skip, as above.
-    let Ok(session) = PlaybackSession::open(asset("test_anamorphic_hevc.mkv")) else {
+    // The refusal is decided at the header read, but the export reads the HEVC
+    // source back, and the test keeps the plugin-or-skip gate it had, as above.
+    if !plugin_here() {
         println!("no VA-API plugin: skipping the mp4 exact refusal test");
         return;
-    };
+    }
+    let session = PlaybackSession::open(asset("test_anamorphic_hevc.mkv"))
+        .expect("open test_anamorphic_hevc.mkv");
     let out = Scratch::file("ve_anamorphic_exact_refused", "mp4");
     let settings = ExportSettings {
         format: Format::Mp4,
@@ -466,12 +480,9 @@ fn an_mp4_copy_of_an_anamorphic_source_refuses_in_words() {
         ..Default::default()
     };
     let handle = session.export_to_with(&out, &settings);
-    wait(&handle, Duration::from_secs(300))
-        .expect_err("an mp4 cannot honour exact for an anamorphic source");
-    let error = handle
-        .result()
-        .expect("a finished export has an outcome")
-        .expect_err("the export refused")
+    // `wait` takes the outcome off the handle, so the refusal is read from it.
+    let error = wait(&handle, Duration::from_secs(300))
+        .expect_err("an mp4 cannot honour exact for an anamorphic source")
         .to_string();
     assert!(
         error.contains("pixel aspect"),

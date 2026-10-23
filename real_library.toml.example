@@ -31,3 +31,28 @@ av1_opus_51 = "/path/to/a-1080p-av1-opus-5.1-remux.mkv"
 # the multichannel AC-3 seat's own film witness, seeked and correlated against
 # ffmpeg like the Opus and AAC films are.
 ac3_51_film = "/path/to/an-ac3-5.1-film.mkv"
+
+# A VP8 WebM (Matroska), odd-height picture: the software VP8 seat's frames
+# against ffmpeg's rawvideo.
+vp8_webm = "/path/to/a-vp8-webm.webm"
+
+# A VP9 Profile 0 stream in mp4 with an Opus track beside it: the VP9 frames
+# against ffmpeg, and the mp4 packet table of both tracks against ffprobe.
+vp9_opus_mp4 = "/path/to/a-vp9-opus.mp4"
+
+# A plain mp4 with H.264 and AAC-LC: the packet table against ffprobe, and the
+# AAC-LC audio against ffmpeg's decode.
+mp4_h264_aac = "/path/to/an-h264-aac-lc.mp4"
+
+# A phone recording: H.264 with full-range (yuvj420p) pixels and AAC-LC at 48 kHz.
+mp4_phone_h264 = "/path/to/a-phone-recording.mp4"
+
+# An mp4 with H.264, AAC-LC and a mov_text subtitle track.
+mp4_mov_text = "/path/to/an-mp4-with-mov-text.mp4"
+
+# An mp4 with an HE-AAC v1 (SBR) track: the packet table against ffprobe and the
+# decode against ffmpeg's f32 output.
+mp4_heaac = "/path/to/an-he-aac-v1.mp4"
+
+# A PCM16 WAV: every sample bit-equal to ffmpeg's decode.
+wav_pcm16 = "/path/to/a-pcm16.wav"

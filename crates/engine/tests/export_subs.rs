@@ -22,6 +22,7 @@ use engine::export::{ExportSettings, Format};
 use engine::project::{Lane, LaneKind, SubClip};
 use engine::scratch::Scratch;
 use engine::subtitle::{self, Cue, SubtitleTrack};
+use engine::text::TextStyle;
 use engine::{ExportHandle, Project};
 
 /// The media fixture: five seconds at 30 fps, and a picture this box can decode
@@ -32,6 +33,8 @@ const FRAMES: u32 = 150;
 /// exact microseconds -- only the write rounds -- so nothing wider than this is
 /// being allowed for.
 const SLACK_US: i64 = 1_000;
+// The tests check cues and tracks, not pictures, so the picture is kept small.
+const SMALL: (u32, u32) = (64, 48);
 
 fn asset(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -45,9 +48,9 @@ fn out_path(name: &str) -> Scratch {
 
 fn pin_software() {
     static PIN: Once = Once::new();
-    PIN.call_once(|| unsafe {
-        std::env::set_var("VE_SW", "1");
-        std::env::set_var("VE_SW_ENC", "1");
+    PIN.call_once(|| {
+        engine::envcfg::set("VE_SW", "1");
+        engine::envcfg::set("VE_SW_ENC", "1");
     });
 }
 
@@ -89,18 +92,24 @@ fn track() -> SubtitleTrack {
                 end_us: 1_500_000,
                 text: "first line".into(),
                 image: None,
+                words: Vec::new(),
+                karaoke: Vec::new(),
             },
             Cue {
                 start_us: 2_000_000,
                 end_us: 3_250_000,
                 text: "second line\nwith a break".into(),
                 image: None,
+                words: Vec::new(),
+                karaoke: Vec::new(),
             },
             Cue {
                 start_us: 4_000_000,
                 end_us: 4_750_000,
                 text: "third line".into(),
                 image: None,
+                words: Vec::new(),
+                karaoke: Vec::new(),
             },
         ],
         refused: None,
@@ -145,6 +154,17 @@ fn exported_want(
     picks: &[usize],
     want: usize,
 ) -> (Scratch, Vec<SubtitleTrack>) {
+    exported_sized(name, project, picks, want, Some(SMALL))
+}
+
+/// [`exported_want`] at the given picture size: `None` is the project's own size.
+fn exported_sized(
+    name: &str,
+    project: Project,
+    picks: &[usize],
+    want: usize,
+    size: Option<(u32, u32)>,
+) -> (Scratch, Vec<SubtitleTrack>) {
     pin_software();
     let out = out_path(name);
     let (meta, _) = engine::demux::Demuxer::open(&asset(MEDIA)).expect("probe the media");
@@ -155,6 +175,7 @@ fn exported_want(
         &ExportSettings {
             format: Format::Hevc,
             subtitles: picks.to_vec(),
+            size,
             ..Default::default()
         },
         None,
@@ -187,6 +208,7 @@ fn exported_mp4(name: &str, project: Project, picks: &[usize]) -> Scratch {
         &ExportSettings {
             format: Format::Mp4,
             subtitles: picks.to_vec(),
+            size: Some(SMALL),
             ..Default::default()
         },
         None,
@@ -270,7 +292,7 @@ fn ffprobe_last_audio_pts(path: &Path) -> Option<f64> {
         .output()
         .ok()?;
     let printed = String::from_utf8_lossy(&out.stdout).into_owned();
-    let last = printed.lines().filter(|l| !l.trim().is_empty()).next_back()?;
+    let last = printed.lines().rfind(|l| !l.trim().is_empty())?;
     println!("last audio packet: {last} s");
     last.trim_end_matches(',').parse().ok()
 }
@@ -570,6 +592,7 @@ fn an_hevc_mp4_keeps_its_rewritten_entry_and_its_text() {
         &ExportSettings {
             format: Format::HevcMp4,
             subtitles: vec![1],
+            size: Some(SMALL),
             ..Default::default()
         },
         None,
@@ -663,6 +686,7 @@ fn more_tracks_than_a_block_can_number_are_refused_by_name() {
         &ExportSettings {
             format: Format::Hevc,
             subtitles: (0..over).collect(),
+            size: Some(SMALL),
             ..Default::default()
         },
         None,
@@ -741,6 +765,9 @@ fn the_plan_says_what_each_container_does_with_them() {
     assert_eq!(plan(Format::Mp4), "eng → embedded");
     assert_eq!(plan(Format::HevcMp4), "eng → embedded");
     assert_eq!(plan(Format::Av1Mp4), "eng → embedded");
+    // WebM names no subtitle track this writer can state, so the card says
+    // so instead of promising a track the file will not have.
+    assert_eq!(plan(Format::Webm), "none — a WebM file carries no subtitles");
     assert_eq!(plan(Format::Wav), "none — this format is the sound alone");
     // A track of *pictures* on a format that is the sound alone says what the
     // file cannot do rather than what the track cannot: the per-track reason
@@ -859,13 +886,13 @@ fn a_lane_is_a_track_and_the_lanes_order_the_file() {
     );
     // The card says the same before the button is pressed, lane by lane.
     assert_eq!(
-        engine::export::planned_subtitles(&project, Format::Hevc, [0, 1]),
+        engine::export::planned_subtitles(&project, Format::Hevc, [1, 0]),
         "2 lanes → embedded (S1 fra — Signs, S2 eng)"
     );
 
-    // ...and the picks are *not* what travels: this asks for the palette's order
-    // and gets the lanes' one.
-    let (out, tracks) = exported_want("lanes_two", project, &[0, 1], 2);
+    // The file writes the tracks in the order the picks name them: [1, 0] asks for the
+    // lanes' order (S1 first), and that is the order the file declares them in.
+    let (out, tracks) = exported_want("lanes_two", project, &[1, 0], 2);
     assert_eq!(tracks[0].label, "fra — Signs", "S1 is the first track");
     assert_eq!(tracks[1].label, "eng", "S2 is the second");
     for track in &tracks {
@@ -1023,7 +1050,8 @@ fn a_caption_past_the_last_picture_is_cut_off_with_the_file() {
          off there"
     );
 
-    let (out, tracks) = exported_want("lanes_tail", project, &[], 1);
+    // The one test here that reads pixels (ffmpeg_last_luma), so it keeps the project's size.
+    let (out, tracks) = exported_sized("lanes_tail", project, &[], 1, None);
     let cues = &tracks[0].cues;
     assert_eq!(cues.len(), 1, "the one cue the window holds: {cues:?}");
     near(cues[0].start_us, 4_500_000, "where the placement puts it");
@@ -1096,6 +1124,7 @@ fn more_lanes_than_a_block_can_number_are_refused_by_name() {
         &out,
         &ExportSettings {
             format: Format::Hevc,
+            size: Some(SMALL),
             ..Default::default()
         },
         None,
@@ -1109,4 +1138,138 @@ fn more_lanes_than_a_block_can_number_are_refused_by_name() {
         "the muxer refuses it again, in its own words: {said}"
     );
     assert!(!out.exists(), "and no half-written file is left: {said}");
+}
+
+// --- Burned captions alone -------------------------------------------------
+//
+// Burning draws the lanes' words into the picture; a soft track of those same
+// words beside it shows them twice. `no_soft_subtitles` is the switch that
+// writes the picture's captions and nothing else.
+
+/// One second of the lane project (frames 0 to 30) as an mp4, with the captions
+/// burned in and the soft tracks either allowed or switched off; returns the
+/// subtitle tracks the file carries, read back by the mp4 reader.
+fn burned_mp4_tracks(name: &str, no_soft: bool) -> Vec<SubtitleTrack> {
+    pin_software();
+    let out = Scratch::file(&format!("ve_subs_burn_{name}"), "mp4");
+    let project = on_lanes(both_tracks(), &[(0, WHOLE.0, WHOLE.1, WHOLE.2, WHOLE.3)]);
+    let (meta, _) = engine::demux::Demuxer::open(&asset(MEDIA)).expect("probe the media");
+    let handle = engine::export::start(
+        project,
+        meta,
+        &out,
+        &ExportSettings {
+            format: Format::Mp4,
+            range: Some((0, 30)),
+            burn_subtitles: Some((0, TextStyle::default())),
+            no_soft_subtitles: no_soft,
+            size: Some(SMALL),
+            ..Default::default()
+        },
+        None,
+    );
+    wait(&handle, Duration::from_secs(1800)).expect("the export finishes");
+    let tracks = subtitle::of_mp4(&out).expect("read the export back");
+    std::fs::remove_file(&out).unwrap();
+    tracks
+}
+
+/// The captions burned and nothing else: the file has no subtitle stream at
+/// all, though the same export with the soft tracks allowed carries the lane.
+#[test]
+fn a_burn_only_export_carries_no_soft_subtitle_track() {
+    let allowed = burned_mp4_tracks("soft", false);
+    assert_eq!(allowed.len(), 1, "the lane is a soft track when allowed: {allowed:?}");
+    let burned = burned_mp4_tracks("alone", true);
+    assert!(burned.is_empty(), "a burn-only export carries soft tracks: {burned:?}");
+}
+
+/// A ranged export of the three-cue track: the file's own clock starts where
+/// the range does, so every cue is moved back by the range's start. Returns the
+/// file as written, with the picked track read back by the reader its container
+/// has (`mkv` by [`subtitle::of_matroska`], `mp4` by [`subtitle::of_mp4`]).
+fn ranged_export(
+    format: Format,
+    name: &str,
+    range: (u32, u32),
+) -> (Scratch, Vec<SubtitleTrack>) {
+    pin_software();
+    let ext = match format {
+        Format::Mp4 => "mp4",
+        _ => "mkv",
+    };
+    let out = Scratch::file(&format!("ve_subs_ranged_{name}"), ext);
+    let (meta, _) = engine::demux::Demuxer::open(&asset(MEDIA)).expect("probe the media");
+    let handle = engine::export::start(
+        project(),
+        meta,
+        &out,
+        &ExportSettings {
+            format,
+            subtitles: vec![0],
+            range: Some(range),
+            size: Some(SMALL),
+            ..Default::default()
+        },
+        None,
+    );
+    wait(&handle, Duration::from_secs(1800)).expect("the ranged export finishes");
+    assert_eq!(handle.progress(), 1.0, "finished at full progress");
+    let tracks = match format {
+        Format::Mp4 => subtitle::of_mp4(&out).expect("read the mp4 back"),
+        _ => subtitle::of_matroska(&out).expect("read the mkv back"),
+    };
+    (out, tracks)
+}
+
+/// The cues a ranged file must carry for the three-cue track, given as
+/// `(start_us, end_us, text)` on the file's clock.
+fn assert_cues(cues: &[Cue], want: &[(i64, i64, &str)], what: &str) {
+    assert_eq!(cues.len(), want.len(), "{what}: cue count: {cues:?}");
+    for (cue, (start, end, text)) in cues.iter().zip(want) {
+        near(cue.start_us, *start, &format!("{what}: start of {text:?}"));
+        near(cue.end_us, *end, &format!("{what}: end of {text:?}"));
+        assert_eq!(cue.text, *text, "{what}: text");
+    }
+}
+
+/// Range 1.0 s to 4.0 s (frames 30 to 120): the first cue straddles the start
+/// and keeps its tail, the second moves back by a second, and the third sits
+/// wholly after the range and is dropped. The file is three seconds long.
+#[test]
+fn a_ranged_mkv_export_shifts_clips_and_drops_its_soft_cues() {
+    let (out, tracks) = ranged_export(Format::Hevc, "mkv_start", (30, 120));
+    assert_cues(
+        &tracks[0].cues,
+        &[
+            (0, 500_000, "first line"),
+            (1_000_000, 2_250_000, "second line\nwith a break"),
+        ],
+        "mkv, range 1.0 s to 4.0 s",
+    );
+    std::fs::remove_file(&out).unwrap();
+}
+
+/// Range 2.0 s to 4.5 s (frames 60 to 135): the first cue lies wholly before the
+/// range and is dropped, the second moves back by two seconds, and the third
+/// straddles the far edge and keeps the half inside it. An mp4 writes these as
+/// `tx3g` timed text, so the same cues are read back through the mp4 reader.
+#[test]
+fn a_ranged_mp4_export_drops_before_shifts_and_clips_the_far_edge() {
+    let (out, tracks) = ranged_export(Format::Mp4, "mp4_end", (60, 135));
+    assert_cues(
+        &tracks[0].cues,
+        &[
+            (0, 1_250_000, "second line\nwith a break"),
+            (2_000_000, 2_500_000, "third line"),
+        ],
+        "mp4, range 2.0 s to 4.5 s",
+    );
+    if let Some(srt) = ffmpeg_srt(&out, 0) {
+        println!("ffmpeg reads the ranged mp4 track back as:\n{srt}");
+        assert!(srt.contains("00:00:00,000 --> 00:00:01,250"), "{srt}");
+        assert!(srt.contains("00:00:02,000 --> 00:00:02,500"), "{srt}");
+        assert!(!srt.contains("first line"), "{srt}");
+    }
+    std::fs::remove_file(&out).unwrap();
 }

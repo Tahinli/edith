@@ -263,86 +263,169 @@ pub(crate) fn stream_detail(info: &StreamInfo) -> String {
     parts.join(" ")
 }
 
-/// What a file is coded at, for the properties cards: the rate of the whole
-/// file, then each track's own beside it. A component the container does not
-/// state is left out for `stream_detail`'s reason -- a fabricated `0` would be
-/// saying something -- and a file that states none of the three says so rather
-/// than showing an empty row. `None` is the probe still running, which is a
-/// real wait: it walks a Matroska's clusters.
-///
-/// The whole file's rate is the one that carries the unit and no word: named
-/// "total" as well, the line loses its last component to `MENU_W`'s truncation
-/// on an ordinary 1080p file -- and a rate cut to "0.13 soun" is a number the
-/// card did not give.
-///
-/// `tracks` is how many sound tracks the file has, from `probe_streams`. The
-/// rate is the one track this engine plays -- the first, neither their sum nor
-/// the biggest -- so a file with more says which of how many: a bare "0.16
-/// sound" on a file whose name says AC3.5.1 names a track without saying it is
-/// one of two, and the card's Audio row above it may be describing the other.
-///
-/// The marker costs the word "sound", the way the whole file's rate costs the
-/// word "total" above, and for the same reason. Measured in Noto Sans 11 px
-/// against the 186 px this value has beside a "Bitrate" label: "0.16 sound 1/2"
-/// wants 192 px on a 4.7 Mb/s film and 205 on the 39.8 Mb/s remux --
-/// the marker is what gets cut, which is the one part of the line that is new.
-/// Nothing that keeps the word fits the wide files -- the shortest, "snd 1/2",
-/// still wants 188 px on that remux -- so the word goes and the number keeps
-/// the answer: "0.16 1 of 2" wants 172 px, and 185 on the widest line a
-/// library can produce (the 10.9 Mb/s three-track film).
-pub(crate) fn bitrate_detail(rate: Option<MediaBitrate>, tracks: usize) -> String {
-    let Some(rate) = rate else {
-        return "…".to_string();
-    };
-    let (per, unit) = rate_scale(rate);
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(total) = rate.total {
-        // One unit for the three numbers, carried once, on the whole file's
-        // rate: the components are read against it.
-        parts.push(format!("{} {unit}", scaled(total, per)));
+/// How big a file is, for a person: the largest unit that keeps the figure to
+/// one decimal (`1.2 GB`, `840 MB`), bytes below a kilobyte.
+pub(crate) fn size_human(bytes: u64) -> String {
+    for (unit, per) in [("GB", 1e9), ("MB", 1e6), ("kB", 1e3)] {
+        if bytes as f64 >= per {
+            let n = bytes as f64 / per;
+            return match n >= 10. {
+                true => format!("{n:.0} {unit}"),
+                false => format!("{n:.1} {unit}"),
+            };
+        }
     }
-    if let Some(video) = rate.video {
-        parts.push(format!("{} video", scaled(video, per)));
-    }
-    if let Some(audio) = rate.audio {
-        parts.push(match tracks > 1 {
-            true => format!("{} 1 of {tracks}", scaled(audio, per)),
-            false => format!("{} sound", scaled(audio, per)),
-        });
-    }
-    match parts.is_empty() {
-        true => "not stated".to_string(),
-        false => parts.join(" · "),
+    format!("{bytes} B")
+}
+
+/// A picture's height as a person names it: `1080p`, and `4K` for the 2160
+/// line, which is the one name people use for it.
+pub(crate) fn resolution_label(height: u32) -> String {
+    match height {
+        2160 => "4K".to_string(),
+        h => format!("{h}p"),
     }
 }
 
-/// Below this a megabit's two decimals cannot state a rate, so the line is read
-/// in kilobits instead.
-pub(crate) const MB_FLOOR: u64 = 10_000;
+/// One stream's rate in the unit its size asks for: bits a second below a
+/// kilobit, kilobits below a megabit, megabits above. One track's own rate, so
+/// there is no shared unit to keep across a line of them.
+pub(crate) fn bits_label(bits: u64) -> String {
+    match bits {
+        0..1_000 => format!("{bits} b/s"),
+        1_000..1_000_000 => format!("{} kb/s", scaled(bits, 1_000.)),
+        _ => format!("{} Mb/s", scaled(bits, 1_000_000.)),
+    }
+}
 
-/// What the line counts in, and the name of it: the largest unit that can state
-/// its *smallest* component, because that is the one a bigger unit rounds away.
-/// Megabits for everything a real file produces -- the smallest component over
-/// an 18-file sweep of a library was 0.13 Mb/s -- kilobits for the sub-32x32
-/// encodes below that.
-///
-/// corner-cut: one unit for the whole line, so a file mixing a multi-megabit
-/// picture with a sub-10 kb/s sound track prints the picture as four or five
-/// digits of kilobits and loses the line's tail to `MENU_W`. No such file
-/// exists in a library, and both units at once ("0.01 Mb/s · 1.2 kb/s video ·
-/// 9.5 kb/s sound") wants 215 px of the 186 the row has. Upgrade path is a
-/// suffix per component ("1.2k video"), which measures 177 px.
-pub(crate) fn rate_scale(rate: MediaBitrate) -> (f64, &'static str) {
-    match [rate.total, rate.video, rate.audio]
-        .into_iter()
-        .flatten()
-        .min()
-    {
-        // A rate this small is a broken header rather than a track, but it is
-        // still a number the file stated, and bits state it.
-        Some(bits) if bits < 10 => (1., "b/s"),
-        Some(bits) if bits < MB_FLOOR => (1_000., "kb/s"),
-        _ => (1_000_000., "Mb/s"),
+/// A picture track as the properties plate says it: codec, size, rate, depth
+/// and its own bitrate, each left out where the file does not state it.
+pub(crate) fn video_detail(video: &engine::VideoFacts, bitrate: Option<u64>) -> String {
+    let mut parts = vec![video.codec.name().to_string()];
+    if video.width > 0 && video.height > 0 {
+        parts.push(format!("{}×{}", video.width, video.height));
+    }
+    if let Some(fps) = video.frame_rate {
+        parts.push(format!("{} fps", crate::export_ui::fps_label(fps)));
+    }
+    if let Some(depth) = video.bit_depth {
+        parts.push(format!("{depth}-bit"));
+    }
+    if let Some(bits) = bitrate {
+        parts.push(bits_label(bits));
+    }
+    parts.join(" · ")
+}
+
+/// A sound track as the properties plate says it: codec, rate, layout, depth
+/// and its own bitrate. The codec is `"unknown"` only where the header will not
+/// name it, which says nothing and is left out.
+pub(crate) fn audio_detail(info: &StreamInfo) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if !info.codec.is_empty() && info.codec != "unknown" {
+        parts.push(info.codec.clone());
+    }
+    if info.sample_rate > 0 {
+        parts.push(format!("{} kHz", f64::from(info.sample_rate) / 1000.));
+    }
+    parts.extend(layout(info.channels));
+    if let Some(depth) = info.bit_depth {
+        parts.push(format!("{depth}-bit"));
+    }
+    if let Some(bits) = info.bitrate {
+        parts.push(bits_label(bits));
+    }
+    parts.join(" · ")
+}
+
+/// What the properties plate says about a file, top to bottom: the file and its
+/// path, its container and size, then one line per picture and sound track.
+/// Rows the probe has not answered for are simply not there -- the plate fills
+/// in as the header reads, and never says "unknown".
+pub(crate) fn file_properties(
+    path: &Path,
+    facts: Option<&engine::MediaFacts>,
+    streams: &[StreamInfo],
+    rate: Option<MediaBitrate>,
+) -> Vec<(String, String)> {
+    let mut out = vec![
+        ("File".to_string(), file_name(path)),
+        ("Path".to_string(), path.display().to_string()),
+    ];
+    if let Some(container) = facts.and_then(|f| f.container.clone()) {
+        out.push(("Container".to_string(), container));
+    }
+    if let Some(bytes) = facts.and_then(|f| f.bytes) {
+        out.push((
+            "Size".to_string(),
+            match rate.and_then(|r| r.total) {
+                Some(total) => format!("{} · {}", size_human(bytes), bits_label(total)),
+                None => size_human(bytes),
+            },
+        ));
+    }
+    if let Some(video) = facts.and_then(|f| f.video.as_ref()) {
+        out.push((
+            "Video".to_string(),
+            video_detail(video, rate.and_then(|r| r.video)),
+        ));
+    }
+    for info in streams {
+        let label = match streams.len() > 1 {
+            true => format!("Audio {} of {}", info.index + 1, streams.len()),
+            false => "Audio".to_string(),
+        };
+        out.push((label, audio_detail(info)));
+    }
+    out
+}
+
+/// The plate's Copy button: the full path on the clipboard, and a toast that
+/// says so. Shared by both properties plates so the two cannot word it apart.
+pub(crate) fn copy_path_button(path: &Path, cx: &mut Context<Player>) -> AnyElement {
+    let text = path.display().to_string();
+    control(
+        "properties-copy-path",
+        0.,
+        BG_RAISED(),
+        None,
+        "Copy",
+        "copies the full path of this file".to_string(),
+        true,
+        cx.listener(move |this, _: &ClickEvent, _, cx| {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.clone()));
+            this.notify_user("Path copied".into());
+            cx.notify();
+        }),
+    )
+    .into_any_element()
+}
+
+impl Player {
+    /// Read each source's header once for the properties plates: container,
+    /// size, picture and track. Off the render thread like the bitrate probe
+    /// beside it, and filled the same way -- presence means "asked", and the
+    /// inner `None` is "asked, not answered yet".
+    pub(crate) fn cache_facts(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = &self.session else {
+            return;
+        };
+        for path in unseen_paths(session.sources(), &self.facts) {
+            self.facts.insert(path.clone(), None);
+            let probed = cx.background_executor().spawn({
+                let path = path.clone();
+                async move { engine::probe_media(&path) }
+            });
+            cx.spawn(async move |this, cx| {
+                let probed = probed.await;
+                this.update(cx, |this, cx| {
+                    this.facts.insert(path, Some(probed));
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+        }
     }
 }
 
@@ -350,11 +433,11 @@ pub(crate) fn rate_scale(rate: MediaBitrate) -> (f64, &'static str) {
 /// two below -- a 128 kbps song rounded to one decimal is "0.1", which reads as
 /// a guess where "0.13" reads as a measurement.
 ///
-/// Never `0.00`: [`rate_scale`] picks the unit off the smallest component, so
-/// two decimals always reach it. Every rate that gets here is one the container
-/// really stated (the probe leaves out what it does not state, it never zeroes
-/// it), and a "0.00 sound" would be this card saying a track that plays is
-/// silent.
+/// Never `0.00`: [`bits_label`] only asks for this in a unit where the number
+/// is at least 0.001 of it, so two decimals always reach it. Every rate that
+/// gets here is one the container really stated (the probe leaves out what it
+/// does not state, it never zeroes it), and a "0.00 sound" would be this card
+/// saying a track that plays is silent.
 pub(crate) fn scaled(bits: u64, per: f64) -> String {
     let n = bits as f64 / per;
     match n >= 1. {
@@ -458,6 +541,21 @@ pub(crate) fn window_title(name: &str) -> String {
     } else {
         format!("{name} — edith")
     }
+}
+
+/// What the window is called once a project is in play: the same name the
+/// header bar shows (`ui::menubar::bar`), so the title and the bar never
+/// disagree. A project started or saved answers with its own name; an unsaved
+/// one is "Untitled"; with no project at all the window keeps `name`, which is
+/// the media's.
+pub(crate) fn shown_title(name: &str, project: &Path, new_project: Option<&Path>, armed: bool) -> String {
+    let project_name = match (project.as_os_str().is_empty(), new_project) {
+        (_, Some(path)) => Some(crate::files::stem(path)),
+        (true, None) => None,
+        (false, None) if armed => Some(crate::files::stem(project)),
+        (false, None) => Some("Untitled".to_string()),
+    };
+    window_title(&project_name.unwrap_or_else(|| name.to_string()))
 }
 
 /// The tint a clip from source `n` wears. Cycled rather than extended: past the

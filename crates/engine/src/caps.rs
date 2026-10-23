@@ -30,20 +30,20 @@ const HW_CODECS: [(u32, &str); 4] = [
 
 /// The software half: the codec, the crate that carries it here, and which
 /// halves of the job that crate does. Named crates rather than a bare "SW",
-/// because the answer to "why is my HEVC file so large" is `ec-h265 intra`,
+/// because the answer to "why is my HEVC file so large" is `ec-h265 intra` (the intra-only setting),
 /// and the row that says so is the row that answers it.
 const SW_CODECS: [(&str, &str, bool, bool); 10] = [
     ("H.264", "ec-h264", true, true),
-    ("HEVC", "ec-h265 intra", false, true),
+    ("HEVC", "ec-h265 GOP", false, true),
     ("AV1", "rav1e", false, true),
     // Decode is split by width: symphonia carries stereo and narrower, `ec-aac`
     // everything wider; the encoder is `ec-aac` as well.
     ("AAC", "symphonia / ec-aac / ec-aac", true, true),
     ("MP3", "symphonia / ec-mp3", true, true),
-    ("FLAC", "symphonia / flacenc", true, true),
-    ("PCM", "symphonia / hound", true, true),
+    ("FLAC", "symphonia / ec-flac", true, true),
+    ("PCM", "symphonia / ec-riff", true, true),
     ("AC-3", "ec-ac3", true, false),
-    ("Vorbis", "symphonia / ec-vorbis", true, true),
+    ("Vorbis", "ec-vorbis", true, true),
     ("ALAC", "symphonia", true, false),
 ];
 
@@ -159,13 +159,13 @@ mod tests {
     #[test]
     fn the_software_line_names_every_encoder_this_build_carries() {
         let line = software();
-        for name in ["ec-h264", "ec-h265 intra", "rav1e", "ec-aac"] {
+        for name in ["ec-h264", "ec-h265 GOP", "rav1e", "ec-aac"] {
             assert!(line.contains(name), "{name} missing from {line}");
         }
         // Decode-only crates must not read as encoders, and the seat words are
         // the only thing saying which is which.
         assert!(line.contains("AC-3 dec (ec-ac3)"));
         assert!(line.contains("H.264 dec+enc (ec-h264)"));
-        assert!(line.contains("HEVC enc (ec-h265 intra)"));
+        assert!(line.contains("HEVC enc (ec-h265 GOP)"));
     }
 }

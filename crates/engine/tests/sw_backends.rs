@@ -213,14 +213,11 @@ fn display_order_releases_the_same_pictures() {
 /// timeline index) and the one the hardware backend already kept.
 #[test]
 fn the_software_seat_labels_the_timeline_in_display_order() {
-    // Pin the software seat: on a box with the plugin this test is about the
-    // decoder under swap, not the driver. SAFETY: single-threaded by the
-    // documented invocation, and no other test in this binary reads the env.
-    unsafe { std::env::set_var("VE_SW", "1") };
+    engine::envcfg::set("VE_SW", "1");
 
     let path = asset("test_high.mp4");
     let (meta, rx) = engine::DecodeSession::open(&path).expect("open");
     let indices: Vec<u32> = rx.into_iter().map(|f| f.index).collect();
-    let want: Vec<u32> = (0..u32::try_from(meta.frame_count).expect("frame count")).collect();
+    let want: Vec<u32> = (0..meta.frame_count).collect();
     assert_eq!(indices, want, "frames must arrive 0..n in display order");
 }

@@ -6,9 +6,10 @@ use crate::player::library::{
     auto_proxies_pref_path, load_auto_proxies_pref, save_auto_proxies_pref,
 };
 use crate::subs::{
-    SUB_SIZE_RANGE, audio_import_tail, load_subtitle_style, save_subtitle_style, sub_line_h_for,
-    subtitle_style_path,
+    SUB_SIZE_RANGE, SubOutline, SubPlace, SubStyle, audio_import_tail, load_subtitle_style,
+    save_subtitle_style, sub_line_h_for, sub_size_at, subtitle_style_path,
 };
+use crate::ui::dock_stance::{viz_glow_at, viz_strands_at};
 use crate::ui::preview::{bgra_to_rgba, screenshot_path};
 
 /// The notice queue's own half of the sound watch, and the three words it is
@@ -30,18 +31,25 @@ use crate::notices::{
 /// `engine::tests::decode_failure` observes it end to end on the engine side.
 #[test]
 fn a_decode_that_fails_under_an_open_file_says_so_and_unsays_it() {
-    let mut notices: std::collections::VecDeque<gpui::SharedString> =
-        ["OPENED take.mp4".into()].into_iter().collect();
+    // A question stays on screen beside the one ordinary slot, so it is the
+    // line that must survive every change below.
+    let mut notices: std::collections::VecDeque<crate::notices::Toast> = Default::default();
+    crate::notices::push_sticky_toast(
+        &mut notices,
+        "Opened take.mp4".into(),
+        crate::notices::Tone::Info,
+        Vec::new(),
+    );
     let failed = decode_failed_line("decode error at access unit 130");
     assert!(
-        failed.starts_with("DECODE FAILED"),
+        failed.starts_with("Decode failed"),
         "the line lost the state word the strip reads first: {failed}"
     );
     // The file was fine, and then the picture stopped: the reason arrives
     // between two frames.
     decode_change_notice(&mut notices, None, Some("decode error at access unit 130"));
     assert_eq!(
-        notices.back().map(|notice| &***notice),
+        notices.back().map(|notice| notice.text.as_ref()),
         Some(failed.as_str()),
         "a decode failure that arrives mid-session is never pushed"
     );
@@ -56,18 +64,26 @@ fn a_decode_that_fails_under_an_open_file_says_so_and_unsays_it() {
     // strip keeps saying DECODE FAILED over a film that plays.
     decode_change_notice(&mut notices, Some("decode error at access unit 130"), None);
     assert_eq!(
-        notices.iter().map(|notice| &***notice).collect::<Vec<_>>(),
-        vec!["OPENED take.mp4"],
-        "the DECODE FAILED line is still on the strip over a film that plays"
+        notices
+            .iter()
+            .map(|notice| notice.text.as_ref())
+            .collect::<Vec<_>>(),
+        vec!["Opened take.mp4"],
+        "the decode failed line is still on the strip over a film that plays"
     );
-    // The sound line is a different line and is none of this step's business.
+    // The sound line is a different line, and the one slot means the newest
+    // error is the one on screen: taking that newest line back leaves the
+    // question beside it, and nothing else is touched.
     audio_change_notice(&mut notices, None, Some("AUDIO_LOST"));
     decode_change_notice(&mut notices, None, Some("decode error at access unit 7"));
     decode_change_notice(&mut notices, Some("decode error at access unit 7"), None);
     assert_eq!(
-        notices.iter().map(|notice| &***notice).collect::<Vec<_>>(),
-        vec!["OPENED take.mp4", audio_lost_line("AUDIO_LOST").as_str()],
-        "one reason's retraction took the other one's line with it"
+        notices
+            .iter()
+            .map(|notice| notice.text.as_ref())
+            .collect::<Vec<_>>(),
+        vec!["Opened take.mp4"],
+        "retracting one reason took more than its own line"
     );
     // The wiring: the pump is the one place every frame passes through, and a
     // watcher nothing calls is a message nobody reads.
@@ -100,19 +116,26 @@ fn a_decode_that_fails_under_an_open_file_says_so_and_unsays_it() {
 /// source guard below.
 #[test]
 fn a_device_that_dies_under_an_open_file_says_so_and_unsays_it() {
-    let mut notices: std::collections::VecDeque<gpui::SharedString> =
-        ["OPENED take.mp4".into()].into_iter().collect();
+    // A question stays on screen beside the one ordinary slot, so it is the
+    // line that must survive every change below.
+    let mut notices: std::collections::VecDeque<crate::notices::Toast> = Default::default();
+    crate::notices::push_sticky_toast(
+        &mut notices,
+        "Opened take.mp4".into(),
+        crate::notices::Tone::Info,
+        Vec::new(),
+    );
     let lost = audio_lost_line("AUDIO_LOST");
     // The file was fine, and then the sound is gone: the reason arrives between
     // two frames.
     audio_change_notice(&mut notices, None, Some("AUDIO_LOST"));
     assert_eq!(
-        notices.back().map(|notice| &***notice),
+        notices.back().map(|notice| notice.text.as_ref()),
         Some(lost.as_str()),
         "a reason that arrives mid-session is never pushed"
     );
     assert!(
-        lost.starts_with("AUDIO LOST") && lost.ends_with(&audio_tail("AUDIO_LOST")),
+        lost.starts_with("Audio lost") && lost.ends_with(&audio_tail("AUDIO_LOST")),
         "the standing line lost its state word, or stopped sharing \
          `audio_notice`'s own tail"
     );
@@ -122,13 +145,19 @@ fn a_device_that_dies_under_an_open_file_says_so_and_unsays_it() {
     // The re-arm takes: the line goes with it, and nothing else does.
     audio_change_notice(&mut notices, Some("AUDIO_LOST"), None);
     assert_eq!(
-        notices.iter().map(|notice| &***notice).collect::<Vec<_>>(),
-        vec!["OPENED take.mp4"],
-        "the NO AUDIO line is still on the strip over a film that plays"
+        notices
+            .iter()
+            .map(|notice| notice.text.as_ref())
+            .collect::<Vec<_>>(),
+        vec!["Opened take.mp4"],
+        "the no audio line is still on the strip over a film that plays"
     );
     // A second death later says so again.
     audio_change_notice(&mut notices, None, Some("AUDIO_LOST"));
-    assert_eq!(notices.back().map(|notice| &***notice), Some(lost.as_str()));
+    assert_eq!(
+        notices.back().map(|notice| notice.text.as_ref()),
+        Some(lost.as_str())
+    );
     // The wiring: the pump is the one place every frame passes through, and a
     // watcher nothing calls is a message nobody reads.
     assert!(
@@ -262,7 +291,7 @@ fn an_import_line_says_a_stage_has_stopped_moving_and_only_then() {
     assert!(since < IMPORT_STALL, "{since}");
     let moving = import_line("A Film.mkv", import.seen, 9., since, 2, false);
     assert!(
-        moving.starts_with("IMPORTING A Film.mkv · reading the subtitle tracks"),
+        moving.starts_with("Importing A Film.mkv · reading the subtitle tracks"),
         "{moving}"
     );
     assert!(!moving.contains("still"), "{moving}");
@@ -331,7 +360,7 @@ fn the_file_argv_named_lands_as_the_timeline_and_everything_behind_it_as_imports
 fn the_named_file_is_read_under_an_opening_line_not_an_importing_one() {
     let opening = import_line("Dune.mkv", ImportStage::Header, 0.4, 0.4, 1, true);
     assert!(
-        opening.starts_with("OPENING Dune.mkv · reading the header"),
+        opening.starts_with("Opening Dune.mkv · reading the header"),
         "{opening}"
     );
     assert!(opening.ends_with("· 1 more waiting"), "{opening}");
@@ -339,12 +368,12 @@ fn the_named_file_is_read_under_an_opening_line_not_an_importing_one() {
     // reason the window is up: it says the read is still moving through the
     // same stage and that this is not a freeze.
     let stalled = import_line("Dune.mkv", ImportStage::Header, 12., 12., 0, true);
-    assert!(stalled.starts_with("OPENING Dune.mkv · still"), "{stalled}");
+    assert!(stalled.starts_with("Opening Dune.mkv · still"), "{stalled}");
     assert!(stalled.contains("not frozen"), "{stalled}");
     assert!(stalled.contains("0:12 elapsed"), "{stalled}");
     // The files behind it are imports and still say so.
     let import = import_line("Titles.mov", ImportStage::Header, 0.4, 0.4, 0, false);
-    assert!(import.starts_with("IMPORTING Titles.mov"), "{import}");
+    assert!(import.starts_with("Importing Titles.mov"), "{import}");
 }
 
 /// One gesture over the real gate, with the plumbing around it spelled out:
@@ -435,6 +464,27 @@ fn the_wheel_draws_the_sample_a_drag_is_holding() {
     );
 }
 
+/// The strands and glow sliders: a press's share of the track lands on a
+/// count the engine keeps, at both ends and at the middle, and a share past
+/// an end pins to that end rather than wrapping.
+#[test]
+fn the_strand_and_glow_sliders_land_on_the_engine_range() {
+    assert_eq!(viz_strands_at(0.), 1);
+    assert_eq!(viz_strands_at(1.), 32);
+    // Half a track is 15.5 steps on from one: it rounds up to 17.
+    assert_eq!(viz_strands_at(0.5), 17);
+    assert_eq!(viz_strands_at(-0.2), 1);
+    assert_eq!(viz_strands_at(1.7), 32);
+    assert_eq!(viz_glow_at(0.), 0);
+    assert_eq!(viz_glow_at(1.), 16);
+    assert_eq!(viz_glow_at(0.5), 8);
+    assert_eq!(viz_glow_at(9.), 16);
+    // The default paint's own counts sit inside what the sliders can reach.
+    let azure = engine::decode::VIZ_PAINT_AZURE;
+    assert!((1..=32).contains(&engine::decode::viz_strands_of(azure)));
+    assert!(engine::decode::viz_glow_of(azure) <= 16);
+}
+
 /// The strand's half of the same gesture, and the two things a second ink on
 /// the one wheel may not get wrong. A strand the clip has not chosen starts at
 /// the automatic complement the painter draws there -- the clip's hue half a
@@ -474,7 +524,7 @@ fn the_strand_slot_starts_at_the_complement_and_the_write_chooses_it() {
     // rides with the sample.
     let held = viz_held_paint(paint, Some((VizSlot::Strand, 0, 255)));
     assert_eq!(VizSlot::Strand.hue_sat(held), (0, 255));
-    assert_eq!(viz_strand_set(held), true);
+    assert!(viz_strand_set(held));
     // And the wheel's own slot writes only its own bytes.
     let main = VizSlot::Main.set_hue_sat(picked, 33, 44);
     assert_eq!((viz_hue_ui(main), viz_sat_ui(main)), (33, 44));
@@ -516,10 +566,26 @@ fn a_strand_slot_on_a_single_strand_clip_is_the_clip_s_own_colour() {
 fn a_seek_says_so_only_once_it_has_stood() {
     assert_eq!(seek_line(None), None, "no seek, no line");
     assert_eq!(seek_line(Some(Duration::from_millis(300))), None);
-    let line = seek_line(Some(SEEK_STALL + Duration::from_secs(7))).expect("past the stall");
-    assert!(line.contains("still opening the picture"), "{line}");
-    assert!(line.contains("not frozen"), "{line}");
-    assert!(line.contains("0:09 elapsed"), "{line}");
+    let line = seek_line(Some(SEEK_STALL + Duration::from_secs(4))).expect("past the stall");
+    assert_eq!(line, "Opening the picture\u{2026} 6 s");
+    assert_eq!(
+        seek_line(Some(SEEK_STALL + Duration::from_millis(100))).as_deref(),
+        Some("Opening the picture\u{2026}"),
+        "the seconds only once they say something"
+    );
+}
+
+/// A read that has stood past the give-up mark says why in plain words instead of a running
+/// count. A missing file is not in this line at all: the banner over the picture says it.
+#[test]
+fn a_picture_that_is_not_coming_says_why() {
+    assert_eq!(
+        seek_line(Some(SEEK_GIVE_UP)).as_deref(),
+        Some("Can't show this frame: nothing could be read at the playhead.")
+    );
+    assert!(seek_line(Some(SEEK_GIVE_UP - Duration::from_millis(1))).unwrap().starts_with("Opening"));
+    let overlays = src_text("ui/overlays.rs");
+    assert!(overlays.contains("if self.picture_is_missing() {\n            return None;"), "a missing file is the banner's");
 }
 
 /// The silence card's own state machine, driven the way a repaint drives
@@ -563,12 +629,12 @@ fn a_silence_card_is_up_while_its_scan_runs_and_says_where_it_has_got_to() {
         last = scan.seen;
     }
     let moving = silence_line(scan.seen as f32 / 10., 768., 9., 0.2);
-    assert_eq!(moving, "SCANNING · 6:40 of ~12:48 scanned · 0:09 elapsed");
+    assert_eq!(moving, "Scanning · 6:40 of ~12:48 scanned · 0:09 elapsed");
     assert!(!moving.contains("still"), "{moving}");
     // A header that does not say how long the track is says nothing rather
     // than guessing at it.
     let unknown = silence_line(60., 0., 61., 0.2);
-    assert_eq!(unknown, "SCANNING · 1:00 scanned · 1:01 elapsed");
+    assert_eq!(unknown, "Scanning · 1:00 scanned · 1:01 elapsed");
     // A mark that comes back the same is not the same fact as one that
     // moved: the poll only restarts on a change.
     let held = scan.since;
@@ -833,14 +899,14 @@ fn an_imports_subtitles_are_read_by_the_worker_and_only_pushed_here() {
     let unread: Subs = Err("nothing to read".into());
     assert_eq!(
         subtitle_tail(&mut split, unread),
-        Some(" — SUBTITLES UNREAD: nothing to read".to_string())
+        Some(" — subtitles unread: nothing to read".to_string())
     );
 }
 
 #[test]
 fn every_codec_row_is_offered_or_says_why_not() {
     // One row per codec, and the boxes it can go in are the container row's
-    // business: seven rows that pick, two that say why they cannot. A codec
+    // business: ten rows that pick (the picture ones included), two that say why they cannot. A codec
     // twice over (AV1 · MKV beside AV1 · MP4) was two rows asking the same
     // question, and five picture rows above the fold is what the card was
     // called unfriendly for.
@@ -859,6 +925,9 @@ fn every_codec_row_is_offered_or_says_why_not() {
             &[Format::Flac][..],
             &[Format::Mp3][..],
             &[Format::Ogg][..],
+            &[Format::Opus][..],
+            &[Format::Still, Format::PngSequence][..],
+            &[Format::Gif][..],
         ]
     );
     // Every format the engine writes is on exactly one row: one the card
@@ -873,6 +942,10 @@ fn every_codec_row_is_offered_or_says_why_not() {
         Format::Flac,
         Format::Mp3,
         Format::Ogg,
+        Format::Opus,
+        Format::Still,
+        Format::PngSequence,
+        Format::Gif,
     ] {
         assert_eq!(
             FORMATS
@@ -954,12 +1027,12 @@ fn every_codec_row_is_offered_or_says_why_not() {
     assert!(detail.contains("replaces it"), "VP8: {detail}");
     let (row, _, _, detail) = FORMATS
         .into_iter()
-        .find(|(_, _, name, _)| *name == "OGG")
-        .expect("OGG has a row");
-    assert_eq!(row, [Format::Ogg], "OGG is a row that picks now");
+        .find(|(_, _, name, _)| *name == "Ogg")
+        .expect("Ogg has a row");
+    assert_eq!(row, [Format::Ogg], "Ogg is a row that picks now");
     assert!(
-        detail.contains("ec-vorbis"),
-        "the row names the encoder like every other live one: {detail}"
+        detail.contains("Vorbis"),
+        "the row names its codec in plain words: {detail}"
     );
     assert!(
         FORMATS
@@ -986,34 +1059,12 @@ fn the_budget_row_states_the_size_before_it_is_written() {
     assert_eq!(fps_label(30.), "30");
     assert_eq!(fps_label(24000. / 1001.), "23.976");
     assert_eq!(fps_label(29.97002997), "29.97");
-    // 6 Mbps over a minute is 45 MB -- and the sound rides in the same
-    // number, because it is in the same file.
-    assert_eq!(estimated_bytes(6_000_000, 60.), 45_000_000);
-    assert_eq!(estimated_bytes(6_000_000 + 256_000, 60.), 46_920_000);
-    assert_eq!(estimated_bytes(2_000_000, 90.), 22_500_000);
-    // Nothing to write is nothing to estimate, and never a negative span.
-    assert_eq!(estimated_bytes(6_000_000, 0.), 0);
-    assert_eq!(estimated_bytes(6_000_000, -3.), 0);
-    // Whole megabytes under a gigabyte, two decimals over it: the estimate
-    // is an "≈" and a tenth of a megabyte is precision it does not have.
-    assert_eq!(size_label(45_000_000), "45 MB");
-    assert_eq!(size_label(999_999_999), "1000 MB");
-    assert_eq!(size_label(1_000_000_000), "1.00 GB");
-    assert_eq!(size_label(1_240_000_000), "1.24 GB");
     // The lever's own readout, one decimal, in the unit it is moved in --
     // including below a megabit, which is where the floor lives now.
     assert_eq!(rate_label(6_000_000), "6.0");
     assert_eq!(rate_label(6_500_000), "6.5");
     assert_eq!(rate_label(600_000), "0.6");
     assert_eq!(rate_label(BPS_MIN), "0.1");
-    // Row 3's range readout: the marked span where there is one, and a
-    // sound-only file names no film to take a range from.
-    assert_eq!(range_word(None, true), "whole film");
-    assert_eq!(range_word(None, false), "sound only");
-    assert_eq!(
-        range_word(Some("00:00:04:00\u{2013}00:00:12:00"), true),
-        "marks 00:00:04:00\u{2013}00:00:12:00"
-    );
 }
 
 /// Which cue is on screen when: the whole of what the overlay decides, and
@@ -1026,6 +1077,8 @@ fn a_cue_is_on_screen_from_its_start_until_the_moment_it_ends() {
         end_us,
         text: text.to_string(),
         image: None,
+        words: Vec::new(),
+        karaoke: Vec::new(),
     };
     // Two cues that hand over exactly, and one that overlaps the second --
     // a sign over a line of dialogue, which is two plates at one moment.
@@ -1106,7 +1159,9 @@ fn the_subtitle_plate_and_lanes_fit_the_smallest_window() {
         "a two-line cue does not fit the smallest picture"
     );
     // The text sits on its line rather than being clipped by it.
-    assert!(SUB_LINE_H >= SUB_TEXT);
+    const {
+        assert!(SUB_LINE_H >= SUB_TEXT);
+    }
     // White on the plate, not chrome on chrome: a cue is read against the
     // film, and this is the one pair here that has to survive any picture.
     for id in crate::ui::theme::PaletteId::ALL {
@@ -1115,7 +1170,9 @@ fn the_subtitle_plate_and_lanes_fit_the_smallest_window() {
     // A subtitle lane is dragged onto, trimmed on and lifted from, so its row
     // is a target and binds `HIT_MIN` like every other lane's -- the whole
     // reason it is a lane and no longer a 16 px strip.
-    assert!(LANE_H >= HIT_MIN);
+    const {
+        assert!(LANE_H >= HIT_MIN);
+    }
 }
 
 /// The subtitle style file, round-tripped through a scratch config directory
@@ -1139,28 +1196,98 @@ fn the_subtitle_style_file_round_trips_or_falls_back_to_defaults() {
     std::fs::create_dir_all(&dir).unwrap();
     // The shared process environment is serialized across every config
     // round-trip test by `config_env_lock`.
-    unsafe { std::env::set_var("XDG_CONFIG_HOME", &dir) };
+    crate::keymap::set_test_config_home(Some(dir.clone()));
 
     // Nothing written yet: the defaults, not a crash on a missing file.
-    assert_eq!(load_subtitle_style(), (None, SUB_TEXT));
+    assert_eq!(load_subtitle_style(), SubStyle::default());
 
     // A save, read back whole: family and size both.
-    save_subtitle_style(Some("Iosevka"), 22.).unwrap();
-    assert_eq!(load_subtitle_style(), (Some("Iosevka".to_string()), 22.));
+    let iosevka = SubStyle {
+        family: Some("Iosevka".to_string()),
+        size: 22.,
+        ..SubStyle::default()
+    };
+    save_subtitle_style(&iosevka).unwrap();
+    assert_eq!(load_subtitle_style(), iosevka);
 
     // The platform default (`None`) round-trips too, and is not a family
     // called "".
-    save_subtitle_style(None, 14.).unwrap();
-    assert_eq!(load_subtitle_style(), (None, 14.));
+    let platform = SubStyle {
+        size: 14.,
+        ..SubStyle::default()
+    };
+    save_subtitle_style(&platform).unwrap();
+    assert_eq!(load_subtitle_style(), platform);
+
+    // Every field the card can set reads back as set: outline, box and place
+    // are not in the two-line file they grew out of, so each one has to
+    // survive the trip on its own.
+    let all = SubStyle {
+        family: Some("Iosevka".to_string()),
+        size: 26.,
+        outline: SubOutline::Thick,
+        boxed: false,
+        place: SubPlace::Top,
+    };
+    save_subtitle_style(&all).unwrap();
+    assert_eq!(load_subtitle_style(), all);
 
     // A file present but unreadable as this format -- a stray edit, or bytes
     // from a future version -- leaves the defaults in force rather than
     // failing the window that opens over it.
     std::fs::write(subtitle_style_path(), "not a number\n9999\n").unwrap();
-    assert_eq!(load_subtitle_style(), (None, SUB_TEXT));
+    assert_eq!(load_subtitle_style(), SubStyle::default());
 
-    unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+    // A two-line file from before the outline, box and place existed still
+    // loads its family and size, with the look it always had for the rest.
+    std::fs::write(subtitle_style_path(), "Iosevka\n22\n").unwrap();
+    assert_eq!(load_subtitle_style(), iosevka);
+
+    // A line this build does not know keeps its default, and the lines after
+    // it are still read: a value from a future version costs that one field.
+    std::fs::write(subtitle_style_path(), "Iosevka\n22\nextra-bold\noff\ntop\n").unwrap();
+    assert_eq!(
+        load_subtitle_style(),
+        SubStyle {
+            boxed: false,
+            place: SubPlace::Top,
+            ..iosevka.clone()
+        }
+    );
+
+    crate::keymap::set_test_config_home(None);
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The subtitle card's pure rules: a slider position names a whole size inside
+/// the range at both ends and between, the outline walks its three steps and
+/// wraps, and each outline's copies sit where its width says they do.
+#[test]
+fn the_subtitle_card_sizes_outlines_and_offsets_are_bounded() {
+    assert_eq!(sub_size_at(0.), SUB_SIZE_RANGE.0);
+    assert_eq!(sub_size_at(1.), SUB_SIZE_RANGE.1);
+    assert_eq!(sub_size_at(-3.), SUB_SIZE_RANGE.0);
+    assert_eq!(sub_size_at(7.), SUB_SIZE_RANGE.1);
+    assert_eq!(sub_size_at(0.5), 19.);
+    assert_eq!(sub_size_at(0.52), 19.);
+
+    assert_eq!(SubOutline::None.step(1), SubOutline::Thin);
+    assert_eq!(SubOutline::Thick.step(1), SubOutline::None);
+    assert_eq!(SubOutline::None.step(-1), SubOutline::Thick);
+    assert_eq!(SubOutline::Thin.step(-1), SubOutline::None);
+
+    assert!(SubOutline::None.offsets().is_empty());
+    assert_eq!(SubOutline::Thin.offsets().len(), 4);
+    assert_eq!(SubOutline::Thick.offsets().len(), 8);
+    for outline in [SubOutline::Thin, SubOutline::Thick] {
+        for &(dx, dy) in outline.offsets() {
+            assert!(
+                dx != 0. || dy != 0.,
+                "a copy on the text itself draws nothing"
+            );
+            assert!(dx.abs() <= 2. && dy.abs() <= 2.);
+        }
+    }
 }
 
 /// The auto-proxies default, round-tripped through a scratch config
@@ -1185,7 +1312,7 @@ fn the_auto_proxies_default_round_trips_through_its_own_config_file_or_falls_bac
     std::fs::create_dir_all(&dir).unwrap();
     // `config_env_lock` serializes every test that changes this process-wide
     // path.
-    unsafe { std::env::set_var("XDG_CONFIG_HOME", &dir) };
+    crate::keymap::set_test_config_home(Some(dir.clone()));
 
     // Nothing written yet: On, the field's own long-standing default.
     assert!(load_auto_proxies_pref(), "a missing file must read as On");
@@ -1207,7 +1334,7 @@ fn the_auto_proxies_default_round_trips_through_its_own_config_file_or_falls_bac
         "unreadable content must fall back to On"
     );
 
-    unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+    crate::keymap::set_test_config_home(None);
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -1319,11 +1446,11 @@ fn subtitles_arrive_beside_the_media_and_inside_it() {
     assert_eq!(text(0.7), ["first line"]);
     assert!(text(1.8).is_empty(), "between two cues the plate goes");
     assert_eq!(text(2.5), ["second line\nwith a break"]);
-    // Where the strip puts that first cue: 0.5 s in at 40 px to the second
-    // is 20 px along, and a second of cue is 40 px wide.
+    // Where the strip puts that first cue: 0.5 s in at 60 px to the second
+    // is 30 px along, and a second of cue is 60 px wide.
     let scale = Scale::default();
     assert_eq!(scale.pps, PPS_DEFAULT);
-    assert_eq!(cue_box(scale, &track.cues[0]), (20., 40.));
+    assert_eq!(cue_box(scale, &track.cues[0]), (30., 60.));
     // Zoomed right out, a cue worth a fraction of a pixel is still a mark.
     let far = Scale {
         pps: 0.01,
@@ -1336,7 +1463,7 @@ fn subtitles_arrive_beside_the_media_and_inside_it() {
         pps: PPS_DEFAULT,
         start: 1.,
     };
-    assert_eq!(cue_box(scrolled, &track.cues[0]).0, -20.);
+    assert_eq!(cue_box(scrolled, &track.cues[0]).0, -30.);
 
     // Inside the media: the tracks of an mkv, taken by the same call every
     // open and import door makes. Two of them in the fixture, named by what
@@ -1414,7 +1541,7 @@ fn subtitles_arrive_beside_the_media_and_inside_it() {
         "a cue past the cut end is drawn where the file writes none"
     );
     // ...and the strip's: the second cue is one second wide now, not 1.25.
-    assert_eq!(cue_box(scale, &mapped[1]), (80., 40.));
+    assert_eq!(cue_box(scale, &mapped[1]), (120., 60.));
 
     // The last mile, what the plate over the picture actually reads
     // (`Player::subtitle_overlay` -> `PlaybackSession::sub_lane_cues`): a lane
@@ -1655,8 +1782,10 @@ fn a_screenshot_frame_round_trips_through_its_png() {
     let dir = std::env::temp_dir().join(format!("edith-screenshot-test-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("scratch dir");
     let path = dir.join("roundtrip.png");
-    let buf = image::RgbaImage::from_raw(2, 2, rgba.clone()).expect("2x2 rgba buffer");
-    buf.save(&path).expect("png write");
+    // Written by the screenshot's own encoder and read back by `image`, an
+    // independent decoder, so the round trip crosses both crates.
+    let png = ec_image::png_encode::encode_rgba8(2, 2, &rgba).expect("2x2 rgba png");
+    std::fs::write(&path, png).expect("png write");
     let decoded = image::open(&path).expect("png read").to_rgba8();
     assert_eq!(
         decoded.into_raw(),
@@ -1690,4 +1819,89 @@ fn a_repeated_screenshot_name_gets_a_numeric_suffix() {
     assert_eq!(elsewhere, dir.join("A Film-00-01-03.png"));
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A first import lands on an empty timeline and fits it; a later one only
+/// joins the library, and a Media row's double-click adds at the playhead
+/// rather than previewing. Read from the sources because this binary has no
+/// `TestAppContext` to drive the window (see `darkroom_source_rows_keep_...`).
+#[test]
+fn the_first_import_lands_and_fits_and_a_row_double_click_adds_at_the_playhead() {
+    let library = src_text("player/library.rs");
+    let take = &library[library.find("fn take_import(").expect("take_import")..];
+    for needle in [
+        "self.insert_source(path, 0, None, None, cx);",
+        "self.zoom_fit(cx);",
+    ] {
+        assert!(
+            take.contains(needle),
+            "the first import lost `{needle}`: an empty timeline must take the file"
+        );
+    }
+    let dock = src_text("ui/dock_stance.rs");
+    let row = &dock[dock.find("fn source_gestures(").expect("Darkroom source gestures")..];
+    assert!(
+        row.contains("this.open_preview(&click_path, stream, cx);"),
+        "a Media row's double-click opens the source viewer"
+    );
+}
+
+/// The time estimate is always "about", in seconds under a minute and a half
+/// and in minutes after, and a faster machine writes the same film sooner.
+#[test]
+fn the_write_time_is_about_and_follows_the_pace() {
+    use crate::export_ui::time_words;
+    assert_eq!(time_words(60., Some(1.)), "about 60 s");
+    assert_eq!(time_words(600., Some(1.)), "about 10 min");
+    assert_eq!(time_words(600., Some(4.)), "about 2 min 30 s");
+    assert_eq!(time_words(100., Some(1.)), "about 1 min 40 s");
+    // Never a fake "0 s", and no number at all before a pace was measured.
+    assert_eq!(time_words(0., Some(1.)), "about 1 s");
+    assert_eq!(time_words(60., None), "estimating\u{2026}");
+}
+
+/// The playback plate draws a non-plain caption style with the engine's own
+/// burn function, so the word being spoken moves with the playhead: two frames
+/// inside one karaoke cue are two different pictures, a held pose is the same
+/// key (no redrawing), and the default style is not routed through it at all.
+#[test]
+fn the_plate_draws_the_animated_caption_and_it_changes_inside_one_cue() {
+    use engine::captionanim::{CaptionAnim, CaptionStyle};
+    use engine::subtitle::Cue;
+    let fps = 25.0;
+    let cue = Cue {
+        start_us: 1_000_000,
+        end_us: 3_000_000,
+        text: "one two three four".to_string(),
+        image: None,
+        karaoke: Vec::new(),
+        // Uneven on purpose: "three" owns most of the cue.
+        words: vec![
+            (1_000_000, 1_200_000, "one".into()),
+            (1_200_000, 1_400_000, "two".into()),
+            (1_400_000, 2_800_000, "three".into()),
+            (2_800_000, 3_000_000, "four".into()),
+        ],
+    };
+    let cues = [cue];
+    let karaoke = engine::text::TextStyle {
+        caption: CaptionStyle { anim: CaptionAnim::Karaoke, ..CaptionStyle::default() },
+        ..engine::text::TextStyle::default()
+    };
+    let draw = |style: &engine::text::TextStyle, secs: f64| {
+        let frame = crate::subs::frame_at(secs, fps);
+        let (key, blocks) = crate::subs::animated_caption_key(style, &cues, frame, fps)?;
+        let (w, h, px) = crate::subs::animated_caption_bitmap(style, &blocks, (1280, 720))?;
+        assert_eq!((w, h), (960, 540), "the canvas keeps the project's shape");
+        assert!(px.as_chunks::<4>().0.iter().any(|p| p[3] > 0), "the caption drew something");
+        Some((key, px))
+    };
+    let early = draw(&karaoke, 1.1).expect("a cue is up at 1.1 s");
+    let late = draw(&karaoke, 2.0).expect("a cue is up at 2.0 s");
+    assert_ne!(early.0, late.0, "the word being spoken changed, so did the key");
+    assert_ne!(early.1, late.1, "and so did the picture");
+    let held = draw(&karaoke, 2.1).expect("up");
+    assert_eq!(late.0, held.0, "the same word is the same key: a held pose is not redrawn");
+    assert_eq!(late.1, held.1);
+    assert!(crate::subs::cues_at(&cues, 3.5).is_empty(), "nothing is handed over between cues");
 }

@@ -2,12 +2,49 @@
 //! subtitles, the project file and the lanes.
 
 use crate::*;
+use crate::follow::{Follow, follow_decision};
+use crate::notices::{ToastAction, Tone, push_sticky_toast};
+use crate::player::project_dialogs::PathFor;
 
-/// How long an edit must sit idle before the sidecar catches up with it.
-const AUTOSAVE_DEBOUNCE: Duration = Duration::from_secs(5);
-/// The longest a run of edits with no gap between them goes unsaved: the
-/// periodic half of "debounced + periodic".
-const AUTOSAVE_PERIOD: Duration = Duration::from_secs(60);
+/// Edits since the last autosave that make the next tick write without
+/// waiting for the timer.
+const AUTOSAVE_EDITS: u32 = 20;
+/// The autosave periods Settings offers, in seconds: `None` is Off, which writes no
+/// autosave at all. A missing or unreadable preference is one minute.
+pub(crate) const AUTOSAVE_CHOICES: [Option<u64>; 4] = [None, Some(30), Some(60), Some(300)];
+const AUTOSAVE_DEFAULT_SECS: u64 = 60;
+
+/// The least time between two autosaves that a structural edit asked for: a burst of new
+/// sequences or markers writes once, not once per click.
+const AUTOSAVE_THROTTLE: Duration = Duration::from_secs(5);
+
+/// The name of the one undo step a recovery takes: what Edit reads back as
+/// "Undo Recover unsaved edits".
+const RECOVER_STEP: &str = "Recover unsaved edits";
+
+/// The session a recovery installs: the saved file as it stands, with the
+/// autosave's timeline taken over on top of it as one undo step
+/// ([`PlaybackSession::adopt_as_step`]), so undo takes the recovered edits back
+/// to the saved timeline. With no saved file to stand on (`saved` is `None`, an
+/// untitled session) the autosave is the project and undo has nothing earlier
+/// to return to. Free of any `Player`, so a test can recover a file pair.
+pub(crate) fn recovered_session(
+    saved: Option<&Path>,
+    autosave: &Path,
+) -> Result<PlaybackSession, String> {
+    let autosaved = PlaybackSession::open_project(autosave).map_err(|e| e.to_string())?;
+    let Some(saved) = saved.filter(|p| p.is_file()) else {
+        return Ok(autosaved);
+    };
+    let mut session = PlaybackSession::open_project(saved).map_err(|e| e.to_string())?;
+    let mark = session.step_mark();
+    if session.adopt_as_step(&autosaved) {
+        session.name_step(mark, RECOVER_STEP);
+        Ok(session)
+    } else {
+        Err("the autosave does not fit on the saved project as one step".into())
+    }
+}
 
 /// Where the auto-proxies *default* survives, beside the keybindings and the
 /// theme, same corner-cut persistence as [`crate::subs::subtitle_style_path`]:
@@ -19,6 +56,18 @@ const AUTOSAVE_PERIOD: Duration = Duration::from_secs(60);
 /// open ([`Player::install_project`]) -- this file is only ever read before
 /// that, which is what makes it the difference between "the switch reverts to
 /// On on every relaunch" and "the switch stayed how it was left".
+/// The toasts for the clips a save had to shorten to their files' ends: one toast
+/// each, since a toast is one line that the window would cut off past its width.
+/// Past three, the rest are counted in one line.
+pub(crate) fn shortened_notes(notes: &[String]) -> Vec<String> {
+    const SHOWN: usize = 3;
+    let mut out: Vec<String> = notes.iter().take(SHOWN).cloned().collect();
+    if notes.len() > SHOWN {
+        out.push(format!("{} more clips were shortened to fit their files.", notes.len() - SHOWN));
+    }
+    out
+}
+
 pub(crate) fn auto_proxies_pref_path() -> PathBuf {
     crate::keymap::Keymap::config_path().with_file_name("auto-proxies")
 }
@@ -49,6 +98,48 @@ pub(crate) fn save_auto_proxies_pref(on: bool) -> std::io::Result<()> {
 /// This is the window's own answer, not the project's: a project saved with
 /// the switch set carries its own line and always wins once one is open
 /// ([`Player::install_project`]) -- this file is only ever read before that.
+/// The Settings word for one autosave period: `Off`, or how often it is written.
+pub(crate) fn autosave_label(secs: Option<u64>) -> String {
+    match secs {
+        None => "Off".to_string(),
+        Some(s) if s % 60 == 0 => format!("{} min", s / 60),
+        Some(s) => format!("Every {s} s"),
+    }
+}
+
+/// The small print beside one autosave period in its list.
+pub(crate) fn autosave_detail(secs: Option<u64>) -> &'static str {
+    match secs {
+        None => "unsaved edits are lost if edith quits",
+        Some(_) => "written beside the project while you work",
+    }
+}
+
+pub(crate) fn autosave_pref_path() -> PathBuf {
+    crate::keymap::Keymap::config_path().with_file_name("autosave")
+}
+
+/// The period the file names: `off` is `None`, a number of seconds is that period. Missing or
+/// garbled reads as one minute, the default, since a preference file is not the user's work.
+pub(crate) fn load_autosave_pref() -> Option<u64> {
+    match std::fs::read_to_string(autosave_pref_path()) {
+        Ok(text) => match text.trim() {
+            "off" => None,
+            n => Some(n.parse().unwrap_or(AUTOSAVE_DEFAULT_SECS)),
+        },
+        Err(_) => Some(AUTOSAVE_DEFAULT_SECS),
+    }
+}
+
+/// Writes the pick whole, the way [`save_proxies_pref`] does.
+pub(crate) fn save_autosave_pref(secs: Option<u64>) -> std::io::Result<()> {
+    let path = autosave_pref_path();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(path, secs.map_or("off\n".to_string(), |n| format!("{n}\n")))
+}
+
 pub(crate) fn proxies_pref_path() -> PathBuf {
     crate::keymap::Keymap::config_path().with_file_name("proxies")
 }
@@ -72,7 +163,72 @@ pub(crate) fn save_proxies_pref(on: bool) -> std::io::Result<()> {
     std::fs::write(path, if on { "on\n" } else { "off\n" })
 }
 
+/// How long ago an autosave was written, in plain words: the recovery question's
+/// first half. Under a minute is "a moment ago"; a day back is "yesterday".
+/// Pure, so the words are tested without a file or a clock.
+pub(crate) fn age_words(secs: u64) -> String {
+    let ago = |n: u64, one: &str, many: &str| format!("{} ago", crate::notices::count_noun(n as usize, one, many));
+    match secs {
+        0..60 => "a moment ago".to_string(),
+        60..3600 => ago(secs / 60, "minute", "minutes"),
+        3600..86_400 => ago(secs / 3600, "hour", "hours"),
+        86_400..172_800 => "yesterday".to_string(),
+        _ => ago(secs / 86_400, "day", "days"),
+    }
+}
+
+/// The recovery question's words for an autosave: when its unsaved edits were
+/// written. The buttons carry the rest of the question.
+pub(crate) fn recovery_words(sidecar: &Path) -> String {
+    match std::fs::metadata(sidecar).and_then(|m| m.modified()) {
+        Ok(written) => recovery_words_at(written, std::time::SystemTime::now()),
+        Err(_) => "Unsaved edits were found".to_string(),
+    }
+}
+
+/// [`recovery_words`] for an autosave written at `written`, read at `now`: the
+/// local clock time it was written and how long ago that was, so "from 14:32
+/// (1 minute ago)" says both when and how recent. Pure but for the time zone.
+pub(crate) fn recovery_words_at(written: std::time::SystemTime, now: std::time::SystemTime) -> String {
+    let age = now.duration_since(written).map_or(0, |d| d.as_secs());
+    let clock = chrono::DateTime::<chrono::Local>::from(written).format("%H:%M");
+    format!("Unsaved edits from {clock} ({}) were found.", age_words(age))
+}
+
+/// The recovery toast's words once the window has edits of its own: recovering
+/// would replace them, and says so before the button is pressed.
+pub(crate) fn recovery_replaces_words() -> String {
+    "Recovering will replace the current edits · undo takes them back".to_string()
+}
+
 impl Player {
+    /// The lanes an insert of `path` writes, mirroring the choice
+    /// [`PlaybackSession::place_stream_at`] makes: a still goes on a video lane
+    /// alone, a song on an audio lane alone, and a picture takes its sound with
+    /// it (the grouped take on `V1`/`A1`, or the same-numbered pair for a named
+    /// further lane). With no lane named, a still and a picture land on `V1`
+    /// and a song on `A1`.
+    pub(crate) fn insert_lanes(path: &Path, onto: Option<Lane>) -> Vec<Lane> {
+        if engine::is_image(path) {
+            let lane = match onto {
+                Some(lane) if lane.kind == LaneKind::Video => lane,
+                _ => Lane::V1,
+            };
+            return vec![lane];
+        }
+        if engine::is_audio(path) {
+            let lane = match onto {
+                Some(lane) if lane.kind == LaneKind::Audio => lane,
+                _ => Lane::A1,
+            };
+            return vec![lane];
+        }
+        match onto {
+            Some(lane) if lane.ord > 0 => vec![lane, Lane::new(LaneKind::Audio, lane.ord)],
+            _ => vec![Lane::V1, Lane::A1],
+        }
+    }
+
     /// The one way a library row reaches the timeline: the Add button and a row
     /// dragged onto a lane both come here, so there is a single answer to what
     /// "add this source" does. The whole source goes in as one grouped take at
@@ -81,6 +237,13 @@ impl Player {
     /// everything after it moves along rather than being painted over. Reseeks
     /// like every other edit, and drops the timeline's selection with it: the
     /// insert has just moved the indices it pointed at.
+    /// Puts a source on the end of the timeline: the frame past the last clip on any lane, so
+    /// nothing is pushed and nothing is overwritten.
+    pub(crate) fn append_source(&mut self, path: &Path, stream: usize, cx: &mut Context<Self>) {
+        let end = self.session.as_ref().map(|s| (s.timeline_duration() * self.fps).round() as u32);
+        self.insert_source(path, stream, None, end, cx);
+    }
+
     pub(crate) fn insert_source(
         &mut self,
         path: &Path,
@@ -89,7 +252,82 @@ impl Player {
         at: Option<u32>,
         cx: &mut Context<Self>,
     ) {
+        self.place_source(path, stream, onto, at, false, cx);
+    }
+
+    /// A library item let go on the bed: it **overwrites** what is under it for its length, and
+    /// nothing is pushed along, unless `insert` (Ctrl held) asks for the push
+    /// ([`insert_source`](Self::insert_source)). Refusals say why in a toast, as every placement does.
+    pub(crate) fn drop_source(
+        &mut self,
+        path: &Path,
+        stream: usize,
+        onto: Option<Lane>,
+        at: Option<u32>,
+        insert: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.place_source(path, stream, onto, at, !insert, cx);
+    }
+
+    /// A library item let go below the last lane, where there is no row to aim at: the
+    /// track it needs is made first, in the same undo step as the placement. A file with a
+    /// picture needs its video lane *and* the audio lane beside it, so both are made (`V2`
+    /// with `A2`, say), and a placement that is refused takes the new lanes back again, so no
+    /// empty track is ever left behind.
+    pub(crate) fn drop_source_below_lanes(
+        &mut self,
+        path: &Path,
+        stream: usize,
+        at: Option<u32>,
+        insert: bool,
+        cx: &mut Context<Self>,
+    ) {
         if self.exporting().is_some() {
+            return;
+        }
+        let Some(session) = self.session.as_mut() else {
+            return;
+        };
+        session.begin_batch();
+        let lane = add_drop_lanes(session, path);
+        self.drop_source(path, stream, Some(lane), at, insert, cx);
+        let Some(session) = self.session.as_mut() else {
+            return;
+        };
+        let placed = !session.lane_clips(lane).is_empty();
+        session.end_batch();
+        if !placed {
+            // Refused: the batch holds nothing but the lanes just made, so one undo takes them back.
+            session.undo();
+            self.reset_after_reseek();
+        }
+    }
+
+    /// The one placement behind [`insert_source`](Self::insert_source) and
+    /// [`drop_source`](Self::drop_source): `overwrite` picks the engine door.
+    fn place_source(
+        &mut self,
+        path: &Path,
+        stream: usize,
+        onto: Option<Lane>,
+        at: Option<u32>,
+        overwrite: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.exporting().is_some() {
+            return;
+        }
+        // The drop ends the hover: nothing is below the stack any more.
+        self.drag_below = false;
+        // The source monitor's own item, dragged by its picture or its row
+        // with marks set: the marked part goes, not the whole file.
+        if self.source_has_marks(path, stream) {
+            let kind = match overwrite {
+                true => engine::SourceEdit::Overwrite,
+                false => engine::SourceEdit::Insert,
+            };
+            self.source_edit_at(kind, at, onto, cx);
             return;
         }
         // The lane the pointer named cannot hold this kind of file: refused by
@@ -101,6 +339,16 @@ impl Player {
             self.notify_user(why.into());
             cx.notify();
             return;
+        }
+        // A locked lane takes nothing, named or chosen: the Add button's pick
+        // and a drop onto a lane both write the lanes [`Self::insert_lanes`]
+        // names, and the one that is locked refuses the whole insert with its
+        // own toast before anything moves.
+        for lane in Self::insert_lanes(path, onto) {
+            if self.lane_locked_refusal(lane) {
+                cx.notify();
+                return;
+            }
         }
         // The engine's own length for the file, noted when the import took it
         // in: a row that has never been on a lane is placeable at its full
@@ -114,7 +362,10 @@ impl Player {
             // rather than a neighbouring one.
             Some(session) => {
                 let at = at.map_or_else(|| session.now(), |frame| f64::from(frame) / fps);
-                session.place_stream_at(at, path, stream, onto)
+                match overwrite {
+                    true => session.place_stream_overwrite_at(at, path, stream, onto),
+                    false => session.place_stream_at(at, path, stream, onto),
+                }
             }
             None => Ok(false),
         };
@@ -125,10 +376,196 @@ impl Player {
             }
             // The engine's own words: a stream that cannot join this timeline
             // says which property disagrees, exactly as a refused import does.
-            Err(e) => self.notify_user(format!("NOTHING ADDED — {e}").into()),
+            Err(e) => self.notify_user(format!("Nothing added: {e}").into()),
             Ok(false) => {
-                self.notify_user("NOTHING ADDED — that file could not be placed here".into())
+                self.notify_user("Nothing added: that file could not be placed here".into())
             }
+        }
+        cx.notify();
+    }
+
+    /// `I`/`O` while a library item is previewed: the preview's playhead becomes
+    /// that item's in or out mark (the source monitor's marks), kept in order
+    /// the way the timeline's pair is.
+    pub(crate) fn mark_source(&mut self, is_in: bool, cx: &mut Context<Self>) {
+        let Some(preview) = &self.preview_session else {
+            return;
+        };
+        let Some(src) = preview.sources().first() else {
+            return;
+        };
+        let key = (src.path.clone(), src.audio_stream);
+        let at = preview.now();
+        let (mut a, mut b) = self.source_marks.get(&key).copied().unwrap_or((None, None));
+        if is_in {
+            a = Some(at);
+        } else {
+            b = Some(at);
+        }
+        if let (Some(x), Some(y)) = (a, b)
+            && x > y
+        {
+            (a, b) = (Some(y), Some(x));
+        }
+        self.source_marks.insert(key, (a, b));
+        cx.notify();
+    }
+
+    /// `ctrl+u` while a library item is previewed: lets go of that item's marks.
+    pub(crate) fn clear_source_marks(&mut self, cx: &mut Context<Self>) {
+        if let Some(src) = self.preview_session.as_ref().and_then(|p| p.sources().first()) {
+            self.source_marks.remove(&(src.path.clone(), src.audio_stream));
+        }
+        cx.notify();
+    }
+
+    /// The three-point edit (`F9` insert, `F10` overwrite): the library item
+    /// being previewed, or the last one that was, goes onto the timeline at the
+    /// playhead (the timeline's in mark when set) for its marked in..out -- the
+    /// whole item with no marks -- onto the first unlocked video and audio
+    /// lanes it has. Insert cuts the clip there and ripples the later ones on
+    /// those lanes; overwrite replaces what is there and moves nothing. One
+    /// undo step ([`PlaybackSession::edit_from_source_at`]); a locked lane or a
+    /// take it would pull apart refuses with the engine's words. On success the
+    /// preview closes (the timeline shows what was done) and the playhead
+    /// moves to the end of the new take, so the next press follows on.
+    pub(crate) fn source_edit(&mut self, kind: engine::SourceEdit, cx: &mut Context<Self>) {
+        self.source_edit_at(kind, None, None, cx);
+    }
+
+    /// Whether `(path, stream)` is the source monitor's item and has a mark.
+    fn source_has_marks(&self, path: &Path, stream: usize) -> bool {
+        self.preview_session.is_some()
+            && self.source_target.as_ref().is_some_and(|(p, s)| p == path && *s == stream)
+            && self
+                .source_marks
+                .get(&(path.to_path_buf(), stream))
+                .is_some_and(|(a, b)| a.is_some() || b.is_some())
+    }
+
+    /// [`Self::source_edit`] at a given frame and onto a given lane (a drop),
+    /// else at the playhead on the first free lanes.
+    pub(crate) fn source_edit_at(
+        &mut self,
+        kind: engine::SourceEdit,
+        drop_at: Option<u32>,
+        onto: Option<Lane>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.exporting().is_some() {
+            return;
+        }
+        let verb = match kind {
+            engine::SourceEdit::Insert => "Insert",
+            engine::SourceEdit::Overwrite => "Overwrite",
+        };
+        let target = self
+            .preview_session
+            .as_ref()
+            .and_then(|p| p.sources().first().map(|s| (s.path.clone(), s.audio_stream)))
+            .or_else(|| self.source_target.clone());
+        let Some((path, stream)) = target else {
+            self.notify_user(
+                format!("{verb}: no library item has been previewed").into(),
+            );
+            cx.notify();
+            return;
+        };
+        let Some(session) = &self.session else {
+            return;
+        };
+        let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let want = canon(&path);
+        let Some(source) = session
+            .sources()
+            .iter()
+            .position(|s| s.audio_stream == stream && (s.path == path || canon(&s.path) == want))
+        else {
+            self.notify_user(format!("{verb}: {} is not in this project", file_name(&path)).into());
+            cx.notify();
+            return;
+        };
+        let fps = self.fps;
+        let still = engine::is_image(&path);
+        let picture = still || (!engine::is_audio(&path) && engine::probe_media(&path).video.is_some());
+        let sound = !still
+            && engine::AudioSession::probe_streams(&path).is_ok_and(|streams| streams.len() > stream);
+        let total = if picture {
+            session.file_frames(&path)
+        } else {
+            engine::AudioSession::stream_duration_secs(&path, stream)
+                .ok()
+                .flatten()
+                .map_or(0, |secs| (secs * fps).ceil() as u32)
+        };
+        let lanes: Vec<(Lane, bool)> = session
+            .lanes()
+            .into_iter()
+            .filter(|l| l.kind != LaneKind::Subtitle)
+            .map(|l| (l, session.lane_locked(l)))
+            .collect();
+        let ask = SourceEditAsk {
+            fps,
+            lanes: &lanes,
+            playhead: drop_at.unwrap_or_else(|| frame_at(session.now(), fps)),
+            range: self.range.filter(|_| drop_at.is_none()),
+            marks: self.source_marks.get(&(path.clone(), stream)).copied().unwrap_or((None, None)),
+            source,
+            total,
+            picture: picture && self.source_video,
+            sound: sound && self.source_audio,
+            still,
+            video_patch: Some(self.patch_video),
+            audio_patch: Some(self.patch_audio),
+        };
+        let (at, items) = match plan_source_edit(&ask) {
+            Ok((at, mut items)) => {
+                // A drop names its lane: the half of that kind goes there.
+                if let Some(lane) = onto
+                    && !lanes.iter().any(|(l, locked)| *l == lane && *locked)
+                    && let Some(item) = items.iter_mut().find(|(l, _)| l.kind == lane.kind)
+                {
+                    item.0 = lane;
+                }
+                (at, items)
+            }
+            Err(why) => {
+                self.notify_user(format!("{verb}: {why}").into());
+                cx.notify();
+                return;
+            }
+        };
+        let len = items.iter().map(|(_, c)| c.frames()).max().unwrap_or(0);
+        let done = match self.session.as_mut() {
+            Some(session) => session.edit_from_source_at(kind, f64::from(at) / fps, &items),
+            None => return,
+        };
+        match done {
+            Ok(()) => {
+                self.selected.clear();
+                self.reset_after_reseek();
+                self.mark_dirty();
+                // The source monitor stays up, ready for the next edit; only
+                // the timeline's playhead moves, to the end of the new take.
+                if let Some(session) = self.session.as_mut() {
+                    session.seek(f64::from(at + len) / fps);
+                }
+                self.reset_after_reseek();
+                let (word, where_) = match kind {
+                    engine::SourceEdit::Insert => ("Inserted", "rippling what follows"),
+                    engine::SourceEdit::Overwrite => ("Overwrote", "nothing moved"),
+                };
+                self.notify_user(
+                    format!(
+                        "{word} {} at {} for {}: {where_}; ctrl+z undoes it",
+                        file_name(&path),
+                        timecode(f64::from(at) / fps, fps),
+                        timecode(f64::from(len) / fps, fps),
+                    )
+                    .into(),
+                );
+            }
+            Err(e) => self.notify_user(format!("{verb} refused: {e}").into()),
         }
         cx.notify();
     }
@@ -140,24 +577,24 @@ impl Player {
             return;
         }
         let Some((lane, idx)) = self.selected.anchor() else {
-            self.notify_user("NO VISUALIZER — select a clip with sound".into());
+            self.notify_user("No visualizer: select a clip with sound".into());
             cx.notify();
             return;
         };
         let placed = match &mut self.session {
             None => {
-                self.notify_user("NO VISUALIZER — no file open".into());
+                self.notify_user("No visualizer: no file open".into());
                 cx.notify();
                 return;
             }
             Some(session) => {
-                let Some(clip) = session.lane_clips(lane).get(idx).copied() else {
-                    self.notify_user("NO VISUALIZER — select a clip with sound".into());
+                let Some(clip) = session.lane_clips(lane).get(idx).cloned() else {
+                    self.notify_user("No visualizer: select a clip with sound".into());
                     cx.notify();
                     return;
                 };
                 let Some(src) = session.sources().get(clip.source).cloned() else {
-                    self.notify_user("NO VISUALIZER — that clip has no source".into());
+                    self.notify_user("No visualizer: that clip has no source".into());
                     cx.notify();
                     return;
                 };
@@ -173,11 +610,11 @@ impl Player {
         };
         match placed {
             Ok(true) => {
-                self.notify_user("VISUALIZER ADDED".into());
+                self.notify_user("Visualizer added".into());
                 self.reset_after_reseek();
             }
-            Err(e) => self.notify_user(format!("NO VISUALIZER — {e}").into()),
-            Ok(false) => self.notify_user("NO VISUALIZER — that clip could not be placed".into()),
+            Err(e) => self.notify_user(format!("No visualizer: {e}").into()),
+            Ok(false) => self.notify_user("No visualizer: that clip could not be placed".into()),
         }
         cx.notify();
     }
@@ -189,7 +626,7 @@ impl Player {
         let Some(session) = &mut self.session else {
             return;
         };
-        let Some(clip) = session.lane_clips(lane).get(idx).copied() else {
+        let Some(clip) = session.lane_clips(lane).get(idx).cloned() else {
             return;
         };
         if clip.visualizer & 1 == 0 {
@@ -213,7 +650,7 @@ impl Player {
         let Some(session) = &mut self.session else {
             return;
         };
-        let Some(clip) = session.lane_clips(lane).get(idx).copied() else {
+        let Some(clip) = session.lane_clips(lane).get(idx).cloned() else {
             return;
         };
         if clip.visualizer & 1 == 0 {
@@ -254,7 +691,7 @@ impl Player {
 
     /// Opens the colour type-in on `seed`, the picked slot's colour as the row
     /// already shows it, so a backspace edits that rather than a field opening
-    /// empty over a colour still in force ([`NumberEdit::new`]'s own rule). The
+    /// empty over a colour still in force (the number field's own rule). The
     /// transition row's field is given up: one inline editor at a time.
     pub(crate) fn edit_viz_hex(&mut self, seed: &str) {
         self.transition_edit = None;
@@ -371,7 +808,7 @@ impl Player {
         let Some(session) = &mut self.session else {
             return;
         };
-        let Some(clip) = session.lane_clips(lane).get(idx).copied() else {
+        let Some(clip) = session.lane_clips(lane).get(idx).cloned() else {
             return;
         };
         if clip.visualizer & 1 == 0 {
@@ -428,6 +865,7 @@ impl Player {
                 if self.selected_asset.as_ref() == Some(&(path.to_path_buf(), stream)) {
                     self.selected_asset = None;
                 }
+                self.asset_picks.retain(|r| *r != (path.to_path_buf(), stream));
                 // A copied clip names its source by *index*, and every index
                 // past the one that went has just moved down: without this the
                 // next paste puts some other file on the timeline.
@@ -451,19 +889,16 @@ impl Player {
                 {
                     true => {
                         self.close_session();
-                        format!("REMOVED {} — the library is empty", file_name(path))
+                        format!("Removed {}: the library is empty", file_name(path))
                     }
                     // The undo stack goes with it (`Project::remove_source`):
                     // said here, because a `z` that does nothing afterwards
                     // would otherwise read as a bug.
-                    false => format!(
-                        "REMOVED {} — there is nothing left to undo",
-                        file_name(path)
-                    ),
+                    false => format!("Removed {}: there is nothing left to undo", file_name(path)),
                 }
             }
-            Some(Err(e)) => format!("NOT REMOVED — {e}"),
-            None => "NO TIMELINE — no file open".to_string(),
+            Some(Err(e)) => format!("Not removed: {e}"),
+            None => "No timeline: no file open".to_string(),
         };
         self.notify_user(text.into());
         cx.notify();
@@ -487,7 +922,7 @@ impl Player {
             return;
         }
         let Some(session) = self.session.as_mut() else {
-            self.notify_user("NO TIMELINE — no file open".into());
+            self.notify_user("No timeline: no file open".into());
             return;
         };
         let Some(idx) = session
@@ -578,6 +1013,7 @@ impl Player {
         self.clipboard.clear();
         self.selected.clear();
         self.selected_asset = None;
+        self.asset_picks.clear();
         // The subtitle rows go with the timeline they were on, and so does the
         // lane that was shown: S1 of one project is not S1 of the next.
         self.sub_track = 0;
@@ -588,11 +1024,13 @@ impl Player {
         self.color_open = None;
         self.transform_open = None;
         self.speed_open = None;
+        self.effects_open = None;
         self.close_silence();
         self.waves.clear();
         self.thumbs.clear();
         self.streams.clear();
         self.bitrates.clear();
+        self.facts.clear();
         self.sizes.clear();
         self.syncs.clear();
         self.has_video.clear();
@@ -616,7 +1054,10 @@ impl Player {
         self.preview_scrubbing = false;
         self.eq_dragging = false;
         self.speed_dragging = false;
+        self.effects_drag = None;
+        self.effects_draft = None;
         self.color_dragging = false;
+        self.color_wheel_drag = None;
         self.viz_hs_dragging = false;
         self.pending_color = None;
         self.pending_viz = None;
@@ -667,10 +1108,12 @@ impl Player {
         }
         match PlaybackSession::open_with_audio_stream(path, stream) {
             Ok(mut session) => {
+                self.source_target = Some((path.to_path_buf(), stream));
+                self.source_video = true;
+                self.source_audio = true;
                 session.drop_late_pictures(true);
-                // The button says "plays it" -- a preview that opens paused
-                // reads as a frozen picture, not as a player awaiting a click.
-                session.play();
+                // Parked on its first frame, paused: opening a source is looking at it,
+                // and play is one press away.
                 self.preview_session = Some(session);
                 // The one place the window's level reaches a session
                 // ([`Player::apply_volume`]) -- and it goes at the timeline
@@ -681,13 +1124,13 @@ impl Player {
                 self.session_swapped();
                 self.notify_user(
                     format!(
-                        "PREVIEWING {} — not on the timeline; esc stops it",
-                        file_name(path)
+                        "Previewing {}. Drag it onto the timeline to use it.",
+                        stem(path)
                     )
                     .into(),
                 );
             }
-            Err(e) => self.notify_user(format!("PREVIEW FAILED: {e}").into()),
+            Err(e) => self.notify_user(format!("Preview failed: {e}").into()),
         }
         self.reset_after_reseek();
         cx.notify();
@@ -701,14 +1144,14 @@ impl Player {
         if self.preview_session.take().is_none() {
             return;
         }
-        self.notify_user("PREVIEW STOPPED — back to the timeline".into());
+        self.notify_user("Back to the timeline".into());
         match self.session.as_ref().map(PlaybackSession::now) {
             Some(now) => {
                 self.seek(now, cx);
-                if self.preview_playing {
-                    if let Some(session) = self.session.as_mut() {
-                        session.play();
-                    }
+                if self.preview_playing
+                    && let Some(session) = self.session.as_mut()
+                {
+                    session.play();
                 }
             }
             None => {
@@ -782,6 +1225,12 @@ impl Player {
         let Some(path) = self.imports.pop_front() else {
             return;
         };
+        // An OpenTimelineIO file is read here, whole, and is no media to probe: it becomes a sequence.
+        if crate::importing::is_timeline(&path) {
+            self.import_timeline_file(&path, cx);
+            self.start_import(cx);
+            return;
+        }
         let stage = Arc::new(std::sync::atomic::AtomicU8::new(ImportStage::Header as u8));
         let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
         // The fork is made here, once, and carried to the landing: an import is
@@ -872,19 +1321,19 @@ impl Player {
         for (path, stopped, outcome) in done {
             let text = match (&outcome, stopped) {
                 (Ok(_), _) => format!(
-                    "PROXY READY for {} — Proxies on cuts on it",
+                    "Editing copy ready for {}: Editing copies on cuts on it",
                     file_name(&path)
                 ),
                 // Not a failure and not worded as one: the worker gave up
                 // because it was asked to, and it took its half-written file
                 // with it.
                 (Err(_), true) => format!(
-                    "PROXY STOPPED for {} — nothing of it was kept, and the film itself is what \
+                    "Editing copy stopped for {}: nothing of it was kept, and the original is what \
                      plays",
                     file_name(&path)
                 ),
                 (Err(e), false) => format!(
-                    "PROXY FAILED for {} — {e} — the film itself is what plays",
+                    "Editing copy failed for {}: {e} — the original is what plays",
                     file_name(&path)
                 ),
             };
@@ -951,7 +1400,7 @@ impl Player {
                     Ok(None) => Proxy::Native,
                     Err(e) => {
                         let text = format!(
-                            "NO PROXY for {} — {e} — the film itself is what plays",
+                            "No editing copy for {}: {e} — the original is what plays",
                             file_name(&path)
                         );
                         eprintln!("{text}");
@@ -1013,7 +1462,7 @@ impl Player {
                 cancel.store(true, std::sync::atomic::Ordering::Release);
                 engine::proxy::set_off(path, true);
                 self.proxies.insert(path.to_path_buf(), Proxy::Cancelled);
-                let text = format!("STOPPING the stand-in for {}…", file_name(path));
+                let text = format!("Stopping the stand-in for {}…", file_name(path));
                 eprintln!("{text}");
                 self.notify_user(text.into());
                 cx.notify();
@@ -1022,7 +1471,7 @@ impl Player {
             // and the film has a stand-in now.
             Some(Proxy::Ready) if showed_stop => {
                 let text = format!(
-                    "PROXY READY for {} — it finished before the stop",
+                    "Editing copy ready for {}: it finished before the stop",
                     file_name(path)
                 );
                 eprintln!("{text}");
@@ -1036,11 +1485,11 @@ impl Player {
                         self.proxies.insert(path.to_path_buf(), Proxy::Cancelled);
                         match gone {
                             true => format!(
-                                "PROXY OFF for {} — the film itself is what plays",
+                                "Editing copy off for {}: the original is what plays",
                                 file_name(path)
                             ),
                             false => {
-                                format!("NO PROXY for {} — nothing to delete", file_name(path))
+                                format!("No editing copy for {}: nothing to delete", file_name(path))
                             }
                         }
                     }
@@ -1049,7 +1498,7 @@ impl Player {
                     // one thing it must never do is say off over a proxy that is
                     // playing.
                     Err(e) => format!(
-                        "PROXY KEPT for {} — {e} — it could not be deleted and is still what plays",
+                        "Editing copy kept for {}: {e} — it could not be deleted and is still what plays",
                         file_name(path)
                     ),
                 };
@@ -1095,7 +1544,7 @@ impl Player {
         // Remembered past this window, for [`Player::toggle_proxy`]'s reason:
         // the launch sweep would otherwise start again what was just stopped.
         engine::proxy::set_off(path, true);
-        let text = format!("STOPPING the stand-in for {}…", file_name(path));
+        let text = format!("Stopping the stand-in for {}…", file_name(path));
         eprintln!("{text}");
         self.notify_user(text.into());
         cx.notify();
@@ -1202,11 +1651,11 @@ impl Player {
             .filter(|p| matches!(p, Proxy::Making(_)))
             .count();
         let text = match (on, ready, making) {
-            (false, ..) => "PROXIES OFF — the films themselves are what play".to_string(),
-            (true, 0, 0) => "PROXIES ON — no film here has one".to_string(),
-            (true, 0, n) => format!("PROXIES ON — {n} still being made"),
-            (true, n, 0) => format!("PROXIES ON — cutting on {n}"),
-            (true, n, m) => format!("PROXIES ON — cutting on {n}, {m} still being made"),
+            (false, ..) => "Editing copies off: the originals are what play".to_string(),
+            (true, 0, 0) => "Editing copies on: no video here has one".to_string(),
+            (true, 0, n) => format!("Editing copies on: {n} still being made"),
+            (true, n, 0) => format!("Editing copies on: cutting on {n}"),
+            (true, n, m) => format!("Editing copies on: cutting on {n}, {m} still being made"),
         };
         eprintln!("{text}");
         // Kept for the next launch, not only the next project -- the same
@@ -1215,7 +1664,7 @@ impl Player {
             let path = proxies_pref_path();
             self.notify_user(
                 format!(
-                    "PROXIES DEFAULT COULD NOT BE KEPT — {} — {e}",
+                    "Editing copies default could not be kept: {} — {e}",
                     path.display()
                 )
                 .into(),
@@ -1255,8 +1704,8 @@ impl Player {
             }
         }
         let text = match on {
-            true => "AUTO PROXIES ON — every import gets a stand-in",
-            false => "AUTO PROXIES OFF — no import makes one",
+            true => "Editing copies on import: every import gets one",
+            false => "Editing copies on import off: no import makes one",
         };
         eprintln!("{text}");
         // Kept for the next launch, not only the next project -- a flip made
@@ -1266,7 +1715,7 @@ impl Player {
             let path = auto_proxies_pref_path();
             self.notify_user(
                 format!(
-                    "AUTO PROXIES DEFAULT COULD NOT BE KEPT — {} — {e}",
+                    "Import editing copies default could not be kept: {} — {e}",
                     path.display()
                 )
                 .into(),
@@ -1309,7 +1758,7 @@ impl Player {
             n => format!(" — {n} more dropped from the queue"),
         };
         let text = format!(
-            "IMPORT CANCELLED: {}{tail} — the read stops where the container lets it",
+            "Import cancelled: {}{tail} — the read stops where the container lets it",
             file_name(&import.path)
         );
         eprintln!("{text}");
@@ -1354,6 +1803,13 @@ impl Player {
                         let text = self.install_media(path, opened, place);
                         eprintln!("{text}");
                         self.notify_user(text.into());
+                        // The file argv named becomes the timeline, and a
+                        // timeline that arrives fits, as a first import does
+                        // (DESIGN §7). Opened without a place it is a library
+                        // row and the view stays where it is.
+                        if place && self.session.as_ref().is_some_and(|s| !s.is_empty()) {
+                            self.zoom_fit(cx);
+                        }
                         cx.notify();
                     }
                     Landed::Read(..) => unreachable!("matched above"),
@@ -1371,14 +1827,19 @@ impl Player {
                         meta.frame_count
                     );
                 }
+                // A new project's first footage is in: the file it was named for is written now.
+                if std::mem::take(&mut self.new_project_fresh) {
+                    self.save_project(cx);
+                }
                 return;
             }
         };
-        // An empty window has no library to add to yet: the file opens one, and
-        // the timeline under it stays empty, because an import is an import
-        // whether or not a session was already up. A file *named at launch* is
-        // the other fork -- that one is an open, and it does become the
-        // timeline (`main`).
+        // An empty window has no library to add to yet: the file opens one. An
+        // import is an import whether or not a session was already up, so it
+        // fills the library either way; the one thing that differs is that the
+        // first file into an empty timeline is also placed on it, and the zoom
+        // fits it (DESIGN §7). A file *named at launch* is the other fork --
+        // that one is an open, and it does become the timeline (`main`).
         // A subtitle file is not a source and lands on no lane: it joins the
         // timeline's own list of them, which is what the library's subtitle
         // section shows and what the overlay draws. With no timeline open there
@@ -1406,6 +1867,13 @@ impl Player {
             (Some(session), None) => Some(session.import(path)),
             (None, _) => None,
         };
+        // Whether this import is the first thing into an empty timeline, so it
+        // is also placed on it once the library line below has been said.
+        let first = match &self.session {
+            Some(session) => session.is_empty(),
+            None => true,
+        };
+        let joins: bool;
         let text = match registered {
             Some(Ok(_)) => {
                 // The file's own subtitle tracks with it, exactly as an open
@@ -1423,8 +1891,13 @@ impl Player {
                 // volume, so the player's own level and mute are pushed at it
                 // again here or a muted window would play.
                 self.apply_volume();
+                joins = first;
+                let landing = match first {
+                    true => " and the timeline",
+                    false => "",
+                };
                 format!(
-                    "IMPORTED {} to the library{tail}{}",
+                    "Imported {} to the library{landing}{tail}{}",
                     file_name(path),
                     audio_import_tail(path, self.has_video(path) && !no_video)
                 )
@@ -1432,12 +1905,44 @@ impl Player {
             // Named, because two files can fail in one launch and the queue now
             // shows both: "No such file or directory" twice over, with nothing
             // saying which file, is two messages that answer nothing.
-            Some(Err(e)) => format!("IMPORT FAILED: {} — {e}", file_name(path)),
-            None => self.open_media(path, false, subs),
+            // The engine's words stay on stderr; the window says what the user can do about it.
+            Some(Err(e)) => {
+                joins = false;
+                eprintln!("import of {} failed: {e}", path.display());
+                let name = file_name(path);
+                match path.exists() {
+                    false => format!("Couldn't import {name} \u{2014} the file isn't there."),
+                    true => format!("{name} isn't a video, audio or image file edith can read."),
+                }
+            }
+            None => {
+                let text = self.open_media(path, false, subs);
+                // A window with no session that opened one has an empty
+                // timeline under it, which is the case the first file fills.
+                joins = self.session.is_some();
+                text
+            }
         };
         eprintln!("{text}");
-        self.notify_user(text.into());
+        self.notify_loaded(text);
         cx.notify();
+        // Placed after the line above, so a refusal from the insert is the last
+        // word on the notice. The insert is one undo step (`place` snapshots
+        // the project); the import that stands behind it is not.
+        if joins {
+            self.insert_source(path, 0, None, None, cx);
+            if self
+                .session
+                .as_ref()
+                .is_some_and(|session| !session.is_empty())
+            {
+                self.zoom_fit(cx);
+            }
+        }
+        // A new project's first footage is in: the file it was named for is written now.
+        if std::mem::take(&mut self.new_project_fresh) {
+            self.save_project(cx);
+        }
     }
 
     /// Takes a file as the session an empty window is waiting for. Everything
@@ -1482,6 +1987,18 @@ impl Player {
                 if let Some(rate) = self.pending_settings.2.take() {
                     session.set_sample_rate(Some(rate));
                 }
+                // A project started from a template without clips takes that template's lanes,
+                // names and caption style now, and its export preset once the window is set up.
+                let template_export = match self.pending_template.take() {
+                    Some(name) => match engine::templates::dir().map(|dir| engine::templates::apply(&dir, &name, &mut session)) {
+                        Some(Ok(export)) => Some(export),
+                        _ => {
+                            self.notify_user(format!("The template {name} could not be read").into());
+                            None
+                        }
+                    },
+                    None => None,
+                };
                 self.fps = session.meta().frame_rate;
                 // This window *is* the real-time viewer: a picture already past
                 // the clock is one `pump` takes off the channel and throws away,
@@ -1494,7 +2011,9 @@ impl Player {
                 // A file replaces the one that was open, and track 3 of that one
                 // is not track 3 of this.
                 self.sub_track = 0;
+                crate::export_ui::gui_default_seat(&mut session);
                 self.session = Some(session);
+                self.saved_revision = None;
                 self.session_swapped();
                 // A fresh session comes up at full volume; the player's own
                 // setting outlives the file, so it is pushed at every new one.
@@ -1502,23 +2021,38 @@ impl Player {
                 // ...and so do the stand-in switches, which were answerable
                 // before this file existed and decide what its own import does.
                 self.apply_proxies();
-                // Beside the new file, but still the format the card is set to:
-                // opening another clip is not a change of mind about that.
-                self.export_path = retarget(&export_path(path), self.format);
-                self.project_path = project_path(path);
+                self.project_path = match self.new_project.take() {
+                    // A project started from File > New > Project…: the footage arriving is its
+                    // first, and the file the person named is written as soon as it is placed.
+                    Some(target) => {
+                        self.new_project_fresh = true;
+                        target
+                    }
+                    None => project_path(path),
+                };
                 // Derived, not opened: `project_path` here is a guess at where
                 // a save would land, not a file this window has any business
                 // writing an autosave beside until a manual save earns it.
                 self.autosave_armed = false;
-                self.name = file_name(path).into();
+                // An autosave left by an earlier, unsaved session of this media is
+                // unsaved work too: offered like a project's newer autosave.
+                self.recovery_sidecar = Self::recovery_offer(&self.project_path, false);
+                self.name = match self.new_project_fresh {
+                    true => file_name(&self.project_path).trim_end_matches(".edith").to_string().into(),
+                    false => "Untitled".into(),
+                };
+                self.reset_export_default();
+                if let Some(export) = template_export {
+                    self.apply_template_export(export.as_deref());
+                }
                 self.reset_after_reseek();
                 let name = file_name(path);
                 // The library is filled and the timeline is empty; the only
                 // thing that says so is this line, so it says what to do next.
                 let what = match place {
-                    true => format!("OPENED {name}"),
+                    true => format!("Opened {name}"),
                     false => {
-                        format!("IMPORTED {name} to the library")
+                        format!("Imported {name} to the library")
                     }
                 };
                 let audio = match place {
@@ -1527,8 +2061,80 @@ impl Player {
                 };
                 format!("{what}{}{subs}{audio}", silent.unwrap_or_default())
             }
-            Err(e) => format!("OPEN FAILED: {e}"),
+            Err(_) => self.open_refused(path),
         }
+    }
+
+    /// What a refused open says, in plain words, and the window's name put back:
+    /// a launch that named a file the window never got to open must not stay
+    /// titled with it.
+    fn open_refused(&mut self, path: &std::path::Path) -> String {
+        if self.session.is_none() {
+            self.name = NO_FILE.into();
+        }
+        let name = file_name(path);
+        match (path.exists(), path.extension().is_some_and(|e| e.eq_ignore_ascii_case("edith"))) {
+            (false, _) => format!("Couldn't open {name} \u{2014} the file isn't there."),
+            // A project that will not parse is a damaged one; any other file is media edith cannot read.
+            (true, true) => format!("{name} is damaged or incomplete and can't be opened."),
+            (true, false) => format!("{name} isn't video, audio or an image edith can read."),
+        }
+    }
+
+    /// File > Export timeline as: writes the active sequence in `ext` ("otio", "fcpxml" or
+    /// "edl") to the default export folder, named like an export of this project. No chooser;
+    /// the toast says where it went.
+    pub(crate) fn export_timeline(&mut self, ext: &'static str, cx: &mut Context<Self>) {
+        let Some(session) = self.session.as_ref() else {
+            self.notify_user("No timeline to export: no project is open".into());
+            cx.notify();
+            return;
+        };
+        let timeline = session.timeline_snapshot();
+        let text = match ext {
+            "otio" => engine::interchange::otio::write(&timeline),
+            "fcpxml" => engine::interchange::fcpxml::write(&timeline),
+            _ => engine::interchange::edl::write(&timeline),
+        };
+        let sources: Vec<&Path> = session.sources().iter().map(|s| s.path.as_path()).collect();
+        let first_clip = sources.first().map(|path| crate::files::stem(path));
+        let path = default_path_with_ext(
+            &self.project_path,
+            self.autosave_armed || self.new_project_fresh,
+            first_clip.as_deref(),
+            &sources,
+            ext,
+        );
+        let text = match std::fs::write(&path, text) {
+            Ok(()) => format!("Timeline exported to {}", path.display()),
+            Err(e) => format!("Couldn't export the timeline to {}: {e}", path.display()),
+        };
+        self.notify_user(text.into());
+        cx.notify();
+    }
+
+    /// Reads an OpenTimelineIO file and makes it a new sequence of the open project, which
+    /// becomes the active one. Each file it names is taken in as a library file is. One undo step.
+    pub(crate) fn import_timeline_file(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
+        let text = match self.session.as_ref() {
+            None => "No timeline imported: no project is open".to_string(),
+            Some(session) => {
+                let fps = session.timeline_frame_rate();
+                let read = std::fs::read_to_string(path)
+                    .map_err(|e| e.to_string())
+                    .and_then(|t| engine::interchange::otio::read(&t, fps).map_err(|e| e.to_string()));
+                match (read, self.session.as_mut()) {
+                    (Ok(timeline), Some(session)) => match session.import_timeline(&timeline) {
+                        Ok(_) => format!("Imported {} as a new sequence", timeline.name),
+                        Err(e) => format!("Couldn't import {}: {e}", file_name(path)),
+                    },
+                    (Err(e), _) => format!("Couldn't import {}: {e}", file_name(path)),
+                    (Ok(_), None) => "No timeline imported: no project is open".to_string(),
+                }
+            }
+        };
+        self.notify_user(text.into());
+        cx.notify();
     }
 
     /// The Import button: asks the desktop for a path and takes it the same way
@@ -1541,7 +2147,7 @@ impl Player {
         }
         let picked = cx
             .background_executor()
-            .spawn(async { pick_file("edith — import") });
+            .spawn(async { pick_file("Import media") });
         cx.spawn(async move |this, cx| {
             let picked = picked.await;
             this.update(cx, |this, cx| match picked {
@@ -1551,11 +2157,8 @@ impl Player {
                 Ok(Some(path)) => this.import(&path, cx),
                 // Cancelled: the user already knows what happened.
                 Ok(None) => {}
-                Err(text) => {
-                    eprintln!("{text}");
-                    this.notify_user(text.into());
-                    cx.notify();
-                }
+                // No chooser here: the same question, typed.
+                Err(_) => this.open_path_entry(PathFor::Import, cx),
             })
             .ok();
         })
@@ -1573,14 +2176,14 @@ impl Player {
             return;
         }
         let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
-            self.notify_user("PASTE PATH — nothing on the clipboard".into());
+            self.notify_user("Copy a file's path first".into());
             cx.notify();
             return;
         };
         let text = text.trim().trim_matches(['"', '\'']);
         let path = std::path::PathBuf::from(text);
         if !path.is_file() {
-            self.notify_user(format!("PASTE PATH — not a file: {text}").into());
+            self.notify_user(format!("No file at {text}").into());
             cx.notify();
             return;
         }
@@ -1601,7 +2204,7 @@ impl Player {
         // that opens a dialog, waits for a file and only then says the timeline
         // was never there is the second door disagreeing with the first.
         if let Some(why) = self.enable(ActionId::ImportSubtitles, None).why() {
-            let text = format!("NO SUBTITLES ADDED — {why}");
+            let text = format!("No subtitles added: {why}");
             eprintln!("{text}");
             self.notify_user(text.into());
             cx.notify();
@@ -1616,11 +2219,7 @@ impl Player {
                 Ok(Some(path)) => this.add_subtitles(&path, cx),
                 // Cancelled: the user already knows what happened.
                 Ok(None) => {}
-                Err(text) => {
-                    eprintln!("{text}");
-                    this.notify_user(text.into());
-                    cx.notify();
-                }
+                Err(_) => this.open_path_entry(PathFor::Subtitles, cx),
             })
             .ok();
         })
@@ -1642,7 +2241,7 @@ impl Player {
             self.landed_subtitles(path, None, cx);
             return;
         }
-        self.notify_user(format!("READING {} for subtitles…", file_name(path)).into());
+        self.notify_user(format!("Reading {} for subtitles…", file_name(path)).into());
         let parsed = cx.background_executor().spawn({
             let path = path.to_path_buf();
             async move { engine::PlaybackSession::parse_subtitles(&path) }
@@ -1700,14 +2299,15 @@ impl Player {
             // palette and nothing is placed until one is dragged onto an S
             // track, which is the whole of what this door does.
             Some(Ok(n)) => format!(
-                "SUBTITLES {} — {n} track(s) in the palette — drag one onto an S track ({} adds \
+                "Subtitles {}: {} in the palette — drag one onto an S track ({} adds \
                  one), showing over the picture meanwhile, {} hides them",
                 file_name(path),
+                count_noun(n, "track", "tracks"),
                 self.keymap.display(ActionId::AddSubtitleLane),
                 self.keymap.display(ActionId::ToggleSubtitles)
             ),
-            Some(Err(e)) => format!("SUBTITLE IMPORT FAILED: {e}"),
-            None => "NO SUBTITLES ADDED — no file open".to_string(),
+            Some(Err(e)) => format!("Subtitle import failed: {e}"),
+            None => "No subtitles added: no file open".to_string(),
         };
         eprintln!("{text}");
         self.notify_user(text.into());
@@ -1738,7 +2338,7 @@ impl Player {
         // the very fact the toggle is refused by -- so the same arm answers
         // both (oracle.rs) rather than a second reading of the same state.
         if let Some(why) = self.enable(ActionId::ToggleSubtitles, None).why() {
-            let text = format!("NO SUBTITLES REMOVED — {why}");
+            let text = format!("No subtitles removed: {why}");
             eprintln!("{text}");
             self.notify_user(text.into());
             cx.notify();
@@ -1772,13 +2372,13 @@ impl Player {
                 // note, for its reason and with its upgrade path.
                 self.sub_image = None;
                 format!(
-                    "{name} REMOVED — {} puts a file's subtitles back in the palette, the file \
+                    "{name} removed: {} puts a file's subtitles back in the palette, the file \
                      itself stays off",
                     self.keymap.display(ActionId::ImportSubtitles)
                 )
             }
-            Some(Err(e)) => format!("NO SUBTITLES REMOVED — {e}"),
-            None => "NO SUBTITLES REMOVED — no file open".to_string(),
+            Some(Err(e)) => format!("No subtitles removed: {e}"),
+            None => "No subtitles removed: no file open".to_string(),
         };
         eprintln!("{text}");
         self.notify_user(text.into());
@@ -1807,13 +2407,15 @@ impl Player {
                 // [`engine::PlaybackSession::open_project`] -- a pick made
                 // before this project loaded is not this project's.
                 self.pending_settings = (None, None, None);
+                self.pending_template = None;
+                // Another project was opened: a new one still waiting for footage is given up.
+                self.new_project = None;
+                self.new_project_fresh = false;
                 self.fps = session.meta().frame_rate;
                 // As at the file door above: the window watches in real time.
                 session.drop_late_pictures(true);
                 let silent = audio_notice(&session);
-                // A project is named after itself but still exports beside its
-                // media: that is the only place an export has ever landed.
-                self.export_path = retarget(&export_path(&session.sources()[0].path), self.format);
+                crate::export_ui::gui_default_seat(&mut session);
                 self.session = Some(session);
                 self.session_swapped();
                 self.apply_volume();
@@ -1826,10 +2428,15 @@ impl Player {
                     self.auto_proxies_on = session.auto_proxies();
                 }
                 self.project_path = path.to_path_buf();
+                crate::recent::push(path);
                 // Opened from the `.edith` itself: the file this window will
                 // autosave beside is the one the user actually chose.
                 self.autosave_armed = true;
+                self.disk_known = crate::follow::stamp(path);
+                self.edited_since_save = false;
+                self.saved_revision = self.revision_now();
                 self.name = file_name(path).into();
+                self.reset_export_default();
                 // A copied clip names its source by index, which means a
                 // different file -- or none -- in another project.
                 self.clipboard.clear();
@@ -1848,6 +2455,7 @@ impl Player {
                 // the file that index names any more -- and neither is the
                 // subtitle track that was showing.
                 self.selected_asset = None;
+                self.asset_picks.clear();
                 self.sub_track = 0;
                 // The counters describe one timeline; the eof line must not
                 // report the old one's frames against the new one.
@@ -1858,33 +2466,77 @@ impl Player {
                 // reaches the screen the way a seek's does. The old picture is
                 // released by the swap in `pump`, as after any other seek.
                 self.reset_after_reseek();
-                // Offered right after the load it is about, on top of the
-                // "LOADED" line rather than instead of it: a person deciding
-                // whether to recover still gets to see what they *did* open.
-                self.recovery_sidecar = Self::recovery_offer(path);
-                let recovery = self.recovery_sidecar.as_ref().map(|_| {
-                    " — a newer autosave was found: enter recovers it, any other key keeps this"
-                });
-                format!(
-                    "LOADED {}{}{}",
-                    file_name(path),
-                    silent.unwrap_or_default(),
-                    recovery.unwrap_or_default()
-                )
+                // A saved view is the project's own place: it is set after the
+                // reseek (which resets the hand's flag) and wins over the
+                // first-import fit, so a project with none keeps today's view.
+                if let Some(state) = crate::view_state::load(path) {
+                    let restored = crate::view_state::restored(&state);
+                    self.scale = restored.scale;
+                    self.lane_h = restored.lane_h;
+                    self.panned = restored.panned;
+                    self.fitted_bed = restored.fitted_bed;
+                    self.fit_pending = restored.fit_pending;
+                    self.viewer = state.viewer;
+                    self.viewer_pan = (0., 0.);
+                    self.collapsed_bins = state.closed_bins.iter().copied().collect();
+                    self.sections_mem = state.sections.clone();
+                    self.sections_anchor = None;
+                    self.waveforms = state.waveforms;
+                    self.scrub_audio = state.scrub_audio;
+                } else {
+                    self.viewer = crate::viewer_view::Prefs::default();
+                    self.viewer_pan = (0., 0.);
+                    self.collapsed_bins.clear();
+                    self.sections_mem.clear();
+                    self.sections_anchor = None;
+                    self.waveforms = true;
+                    self.scrub_audio = true;
+                }
+                // Offered right after the load it is about: `notify_loaded` puts the
+                // question on its own sticky toast, under the "Loaded" line.
+                self.recovery_sidecar = Self::recovery_offer(path, true);
+                format!("Loaded {}{}", file_name(path), silent.unwrap_or_default())
             }
-            Err(e) => format!("OPEN FAILED: {e}"),
+            Err(_) => self.open_refused(path),
         };
         eprintln!("{text}");
-        self.notify_user(text.into());
+        self.notify_loaded(text);
         cx.notify();
     }
 
-    /// Whether a close has to be answered instead of obeyed: the timeline
-    /// holds at least one clip and the project file does not hold the latest
-    /// edit -- the same `autosave_dirty` the ledger's `unsaved` ghost reads,
-    /// so what the strip says and what the close asks can never disagree.
-    /// An empty timeline, or a saved one, closes the way it always did.
+    /// Says what a load did. A recovery on offer is its own sticky toast with
+    /// Recover and Discard: it stays on the bar until one of them is pressed, so
+    /// the question cannot time out under the person's nose.
+    fn notify_loaded(&mut self, text: String) {
+        self.notify_user(text.into());
+        if let Some(sidecar) = self.recovery_sidecar.clone() {
+            push_sticky_toast(
+                &mut self.notices,
+                recovery_words(&sidecar).into(),
+                Tone::Info,
+                vec![ToastAction::Recover, ToastAction::Discard],
+            );
+        }
+    }
+
+    /// Takes the recovery question off the bar: the one the recovery answers
+    /// have just been given to, or that a save made moot.
+    fn drop_recovery_toasts(&mut self) {
+        self.notices
+            .retain(|toast| !toast.actions.contains(&ToastAction::Recover));
+    }
+
+    /// Whether a close has to be answered instead of obeyed: unsaved edits on
+    /// the timeline, or an export that has not finished.
     pub(crate) fn close_needs_answer(&self) -> bool {
+        self.close_dirty() || self.queue.unfinished() > 0
+    }
+
+    /// Unsaved work on the timeline: the save half of the close question. It
+    /// reads `edited_since_save` (a real save clears it), never the autosave's
+    /// flag: an autosave is crash recovery, not saving, so an edit the autosave
+    /// has already written still asks on close.
+    pub(crate) fn close_dirty(&self) -> bool {
         let clips = self.session.as_ref().map_or(0, |session| {
             session
                 .lanes()
@@ -1892,14 +2544,15 @@ impl Player {
                 .map(|lane| session.lane_clips(lane).len())
                 .sum()
         });
-        Self::close_asks(clips, self.autosave_dirty)
+        Self::close_asks(clips, self.edited_since_save)
     }
 
-    /// The close question as a value: clips on the timeline and an edit the
-    /// file does not have. Split out of [`Player::close_needs_answer`] so the
-    /// rule can be read and tested without a window or a session.
-    pub(crate) fn close_asks(clips: usize, dirty: bool) -> bool {
-        clips > 0 && dirty
+    /// The close question as a value: clips on the timeline and an edit since
+    /// the last real save. Split out of [`Player::close_dirty`] so the rule can
+    /// be read and tested without a window or a session. An empty timeline
+    /// closes the way it always did.
+    pub(crate) fn close_asks(clips: usize, edited: bool) -> bool {
+        clips > 0 && edited
     }
 
     /// Whether a save has to be answered instead of obeyed: `project_path`
@@ -1926,35 +2579,109 @@ impl Player {
     /// The overwrite question, when one is owed at all, was asked by Save's
     /// door ([`Player::save_guarded`]) or already answered at the quit
     /// plate; the notice here is the confirmation, not the permission.
-    pub(crate) fn save_project(&mut self, cx: &mut Context<Self>) {
+    /// Returns whether the file was written, so a close that is answered with
+    /// Save only goes once the work is actually on disk.
+    pub(crate) fn save_project(&mut self, cx: &mut Context<Self>) -> bool {
         let saved = self
             .session
             .as_ref()
-            .map(|session| session.save_project(&self.project_path));
+            .map(|session| session.save_project_noted(&self.project_path));
+        let written = matches!(saved, Some(Ok(_)));
+        let mut shortened = Vec::new();
         let text = match saved {
-            Some(Ok(())) => {
+            Some(Ok(notes)) => {
+                shortened = notes;
                 // The manual save is now the newest copy of the timeline, so
                 // the sidecar's job is done -- left behind it would outlive
                 // its use and, if it later grew younger than a *later* manual
                 // save through some clock oddity, could be offered as
                 // "recovery" over a file that already holds everything it did.
-                if let Some(sidecar) = Self::autosave_path(&self.project_path) {
-                    let _ = std::fs::remove_file(sidecar);
+                for armed in [true, false] {
+                    if let Some(autosave) = Self::autosave_target(&self.project_path, armed) {
+                        let _ = std::fs::remove_file(autosave);
+                    }
                 }
                 self.autosave_dirty = false;
-                self.autosave_last_edit = None;
+                self.autosave_edits = 0;
+                // The file now holds everything the offered autosave did: the
+                // question is answered by the save itself.
+                self.recovery_sidecar = None;
+                self.drop_recovery_toasts();
+                self.save_view_state();
                 // A manual save is exactly the event this flag exists to
                 // require: whatever `project_path` was derived from, it now
                 // names a file the user just chose to write.
+                // The export's default follows the project to where it was just saved, unless
+                // the person had already chosen one.
+                let was_default = self.export_path == self.default_export_target();
                 self.autosave_armed = true;
-                format!("SAVED {}", file_name(&self.project_path))
+                if was_default || self.export_path.as_os_str().is_empty() {
+                    self.reset_export_default();
+                }
+                // Our own write: the stamp it left is what the file is now, so
+                // the follow tick reads it as unchanged and not as the agent's.
+                self.disk_known = crate::follow::stamp(&self.project_path);
+                self.edited_since_save = false;
+                self.saved_revision = self.revision_now();
+                crate::recent::push(&self.project_path);
+                format!("Saved {}", file_name(&self.project_path))
             }
-            Some(Err(e)) => format!("SAVE FAILED: {e}"),
-            None => "NOTHING TO SAVE — no file open".to_string(),
+            Some(Err(e)) => format!("Save failed: {e}"),
+            None => "Nothing to save: no file open".to_string(),
         };
         eprintln!("{text}");
         self.notify_user(text.into());
+        for note in shortened_notes(&shortened) {
+            eprintln!("{note}");
+            self.notify_user(note.into());
+        }
         cx.notify();
+        written
+    }
+
+    /// Drops the unsaved edits for good, as the close question's Don't save
+    /// does: the autosave goes on disk and in memory, so the next open does not
+    /// offer the edits back as recovery. Nothing else is touched -- the project
+    /// file keeps what it had.
+    pub(crate) fn discard_unsaved_edits(&mut self) {
+        for armed in [true, false] {
+            if let Some(autosave) = Self::autosave_target(&self.project_path, armed) {
+                Self::discard_sidecar(&autosave);
+            }
+        }
+        if let Some(sidecar) = self.recovery_sidecar.take() {
+            Self::discard_sidecar(&sidecar);
+        }
+        self.drop_recovery_toasts();
+        self.autosave_dirty = false;
+        self.autosave_edits = 0;
+        self.edited_since_save = false;
+        self.saved_revision = self.revision_now();
+    }
+
+    /// Keeps the view the project is left in, beside the project's hash
+    /// ([`crate::view_state`]). Best effort: a view that fails to write costs
+    /// the next open its place and nothing else. A project with no file yet
+    /// (its first import has not been saved) has nothing to key on.
+    pub(crate) fn save_view_state(&self) {
+        if self.session.is_none() || !self.project_path.is_file() {
+            return;
+        }
+        let state = crate::view_state::ViewState {
+            pps: self.scale.pps,
+            start: self.scale.start,
+            lane_h: self.lane_h.clone(),
+            viewer: self.viewer,
+            closed_bins: {
+                let mut ids: Vec<u32> = self.collapsed_bins.iter().copied().collect();
+                ids.sort_unstable();
+                ids
+            },
+            sections: self.sections_mem.clone(),
+            waveforms: self.waveforms,
+            scrub_audio: self.scrub_audio,
+        };
+        let _ = crate::view_state::save(&self.project_path, &state);
     }
 
     /// Save's door: asks before the first overwrite of a file this window
@@ -1979,45 +2706,181 @@ impl Player {
     /// refusal too -- an autosave a beat early costs nothing a real edit
     /// would not have earned anyway.
     pub(crate) fn mark_dirty(&mut self) {
+        // An edit can change the picture as shot at the frame on screen, so the compare view reads it again.
+        self.before_at = None;
         self.autosave_dirty = true;
-        self.autosave_last_edit = Some(Instant::now());
+        self.edited_since_save = true;
+        self.autosave_edits = self.autosave_edits.saturating_add(1);
+        // An edit made while the recovery is on offer: the offer now says what
+        // recovering costs, since the edits it would replace are real. `act`
+        // calls this before an edit lands, so the revision is not read here.
+        if self.recovery_sidecar.is_some() {
+            self.word_recovery_replaces();
+        }
     }
 
-    /// Where the autosave for `project_path` lives: beside it, named after it.
-    /// A project with no path yet (nothing saved, nothing opened) has nowhere
-    /// beside it to write to, so autosave sits out until the first manual
-    /// save gives it one -- the same file the recovery check on open reads.
-    fn autosave_path(project_path: &Path) -> Option<PathBuf> {
-        (!project_path.as_os_str().is_empty()).then(|| {
-            let mut name = project_path.as_os_str().to_owned();
-            name.push(".autosave");
-            PathBuf::from(name)
-        })
+    /// An edit that changes what the window is (a sequence made, copied, opened or nested, a
+    /// marker dropped): the autosave is written soon after it, not at the next 20 edits, so a
+    /// crash right after it loses nothing. Throttled by [`AUTOSAVE_THROTTLE`].
+    pub(crate) fn mark_structural(&mut self) {
+        self.mark_dirty();
+        self.autosave_urgent = true;
     }
 
-    /// Answers the recovery notice with `enter`: opens the sidecar
-    /// [`recovery_sidecar`](Self::recovery_sidecar) named and installs it the
-    /// same way any other `.edith` lands, but naming the *real* project's
-    /// path -- so the sidecar's contents replace the timeline in memory while
-    /// `project_path` keeps pointing at the user's own file, exactly as it did
-    /// before this call. Nothing here ever writes that file: the next thing to
-    /// touch it is still only a manual save.
+    /// The engine revision of the timeline as it stands, `None` with no session.
+    pub(crate) fn revision_now(&self) -> Option<u64> {
+        self.session.as_ref().map(PlaybackSession::revision)
+    }
+
+    /// The mark an undo or a redo leaves, after [`Player::mark_dirty`]: the
+    /// window is edited unless the timeline it landed on is the saved one. Undo
+    /// and redo are the only steps that can walk back to the saved timeline, so
+    /// this is the one place the flag is cleared by an edit's door.
+    pub(crate) fn settle_saved_point(&mut self) {
+        self.edited_since_save = self.revision_now() != self.saved_revision;
+    }
+
+    /// Puts the recovery's cost on its own toast, in place of the age-only line,
+    /// once the timeline has moved off the saved one.
+    fn word_recovery_replaces(&mut self) {
+        if self.recovery_sidecar.is_none() {
+            return;
+        }
+        let text: SharedString = recovery_replaces_words().into();
+        if let Some(toast) = self
+            .notices
+            .iter_mut()
+            .find(|toast| toast.actions.contains(&ToastAction::Recover))
+        {
+            toast.text = text;
+        }
+    }
+
+    /// Where the autosave for `project_path` goes. Beside a project this window
+    /// opened or saved (`armed`), as `<stem>.autosave.edith`, the name
+    /// `edith_mcp` reads too. An untitled session (`armed` false) has a
+    /// `project_path` that is only a guess at where a save would land, and
+    /// that file may be somebody's real project, so its autosave goes to the
+    /// state directory instead, one file per guessed path. `None` when there is
+    /// no path at all.
+    pub(crate) fn autosave_target(project_path: &Path, armed: bool) -> Option<PathBuf> {
+        if project_path.as_os_str().is_empty() {
+            return None;
+        }
+        let stem = project_path
+            .file_stem()
+            .map_or_else(|| "untitled".to_string(), |s| s.to_string_lossy().into_owned());
+        if armed {
+            return Some(project_path.with_file_name(format!("{stem}.autosave.edith")));
+        }
+        // FNV-1a over the path's bytes: a name that stays the same across builds,
+        // which `DefaultHasher` does not promise.
+        let hash = project_path
+            .as_os_str()
+            .as_encoded_bytes()
+            .iter()
+            .fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x100_0000_01b3));
+        Some(Self::autosave_state_dir()?.join(format!("{stem}-{hash:016x}.autosave.edith")))
+    }
+
+    /// `$XDG_STATE_HOME/edith`, or `~/.local/state/edith` when that is unset or
+    /// not an absolute path, as the XDG base directory spec says.
+    pub(crate) fn autosave_state_dir() -> Option<PathBuf> {
+        let state = std::env::var_os("XDG_STATE_HOME")
+            .filter(|v| !v.is_empty() && Path::new(v).is_absolute())
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local").join("state"))
+            })?;
+        Some(state.join("edith"))
+    }
+
+    /// The Recover answer to the recovery notice: the autosave's unsaved edits
+    /// go on top of the saved project ([`recovered_session`]), and the window's
+    /// own timeline as it stands is kept one undo step back, so the recovery
+    /// replaces the edits made since the file was opened without losing them:
+    /// undo brings them back ([`PlaybackSession::adopt_as_step`]). Nothing here
+    /// writes the project file: the next thing to touch it is still only a
+    /// manual save.
     pub(crate) fn recover_from_sidecar(&mut self, cx: &mut Context<Self>) {
-        let Some(sidecar) = self.recovery_sidecar.take() else {
+        let Some(sidecar) = self.recovery_sidecar.clone() else {
             return;
         };
         let project_path = self.project_path.clone();
-        let opened = PlaybackSession::open_project(&sidecar).map_err(|e| e.to_string());
+        // An armed window's saved file is the base the autosave goes on top of;
+        // an untitled one has no saved file to be the base.
+        let armed = self.autosave_armed;
+        let opened = match recovered_session(armed.then_some(project_path.as_path()), &sidecar) {
+            Ok(recovered) => match self.session.take() {
+                // The window's own timeline becomes the step back: its history
+                // stays, and its current state is one undo step away.
+                Some(mut current) => {
+                    let mark = current.step_mark();
+                    if current.adopt_as_step(&recovered) {
+                        current.name_step(mark, RECOVER_STEP);
+                        Ok(current)
+                    } else {
+                        self.session = Some(current);
+                        Err("the recovered edits do not fit on the edits made here as one step".to_string())
+                    }
+                }
+                None => Ok(recovered),
+            },
+            Err(e) => Err(e),
+        };
+        if let Err(e) = opened {
+            // Nothing was taken or dropped: the window is as it was, and the
+            // autosave stays on disk for another try or for Discard. Said in a
+            // dialog, since the reason can be a sentence long.
+            let kept = if self.edited_since_save {
+                "Your edits in this window are still here"
+            } else {
+                "Your saved version is open"
+            };
+            self.recovery_failure = Some(format!("Reason: {e}. {kept}. Nothing was deleted."));
+            cx.notify();
+            return;
+        }
+        // The saved timeline is the file's, not the one recovery stands on:
+        // install_project would take the new session's as saved, so keep ours.
+        let saved_revision = self.saved_revision;
+        // The export's own default is the project's, so a path the person picked
+        // after opening is theirs to keep through the recovery.
+        let export_path = self.export_path.clone();
         self.install_project(&project_path, opened, cx);
-        // `install_project` just re-ran the same mtime check on its way in and
-        // found the same sidecar still younger (recovering writes nothing to
-        // either file) -- offering the recovery it was just asked for right
-        // back would be the one loop in this feature.
+        self.export_path = export_path;
+        self.saved_revision = saved_revision;
+        // `install_project` arms the window, as any opened `.edith` does. An
+        // untitled session stays unarmed: its `project_path` is still a guess.
+        self.autosave_armed = armed;
+        // install_project re-ran the offer on its way in and found the same
+        // autosave still younger; offering it back here would be the one loop.
         self.recovery_sidecar = None;
+        self.drop_recovery_toasts();
+        // The recovered edits are not in the file yet, so the next autosave
+        // must write them out.
+        self.mark_dirty();
+        self.notify_user(
+            format!(
+                "Recovered unsaved edits · undo {}",
+                self.keymap.display(ActionId::Undo)
+            )
+            .into(),
+        );
+        cx.notify();
     }
 
-    /// Answers the recovery notice with anything but `enter`: the sidecar is
-    /// discarded, on disk as well as in memory. Left behind, an unread
+    /// The Discard answer to the recovery notice: the autosave goes, on disk as
+    /// well as in memory, so the offer does not come back on the next open.
+    pub(crate) fn discard_recovery(&mut self) {
+        if let Some(sidecar) = self.recovery_sidecar.take() {
+            Self::discard_sidecar(&sidecar);
+        }
+        self.drop_recovery_toasts();
+    }
+
+    /// Deletes an autosave the person declined to recover: on disk as well as in
+    /// memory. Left behind, an unread
     /// autosave from a scratch session would keep outdating the real project
     /// it sits beside and reappear as "recovery" on every open of that file
     /// (reference-editor behaviour: a declined backup is discarded, not kept
@@ -2027,17 +2890,17 @@ impl Player {
         let _ = std::fs::remove_file(sidecar);
     }
 
-    /// Whether `project_path` has a sidecar beside it that outdates the file
-    /// itself: the sidecar exists, the project exists, and the sidecar's mtime
-    /// is strictly the younger of the two. Pure and file-system-only -- no
-    /// session, no `Player` -- so [`install_project`](Self::install_project)
-    /// asks it before anything is loaded and a test can ask it with nothing
-    /// but two paths on disk. A missing project file (a `.edith` opened for
-    /// the first time from somewhere else) or a missing/older sidecar both
-    /// answer `None`: there is nothing here a person did not just open on
-    /// their own.
-    fn recovery_offer(project_path: &Path) -> Option<PathBuf> {
-        let sidecar = Self::autosave_path(project_path)?;
+    /// Whether opening `project_path` should offer a recovery, and the autosave
+    /// it would recover. An armed project (a `.edith` this window opened or
+    /// saved) is offered only when its autosave is strictly the younger of the
+    /// two. An untitled session has no saved file to be newer than, so any
+    /// autosave left for it is unsaved work. Reads only the filesystem: no
+    /// session, no `Player`, so a test can ask it with nothing but paths.
+    pub(crate) fn recovery_offer(project_path: &Path, armed: bool) -> Option<PathBuf> {
+        let sidecar = Self::autosave_target(project_path, armed)?;
+        if !armed {
+            return sidecar.is_file().then_some(sidecar);
+        }
         let project_mtime = std::fs::metadata(project_path)
             .and_then(|m| m.modified())
             .ok()?;
@@ -2047,8 +2910,8 @@ impl Player {
         (sidecar_mtime > project_mtime).then_some(sidecar)
     }
 
-    /// Starts the one background loop that ticks the autosave: every five
-    /// seconds, forever, for as long as the window is up. Cheap to run idle --
+    /// Starts the one background loop that ticks the autosave: every second,
+    /// forever, for as long as the window is up. Cheap to run idle --
     /// a tick with nothing dirty does nothing but reschedule itself -- so one
     /// loop for the window's whole life is simpler than arming and disarming
     /// a timer around every edit.
@@ -2056,7 +2919,7 @@ impl Player {
         cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor()
-                    .timer(std::time::Duration::from_secs(5))
+                    .timer(std::time::Duration::from_secs(1))
                     .await;
                 if this.update(cx, |this, cx| this.autosave_tick(cx)).is_err() {
                     return;
@@ -2066,50 +2929,160 @@ impl Player {
         .detach();
     }
 
-    /// Whether a tick is allowed to write at all: armed (`project_path` names
-    /// a file this window opened or saved -- see `autosave_armed`), dirty,
-    /// and not mid-export. Pure and split out from [`autosave_tick`](Self::autosave_tick)
-    /// for the same reason [`recovery_offer`](Self::recovery_offer) is: a test
-    /// can ask it with three bools, with no `Player` to build.
-    fn autosave_gate(armed: bool, dirty: bool, exporting: bool) -> bool {
-        armed && dirty && !exporting
+    /// Starts the loop that watches the open project file for a write from
+    /// outside (the agent's, through `edith_mcp`): every half second, for as
+    /// long as the window is up. A stat each tick, nothing more.
+    pub(crate) fn start_follow(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(500))
+                    .await;
+                if this.update(cx, |this, cx| this.follow_tick(cx)).is_err() {
+                    return;
+                }
+            }
+        })
+        .detach();
     }
 
-    /// One tick of the loop above. Writes the sidecar when an edit has been
-    /// idle for [`AUTOSAVE_DEBOUNCE`] (the debounce) or dirty edits have gone
-    /// unwritten for [`AUTOSAVE_PERIOD`] (the periodic safety net for a run
-    /// that never goes idle), and never while an export is running -- the two
-    /// would fight the same disk and the same worker for nothing an export
-    /// needs. Failure is a stderr line, never a notice: a sidecar losing a
-    /// write is not something a person can do anything about right now, and a
-    /// modal over it would be worse than the risk it is guarding against.
+    /// One look at the project file. Only a project this window opened or
+    /// saved is followed: a derived path names a file the window never
+    /// claimed. Acting on what [`follow_decision`] says is all this does.
+    fn follow_tick(&mut self, cx: &mut Context<Self>) {
+        if !self.autosave_armed || self.exporting().is_some() {
+            return;
+        }
+        let now = crate::follow::stamp(&self.project_path);
+        match follow_decision(self.disk_known, now, self.edited_since_save) {
+            Follow::Wait | Follow::Idle => {}
+            Follow::Adopt => self.disk_known = now,
+            Follow::Reload => self.reload_from_disk(cx),
+            Follow::Ask => {
+                // Recorded as answered before the question is asked, so the
+                // same change does not ask again on the next tick.
+                self.disk_known = now;
+                self.notify_user_actions(
+                    "Project changed on disk".into(),
+                    vec![ToastAction::Reload, ToastAction::KeepMine],
+                );
+                cx.notify();
+            }
+        }
+    }
+
+    /// Reloads the open project from its file, in place. The timeline becomes
+    /// the file's; the playhead stays where it was (clamped to the file's own
+    /// length); the view (zoom, scroll, lane heights) stays as it was. Play
+    /// stays paused, as a load always leaves it. Undo history and the selection
+    /// belong to the old timeline and go with it.
+    pub(crate) fn reload_from_disk(&mut self, cx: &mut Context<Self>) {
+        if self.exporting().is_some() || !self.autosave_armed || self.session.is_none() {
+            return;
+        }
+        let path = self.project_path.clone();
+        let at = self.playhead(self.drawn_duration());
+        let scale = self.scale;
+        let lane_h = self.lane_h.clone();
+        let (panned, fitted_bed, fit_pending) =
+            (self.panned, self.fitted_bed, self.fit_pending);
+        let before = self.notices.back().map(|toast| toast.id);
+        let opened = PlaybackSession::open_project(&path).map_err(|e| e.to_string());
+        let ok = opened.is_ok();
+        self.install_project(&path, opened, cx);
+        // Recorded whether or not the open took: a file that will not open is
+        // answered once, not retried on every tick.
+        self.disk_known = crate::follow::stamp(&path);
+        if !ok {
+            return;
+        }
+        // install_project's own "Loaded" line is replaced by the one that says
+        // what happened here. Taken off only if install pushed one.
+        if self.notices.back().map(|toast| toast.id) != before {
+            self.notices.pop_back();
+        }
+        self.recovery_sidecar = None;
+        self.scale = scale;
+        self.lane_h = lane_h;
+        // A seek takes the view back to the playhead; the view is put back
+        // after it, so the reload keeps where the person was looking.
+        let dur = self.drawn_duration();
+        self.seek(at.clamp(0., dur), cx);
+        (self.panned, self.fitted_bed, self.fit_pending) = (panned, fitted_bed, fit_pending);
+        self.notify_user("Reloaded — changed on disk".into());
+        cx.notify();
+    }
+
+    /// The reload asked for by the menu or the palette. Unsaved edits are not
+    /// dropped on a click: they get the same question a changed file does.
+    pub(crate) fn reload_request(&mut self, cx: &mut Context<Self>) {
+        if self.exporting().is_some() || !self.autosave_armed || self.session.is_none() {
+            return;
+        }
+        if self.edited_since_save {
+            self.notify_user_actions(
+                "Reload would drop unsaved edits".into(),
+                vec![ToastAction::Reload, ToastAction::KeepMine],
+            );
+            cx.notify();
+            return;
+        }
+        self.reload_from_disk(cx);
+    }
+
+    /// Whether a tick is allowed to write at all: dirty and not mid-export.
+    /// Pure, so a test can ask it with two bools and no `Player` to build.
+    fn autosave_gate(dirty: bool, exporting: bool) -> bool {
+        dirty && !exporting
+    }
+
+    /// One tick of the loop above. Writes the autosave when [`AUTOSAVE_EDITS`]
+    /// edits have landed since the last write, or the session has been dirty
+    /// for [`AUTOSAVE_PERIOD`] without one. Never while an export is running:
+    /// the two would fight the same disk and worker for nothing an export
+    /// needs. The write is [`PlaybackSession::save_autosave`]: atomic (a
+    /// `.part` file, fsynced, renamed over), and it cannot refuse over a
+    /// session's state the way a manual save may. Failure is a stderr line,
+    /// never a notice: a modal over a lost autosave would be worse than the risk.
     fn autosave_tick(&mut self, cx: &mut Context<Self>) {
-        if !Self::autosave_gate(
-            self.autosave_armed,
-            self.autosave_dirty,
-            self.exporting().is_some(),
-        ) {
+        // An autosave on offer is the unsaved work the person has not answered
+        // for yet: writing this session over it would destroy that work silently.
+        if self.recovery_sidecar.is_some() {
+            return;
+        }
+        // Off writes no autosave at all: the Settings row says so.
+        let Some(period) = self.autosave_secs.map(Duration::from_secs) else {
+            return;
+        };
+        if !Self::autosave_gate(self.autosave_dirty, self.exporting().is_some()) {
             return;
         }
         let now = Instant::now();
-        let idle = self
-            .autosave_last_edit
-            .map_or(true, |t| now.duration_since(t) >= AUTOSAVE_DEBOUNCE);
         let overdue = self
             .autosave_last_run
-            .map_or(true, |t| now.duration_since(t) >= AUTOSAVE_PERIOD);
-        if !idle && !overdue {
+            .is_none_or(|t| now.duration_since(t) >= period);
+        // A structural edit is written once the throttle has let the last write go by.
+        let urgent = self.autosave_urgent
+            && self
+                .autosave_last_run
+                .is_none_or(|t| now.duration_since(t) >= AUTOSAVE_THROTTLE);
+        if self.autosave_edits < AUTOSAVE_EDITS && !overdue && !urgent {
             return;
         }
-        let Some(sidecar) = Self::autosave_path(&self.project_path) else {
+        let Some(target) = Self::autosave_target(&self.project_path, self.autosave_armed) else {
             return;
         };
         let Some(session) = self.session.as_ref() else {
             return;
         };
-        match session.save_project(&sidecar) {
+        if let Some(dir) = target.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        match session.save_autosave(&target) {
             Ok(()) => {
                 self.autosave_dirty = false;
+                self.autosave_edits = 0;
+                self.autosave_urgent = false;
                 self.autosave_last_run = Some(now);
             }
             Err(e) => eprintln!("AUTOSAVE FAILED: {e}"),
@@ -2130,14 +3103,14 @@ impl Player {
                 let lane = session.add_lane(kind);
                 self.notify_user(
                     format!(
-                        "{} ADDED · undo {}",
+                        "{} added · undo {}",
                         lane.label(),
                         self.keymap.display(ActionId::Undo)
                     )
                     .into(),
                 );
             }
-            None => self.notify_user("NO TRACK ADDED — no file open".into()),
+            None => self.notify_user("No track added: no file open".into()),
         }
         cx.notify();
     }
@@ -2172,6 +3145,7 @@ impl Player {
                 self.color_open = None;
                 self.transform_open = None;
                 self.speed_open = None;
+                self.effects_open = None;
                 self.close_silence();
                 // The shown lane with them: a `Lane` is a position among
                 // its kind, so a pick now names another track -- the same
@@ -2179,13 +3153,13 @@ impl Player {
                 // left is drawn ([`subs::active_lane`]).
                 self.sub_lane = None;
                 format!(
-                    "{} REMOVED — {} brings it back",
+                    "{} removed — {} brings it back",
                     lane.label(),
                     self.keymap.display(ActionId::Undo)
                 )
             }
-            Some(Err(e)) => format!("NO TRACK REMOVED — {e}"),
-            None => "NO TRACK REMOVED — no file open".to_string(),
+            Some(Err(e)) => format!("No track removed: {e}"),
+            None => "No track removed: no file open".to_string(),
         };
         self.notify_user(text.into());
         cx.notify();
@@ -2231,6 +3205,7 @@ impl Player {
             self.color_open = None;
             self.transform_open = None;
             self.speed_open = None;
+            self.effects_open = None;
             self.close_silence();
             // The shown lane with them: a `Lane` is a position among its
             // kind, so a pick now names another track -- the same reason
@@ -2239,7 +3214,7 @@ impl Player {
         }
         self.notify_user(
             format!(
-                "{} IS TRACK {} NOW · undo {}",
+                "{} is track {} now · undo {}",
                 moved.label(),
                 to + 1,
                 self.keymap.display(ActionId::Undo)
@@ -2253,13 +3228,10 @@ impl Player {
     /// one the matching add key appended. Nothing at all before a file is open,
     /// where the timeline drawn is a placeholder pair.
     pub(crate) fn remove_last_lane(&mut self, kind: LaneKind, cx: &mut Context<Self>) {
-        let last = self.session.as_ref().and_then(|session| {
-            session
-                .lanes()
-                .into_iter()
-                .filter(|l| l.kind == kind)
-                .next_back()
-        });
+        let last = self
+            .session
+            .as_ref()
+            .and_then(|session| session.lanes().into_iter().rfind(|l| l.kind == kind));
         match last {
             Some(lane) => self.remove_lane(lane, cx),
             // Two different nothings: no timeline at all, and a timeline whose
@@ -2270,14 +3242,14 @@ impl Player {
                 self.notify_user(
                     match self.session.is_some() {
                         true => format!(
-                            "NO TRACK REMOVED — there is no {} track to remove",
+                            "No track removed: there is no {} track to remove",
                             match kind {
                                 LaneKind::Video => "video",
                                 LaneKind::Audio => "audio",
                                 LaneKind::Subtitle => "subtitle",
                             }
                         ),
-                        false => "NO TRACK REMOVED — no file open".to_string(),
+                        false => "No track removed: no file open".to_string(),
                     }
                     .into(),
                 );
@@ -2285,6 +3257,88 @@ impl Player {
             }
         }
     }
+}
+
+impl Player {
+    /// Where an export goes until the person says otherwise: [`default_export_target`](Self::default_export_target),
+    /// which is the format the card is set to, so a new file keeps that choice.
+    pub(crate) fn reset_export_default(&mut self) {
+        self.export_path = self.default_export_target();
+    }
+
+    /// The export's default target right now: [`default_export_path`] over this
+    /// session's sources, the first of which names an untitled project.
+    pub(crate) fn default_export_target(&self) -> PathBuf {
+        let sources: Vec<&Path> = self
+            .session
+            .as_ref()
+            .map_or_else(Vec::new, |s| s.sources().iter().map(|s| s.path.as_path()).collect());
+        let first_clip = sources.first().map(|path| crate::files::stem(path));
+        default_export_path(&self.project_path, self.autosave_armed || self.new_project_fresh, first_clip.as_deref(), &sources, self.format)
+    }
+}
+
+/// [`Player::reset_export_default`]'s rule. A saved project is named after itself,
+/// an untitled one after its first clip (`<clip> edit`), and nothing with neither is
+/// "Untitled". The name never equals one of `sources`: a taken one gets " (2)", " (3)"
+/// and so on until it is free.
+pub(crate) fn default_export_path(
+    project: &Path,
+    saved: bool,
+    first_clip: Option<&str>,
+    sources: &[&Path],
+    format: Format,
+) -> PathBuf {
+    default_path_with_ext(project, saved, first_clip, sources, format.ext())
+}
+
+/// [`default_export_path`] for any extension: a timeline export ([`Player::export_timeline`])
+/// lands beside an export of the same project, under the same name rule.
+pub(crate) fn default_path_with_ext(
+    project: &Path,
+    saved: bool,
+    first_clip: Option<&str>,
+    sources: &[&Path],
+    ext: &str,
+) -> PathBuf {
+    let stem = match (saved, project.file_stem(), first_clip) {
+        (true, Some(stem), _) => stem.to_string_lossy().into_owned(),
+        (_, _, Some(clip)) => format!("{clip} edit"),
+        _ => "Untitled".to_string(),
+    };
+    let folder = engine::export::default_export_folder(project);
+    let mut n = 1;
+    loop {
+        let name = match n {
+            1 => stem.clone(),
+            n => format!("{stem} ({n})"),
+        };
+        let path = folder.join(format!("{name}.{ext}"));
+        if !is_a_source(&path, sources) {
+            return path;
+        }
+        n += 1;
+    }
+}
+
+/// The lanes a drop below the stack needs, made in the open batch: a picture gets a video
+/// lane and an audio lane of the same number, so [`PlaybackSession::place_take`] finds its
+/// partner, and a sound gets an audio lane. Returns the lane the file lands on.
+fn add_drop_lanes(session: &mut PlaybackSession, path: &Path) -> Lane {
+    if engine::is_audio(path) {
+        return session.add_lane(LaneKind::Audio);
+    }
+    let count = |session: &PlaybackSession, kind: LaneKind| {
+        session.lanes().into_iter().filter(|l| l.kind == kind).count()
+    };
+    let ord = count(session, LaneKind::Video).max(count(session, LaneKind::Audio));
+    while count(session, LaneKind::Video) <= ord {
+        session.add_lane(LaneKind::Video);
+    }
+    while count(session, LaneKind::Audio) <= ord {
+        session.add_lane(LaneKind::Audio);
+    }
+    Lane::new(LaneKind::Video, ord)
 }
 
 #[cfg(test)]
@@ -2306,6 +3360,61 @@ mod autosave_tests {
             "saved work closes without a question"
         );
         assert!(Player::close_asks(1, true));
+    }
+
+    /// The recovery question reads the sidecar's own mtime, not the clock of the
+    /// open: a sidecar written three minutes ago says so.
+    #[test]
+    fn the_recovery_question_reads_the_sidecars_real_age() {
+        let dir = std::env::temp_dir().join(format!("edith-recovery-age-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sidecar = dir.join("p.autosave.edith");
+        std::fs::write(&sidecar, b"autosave").unwrap();
+        let written = std::time::SystemTime::now() - Duration::from_secs(3 * 60 + 5);
+        std::fs::File::options()
+            .write(true)
+            .open(&sidecar)
+            .unwrap()
+            .set_modified(written)
+            .unwrap();
+        // The clock time is the local time the file was written, so the test
+        // reads it back the same way rather than naming a zone's hour.
+        let clock = chrono::DateTime::<chrono::Local>::from(written).format("%H:%M").to_string();
+        assert_eq!(
+            recovery_words(&sidecar),
+            format!("Unsaved edits from {clock} (3 minutes ago) were found.")
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The recovery question names the local clock time the autosave was written
+    /// and how long ago it was: "from 14:32 (1 minute ago)".
+    #[test]
+    fn the_recovery_question_names_the_clock_time_and_the_age() {
+        let now = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let words = recovery_words_at(now - Duration::from_secs(70), now);
+        let clock = chrono::DateTime::<chrono::Local>::from(now - Duration::from_secs(70)).format("%H:%M").to_string();
+        assert_eq!(clock.len(), 5, "HH:MM");
+        assert_eq!(
+            words,
+            format!("Unsaved edits from {clock} (1 minute ago) were found.")
+        );
+        let just = recovery_words_at(now, now);
+        assert!(just.contains("(a moment ago) were found"), "{just}");
+    }
+
+    /// The recovery question's age, in plain words at each step.
+    #[test]
+    fn the_recovery_age_reads_in_plain_words() {
+        assert_eq!(age_words(0), "a moment ago");
+        assert_eq!(age_words(59), "a moment ago");
+        assert_eq!(age_words(60), "1 minute ago");
+        assert_eq!(age_words(7 * 60), "7 minutes ago");
+        assert_eq!(age_words(3600), "1 hour ago");
+        assert_eq!(age_words(5 * 3600), "5 hours ago");
+        assert_eq!(age_words(86_400), "yesterday");
+        assert_eq!(age_words(2 * 86_400 - 1), "yesterday");
+        assert_eq!(age_words(3 * 86_400), "3 days ago");
     }
 
     /// The overwrite question Save's door asks: a target that exists on
@@ -2341,14 +3450,14 @@ mod autosave_tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let project = dir.join("p.edith");
-        let sidecar = dir.join("p.edith.autosave");
+        let sidecar = dir.join("p.autosave.edith");
 
         // Neither file exists yet.
-        assert_eq!(Player::recovery_offer(&project), None);
+        assert_eq!(Player::recovery_offer(&project, true), None);
 
         std::fs::write(&project, b"project").unwrap();
         // A project with no sidecar beside it: nothing to offer.
-        assert_eq!(Player::recovery_offer(&project), None);
+        assert_eq!(Player::recovery_offer(&project, true), None);
 
         std::fs::write(&sidecar, b"sidecar").unwrap();
         let now = std::time::SystemTime::now();
@@ -2362,7 +3471,7 @@ mod autosave_tests {
             .unwrap()
             .set_modified(now)
             .unwrap();
-        assert_eq!(Player::recovery_offer(&project), Some(sidecar.clone()));
+        assert_eq!(Player::recovery_offer(&project, true), Some(sidecar.clone()));
 
         // The sidecar left over from *before* the last manual save (the save
         // that answered it, per `Player::save_project`, deletes it -- but an
@@ -2376,37 +3485,47 @@ mod autosave_tests {
             .unwrap()
             .set_modified(now - Duration::from_secs(60))
             .unwrap();
-        assert_eq!(Player::recovery_offer(&project), None);
+        assert_eq!(Player::recovery_offer(&project, true), None);
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// The bug this module exists to close: a plain media open derives
-    /// `project_path` (a guess at where a save would land) but never arms
-    /// autosave for it -- so a dirty, never-saved scratch session writes no
-    /// sidecar beside whatever `.edith` that guess happens to name, even if
-    /// one already exists as somebody's real saved project.
+    /// An untitled session's autosave never lands beside the guessed `.edith`
+    /// (which may be somebody's real project): it goes to the state directory,
+    /// one file per guessed path. A saved window's goes beside it, by the name
+    /// `edith_mcp` reads.
     #[test]
-    fn unarmed_session_never_writes_even_when_dirty() {
-        assert!(!Player::autosave_gate(false, true, false));
+    fn untitled_autosave_goes_to_the_state_dir_never_beside_the_guess() {
+        let guessed = Path::new("/media/clips/take1.edith");
+        let untitled = Player::autosave_target(guessed, false).expect("a path to autosave for");
+        let state = Player::autosave_state_dir().expect("a state dir");
+        assert!(untitled.starts_with(&state), "{untitled:?} is not under {state:?}");
+        assert_ne!(untitled.parent(), guessed.parent());
+        // The same guess names the same file every time, and another guess another one.
+        assert_eq!(Player::autosave_target(guessed, false), Some(untitled.clone()));
+        assert_ne!(
+            Player::autosave_target(Path::new("/media/clips/take2.edith"), false),
+            Some(untitled)
+        );
+        assert_eq!(
+            Player::autosave_target(guessed, true),
+            Some(PathBuf::from("/media/clips/take1.autosave.edith"))
+        );
+        assert_eq!(Player::autosave_target(Path::new(""), true), None);
     }
 
-    /// Both doors that earn the write: opening the `.edith` itself
-    /// (`install_project`) and a manual save (`save_project`), each setting
-    /// `autosave_armed = true` before this gate is ever asked again.
+    /// Autosave writes on a dirty session and nowhere else: a clean one, or
+    /// one mid-export, is left alone.
     #[test]
-    fn armed_and_dirty_session_writes() {
-        assert!(Player::autosave_gate(true, true, false));
-        // Still withheld while an export is running, armed or not.
-        assert!(!Player::autosave_gate(true, true, true));
-        // Still withheld while clean, armed or not.
-        assert!(!Player::autosave_gate(true, false, false));
+    fn only_a_dirty_session_outside_an_export_writes() {
+        assert!(Player::autosave_gate(true, false));
+        assert!(!Player::autosave_gate(true, true), "an export owns the disk");
+        assert!(!Player::autosave_gate(false, false), "nothing changed");
     }
 
-    /// Declining the recovery notice (any key but `enter`, in
-    /// [`render::key handler`](crate::render)) discards the sidecar on disk,
-    /// not just the in-memory offer -- otherwise the same stale sidecar
-    /// outdates the project again on the very next open.
+    /// Discard on the recovery notice deletes the sidecar on disk, not just the
+    /// in-memory offer -- otherwise the same stale sidecar outdates the project
+    /// again on the very next open.
     #[test]
     fn declining_recovery_deletes_the_sidecar() {
         let dir = std::env::temp_dir().join(format!(
@@ -2415,7 +3534,7 @@ mod autosave_tests {
             std::thread::current().id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let sidecar = dir.join("p.edith.autosave");
+        let sidecar = dir.join("p.autosave.edith");
         std::fs::write(&sidecar, b"stale").unwrap();
 
         Player::discard_sidecar(&sidecar);

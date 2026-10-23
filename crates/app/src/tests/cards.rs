@@ -3,6 +3,9 @@
 
 use super::*;
 use crate::audio_cards::EQ_GRAPH_MAX_H;
+use crate::Player;
+use crate::eq_ui::{eq_band_changes, eq_takes_gain, EQ_KINDS};
+use crate::player::cards::{speed_fraction, speed_on_bar};
 use crate::ui::dock_stance::transition_of;
 use std::sync::atomic::Ordering;
 
@@ -61,15 +64,11 @@ fn every_modal_field_has_a_mounted_surface_somewhere_in_the_darkroom() {
     // rather than hand-copied -- a hand-copied list is exactly the shape
     // that let three cards go modal with nothing mounted (GAP 2): the field
     // was in `modal()` and nowhere in this test.
-    // `modal()` itself is now just `card_open() || exporting().is_some()`
-    // ([`Player::card_open`], split out so the darkroom's key guard can read
-    // "a card is open" without also reading "an export is running" -- see
-    // `ui::stance`'s guard and `an_export_alone_does_not_lock_the_stances_keyboard`
-    // below) -- so the card fields this test pins live in `card_open()` now,
-    // with `exporting` added by hand since `modal()`'s own body names it
-    // directly rather than through a field this splitter would find.
+    // `modal()` is just `card_open()` now: a running export no longer makes
+    // the room modal (the oracle refuses what it must, action by action), so
+    // every field this test pins lives in `card_open()`.
     let modal_body = fn_body("card_open");
-    let mut fields = vec!["exporting".to_string()];
+    let mut fields = Vec::<String>::new();
     for chunk in modal_body.split("self.").skip(1) {
         let name: String = chunk
             .chars()
@@ -85,23 +84,28 @@ fn every_modal_field_has_a_mounted_surface_somewhere_in_the_darkroom() {
     );
     // The mounted-surface function each field's own card draws, by the
     // convention the param cards already follow (`x_open` -> `x_card(` --
-    // `Player::eq_card`/`color_card`/... in `ui/cards.rs`).
-    // `export_open`/`exporting` don't follow that convention (export pairs
-    // with the running-export sheet), so they're named explicitly. Anything else unmapped panics loudly --
-    // the point is that a ninth card has to earn a line here, not just a
-    // mount, or this test cannot see it.
+    // `Player::eq_card`/`color_card`/... in `ui/cards/`).
+    // `export_open` doesn't follow that convention (it mounts `export_panel`),
+    // so it is named explicitly. Anything else unmapped panics loudly -- the
+    // point is that a ninth card has to earn a line here, not just a mount,
+    // or this test cannot see it.
     let mount_for = |field: &str| -> &'static str {
         match field {
-            "export_open" => "export_card(",
-            "exporting" => "export_progress_card(",
+            "export_open" => "export_panel(",
             "eq_open" => "eq_card(",
             "color_open" => "color_card(",
             "transform_open" => "transform_card(",
             "speed_open" => "speed_card(",
+            "effects_open" => "effects_card(",
             "silence_open" => "silence_card(",
+            "beats_open" => "beats_card(",
             "mix_open" => "mix_card(",
+            "markers_open" => "markers_card(",
+            "history_open" => "history_card(",
+            "tools" => "tools_card(",
             "subtitle_style_open" => "subtitle_style_card(",
             "settings_open" => "settings_stance::render(",
+            "proj_dialog" => "project_dialog_card(",
             other => panic!(
                 "Player::modal() now reads `self.{other}` with no entry in this test's \
                  mount_for map -- add one naming the function that mounts its surface in \
@@ -135,12 +139,10 @@ fn every_modal_field_has_a_mounted_surface_somewhere_in_the_darkroom() {
 ///
 /// The fix lives in the guard, not in Settings alone (the charter this test
 /// pins is explicit that a per-action patch would leave every *other* action
-/// refused during a bare export equally mute): [`Player::card_open`] is
-/// `modal()` with `exporting()` split out, and the stance's guard now reads
-/// `card_open()` -- never `overlaid()`/`modal()` directly, both of which
-/// still fold `exporting()` back in for the surfaces that are meant to keep
-/// blocking imports and edits during an export ([`Player::modal`]'s own
-/// doc comment). This is a source scan, the same kind the guard above it
+/// refused during a bare export equally mute): [`Player::modal`] no longer
+/// reads `exporting()` at all, and the stance's guard reads `card_open()` --
+/// never `overlaid()`/`modal()` directly, so the guard's own list stays the
+/// cards, menus and pickers. This is a source scan, the same kind the guard above it
 /// already is: this binary has no `TestAppContext` to actually press `ctrl+,`
 /// mid-export and read the notice plate back.
 #[test]
@@ -155,16 +157,17 @@ fn the_stances_key_guard_does_not_swallow_a_bare_export_before_the_oracle_is_ask
         "the stance's key guard reads overlaid()/modal() again, which folds `exporting()` \
          back in and re-mutes every refusal an export-only moment should be able to speak (D2)"
     );
-    // The split itself: card_open() must never grow an exporting read of its
-    // own, or the guard above -- which trusts card_open() to mean "an actual
-    // card/menu/rebind owns the keyboard" -- silently regains the same mute.
-    let card_open_body = fn_body("card_open");
-    assert!(
-        !card_open_body.contains("exporting"),
-        "Player::card_open() now reads `exporting` -- that reintroduces the swallow \
-         `the_stances_key_guard_does_not_swallow_a_bare_export_before_the_oracle_is_asked` \
-         exists to keep out; `modal()` is where `exporting()` belongs"
-    );
+    // The guard trusts card_open() to mean "an actual card owns the keyboard",
+    // so neither it nor modal() may grow an exporting read -- either would
+    // silently regain the same mute.
+    for body in [fn_body("card_open"), fn_body("modal")] {
+        assert!(
+            !body.contains("exporting"),
+            "Player::card_open()/modal() now reads `exporting` -- that reintroduces the \
+             swallow `the_stances_key_guard_does_not_swallow_a_bare_export_before_the_oracle_is_asked` \
+             exists to keep out; an export is refused by the oracle, not by the modal"
+        );
+    }
 }
 
 /// The whole point of the card: there is no action a pointer cannot reach.
@@ -182,14 +185,15 @@ fn every_action_is_on_the_actions_card() {
             _ => None,
         })
         .collect();
-    for action in ActionId::ALL {
+    // The angles 2 to 9 share the one "angle 1-9" row, so they are not listed of their own.
+    for action in ActionId::ALL.into_iter().filter(|a| a.angle_number().is_none_or(|n| n == 1)) {
         assert_eq!(
             listed.iter().filter(|a| **a == action).count(),
             1,
             "{action:?} is not on the card exactly once"
         );
     }
-    assert_eq!(listed.len(), ActionId::ALL.len());
+    assert_eq!(listed.len(), ActionId::ALL.len() - 8);
     // Under its own heading, in the registry's order: every row after a
     // heading belongs to that heading until the next one.
     let mut heading = None;
@@ -215,12 +219,156 @@ fn every_action_is_on_the_actions_card() {
     // Both columns say something: the label does the action, the stroke
     // beside it changes that stroke, and neither may read blank.
     let keymap = keymap::Keymap::defaults();
+    // DESIGN §10.2's menu-only rows: the mock leaves them without a stroke on
+    // purpose, and the menu is their door.
+    let menu_only = [
+        ActionId::MarkerHere,
+        ActionId::TrackSmall,
+        ActionId::TrackMedium,
+        ActionId::TrackLarge,
+        ActionId::PlayheadHere,
+        ActionId::PasteFilePath,
+        ActionId::AddVideoLane,
+        ActionId::AddAudioLane,
+        ActionId::RemoveVideoLane,
+        ActionId::RemoveAudioLane,
+        ActionId::AddSubtitleLane,
+        ActionId::RemoveSubtitleLane,
+        ActionId::ToggleAutoProxies,
+        ActionId::Theme,
+        ActionId::AccentColour,
+        // The viewer header owns these four; no stroke, menu and palette are the doors.
+        ActionId::ViewZoom,
+        ActionId::PlaybackQuality,
+        ActionId::GuideStyle,
+        ActionId::GuideMask,
+        // No stroke by decision: a key that throws away edits is pressed by accident.
+        ActionId::ReloadProject,
+        ActionId::SaveVersion,
+        ActionId::SaveTemplate,
+        ActionId::ExportCaptions,
+        ActionId::NewProject,
+        ActionId::Versions,
+        ActionId::CollectMedia,
+        ActionId::ProjectNotes,
+        // The transition kinds are palette commands and the Clip tab's picker.
+        ActionId::TransitionDissolve,
+        ActionId::TransitionDipBlack,
+        ActionId::TransitionDipWhite,
+        ActionId::TransitionWipeLeft,
+        ActionId::TransitionWipeRight,
+        ActionId::TransitionWipeUp,
+        ActionId::TransitionWipeDown,
+        ActionId::TransitionSlideLeft,
+        ActionId::TransitionSlideRight,
+        ActionId::TransitionSlideUp,
+        ActionId::TransitionSlideDown,
+        ActionId::TransitionPushLeft,
+        ActionId::TransitionPushRight,
+        ActionId::TransitionPushUp,
+        ActionId::TransitionPushDown,
+        ActionId::TransitionZoom,
+        // The cards' stopwatch diamonds are their doors; the menu lists the same four.
+        ActionId::KeyPlacement,
+        ActionId::KeyOpacity,
+        ActionId::KeyColor,
+        ActionId::KeyEasing,
+        // The creator tools: menu and palette, no chord yet.
+        // The speed ramp's shapes and key verbs live on the palette, the Clip menu
+        // and the speed card; the card is `j`.
+        ActionId::SpeedRampUp,
+        ActionId::SpeedRampDown,
+        ActionId::SpeedRampSlowFastSlow,
+        ActionId::SpeedRampFastSlowFast,
+        ActionId::SpeedRampKey,
+        ActionId::SpeedRampClear,
+        // Auto reframe is a menu row and a transform-card row, with no stroke.
+        ActionId::Reframe,
+        ActionId::About,
+        // Sequences and compound clips are menu rows and tabs, with no stroke.
+        ActionId::NestClips,
+        ActionId::BreakApart,
+        ActionId::OpenCompound,
+        ActionId::CloseCompound,
+        ActionId::NewSequence,
+        ActionId::DuplicateSequence,
+        ActionId::RenameSequence,
+        ActionId::DeleteSequence,
+        // Multicam: menu rows, with no stroke.
+        ActionId::CreateMulticam,
+        ActionId::FlattenMulticam,
+        ActionId::RenameLane,
+        ActionId::PasteColor,
+        ActionId::PasteEffects,
+        ActionId::PasteTransform,
+        ActionId::PasteSpeed,
+        ActionId::PasteAudio,
+        ActionId::ClipLabel,
+        ActionId::NewSolid,
+        ActionId::NewGradient,
+        ActionId::NewCountdown,
+        ActionId::NewBars,
+        ActionId::NewTone,
+        ActionId::NewBarsAndTone,
+        ActionId::NewAdjustment,
+        ActionId::NewBin,
+        ActionId::NewBinInside,
+        ActionId::RenameBin,
+        ActionId::RemoveBin,
+        ActionId::ToggleFavourite,
+        ActionId::MoveToBin,
+        ActionId::ShowFavourites,
+        ActionId::ShowAllMedia,
+        ActionId::NewRectangle,
+        ActionId::NewEllipse,
+        ActionId::NewLine,
+        ActionId::NewArrow,
+        // The transcript's cut: a Clip row and the palette, no stroke (Delete does it in the transcript).
+        ActionId::CutSelectedWords,
+        // The ruler's marker menu: rows with no stroke.
+        ActionId::RenameMarker,
+        ActionId::DeleteMarker,
+        // The View menu's switch: no NLE convention gives it a key.
+        ActionId::ToggleWaveforms,
+        // The View menu's audible-scrub switch: likewise.
+        ActionId::ToggleScrubAudio,
+        // Edit > History opens its card from the menu: no stroke.
+        ActionId::History,
+        // Compare grade and the colour card's Auto and Save look: no NLE key gives them one.
+        ActionId::CompareOff,
+        ActionId::CompareSplit,
+        ActionId::CompareSide,
+        ActionId::AutoColour,
+        ActionId::SaveLook,
+        // Track mask: a Clip row with no stroke; the effects card's Track row is its surface.
+        ActionId::TrackMask,
+        // Timeline > Record voice-over: a sheet, and no NLE convention gives it a key.
+        ActionId::RecordVoiceover,
+        // The video output window and its display: menu rows, no NLE key.
+        ActionId::ToggleOutputWindow,
+        ActionId::OutputDisplay,
+        // The timeline interchange rows: File menu entries with no stroke.
+        ActionId::ExportTimelineOtio,
+        ActionId::ExportTimelineFcpxml,
+        ActionId::ExportTimelineEdl,
+        ActionId::ImportTimelineOtio,
+        // The render preview rows in the Timeline menu's submenu: no stroke for the last three.
+        ActionId::RenderAll,
+        ActionId::CancelRender,
+        ActionId::DeleteRenderFiles,
+    ];
     for action in ActionId::ALL {
         assert!(!action.label().is_empty(), "{action:?}");
-        assert_ne!(keymap.display(action), "unbound", "{action:?}");
+        if menu_only.contains(&action) {
+            assert_eq!(keymap.display(action), "unbound", "{action:?}");
+        } else {
+            assert_ne!(keymap.display(action), "unbound", "{action:?}");
+        }
     }
     // Both halves of a row are click targets, so WCAG 2.5.8 binds them.
-    assert!(KEYS_ROW_H >= HIT_MIN);
+    const {
+        assert!(KEYS_ROW_H >= HIT_MIN);
+    }
 }
 
 /// What a keystroke means to that box: a letter is a letter, and a word
@@ -241,7 +389,7 @@ fn only_a_printable_stroke_types_into_the_search() {
 #[test]
 fn keys_search_keeps_matching_rows_and_drops_empty_heads() {
     let km = keymap::Keymap::defaults();
-    let cut = keys_rows_matching("cut", &km);
+    let cut = keys_rows_matching("split", &km);
     assert!(cut.iter().any(|r| matches!(r, KeyRow::Act(ActionId::Cut))));
     assert!(!cut.iter().any(|r| matches!(r, KeyRow::Act(ActionId::Play))));
     assert!(cut.iter().any(|r| matches!(r, KeyRow::Head(_))));
@@ -265,10 +413,65 @@ fn the_keybindings_card_fits_the_smallest_window() {
         title + status + search + separator + 10. * KEYS_ROW_H + gaps + padding <= 360.,
         "card too tall"
     );
-    assert!(KEYS_W <= 640., "card too wide");
+    const {
+        assert!(KEYS_W <= 640., "card too wide");
+    }
     // The rows are clickable, so WCAG 2.5.8 binds them like every other
     // target in this window.
-    assert!(KEYS_ROW_H >= HIT_MIN);
+    const {
+        assert!(KEYS_ROW_H >= HIT_MIN);
+    }
+}
+
+/// The equalizer's band rows: a cut shows no gain because it has none to set,
+/// every kind has exactly one chip, and a number reads as changed only once it
+/// has left the layout the clip opens on -- so the ink says what was moved.
+#[test]
+fn eq_rows_show_only_the_numbers_a_band_uses_and_mark_what_moved() {
+    use engine::eq::{BandKind, EqParams};
+
+    assert!(!eq_takes_gain(BandKind::LowCut) && !eq_takes_gain(BandKind::HighCut));
+    assert!(
+        eq_takes_gain(BandKind::LowShelf)
+            && eq_takes_gain(BandKind::Peak)
+            && eq_takes_gain(BandKind::HighShelf)
+    );
+
+    let kinds = [
+        BandKind::LowCut,
+        BandKind::LowShelf,
+        BandKind::Peak,
+        BandKind::HighShelf,
+        BandKind::HighCut,
+    ];
+    assert_eq!(EQ_KINDS.len(), kinds.len());
+    for kind in kinds {
+        assert_eq!(
+            EQ_KINDS.iter().filter(|(k, _, _)| *k == kind).count(),
+            1,
+            "{kind:?} needs exactly one chip"
+        );
+    }
+
+    let layout = EqParams::default_layout();
+    assert_eq!(
+        eq_band_changes(&layout.bands[0], 0),
+        (false, false, false),
+        "a band at its layout default reads ink3 on every number"
+    );
+    let mut moved = layout.bands[1];
+    moved.freq_hz *= 1.2;
+    assert_eq!(eq_band_changes(&moved, 1), (true, false, false));
+    let mut moved = layout.bands[1];
+    moved.gain_db = 3.;
+    assert_eq!(eq_band_changes(&moved, 1), (false, true, false));
+    let mut moved = layout.bands[1];
+    moved.q = 2.;
+    assert_eq!(eq_band_changes(&moved, 1), (false, false, true));
+    assert!(
+        eq_band_changes(&layout.bands[1], 7).0,
+        "a band past the layout has no default, so its frequency reads as moved"
+    );
 }
 
 /// The equalizer card's graph: where a band lands on it, that a drag reads
@@ -389,19 +592,27 @@ fn the_equalizer_graph_puts_a_band_where_a_drag_reads_it_and_fits_the_smallest_w
         title + status + EQ_GRAPH_H + HIT_MIN + gaps + padding + CONTROL_H <= 360.,
         "card too tall"
     );
-    assert!(
-        EQ_GRAPH_H <= (8. * KEYS_ROW_H),
-        "graph taller than a card of rows"
-    );
+    const {
+        assert!(
+            EQ_GRAPH_H <= (8. * KEYS_ROW_H),
+            "graph taller than a card of rows"
+        );
+    }
     // What is dragged is the whole graph -- the handle is a 10 px dot, but
     // a press anywhere in the box takes the band nearest it -- so WCAG
     // 2.5.8 is satisfied by the box, which is far past the minimum.
-    assert!(EQ_GRAPH_H >= HIT_MIN);
-    assert!(
-        EQ_HANDLE < HIT_MIN,
-        "a dot that size would want its own hitbox"
-    );
-    assert!(KEYS_ROW_H >= HIT_MIN);
+    const {
+        assert!(EQ_GRAPH_H >= HIT_MIN);
+    }
+    const {
+        assert!(
+            EQ_HANDLE < HIT_MIN,
+            "a dot that size would want its own hitbox"
+        );
+    }
+    const {
+        assert!(KEYS_ROW_H >= HIT_MIN);
+    }
 }
 
 /// Editing a band, which is what the card is *for*: the pointer reads a
@@ -470,15 +681,19 @@ fn a_band_can_be_moved_added_and_reached() {
 
     // Every band the card will hold is one digit away: the keyboard has ten
     // digits, which is exactly why the cap is what it is.
-    assert!(
-        EQ_BANDS_MAX <= 10,
-        "a band past the tenth has no key that picks it"
-    );
+    const {
+        assert!(
+            EQ_BANDS_MAX <= 10,
+            "a band past the tenth has no key that picks it"
+        );
+    }
     assert!(EQ_BANDS_MAX > EqParams::default_layout().bands.len());
     // The Q range holds the default, so a file's band never opens out of
     // range and needs dragging back in before it can be edited.
     assert!((EQ_Q_LOW..=EQ_Q_HIGH).contains(&0.707));
-    assert!(EQ_Q_STEP > 1.);
+    const {
+        assert!(EQ_Q_STEP > 1.);
+    }
 }
 
 /// The analyser drawn behind the curve: a tone has to land on its own
@@ -571,16 +786,9 @@ fn the_speed_bar_lands_where_it_paints_and_real_time_is_reachable() {
         origin: point(px(180.), px(240.)),
         size: size(px(COLOR_BAR_W), px(KEYS_ROW_H)),
     };
-    let (lo, hi) = (
-        f32::from(Speed::MIN.permille()),
-        f32::from(Speed::MAX.permille()),
-    );
     // The same arithmetic `Player::drag_speed` runs, which is the one thing
     // a test of it can share without re-deriving it.
-    let at = |x: f32| {
-        let raw = lo + frac_along(px(x), bar) * (hi - lo);
-        speed_at((raw / SPEED_STEP as f32).round() as i32 * SPEED_STEP)
-    };
+    let at = |x: f32| speed_on_bar(frac_along(px(x), bar));
     assert_eq!(at(180.), Speed::MIN, "the left end is a quarter speed");
     assert_eq!(at(180. + COLOR_BAR_W), Speed::MAX, "the right end is 4x");
     assert_eq!(at(-4000.), Speed::MIN, "off the left clamps");
@@ -596,9 +804,20 @@ fn the_speed_bar_lands_where_it_paints_and_real_time_is_reachable() {
             "{speed} is off the {SPEED_STEP} grid the keys move on"
         );
         // What the bar paints from that rate is where the pointer was, to
-        // within the half step the snap costs.
-        let painted = (f32::from(speed.permille()) - lo) / (hi - lo);
-        let slack = SPEED_STEP as f32 / (hi - lo) / 2. + 1e-4;
+        // within half a grid step's width on the log scale.
+        let p = f32::from(speed.permille());
+        let painted = speed_fraction(p);
+        let half = SPEED_STEP as f32 / 2.;
+        // The press can be anywhere in the cell this rate stands for, which
+        // runs from the bar where `p - half` sits to where `p + half` sits.
+        // `painted` is the middle of that cell only while neither edge is
+        // clamped: `speed_fraction` clamps the lower edge to the bar's start,
+        // so at `Speed::MIN` the cell is one-sided and the paint sits on its
+        // edge. The slack is the distance to the far edge, not half of the
+        // whole cell, so both cases are covered.
+        let slack = (speed_fraction(p + half) - painted)
+            .max(painted - speed_fraction(p - half))
+            + 1e-4;
         assert!(
             (painted - along).abs() <= slack,
             "pressed at {along}, paints at {painted}"
@@ -611,6 +830,19 @@ fn the_speed_bar_lands_where_it_paints_and_real_time_is_reachable() {
         assert_eq!(i32::from(permille) % SPEED_STEP, 0);
     }
     assert!(SPEED_PRESETS.contains(&Speed::NORMAL.permille()), "reset");
+}
+
+/// The speed bar is logarithmic: every doubling takes the same travel, so the
+/// quarter-to-half stretch is as long as the two-to-four one, and real time
+/// sits in the middle of the bar where a person expects it.
+#[test]
+fn the_speed_bar_gives_every_doubling_the_same_travel() {
+    let quarter_to_half = speed_fraction(500.) - speed_fraction(250.);
+    let two_to_four = speed_fraction(4000.) - speed_fraction(2000.);
+    assert!((quarter_to_half - two_to_four).abs() < 1e-5);
+    assert!((speed_fraction(1000.) - 0.5).abs() < 1e-5, "1.00x is mid-bar");
+    assert!(speed_fraction(250.).abs() < 1e-5);
+    assert!((speed_fraction(4000.) - 1.).abs() < 1e-5);
 }
 
 /// A colour slider is dragged straight to a value, so where the pointer
@@ -660,30 +892,33 @@ fn a_colour_drag_lands_where_it_paints_and_the_card_fits_the_smallest_window() {
         }
     }
 
-    // The same shape as the other two cards, so it fits where they do: the
-    // graph, four rows and the reset button inside a 360 px window.
+    // The shape the card opens in, inside a 360 px window: the graph, the two
+    // main sliders (each a label line, a gap and a track), the More fold, the
+    // compare line for a first clip, and the reset line. An open fold adds the
+    // two rare sliders below that, and the card grows past 360 px.
     let (title, status, gaps, padding) = (17., 17., 6. * 2., 24.);
-    let rows = COLOR_BANDS.len() as f32 * KEYS_ROW_H;
+    let slider = crate::ui::type_scale::LABEL_ROW_PX + 4. + HIT_MIN;
+    let rows = 2. * slider + 2. * HIT_MIN;
     assert!(
         title + status + HIST_H + rows + gaps + padding + CONTROL_H + 4. <= 360.,
         "card too tall"
     );
-    assert!(COLOR_W <= 640., "card too wide");
-    // The label still has room beside the bar and the readout, which is
-    // what the buttons coming off the row bought.
-    let row = COLOR_W - padding - 12. - 2. * 8. - COLOR_BAR_W - 44.;
-    assert!(row >= 36., "no room left for a label: {row}px");
-    // What is dragged is the whole row's height, not the 4 px the bar is
+    const {
+        assert!(COLOR_W <= 640., "card too wide");
+    }
+    // What is dragged is the whole track's height, not the 4 px the bar is
     // drawn as (WCAG 2.5.8) -- the same split the ruler makes.
-    assert!(KEYS_ROW_H >= HIT_MIN);
+    const {
+        assert!(KEYS_ROW_H >= HIT_MIN);
+    }
 }
 
 /// The graph over the sliders is the frame the grade already went through,
-/// so it has to count what is actually in those bytes -- BGRA on the wire,
-/// red-green-blue in the bins.
+/// so it has to count what is actually in those bytes -- the luma of each
+/// pixel, read off BGRA on the wire.
 #[test]
-fn the_histogram_counts_the_frame_it_is_handed() {
-    // Half pure red, half mid grey: two known values, in two known bins.
+fn the_histogram_counts_the_luma_of_the_frame_it_is_handed() {
+    // Half pure red, half mid grey: two known lumas, in two known bins.
     let (w, h) = (64usize, 64usize);
     let mut frame = Vec::with_capacity(w * h * 4);
     for _ in 0..h {
@@ -696,33 +931,31 @@ fn the_histogram_counts_the_frame_it_is_handed() {
     }
     let bins = histogram(&frame);
     let half = (w * h / 2) as u32;
-    // 64 bins over 256 codes: 255 is the last bin, 128 the middle one, 0 the
-    // first.
-    assert_eq!(bins[0][63], half, "the red half tops the red channel");
-    assert_eq!(bins[0][32], half, "and the grey half sits mid red");
-    for channel in [1, 2] {
-        assert_eq!(bins[channel][0], half, "no green or blue in the red half");
-        assert_eq!(bins[channel][32], half);
-        assert_eq!(bins[channel][63], 0);
-    }
+    // 64 bins over 256 codes. Pure red's luma is 0.2126 * 255, which is 53, in
+    // bin 13; grey 128 is exactly half, bin 32.
+    assert_eq!(bins[13], half, "the red half lands at luma 53");
+    assert_eq!(bins[32], half, "and the grey half sits mid-range");
+    assert_eq!(
+        bins.iter().filter(|&&n| n > 0).count(),
+        2,
+        "nothing else is counted"
+    );
     // Nothing is counted twice and nothing is dropped: this frame is small
     // enough to be read whole.
-    for channel in bins {
-        assert_eq!(channel.iter().sum::<u32>(), (w * h) as u32);
-    }
+    assert_eq!(bins.iter().sum::<u32>(), (w * h) as u32);
 
     // A grade shifts it, which is the whole point of drawing it: the same
     // frame darkened lands in lower bins.
     let darker: Vec<u8> = frame.iter().map(|b| b / 2).collect();
     let bins = histogram(&darker);
-    assert_eq!(bins[0][31], half, "255 -> 127");
-    assert_eq!(bins[0][16], half, "128 -> 64");
+    assert_eq!(bins[6], half, "red 127 is luma 26, bin 6");
+    assert_eq!(bins[16], half, "grey 64 is bin 16");
 
     // A real frame is subsampled: a 1080p one is read every 253rd pixel, so
     // the shape costs a thousandth of the reads and still counts thousands.
     let big = vec![200u8; 1920 * 1080 * 4];
     let bins = histogram(&big);
-    let counted = bins[0].iter().sum::<u32>();
+    let counted = bins.iter().sum::<u32>();
     let pixels = 1920 * 1080usize;
     let expected = pixels.div_ceil(pixels / HIST_SAMPLES) as u32;
     assert_eq!(counted, expected, "every strided pixel counted, once");
@@ -730,11 +963,11 @@ fn the_histogram_counts_the_frame_it_is_handed() {
         (HIST_SAMPLES as u32..=HIST_SAMPLES as u32 + 64).contains(&counted),
         "{counted} samples is not the budget"
     );
-    assert_eq!(bins[0][200 * HIST_BINS / 256], counted, "all in one bin");
+    assert_eq!(bins[200 * HIST_BINS / 256], counted, "all in one bin");
 
     // An empty buffer is a flat graph rather than a panic: the card is open
     // before the first frame is pumped.
-    assert_eq!(histogram(&[]), [[0; HIST_BINS]; 3]);
+    assert_eq!(histogram(&[]), [0; HIST_BINS]);
 }
 
 /// Mute and level are one control with two states, and the whole point is
@@ -812,8 +1045,11 @@ fn the_clock_stops_where_the_timeline_does_and_the_end_still_restarts() {
 
     // The pump's own loop -- tick, drain, ask where the transport is --
     // with a deadline so a fixture that will not decode fails as a failure
-    // rather than as a hang.
-    let deadline = Instant::now() + Duration::from_secs(20);
+    // rather than as a hang. The first picture of a seek is a debug-build
+    // software decode, and on a box whose cores are saturated by other work
+    // it has taken 40-60s to arrive, so the bound is generous: the clock
+    // running on wall time meanwhile is by design (see `halt_at_end`).
+    let deadline = Instant::now() + Duration::from_secs(120);
     let mut state = transport(session.is_playing(), session.is_eos());
     while state != Transport::Ended {
         assert!(
@@ -985,56 +1221,60 @@ fn the_budget_lever_steps_by_a_tenth_and_a_whole_megabit() {
     assert_eq!(step(BPS_MAX, 9, true), BPS_MAX, "and so does the ceiling");
 }
 
-/// The moment itself, read off its own source: three rows, no scrolling
-/// list, no second pane, and exactly one boxed chip in the room (DESIGN §4).
+/// The sheet itself, read off its own source: presets first, then the range,
+/// the destination and the summary, with the detailed settings behind the one
+/// "More settings" disclosure -- and the scrim stops at the time band.
 /// A source scan, like the stance guards above it -- this binary has no
 /// `TestAppContext` to render a card and measure it.
 #[test]
-fn the_export_moment_is_three_rows_one_chip_and_no_list() {
-    let body = fn_body("export_card");
-    assert!(
-        !body.contains("overflow_y_scroll"),
-        "the export moment scrolls again -- it is three rows and a fixed height"
-    );
-    assert_eq!(
-        body.matches(".border_1()").count(),
-        2,
-        "one border for the plate and one for the chip: §4's single boxed chip"
-    );
-    for gone in [
-        "Advanced",
-        "preset",
-        "Quality",
-        "Subtitles",
-        "GPU: ",
-        "Built in",
+fn the_export_sheet_reads_presets_range_destination_summary_then_more() {
+    let card = src_text("ui/cards/export.rs");
+    let body = fn_body("sheet_settings");
+    let order = [
+        "self.sheet_preset(cx)",
+        "self.sheet_destination(cx)",
+        "self.sheet_range(cx)",
+        "self.sheet_summary(",
+        "more_toggle(more, cx)",
+        "more.then(|| self.sheet_more(cx))",
+    ];
+    let at: Vec<usize> = order
+        .iter()
+        .map(|part| body.find(part).unwrap_or_else(|| panic!("{part} is not on the sheet")))
+        .collect();
+    assert!(at.windows(2).all(|w| w[0] < w[1]), "the sheet's sections are out of order");
+    // The body scrolls on a short window rather than the sheet moving down.
+    assert!(body.contains("overflow_y_scroll"), "a short sheet cannot scroll");
+    // The disclosure is the folds file's own, so it is remembered.
+    assert!(card.contains("toggle_fold(&mut this.folds, EXPORT_MORE_FOLD)"));
+    assert!(card.contains(".child(\"Details\")"));
+    // The panel is the dock's third tab, in flow: no scrim, no absolute box.
+    let mount = fn_body("export_panel");
+    assert!(!mount.contains("absolute()") && !mount.contains("scrim"));
+    assert!(src_text("ui/dock_stance.rs").contains("player.export_panel(cx)"));
+    assert!(src_text("ui/dock_stance.rs").contains("\"dock-tab-export\""));
+    // Every press has a pointer door as well as a key.
+    for id in [
+        "export-confirm",
+        "export-range-whole",
+        "export-range-marks",
+        "export-name",
+        "export-folder",
+        "export-destination",
+        "export-preset",
+        "export-overwrite-replace",
+        "export-overwrite-keep",
+        "export-overwrite-cancel",
+        "export-cancel",
+        "export-retry",
+        "export-show-file",
+        "export-play",
     ] {
-        assert!(!body.contains(gone), "the old card's {gone} is still here");
+        assert!(card.contains(&format!("\"{id}\"")), "{id} is on no control");
     }
-    // Row 1 is one line at every width: the stem ellipsizes and the
-    // extension rides beside it (at 1280 the nested block child wrapped
-    // `.mp4` onto a second line and the moment read as four rows).
-    let name = &body[body.find("\"destination\"").expect("the file row")..];
-    let name = &name[..name.find("\"budget\"").unwrap_or(name.len())];
-    assert!(
-        name.contains(".truncate()"),
-        "the file name wraps again -- it must ellipsize on one line"
-    );
-    assert!(
-        name.contains(".flex_none()") && name.contains("ext.to_string()"),
-        "the extension must sit beside the stem, not under it"
-    );
-    // Its three rows, each reachable by pointer as well as by chord.
-    for id in ["destination", "budget", "budget-track", "export-confirm"] {
-        assert!(body.contains(&format!("\"{id}\"")), "{id} is on no row");
+    const {
+        assert!(KEYS_ROW_H >= HIT_MIN);
     }
-    // 200px, and it fits the smallest window this editor draws with the
-    // room's own chrome above and below it.
-    assert_eq!(EXPORT_MOMENT_H, 200.);
-    assert!(EXPORT_MOMENT_H + crate::ui::stance::TIME_BAND_H + CONTROL_H <= 360.);
-    // The clickable rows are `HIT_MIN` tall (WCAG 2.5.8) -- the track is
-    // drawn 1px and grabbed a whole row.
-    assert!(KEYS_ROW_H >= HIT_MIN);
 }
 
 /// The shipped defect: a chord the export surface answers (`n`) also reached
@@ -1045,7 +1285,7 @@ fn the_export_moment_is_three_rows_one_chip_and_no_list() {
 fn a_chord_the_export_moment_answers_never_reaches_the_room() {
     // The leak was real: `n` is the room's own snap chord.
     let keymap = keymap::Keymap::defaults();
-    assert_eq!(keymap.display(keymap::ActionId::ToggleSnap), "n");
+    assert_eq!(keymap.display(keymap::ActionId::ToggleSnap), "N");
     // One door, and it is asked *before* the stance's modal guard.
     let cards = src_text("player/cards.rs");
     assert!(
@@ -1065,8 +1305,13 @@ fn a_chord_the_export_moment_answers_never_reaches_the_room() {
         "a stroke fell through to the room's keymap again -- that is the `n` \
          toggling snap defect"
     );
-    // Escape retreats one step at a time (DESIGN.md:146): the field is
-    // closed inside the typing branch, the moment only once it is shut.
+    // Escape retreats one step at a time (DESIGN.md:146): the question and
+    // the field are closed inside their own branches, the sheet only once
+    // both are shut.
+    let (asking, rest) = rest
+        .split_once("return true;")
+        .expect("the question branch returns before the chords below it");
+    assert!(asking.contains("ESCAPE => self.answer_overwrite(Overwrite::Cancel, cx)"));
     let (typing, closed) = rest
         .split_once("return true;")
         .expect("the typing branch returns before the chords below it");
@@ -1075,7 +1320,7 @@ fn a_chord_the_export_moment_answers_never_reaches_the_room() {
         "esc leaves the field"
     );
     assert!(
-        closed.contains("self.close_card()"),
+        closed.contains("self.leave_sheet_face()"),
         "then esc closes the moment"
     );
     // Its chords, all of them consumed here rather than by the keymap.
@@ -1084,137 +1329,62 @@ fn a_chord_the_export_moment_answers_never_reaches_the_room() {
         "\"n\"",
         "\"e\"",
         "\"enter\"",
-        "\"up\"",
-        "\"down\"",
-        "\"c\"",
-        "\"b\"",
-        "\"g\"",
+        "\"left\"",
+        "\"right\"",
         "\",\"",
     ] {
         assert!(closed.contains(chord), "{chord} is not the moment's own");
     }
 }
 
-/// The user could not find the encode options from the moment that spends
-/// them ("simplifying doesn't mean getting rid of advanced settings"): row 3
-/// now *is* the options -- three ghost segments carrying the Settings room's
-/// own setters, plus the door to the rest of that room.
+/// "Simplify it, not hide the things": every detailed setting is on the
+/// sheet behind "Details" -- container and codec, encoder seat (software
+/// first), bitrate, resolution, bit depth, sound rate, loudness, chapters and
+/// captions. Each is a labelled row that opens a list of every value.
 #[test]
-fn row_three_wears_the_encode_options_and_the_door_to_the_rest() {
-    let cards = src_text("ui/cards.rs");
-    let start = cards.find("fn export_card(").expect("the moment");
-    let body = &cards[start
-        ..start
-            + cards[start..]
-                .find("\n    /// ")
-                .unwrap_or(cards.len() - start)];
-    // A segment is the setter it names, not a readout of it.
-    for (id, chord, setter) in [
-        ("moment-picture", "\"c\"", "cycle_export_picture"),
-        ("moment-sound", "\"b\"", "cycle_audio_kbps"),
-        ("moment-encoder", "\"g\"", "cycle_encoder"),
+fn details_holds_every_export_setting_as_direct_choices() {
+    let more = fn_body("sheet_more");
+    for (what, needle) in [
+        ("the container", "ExportRow::Container"),
+        ("the codec", "ExportRow::Codec"),
+        ("the encoder", "ExportRow::Seat"),
+        ("the bitrate", "ExportRow::Bitrate"),
+        ("the size", "ExportRow::Size"),
+        ("the bit depth", "ExportRow::Depth"),
+        ("the sound rate", "ExportRow::Kbps"),
+        ("the loudness", "ExportRow::Loudness"),
+        ("the captions", "ExportRow::Captions"),
+        ("the chapters", "s.chapters().len()"),
     ] {
-        assert!(body.contains(id), "row 3 lost its {id} segment");
-        assert!(body.contains(chord), "the {id} segment wears no chord");
-        assert!(body.contains(setter), "the {id} segment changes nothing");
+        assert!(more.contains(needle), "Details lost {what}");
     }
-    // The door, wearing the room's own chord rather than a hand-typed one.
-    assert!(
-        body.contains("moment-settings"),
-        "row 3 has no settings door"
-    );
-    assert!(
-        body.contains("self.keymap.chord(ActionId::Settings)"),
-        "the door's chord is not read from the keymap"
-    );
-    assert!(body.contains("open_settings"), "the door opens nothing");
-    // Quiet, and a control: ink3 with the chord in ink4 (DESIGN §4), never
-    // the ink4 line the plan used to be.
-    let seg = cards
-        .find("fn moment_segment(")
-        // Wide enough for the atom's whole chain, plate included -- the
-        // hover line pushed the ink pair past the old 1200-char window.
-        .map(|at| &cards[at..at + 1900])
-        .expect("the segment atom");
-    assert!(seg.contains("INK3()") && seg.contains("INK4()"));
-    assert!(
-        seg.contains("DARK_RAISED()"),
-        "a segment does not answer hover"
-    );
-    // The readouts worth seeing: the project's picture size and rate, and
-    // a sound rate that is on the line whether or not it is pressable.
-    assert!(
-        body.contains("s.resolution()") && body.contains("fps_label(self.fps)"),
-        "row 3 says nothing about the picture the file will hold"
-    );
-    assert!(
-        body.contains("format!(\"{word} {}\", self.audio_kbps)"),
-        "the sound segment no longer says the rate it is spent at"
-    );
-    // The picture segment is a child, not a `has_video` maybe: hidden on the
-    // sound-only formats it left `c` pressing nothing and no way back.
-    let at = body
-        .find("\"moment-picture\"")
-        .expect("the picture segment");
-    assert!(
-        !body[at - 240..at].contains("has_video"),
-        "the picture segment is gated on has_video again -- the dead end"
-    );
-    // Wrapped, never cut: the readouts made row 3 longer than 1280 wide.
-    assert!(
-        body.contains(".flex_wrap()"),
-        "row 3 truncates instead of wrapping"
-    );
-}
-
-/// The dead end the user hit: the cycle walked into the sound-only formats
-/// and stopped there ("when selection reaches the audio clicking is disabled
-/// and can't turn it back to video"). One cycle, and it wraps.
-#[test]
-fn the_picture_cycle_wraps_out_of_the_sound_only_formats() {
-    use crate::ui::settings_stance::{PICTURE_CYCLE, next_picture};
-    // Nothing refused: every stop is the next one, and the last wraps to the
-    // first -- OGG, the tail of the list, back to MP4.
-    let mut at = PICTURE_CYCLE[0];
-    for &want in PICTURE_CYCLE
-        .iter()
-        .skip(1)
-        .chain(std::iter::once(&PICTURE_CYCLE[0]))
-    {
-        at = next_picture(at, |_| false);
-        assert_eq!(at, want, "the cycle stopped walking");
+    for cycle in ["cycle_export_picture", "cycle_audio_kbps", "cycle_encoder"] {
+        assert!(!more.contains(cycle), "{cycle} is a press-to-cycle row again");
     }
-    assert_eq!(
-        at, PICTURE_CYCLE[0],
-        "a full walk is a wrap, not a dead end"
+    assert!(
+        crate::export_ui::ENCODER_SEATS[0] == EncoderSeat::Software,
+        "the software seat is not listed first"
     );
-    assert_eq!(next_picture(Format::Ogg, |_| false), Format::Mp4);
-    // A timeline with no picture refuses every video format, and the cycle
-    // still moves: the sound-only stops are what is left of it.
-    let sound_only = next_picture(Format::Ogg, |f| f.has_video());
-    assert!(!sound_only.has_video() && sound_only != Format::Ogg);
+    let seats = fn_body("export_choices");
+    assert!(seats.contains("ENCODER_SEATS"));
+    // Hardware stays on the list, named plainly, and is never the default.
+    assert!(crate::export_ui::seat_plain(EncoderSeat::Hardware).contains("GPU"));
 }
 
 /// The budget is a video setting -- the engine's own word is that the bitrate
-/// settings "mean nothing to the audio-only ones" -- yet the moment drew the
-/// row, and answered `n` with a typing field, for a file that carries no
-/// picture. The row now mounts only where the format writes one, and both
-/// doors into the number answer the same gate: a row the moment does not
-/// show cannot have been changed.
+/// settings "mean nothing to the audio-only ones". Its Details row stays in
+/// place (nothing shifts) but dims with its reason for a file with no picture,
+/// and both doors into the number answer the same gate: a row the moment does
+/// not show cannot have been changed.
 #[test]
 fn the_budget_row_and_its_doors_are_video_only() {
-    // The row: still built, mounted under the gate -- a video format sees
-    // exactly the rows it saw before.
-    let cards = src_text("ui/cards.rs");
-    let start = cards.find("fn export_card(").expect("the moment");
-    let body = &cards[start
-        ..start
-            + cards[start..]
-                .find("\n    /// ")
-                .unwrap_or(cards.len() - start)];
+    let body = fn_body("sheet_more");
+    // A sound-only file has no picture settings at all: the video group's rows
+    // (the bitrate among them) are built only `if video`.
+    let gate = body.find("if video {").expect("the picture rows are gated on a picture");
     assert!(
-        body.contains(".children(self.format.has_video().then(|| budget_row))"),
-        "the budget row is back on the sound-only moment"
+        body.find("\"export-d-bitrate\"").is_some_and(|at| at > gate),
+        "the bitrate row is not behind the video gate"
     );
     // The `n` door: the moment's chord and the row's own click both funnel
     // through `edit_budget`, so its gate is the one gate -- and it must sit
@@ -1283,8 +1453,8 @@ fn the_export_overwrite_question_owns_the_door_and_the_keyboard() {
         .split_once("export_to_with")
         .expect("the worker is still started from start_export");
     assert!(
-        guard.contains("self.close_card()") && guard.contains("self.export_ask = true"),
-        "asking leaves the moment up over the plate's strip"
+        guard.contains("self.export_ask = true") && !guard.contains("self.close_card()"),
+        "the question is asked inside the sheet, which stays up"
     );
     assert!(
         started.contains("self.export_known = Some(self.export_path.clone())"),
@@ -1293,57 +1463,34 @@ fn the_export_overwrite_question_owns_the_door_and_the_keyboard() {
     let stance = src_text("ui/stance.rs");
     let (_, handler) = stance
         .split_once("if this.export_ask {")
-        .expect("the export plate is up with no key answering it");
+        .expect("the export question is up with no key answering it");
+    for answer in ["Overwrite::Replace", "Overwrite::KeepBoth", "Overwrite::Cancel"] {
+        assert!(handler.contains(answer), "the question's keys lost {answer}");
+    }
+    let answer = fn_body("answer_overwrite");
+    let (replace, _) = answer
+        .split_once("Overwrite::KeepBoth")
+        .expect("Keep both is an answer");
     assert!(
-        handler.contains("this.export_known = Some(this.export_path.clone())"),
-        "the plate's enter does not confirm the target before re-entering the door"
+        replace.contains("self.export_known = Some(self.export_path.clone())"),
+        "Replace does not confirm the target before re-entering the door"
     );
+    assert!(answer.contains("unique_path(&self.export_path"));
+    let sheet = fn_body("sheet_overwrite");
     assert!(
-        stance.contains("stance-export-ask") && stance.contains("file_name(&player.export_path)"),
-        "the export plate does not name the file it would overwrite"
+        sheet.contains("file_name(&self.export_path)"),
+        "the question does not name the file it would overwrite"
     );
 }
 
-/// One chord per thing, said the same on both surfaces: the moment's segments
-/// and the Settings room's EXPORT rows drive the same setters, so a chord that
-/// drifted on one of them would teach the user a key the other refuses.
+/// The export panel's handler swallows every stroke so none reaches the room
+/// under it; Settings has no Export tab.
 #[test]
-fn the_moment_and_the_settings_room_wear_the_same_export_chords() {
-    let settings = src_text("ui/settings_stance.rs");
-    let moment = src_text("ui/cards.rs");
-    let player = src_text("player/cards.rs");
+fn the_moment_and_the_room_wear_the_same_export_chords() {
     let handler = fn_body("export_moment_key");
-    for chord in ["\"c\"", "\"b\"", "\"g\""] {
-        assert!(settings.contains(chord), "the EXPORT rows lost {chord}");
-        assert!(moment.contains(chord), "row 3 lost {chord}");
-        assert!(handler.contains(chord), "the moment answers no {chord}");
-        assert!(
-            player.contains(chord),
-            "the settings page answers no {chord}"
-        );
-    }
-    // The Encoder row is the picture's own -- the engine opens no seat for a
-    // song -- so the settings room gates it on the format exactly as the
-    // moment does, and neither mounts a row for an audio-only format.
-    assert_eq!(Format::Mp4.has_video(), true);
-    for audio_only in [Format::Wav, Format::Flac, Format::Mp3, Format::Ogg] {
-        assert_eq!(audio_only.has_video(), false, "{audio_only:?}");
-    }
-    let at = settings
-        .find("settings-export-encoder")
-        .expect("the Encoder row");
-    let mount = &settings[at.saturating_sub(260)..at];
-    assert!(
-        mount.contains("has_video()"),
-        "the Encoder row is mounted for a song, where pressing it does nothing"
-    );
-    // `e` stays the Export press: the encoder seat took `g` rather than a
-    // shifted letter, which no ghost wears.
     assert!(handler.contains("\"e\" | \"enter\" => self.start_export"));
-    assert!(
-        !settings.contains("\n            \"e\","),
-        "the Encoder row took `e` back"
-    );
+    let settings = src_text("ui/settings_stance.rs");
+    assert!(!settings.contains("SettingsTab::Export"), "Settings grew an Export tab again");
 }
 
 /// The Sound row: what it offers, and that the pick travels to the engine
@@ -1377,46 +1524,12 @@ fn the_sound_row_carries_its_rate_into_both_kinds_of_file() {
     assert_eq!(rows.iter().filter(|(.., picked)| *picked).count(), 1);
     for ((choice, label, detail, picked), kbps) in rows.iter().zip(AUDIO_KBPS) {
         assert_eq!(*choice, Choice::AudioRate(kbps));
-        assert_eq!(label.as_ref(), format!("{kbps} kbps"));
+        assert_eq!(label.as_ref(), format!("{kbps} kb/s"));
         assert!(detail.chars().count() <= 26, "{detail} is too long to read");
         assert_eq!(*picked, kbps == DEFAULT_AUDIO_KBPS);
     }
     // A rate no row holds marks none of them, rather than the wrong one.
     assert!(audio_rate_choices(7).iter().all(|(.., picked)| !picked));
-}
-
-/// DEBT #111: the transition duration row's field is the same [`NumberEdit`]
-/// opened `(frames, 0, cap, ..)`, the shape [`Player::edit_transition`]
-/// builds it in -- but it clamps on commit instead of refusing, because the
-/// row's own stepper (`Player::nudge_transition`, backed by
-/// `set_transition_out`/`crossfade`) already clamps to `cap` in silence, and
-/// a typed number holding itself to a stricter rule than the mouse door
-/// would be a field disagreeing with its own stepper.
-#[test]
-fn a_typed_transition_duration_clamps_like_its_own_stepper() {
-    let cap = 24;
-    let digits = cap.to_string().chars().count() + 1;
-    // Opens on the frame count already in force, same as the bitrate field.
-    let mut edit = NumberEdit::new(10, 0, cap, digits, "frames");
-    assert_eq!(edit.text, "10");
-    // A number past the cap clamps to it rather than being refused -- the
-    // stepper's own ceiling, reached by a different door.
-    edit.backspace();
-    edit.backspace();
-    for digit in [9, 9] {
-        edit.digit(digit);
-    }
-    assert_eq!(edit.text, "99");
-    assert_eq!(
-        edit.commit_clamped(),
-        cap,
-        "clamped to the same cap the stepper stops at"
-    );
-    assert_eq!(edit.refusal, None, "clamping is not a refusal");
-    // Empty commits to the floor, not a parse failure -- there is no number
-    // typed that is not zero or more frames.
-    let mut edit = NumberEdit::new(0, 0, cap, digits, "frames");
-    assert_eq!(edit.commit_clamped(), 0);
 }
 
 /// The colour field (`ColorEdit`), the transition field's free-text sibling:
@@ -1574,6 +1687,18 @@ fn a_visualizer_look_write_arms_autosave() {
     );
 }
 
+/// The subtitle style card's caption animation rows write the project's caption style, so the
+/// door arms autosave on the engine's own "it moved" answer, and every row has a keyboard step.
+#[test]
+fn the_caption_style_rows_write_the_project_and_step_from_the_keyboard() {
+    let body = fn_body("edit_caption_style");
+    assert!(body.contains("set_caption_style(cs)") && body.contains("mark_dirty()"));
+    let step = fn_body("step_sub_field");
+    for row in ["SUB_ROW_ANIM", "SUB_ROW_HIGHLIGHT", "SUB_ROW_HL_BOX", "SUB_ROW_UPPERCASE", "SUB_ROW_WORDS"] {
+        assert!(step.contains(row), "{row} has no keyboard step");
+    }
+}
+
 /// The rest of the class the visualizer look family belonged to: every other
 /// door that writes the project from a *click* and so has no action behind it
 /// to arm autosave ([`Player::act`]'s list is the action doors only). Each arm
@@ -1632,8 +1757,8 @@ fn every_click_door_that_writes_the_project_arms_autosave() {
     // rule. Every one of these doors can answer "nothing happened" -- a clip let
     // go where it was picked up, a caption dragged back to the frame it started
     // on, a trim, a fade or a `[`/`]` nudge released against the wall the edge
-    // already stood on, a subtitle row dropped on an overlap ("NOT PLACED") or a
-    // caption that is not there any more ("NOTHING LIFTED") -- and each one used
+    // already stood on, a subtitle row dropped on an overlap ("Not placed") or a
+    // caption that is not there any more ("Nothing lifted") -- and each one used
     // to arm the flag *before* the door was asked, so the ledger's `unsaved`
     // ghost, the autosave sidecar and the save-on-close question described a
     // project whose content was byte-for-byte what it was.
@@ -1644,14 +1769,14 @@ fn every_click_door_that_writes_the_project_arms_autosave() {
     // stood against) and the ramp's own value before and after the fade
     // (`set_fade_*` answer `true` for any index that exists).
     for (name, gate) in [
-        ("move_clip", "match moved {"),
+        ("move_clip_now", "match moved {"),
         (
             "place_sub",
             "let text = match (self.sub_of_track(track), &mut self.session) {",
         ),
         ("move_sub", "Some(Ok(())) => {"),
         ("lift_sub", "if lifted {"),
-        ("commit_trim", "if trim.lane.kind == LaneKind::Subtitle {"),
+        ("commit_trim_now", "if trim.lane.kind == LaneKind::Subtitle {"),
         ("commit_fade", "if set {"),
         ("nudge_cut", "let to = nudge_edge(current, dir, lo, hi);"),
         (
@@ -1677,7 +1802,7 @@ fn every_click_door_that_writes_the_project_arms_autosave() {
     // The history pair is the one place the action table does not arm early:
     // the door's own answer ("there was a step to take") is the gate, so `^z`
     // with an empty history leaves the flag -- and the close question -- clear.
-    let act = fn_body("act");
+    let act = fn_body("run_action");
     for (gate, next) in [
         ("if self.undo(cx) {", "ActionId::Redo =>"),
         ("if self.redo(cx) {", "ActionId::AddVideoLane =>"),
@@ -1865,7 +1990,7 @@ fn the_action_table_arms_nothing_a_door_answers_for_itself() {
     }
     // ...and the two actions are out of the table's list, or the key path is
     // armed twice over and the menu path not at all.
-    let act = fn_body("act");
+    let act = fn_body("run_action");
     let listed = act
         .split_once("if matches!(")
         .unwrap()
@@ -1920,6 +2045,10 @@ fn a_duration_row_shows_only_for_a_transition_and_its_room_is_the_successors() {
     // 0, `speed` 1x, so `Clip::frames()` reads back exactly `len`).
     fn clip(start: u32, len: u32, transition_out: u32, fade_in: u32, fade_out: u32) -> Clip {
         Clip {
+            speed_keys: Vec::new(),
+            reversed: false,
+            stabilise: None, deinterlace: Default::default(), mark: Default::default(),
+            angle: Default::default(),
             start,
             in_frame: 0,
             out_frame: len,
@@ -1933,8 +2062,17 @@ fn a_duration_row_shows_only_for_a_transition_and_its_room_is_the_successors() {
             fade_in,
             fade_out,
             transition_out,
+            transition_kind: Default::default(),
             visualizer: 0,
             viz_paint: 0,
+            gain_db: 0.0,
+            gain_keys: Vec::new(),
+            pan: 0,
+            pitch: 0,
+            transform_keys: Vec::new(),
+            opacity_keys: Vec::new(),
+            color_keys: Vec::new(),
+            effects: Vec::new(),
         }
     }
     // A plain cut carries neither field, so the row has nothing to show.
@@ -1976,6 +2114,75 @@ fn a_duration_row_shows_only_for_a_transition_and_its_room_is_the_successors() {
     // lane, name no transition either -- each kind reads only its own lane.
     let dissolving = clip(0, 10, 4, 0, 0);
     assert_eq!(transition_of(LaneKind::Audio, &dissolving, Some(&b)), None);
+}
+
+/// The transition kinds: sixteen palette actions (one per kind and direction,
+/// each naming the kind it sets once), the card's title follows the clip's kind,
+/// and the kind door arms only on a write that changed the join, as the
+/// dissolve's does.
+#[test]
+fn the_transition_kinds_are_palette_actions_and_set_through_a_gated_door() {
+    use engine::transitions::{Dir, TransitionKind};
+    let kinds: Vec<TransitionKind> = ActionId::ALL
+        .into_iter()
+        .filter_map(|a| a.transition_kind())
+        .collect();
+    assert_eq!(kinds.len(), 16, "dissolve, two dips, three shapes x four ways, zoom");
+    for (i, k) in kinds.iter().enumerate() {
+        assert!(!kinds[..i].contains(k), "{k:?} is set by two actions");
+    }
+    assert!(kinds.contains(&TransitionKind::Push(Dir::Left)));
+    assert!(ActionId::TransitionWipeUp.label().contains("Wipe up"));
+
+    let body = fn_body("set_transition_kind");
+    assert!(body.contains("session.set_transition(lane, idx, kind, frames)"));
+    let gate = "if took && self.transition_edges(lane, idx) != before {";
+    let (ahead, arm) = body
+        .split_once(gate)
+        .expect("set_transition_kind no longer arms on the write that took");
+    assert!(arm.contains("mark_dirty()") && !ahead.contains("mark_dirty()"));
+    // The edge reader tells two kinds apart, or a kind change would not arm.
+    assert!(fn_body("transition_edges").contains("transition_kind_of(lane, idx)"));
+
+    let mut a = Clip {
+        opacity_keys: Vec::new(),
+        color_keys: Vec::new(),
+        effects: Vec::new(),
+        speed_keys: Vec::new(),
+        reversed: false,
+        stabilise: None, deinterlace: Default::default(), mark: Default::default(),
+        angle: Default::default(),
+        start: 0,
+        in_frame: 0,
+        out_frame: 10,
+        source: 0,
+        link: None,
+        eq: None,
+        color: None,
+        transform: None,
+        fit: FitPolicy::default(),
+        speed: Speed::NORMAL,
+        fade_in: 0,
+        fade_out: 0,
+        transition_out: 4,
+        transition_kind: TransitionKind::Push(Dir::Left),
+        visualizer: 0,
+        viz_paint: 0,
+        gain_db: 0.0,
+        gain_keys: Vec::new(),
+        pan: 0,
+        pitch: 0,
+        transform_keys: Vec::new(),
+    };
+    let mut b = a.clone();
+    b.start = 10;
+    b.transition_out = 0;
+    assert_eq!(transition_of(LaneKind::Video, &a, Some(&b)), Some(("Push", 4, 10)));
+    a.transition_kind = TransitionKind::DipBlack;
+    assert_eq!(
+        transition_of(LaneKind::Video, &a, Some(&b)),
+        Some(("Dip to black", 4, 10))
+    );
 }
 
 #[test]
@@ -2045,29 +2252,43 @@ fn a_held_key_moves_a_value_and_nothing_else() {
 #[test]
 fn the_silence_card_fits_the_smallest_window_and_never_slows_a_silence_down() {
     // The same 640x360 floor, and this card starts below the header: a
-    // title over its [`SILENCE_ROWS`] rows, the count line, the keep-only
+    // title, the scope chips, three slider rows (the threshold, the forgiveness
+    // and the rate), the `More …` fold, the status line beside the keep-only
     // switch, and the two apply buttons. Help is the head's `?`, not a line.
-    let (title, count) = (17., 17.);
-    let button_rows = 2.;
-    let gaps = 6. * 5.;
+    // The fold's rows are behind a click, so the floor is the closed card.
+    let (title, label_line, slider_gap) = (17., 17., 4.);
+    let slider_row_h = label_line + slider_gap + HIT_MIN;
+    let gaps = 6. * 6.;
     let padding = 24.;
     assert!(
         HEADER_H
             + 8.
             + title
-            + SILENCE_ROWS as f32 * KEYS_ROW_H
-            + count
-            + button_rows * KEYS_ROW_H
+            + KEYS_ROW_H
+            + 3. * slider_row_h
+            + HIT_MIN
+            + CONTROL_H
+            + CONTROL_H
             + gaps
             + padding
             <= 360.,
         "card too tall"
     );
-    // Its rows, its steppers and its buttons are clicked, so WCAG 2.5.8
-    // binds them: a stepper is `HIT_MIN` square inside a row of that height.
-    assert!(KEYS_ROW_H >= HIT_MIN);
+    // The closed card shows the four main rows; the rest are the fold's.
+    assert_eq!(Player::SILENCE_MAIN_ROWS.len(), 4);
+    assert_eq!(
+        Player::SILENCE_MAIN_ROWS.len() + Player::SILENCE_MORE_ROWS.len(),
+        SILENCE_ROWS
+    );
+    // Its rows, its bars and its buttons are clicked, so WCAG 2.5.8 binds
+    // them: a row's hit is `HIT_MIN` tall.
+    const {
+        assert!(KEYS_ROW_H >= HIT_MIN);
+    }
     // ...and the pair of them fits beside the widest value the card prints.
-    assert!(2. * HIT_MIN + 4. < COLOR_W / 2., "steppers crowd the value");
+    const {
+        assert!(2. * HIT_MIN + 4. < COLOR_W / 2., "steppers crowd the value");
+    }
     // A "speed-up" is never a slow-down: the rate stops above real time at
     // one end and at what a clip can hold at the other, whatever the keys
     // ask for. A silence played *slower* would make the timeline longer,
@@ -2076,6 +2297,49 @@ fn the_silence_card_fits_the_smallest_window_and_never_slows_a_silence_down() {
     assert!(silence_rate(1000) > Speed::NORMAL);
     assert_eq!(silence_rate(i32::MAX), Speed::MAX);
     assert_eq!(silence_rate(4000), Speed::MAX);
+}
+
+/// Each silence slider reads its own range, snaps to its own grid and opens
+/// at a value inside that range -- the three things a press and a Reset
+/// button both lean on. The rate's floor is real time plus one step, the
+/// same floor [`silence_rate`] clamps to, so a press at the left end is a
+/// speed-up and never a slow-down.
+#[test]
+fn the_silence_sliders_snap_to_their_grids_and_open_inside_their_ranges() {
+    // The two rows that are choices are not sliders at all.
+    assert_eq!(Player::silence_snap(0, 0.5), None);
+    assert_eq!(Player::silence_snap(2, 0.5), None);
+    // The threshold sweeps -80..0 dB on whole decibels.
+    assert_eq!(Player::silence_snap(1, 0.), Some(-80.));
+    assert_eq!(Player::silence_snap(1, 1.), Some(0.));
+    assert_eq!(Player::silence_snap(1, 0.5), Some(-40.));
+    // The durations sweep 0..5 s on a twentieth of a second.
+    let forgive = Player::silence_snap(3, 0.1).expect("a slider");
+    assert!((forgive - 0.5).abs() < 1e-9, "{forgive}");
+    let padding = Player::silence_snap(4, 0.333).expect("a slider");
+    assert!((padding / 0.05 - (padding / 0.05).round()).abs() < 1e-9);
+    // The rate sweeps from one step above real time to the top, in steps.
+    let floor = f64::from(Speed::NORMAL.permille()) + f64::from(SPEED_STEP);
+    assert_eq!(Player::silence_snap(6, 0.), Some(floor));
+    assert_eq!(Player::silence_snap(6, 1.), Some(4000.));
+    assert!(silence_rate(floor as i32) > Speed::NORMAL);
+    // A value a press can name is never outside its range, whatever the
+    // track's end it came from.
+    for field in [1, 3, 4, 5, 6] {
+        let (lo, hi, _) = Player::silence_range(field).expect("a slider");
+        for along in [-1., 0., 0.37, 1., 2.] {
+            let at = Player::silence_snap(field, along).expect("a slider");
+            assert!((lo..=hi).contains(&at), "field {field} at {along}: {at}");
+        }
+        // Every row opens inside its own range, so the bar starts on the track.
+        let default = Player::silence_default(field);
+        assert!(
+            (lo..=hi).contains(&default),
+            "field {field} opens at {default}"
+        );
+    }
+    // A fresh card's rate is the top of the range: the speed-up plays at four.
+    assert_eq!(Player::silence_default(6), 4000.);
 }
 
 /// The choice lists that replaced two click-to-cycle surfaces: every value
@@ -2094,7 +2358,9 @@ fn a_choice_list_offers_every_value_and_fits_the_smallest_window() {
             (3840, 2160),
             (2560, 1440),
             (1920, 1080),
+            (1080, 1920),
             (1440, 1080),
+            (1080, 1080),
             (1280, 720),
             (854, 480)
         ]
@@ -2112,15 +2378,15 @@ fn a_choice_list_offers_every_value_and_fits_the_smallest_window() {
     assert_eq!(rows.iter().filter(|(.., picked)| *picked).count(), 1);
     for ((choice, label, detail, picked), size) in rows.iter().zip(&ladder) {
         assert_eq!(*choice, Choice::Size(size.0, size.1));
-        assert_eq!(label.as_ref(), format!("{}p", size.1));
-        assert!(detail.contains(&format!("{}x{}", size.0, size.1)));
+        assert_eq!(label.as_ref(), size_row_label(size.0, size.1));
+        // A tall or square row names its shape, not its numbers, unless it is the media's own.
+        assert_eq!(detail.is_empty(), size.0 <= size.1 && *size != native, "{size:?}");
         assert_eq!(*picked, *size == (1280, 720));
     }
-    // The media's own size says so: it is the one rung a person cannot read
-    // off a number they chose -- in the one word the sample-rate list says
-    // the same fact in, since prose gets cut by `MENU_W` (user: "word cut").
-    let (.., native_detail, _) = &rows[3];
-    assert!(native_detail.ends_with(" source"), "{native_detail}");
+    // The media's own size says so, in plain words: it is the one rung a person
+    // cannot read off a number they chose.
+    let (.., native_detail, _) = rows.iter().find(|r| r.0 == Choice::Size(native.0, native.1)).expect("the media's own rung");
+    assert!(native_detail.ends_with("(matches your media)"), "{native_detail}");
     // A project at a size nobody listed still gets the whole list, with
     // nothing marked rather than a wrong row marked.
     assert!(
@@ -2128,18 +2394,10 @@ fn a_choice_list_offers_every_value_and_fits_the_smallest_window() {
             .iter()
             .all(|(.., picked)| !picked)
     );
-    // Picking a row means that row, and stepping means the next one: the
-    // list and the stroke read the same ladder.
-    assert_eq!(next_resolution(ladder[1], native), ladder[2]);
 
     // The fit list, on a clip: all four policies, in the order the stroke
-    // steps through them, the clip's own marked and every row naming the
+    // lists them, the clip's own marked and every row naming the
     // canvas it would place the picture on.
-    let mut fit = FITS[0];
-    for next in FITS.into_iter().skip(1).chain([FITS[0]]) {
-        assert_eq!(next_fit(fit), next, "the stroke skips a policy");
-        fit = next;
-    }
     let fits = fit_choices(Lane::V1, 3, FITS[2], (1920, 1080));
     assert_eq!(fits.len(), FITS.len());
     assert_eq!(fits.iter().filter(|(.., picked)| *picked).count(), 1);
@@ -2162,9 +2420,9 @@ fn a_choice_list_offers_every_value_and_fits_the_smallest_window() {
     assert_eq!(fps.len(), odd.len());
     assert_eq!(fps.iter().filter(|(.., picked)| *picked).count(), 1);
     assert_eq!(fps[0].0, Choice::Fps(ntsc), "the ratio, not 23.976");
-    assert_eq!(fps[0].1.as_ref(), "23.976 fps");
+    assert_eq!(fps[0].1.as_ref(), "23.976 fps (NTSC film)");
     assert!(fps[0].3, "the rate in force is not marked");
-    assert!(fps[5].2.contains("the media's own"), "{}", fps[5].2);
+    assert!(fps[5].2.contains("Match the media"), "{}", fps[5].2);
     for (.., detail, _) in &fps {
         assert!(detail.chars().count() < 26, "{detail} loses its tail");
     }
@@ -2219,7 +2477,9 @@ fn a_choice_list_offers_every_value_and_fits_the_smallest_window() {
     // longest of them is the rate ladder with an odd rate cycled in, and it
     // hangs at the pointer with every row on screen. Rows are click targets
     // (WCAG 2.5.8).
-    assert!(MENU_ROW_H >= HIT_MIN);
+    const {
+        assert!(MENU_ROW_H >= HIT_MIN);
+    }
     assert!(odd.len() > ladder.len(), "the longest list moved");
     assert!(MENU_PAD * 2. + odd.len() as f32 * MENU_ROW_H <= 360.);
     let tall = MENU_PAD * 2. + ladder.len() as f32 * MENU_ROW_H;
@@ -2249,8 +2509,9 @@ fn the_resolution_and_rate_lists_work_before_any_file_is_open() {
     );
     for ((choice, label, detail, _), size) in none.iter().zip(RESOLUTIONS) {
         assert_eq!(*choice, Choice::Size(size.0, size.1));
-        assert_eq!(label.as_ref(), format!("{}p", size.1));
-        assert_eq!(detail.as_ref(), format!("{}x{}", size.0, size.1));
+        assert_eq!(label.as_ref(), size_row_label(size.0, size.1));
+        let landscape = size.0 > size.1;
+        assert_eq!(detail.as_ref(), if landscape { format!("{}x{}", size.0, size.1) } else { String::new() });
     }
     let picked = pending_resolution_choices(Some(RESOLUTIONS[2]));
     assert_eq!(picked.iter().filter(|(.., picked)| *picked).count(), 1);
@@ -2322,7 +2583,7 @@ fn the_export_estimate_rides_out_a_stall_and_converges() {
                 assert!(left <= truth * 4., "at {elapsed}s: {left} vs {truth}");
                 // While the rate holds, the answer is the true one and it
                 // only ever counts down.
-                if elapsed >= 5. && elapsed < 20. {
+                if (5. ..20.).contains(&elapsed) {
                     assert!((left - truth).abs() <= truth * 0.15, "{elapsed}s: {left}");
                     assert!(left < last, "estimate grew while the rate held");
                 }
@@ -2428,7 +2689,7 @@ fn every_card_opener_closes_every_other_card_through_one_path() {
     for name in &openers {
         let body = fn_body(name);
         assert!(
-            body.contains("self.close_card();"),
+            body.contains("self.close_card();") || body.contains("self.close_other_cards();"),
             "{name} never calls close_card() -- it may be clearing its own \
              hand-picked subset of the other cards again, which is exactly \
              what let two cards stack on screen at once (open speed, then \
@@ -2472,7 +2733,7 @@ fn a_cards_own_help_paints_while_the_card_is_open_but_the_ui_under_it_stays_quie
     // so checking its one help-tooltip call site covers all seven cards (and
     // any future eighth) at once -- it must build an `OverlayTip`, not a
     // plain `Tip`, or this whole fix is undone by construction.
-    let cards_src = src_text("ui/cards.rs");
+    let cards_src = src_text("ui/cards");
     let head_fn_at = cards_src
         .find("fn dark_card_head(")
         .expect("dark_card_head");
@@ -2673,17 +2934,17 @@ fn a_maximized_card_reopens_exactly_as_left_across_a_restart() {
     std::fs::create_dir_all(&dir).unwrap();
     // `config_env_lock` serializes every test that changes this process-wide
     // path.
-    unsafe { std::env::set_var("XDG_CONFIG_HOME", &dir) };
+    crate::keymap::set_test_config_home(Some(dir.clone()));
 
     // Nothing written yet: the default (not maximized), not a crash on a
     // missing file.
-    assert_eq!(crate::ui::dock_stance::load_maximized(), false);
+    assert!(!crate::ui::dock_stance::load_maximized());
 
     crate::ui::dock_stance::save_maximized(true);
-    assert_eq!(crate::ui::dock_stance::load_maximized(), true);
+    assert!(crate::ui::dock_stance::load_maximized());
 
     crate::ui::dock_stance::save_maximized(false);
-    assert_eq!(crate::ui::dock_stance::load_maximized(), false);
+    assert!(!crate::ui::dock_stance::load_maximized());
 
     // A file from a future/corrupt version leaves the default in force
     // rather than failing the room that opens over it.
@@ -2692,9 +2953,9 @@ fn a_maximized_card_reopens_exactly_as_left_across_a_restart() {
         "not a bool\n",
     )
     .unwrap();
-    assert_eq!(crate::ui::dock_stance::load_maximized(), false);
+    assert!(!crate::ui::dock_stance::load_maximized());
 
-    unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+    crate::keymap::set_test_config_home(None);
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -2706,18 +2967,12 @@ fn darkroom_preview_mounts_stop_and_drag_scrub() {
     let stance = src_text("ui/stance.rs");
     let screen = &stance[stance.find("fn screen(").expect("the Darkroom screen")..];
     assert!(
-        screen.contains(".children(player.preview_plate(cx))"),
-        "the Darkroom screen no longer mounts the preview Stop plate"
+        screen.contains(".children(player.source_strip(window, cx))"),
+        "the Darkroom screen no longer mounts the source strip"
     );
     assert!(
-        screen.contains(".child(player.picture_area(position, window, cx))"),
+        screen.contains("player.picture_area(position, window, cx).into_any_element()"),
         "the Darkroom screen no longer routes through the shared picture"
-    );
-
-    let picture = fn_body("picture_area");
-    assert!(
-        picture.contains(".children(self.preview_scrub_bar(cx))"),
-        "the shared Darkroom picture no longer mounts the preview scrub bar"
     );
 
     let preview = src_text("ui/preview.rs");
@@ -2742,8 +2997,8 @@ fn darkroom_source_rows_keep_proxy_add_and_preview_doors() {
     let row = &dock[row_at..];
     for needle in [
         "dock-add-at-playhead",
-        "Add at playhead — ↵ does the same",
-        "this.insert_source(",
+        "Append to timeline end",
+        "this.append_source(",
     ] {
         assert!(
             row.contains(needle),
@@ -2833,7 +3088,7 @@ fn the_seat_probe_is_not_keyed_on_the_budget() {
     );
     // ...and the number the wheel moves is still what the export is given.
     assert!(
-        fn_body("start_export").contains("self.budget_bps()"),
+        fn_body("export_settings_now").contains("self.budget_bps()"),
         "the export no longer writes at the budget on the row"
     );
 }
@@ -2855,8 +3110,10 @@ fn picker_row_tails_are_state_words_and_settings_values_carry_no_ellipsis() {
     ];
     for (.., detail, _) in lists.iter().flatten() {
         let words = detail.split_whitespace().count();
+        // The media's own rung says what it matches in words: a state, not prose.
+        let state = detail.ends_with("(matches your media)") || detail == "matches your media";
         assert!(
-            words <= 2,
+            words <= 2 || state,
             "picker row tail {detail:?} is {words} words -- `MENU_W` cuts prose"
         );
         assert!(
@@ -2931,4 +3188,621 @@ fn a_settings_pick_undoes_and_redoes_like_a_cut() {
     assert_eq!(session.lane_clips(Lane::V1).len(), 0);
     assert!(session.undo(), "the delete is one step");
     assert_eq!(session.lane_clips(Lane::V1).len(), clips);
+}
+
+// The mix panel's meters, solo set and slider maths -- the parts of the card
+// that are not drawn, so they can be pinned without a window.
+
+#[test]
+fn a_meter_rises_at_once_and_falls_at_a_fixed_rate() {
+    use crate::player::cards::{METER_FLOOR_DB, MixMeter};
+    let t0 = Instant::now();
+    let mut meter = MixMeter::default();
+    assert_eq!(meter.level_db, METER_FLOOR_DB, "a new meter reads silence");
+    meter.feed(1.0, t0);
+    assert!(
+        meter.level_db.abs() < 1e-3,
+        "full scale reads 0 dBFS at once"
+    );
+    // Half a second of silence, read every tenth of one, falls 10 dB at 20 dB
+    // a second. (A read is capped at a quarter second, so one long gap would
+    // fall 5 dB at most -- which is the point of the cap.)
+    for step in 1..=5 {
+        meter.feed(0.0, t0 + Duration::from_millis(100 * step));
+    }
+    assert!((meter.level_db + 10.).abs() < 0.01, "{}", meter.level_db);
+    // A long pause between two reads is capped, not a drop through the floor.
+    meter.feed(0.0, t0 + Duration::from_secs(60));
+    assert!(meter.level_db > -16., "{}", meter.level_db);
+}
+
+#[test]
+fn a_meter_holds_its_peak_for_a_second_then_lets_it_fall() {
+    use crate::player::cards::MixMeter;
+    let t0 = Instant::now();
+    let mut meter = MixMeter::default();
+    meter.feed(1.0, t0);
+    meter.feed(0.0, t0 + Duration::from_millis(900));
+    assert!(meter.hold_db.abs() < 1e-3, "still held at 0.9 s");
+    meter.feed(0.0, t0 + Duration::from_secs(2));
+    assert!(
+        (meter.hold_db + 5.).abs() < 0.01,
+        "the marker falls once the hold is over: {}",
+        meter.hold_db
+    );
+    meter.reset();
+    assert_eq!(meter, MixMeter::default(), "a reset meter reads silence");
+}
+
+#[test]
+fn meter_db_is_dbfs_floored_at_the_bottom_of_the_bar() {
+    use crate::player::cards::{METER_FLOOR_DB, meter_db};
+    assert!(meter_db(1.0).abs() < 1e-4);
+    assert!((meter_db(0.1) + 20.).abs() < 1e-3);
+    assert_eq!(meter_db(0.), METER_FLOOR_DB);
+    assert_eq!(meter_db(1e-9), METER_FLOOR_DB, "below the floor pins to it");
+}
+
+#[test]
+fn solo_toggles_a_lane_in_and_out_and_keeps_the_order() {
+    use crate::player::cards::solo_toggled;
+    let (a1, a2, a3) = (
+        Lane::new(LaneKind::Audio, 0),
+        Lane::new(LaneKind::Audio, 1),
+        Lane::new(LaneKind::Audio, 2),
+    );
+    let solo = solo_toggled(&[], a2);
+    assert_eq!(solo, vec![a2]);
+    let solo = solo_toggled(&solo, a1);
+    assert_eq!(solo, vec![a2, a1], "joins at the end");
+    assert_eq!(
+        solo_toggled(&solo, a2),
+        vec![a1],
+        "a second press lets it go"
+    );
+    assert!(solo_toggled(&solo_toggled(&[], a3), a3).is_empty());
+}
+
+#[test]
+fn a_meter_reads_the_audio_lane_the_engine_levels_index() {
+    use crate::player::cards::meter_slot_in;
+    let (a1, a2, a3) = (
+        Lane::new(LaneKind::Audio, 0),
+        Lane::new(LaneKind::Audio, 1),
+        Lane::new(LaneKind::Audio, 2),
+    );
+    // A1 is empty: the engine's levels have no slot for it.
+    let sounding = [a2, a3];
+    assert_eq!(meter_slot_in(&sounding, a2), Some(0));
+    assert_eq!(meter_slot_in(&sounding, a3), Some(1));
+    assert_eq!(meter_slot_in(&sounding, a1), None);
+    // With no sound at all the engine plays A1 as its one slot.
+    assert_eq!(meter_slot_in(&[], Lane::A1), Some(0));
+    assert_eq!(meter_slot_in(&[], a2), None);
+}
+
+#[test]
+fn a_slider_press_maps_onto_its_range_and_clamps() {
+    use crate::player::cards::{bar_fraction, value_at};
+    use engine::project::{MAX_GAIN_DB, MIN_GAIN_DB};
+    assert_eq!(value_at(0., MIN_GAIN_DB, MAX_GAIN_DB), MIN_GAIN_DB);
+    assert_eq!(value_at(1., MIN_GAIN_DB, MAX_GAIN_DB), MAX_GAIN_DB);
+    assert!((value_at(0.5, -60., 12.) + 24.).abs() < 1e-4);
+    assert_eq!(value_at(2., -60., 12.), 12., "past the end pins to it");
+    assert_eq!(value_at(-1., -60., 12.), -60.);
+    // A bar that has not been drawn yet answers nothing rather than dividing.
+    assert_eq!(bar_fraction(Bounds::default(), px(10.)), None);
+    let bar = Bounds::new(point(px(0.), px(0.)), size(px(200.), px(4.)));
+    assert_eq!(bar_fraction(bar, px(50.)), Some(0.25));
+}
+
+/// Export follow-ups (X1): an export no longer makes the room modal, so what
+/// it must refuse is refused by the oracle and says why -- these pin the
+/// wiring of each piece by source, the way the guards above do, since there is
+/// no window here to press the keys.
+#[test]
+fn an_export_done_toast_offers_play_then_show_in_folder() {
+    let actions = src_text("player/actions.rs");
+    assert!(
+        actions.contains(
+            "ToastAction::Play(path.clone()),\n                ToastAction::ShowInFolder(path),"
+        ),
+        "the export-done toast no longer carries Play then Show in folder"
+    );
+    assert!(
+        actions.contains("xdg-open") && actions.contains("ToastAction::Play(path) =>"),
+        "Play no longer opens the file in the default player off the UI thread"
+    );
+    let stance = src_text("ui/stance.rs");
+    assert!(
+        stance.contains("toast.actions.iter().enumerate()")
+            && stance.contains("ToastAction::Play(_) => \"Play\""),
+        "the toast draws one button per action, Play included"
+    );
+}
+
+#[test]
+fn a_running_export_is_refused_by_the_oracle_not_by_the_modal() {
+    let body = fn_body("modal");
+    assert!(
+        !body.contains("exporting"),
+        "modal() reads exporting() again -- an export would swallow the keyboard"
+    );
+    // The picked-row Add is a second door to the edit list: it asks the row
+    // oracle, which refuses it while an export reads the list.
+    let actions = src_text("player/actions.rs");
+    assert!(
+        actions.contains("crate::oracle::row_enable(item, self.row_ctx(&path, stream))"),
+        "the media panel's Add no longer asks the row oracle during an export"
+    );
+    // Escape is Deselect and an export refuses it, so the press says what does
+    // cancel instead of doing nothing.
+    let stance = src_text("ui/stance.rs");
+    assert!(
+        stance.contains("if key == ESCAPE && !ctrl && this.exporting().is_some()")
+            && stance.contains("Esc keeps the export running."),
+        "Esc during an export no longer says that the export keeps running"
+    );
+}
+
+#[test]
+fn a_webm_export_says_why_the_subtitles_do_not_travel() {
+    let card = src_text("ui/cards/export.rs");
+    assert!(
+        card.contains(".filter(|_| self.format == Format::Webm)")
+            && card.contains("s.planned_subtitles(self.format, 0..s.subtitles().len())")
+            && card.contains(".filter(|why| why != \"none\")"),
+        "the export card no longer shows the engine's subtitle reason for WebM"
+    );
+}
+
+#[test]
+fn the_gui_opens_on_the_software_seat_and_keeps_a_hardware_pick() {
+    let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+    // The engine's own default (and every old saved project) is Auto, which can
+    // resolve to VA-API encode; the window never starts there.
+    assert_eq!(session.encoder_seat(), EncoderSeat::Auto);
+    gui_default_seat(&mut session);
+    assert_eq!(session.encoder_seat(), EncoderSeat::Software);
+    session.set_encoder_seat(EncoderSeat::Hardware);
+    gui_default_seat(&mut session);
+    assert_eq!(session.encoder_seat(), EncoderSeat::Hardware, "an explicit pick stays");
+    // Auto and Hardware are named as the GPU encoder in the list.
+    let rows = encoder_choices(EncoderSeat::Software);
+    assert!(rows[0].2.contains("GPU encoder") && rows[1].2.contains("GPU encoder"));
+}
+
+#[test]
+fn a_marked_span_says_how_long_it_is() {
+    assert_eq!(span_word(1, 30.), "1 frame");
+    assert_eq!(span_word(12, 30.), "12 frames");
+    assert_eq!(span_word(1140, 30.), "38 s");
+    assert_eq!(span_word(2340, 30.), "1 min 18 s");
+}
+
+/// The keyframe doors: four actions on the Clip menu and the palette, a diamond
+/// and the easing chips on the cards, and the sliders writing a key (not the
+/// clip's single value) once the clip is keyed.
+#[test]
+fn the_cards_carry_keyframe_diamonds_and_keyed_writes() {
+    let act = source_from("pub(crate) fn act(");
+    for arm in [
+        "ActionId::KeyPlacement => self.toggle_key_here(engine::project::KeyKind::Placement, cx)",
+        "ActionId::KeyOpacity => self.toggle_key_here(engine::project::KeyKind::Opacity, cx)",
+        "ActionId::KeyColor => self.toggle_key_here(engine::project::KeyKind::Color, cx)",
+        "ActionId::KeyEasing => self.open_key_easing(self.ledger_anchor(LedgerItem::Clip), cx)",
+    ] {
+        assert!(act.contains(arm), "act() lacks `{arm}`");
+    }
+    let ui = ui_source();
+    for id in ["key-diamond", "key-ease", "transform-opacity"] {
+        assert!(ui.contains(&format!("\"{id}\"")), "{id} is on no card");
+    }
+    for a in [ActionId::KeyPlacement, ActionId::KeyOpacity, ActionId::KeyColor, ActionId::KeyEasing] {
+        assert!(
+            ui.contains(&format!("Act(ActionId::{a:?})")) || ui.contains(&format!("Choice(ActionId::{a:?})")),
+            "{a:?} is on no menu"
+        );
+    }
+    assert!(fn_body("write_transform_now").contains("put_transform_key_at("));
+    assert!(fn_body("write_transform_now").contains("put_opacity_key_at("));
+    assert!(fn_body("write_color_now").contains("put_color_key_at("));
+}
+
+// The mix card's dynamics sliders: each one reads and writes exactly its own
+// setting, snapped to its step, and every processor's sliders are listed.
+
+#[test]
+fn voice_sliders_read_and_write_their_own_setting_and_snap_to_the_step() {
+    use crate::player::cards::{VoiceParam, VoiceProc};
+    use engine::voice::VoiceFx;
+    let mut fx = VoiceFx::default();
+    for which in VoiceProc::ALL {
+        assert!(!which.params().is_empty(), "{which:?} has no slider");
+        for &param in which.params() {
+            let (lo, hi, step) = param.range();
+            let before = fx.clone();
+            param.set(&mut fx, hi + 100.);
+            assert!((param.get(&fx) - hi).abs() < 1e-4, "{param:?} clamps to {hi}");
+            param.set(&mut fx, lo - 100.);
+            assert!((param.get(&fx) - lo).abs() < 1e-4, "{param:?} clamps to {lo}");
+            param.set(&mut fx, lo + step * 2.4);
+            assert!(((param.get(&fx) - lo) / step - 2.).abs() < 1e-3, "{param:?} snaps");
+            assert!(!param.text(param.get(&fx)).is_empty());
+            fx = before;
+        }
+    }
+    // A slider moves its own setting and not the processor's switch.
+    VoiceParam::CompRatio.set(&mut fx, 6.);
+    assert_eq!(fx.comp.ratio, 6.);
+    assert!(!fx.comp.on && !fx.is_default());
+    // A hand-set makeup turns the automatic makeup off.
+    fx.comp.auto_makeup = true;
+    VoiceParam::CompMakeup.set(&mut fx, 4.);
+    assert!(!fx.comp.auto_makeup && (fx.comp.makeup() - 4.).abs() < 1e-4);
+}
+
+// ---- the speed card's ramp editor ------------------------------------------
+
+fn ramp_key(at: u32, permille: u16) -> engine::project::SpeedKey {
+    engine::project::SpeedKey {
+        at,
+        speed: Speed::from_permille(permille),
+    }
+}
+
+/// Every shape the card and the palette offer is a ramp the engine takes, on any clip
+/// long enough to hold its keys a frame apart -- and one that is not long enough is
+/// refused by the shape, not by an engine error the hand cannot act on.
+#[test]
+fn every_ramp_preset_is_keys_the_engine_takes() {
+    use crate::audio_cards::RampPreset;
+    for preset in RampPreset::ALL {
+        for frames in [1u32, 2, 3, 30, 150] {
+            match preset.keys(frames) {
+                Some(keys) => {
+                    assert!(engine::project::valid_speed_keys(&keys), "{preset:?} over {frames}");
+                    assert_eq!(keys[0].at, 0, "{preset:?} starts with the clip");
+                    assert_eq!(keys.last().map(|k| k.at), Some(frames), "{preset:?} spans it");
+                }
+                None => assert!(frames < 2, "{preset:?} refuses {frames} frames"),
+            }
+        }
+    }
+    // The shapes are the ones their names say.
+    let speeds = |p: RampPreset| -> Vec<u16> {
+        p.keys(60)
+            .expect("long enough")
+            .iter()
+            .map(|k| k.speed.permille())
+            .collect()
+    };
+    assert_eq!(speeds(RampPreset::Up), [1000, 2000]);
+    assert_eq!(speeds(RampPreset::Down), [2000, 1000]);
+    assert_eq!(speeds(RampPreset::SlowFastSlow), [500, 2000, 500]);
+    assert_eq!(speeds(RampPreset::FastSlowFast), [2000, 500, 2000]);
+}
+
+/// The preset through the session the card writes to: the clip takes the keys, its
+/// footprint is the ramp's, and one undo takes the whole thing back.
+#[test]
+fn a_ramp_preset_lands_on_a_clip_in_one_undo_step() {
+    use crate::audio_cards::RampPreset;
+    let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+    session.set_gain(0.0);
+    let before = session.lane_clips(Lane::V1)[0].clone();
+    for preset in RampPreset::ALL {
+        let keys = preset.keys(before.frames()).expect("the fixture is long");
+        session
+            .set_speed_ramp(Lane::V1, 0, &keys)
+            .expect("a clip alone on its lane takes a ramp");
+        let clip = session.lane_clips(Lane::V1)[0].clone();
+        assert_eq!(clip.speed_keys, keys, "{preset:?}");
+        assert_eq!(
+            clip.frames(),
+            engine::project::ramp_frames(&keys, clip.len()),
+            "{preset:?}: the footprint is the ramp's"
+        );
+        assert!(session.undo(), "{preset:?} is one undo step");
+        assert_eq!(session.lane_clips(Lane::V1)[0], before, "{preset:?} undone");
+    }
+}
+
+/// Adding a key slots it in order, replaces one at the same frame, and stops at the
+/// engine's cap; removing the last key leaves no ramp; a stepper moves a quarter and
+/// stays inside what a speed can hold.
+#[test]
+fn ramp_key_edits_keep_the_keys_in_order_and_inside_their_limits() {
+    use crate::audio_cards::{ramp_key_stepped, ramp_with_key, ramp_without_key};
+    let base = vec![ramp_key(0, 1000), ramp_key(60, 2000)];
+    let inserted = ramp_with_key(&base, 30, Speed::from_permille(500)).expect("room");
+    assert_eq!(inserted, [ramp_key(0, 1000), ramp_key(30, 500), ramp_key(60, 2000)]);
+    assert_eq!(
+        ramp_with_key(&inserted, 30, Speed::from_permille(750)).expect("replaces"),
+        [ramp_key(0, 1000), ramp_key(30, 750), ramp_key(60, 2000)]
+    );
+    assert_eq!(
+        ramp_with_key(&base, 90, Speed::NORMAL).expect("room"),
+        [ramp_key(0, 1000), ramp_key(60, 2000), ramp_key(90, 1000)],
+        "past the last key"
+    );
+    assert!(engine::project::valid_speed_keys(&inserted));
+    let mut full: Vec<_> = (0..engine::project::MAX_SPEED_KEYS as u32)
+        .map(|i| ramp_key(i * 10, 1000))
+        .collect();
+    assert!(ramp_with_key(&full, 5, Speed::NORMAL).is_none(), "a ninth key is refused");
+    assert!(ramp_with_key(&full, 10, Speed::from_permille(500)).is_some(), "but a replace is not");
+    full.truncate(1);
+    assert!(ramp_without_key(&full, 0).is_empty(), "the last key out clears the ramp");
+    assert_eq!(ramp_without_key(&base, 0), [ramp_key(60, 2000)]);
+    let stepped = ramp_key_stepped(&base, 1, 1);
+    assert_eq!(stepped[1].speed.permille(), 2250);
+    assert_eq!(ramp_key_stepped(&base, 0, -10)[0].speed, Speed::MIN);
+    assert_eq!(ramp_key_stepped(&base, 1, 100)[1].speed, Speed::MAX);
+}
+
+/// A clip's box wears its ramp: the keys joined by arrows, shortened past three, and
+/// nothing at all for a clip at real time.
+#[test]
+fn the_clip_label_shows_the_ramp() {
+    use crate::audio_cards::speed_chip_text;
+    let mut clip = Clip::source_range(0, 0, 100);
+    assert_eq!(speed_chip_text(&clip), None);
+    clip.speed = Speed::from_permille(2000);
+    assert_eq!(speed_chip_text(&clip).as_deref(), Some("2×"));
+    clip.speed_keys = vec![ramp_key(0, 1000), ramp_key(60, 2000)];
+    assert_eq!(speed_chip_text(&clip).as_deref(), Some("1×→2×"));
+    clip.speed_keys = vec![ramp_key(0, 500), ramp_key(30, 2000), ramp_key(60, 500)];
+    assert_eq!(speed_chip_text(&clip).as_deref(), Some("0.5×→2×→0.5×"));
+    clip.speed_keys = (0..5).map(|i| ramp_key(i * 10, 1000 + 250 * i as u16)).collect();
+    assert_eq!(speed_chip_text(&clip).as_deref(), Some("1×→2× (5 keys)"));
+}
+
+/// The curve the card draws starts and ends on the ramp's first and last speeds, passes
+/// through a key's height at the key, and sits level for a clip without a ramp.
+#[test]
+fn the_ramp_curve_runs_through_its_keys() {
+    use crate::audio_cards::ramp_curve;
+    let keys = [ramp_key(0, 500), ramp_key(30, 2000), ramp_key(60, 500)];
+    let curve = ramp_curve(&keys, Speed::NORMAL, 60, 60);
+    assert_eq!(curve.len(), 61);
+    assert!((curve[0].1 - speed_fraction(500.)).abs() < 1e-6);
+    assert!((curve[30].1 - speed_fraction(2000.)).abs() < 1e-6, "the middle key");
+    assert!((curve[60].1 - speed_fraction(500.)).abs() < 1e-6);
+    assert!((curve[60].0 - 1.).abs() < 1e-6);
+    let level = ramp_curve(&[], Speed::from_permille(1500), 60, 8);
+    assert!(level.iter().all(|&(_, y)| (y - speed_fraction(1500.)).abs() < 1e-6));
+}
+
+/// The palette's entries for the ramp: each is a real action in the Clips category with
+/// a label that says what it does, and is handled by the table that runs
+/// actions -- an entry the table forgot would be a row that does nothing.
+#[test]
+fn the_ramp_actions_are_in_the_palette_and_run() {
+    use crate::keymap::{ActionId, Category};
+    let ramp = [
+        ActionId::SpeedRampUp,
+        ActionId::SpeedRampDown,
+        ActionId::SpeedRampSlowFastSlow,
+        ActionId::SpeedRampFastSlowFast,
+        ActionId::SpeedRampKey,
+        ActionId::SpeedRampClear,
+    ];
+    let actions = src_text("player/actions.rs");
+    for action in ramp {
+        assert!(ActionId::ALL.contains(&action));
+        assert_eq!(action.category(), Category::Clips, "{action:?}");
+        assert!(action.label().to_lowercase().contains("speed"), "{action:?}: {}", action.label());
+        assert!(
+            actions.contains(&format!("ActionId::{action:?} =>")),
+            "{action:?} is in the palette and does nothing"
+        );
+    }
+}
+
+/// The effects card writes a whole stack at a time, so each act on it is one
+/// `set_effects` call and one undo step; a slider drag is held as a draft and is
+/// one call when the hand lets go.
+#[test]
+fn every_effects_card_act_is_one_undo_step() {
+    use crate::player::effects::{ParamShape, param_shape, snap_param};
+    use engine::effects::{Effect, EffectKind};
+    let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open");
+    let lane = Lane::V1;
+    let depth = |s: &PlaybackSession| s.undo_depth();
+    let step = |s: &mut PlaybackSession, stack: Vec<Effect>, what: &str| {
+        let before = depth(s);
+        assert!(s.set_effects(lane, 0, stack), "{what} changed nothing");
+        assert_eq!(depth(s), before + 1, "{what} is not one undo step");
+    };
+    // Add, at the end.
+    let mut stack = session.effects_of(lane, 0).to_vec();
+    stack.push(Effect::new(EffectKind::Blur));
+    step(&mut session, stack.clone(), "adding a blur");
+    stack.push(Effect::new(EffectKind::Vignette));
+    step(&mut session, stack.clone(), "adding a vignette");
+    // Switch off.
+    stack[0].on = false;
+    step(&mut session, stack.clone(), "switching off");
+    // Move down.
+    stack.swap(0, 1);
+    step(&mut session, stack.clone(), "moving down");
+    assert_eq!(session.effects_of(lane, 0)[1].kind, EffectKind::Blur);
+    // A slider drag: the draft is the card's, the clip is written once.
+    let spec = EffectKind::Blur.params()[0];
+    let before = depth(&session);
+    let mut draft = stack.clone();
+    for raw in [3., 17.3, 42.26] {
+        draft[1].values[0] = snap_param(&spec, raw);
+    }
+    assert_eq!(depth(&session), before, "a held bar writes nothing");
+    assert!(session.set_effects(lane, 0, draft));
+    assert_eq!(depth(&session), before + 1);
+    assert_eq!(session.effects_of(lane, 0)[1].values[0], 42.5);
+    // Remove.
+    stack.remove(0);
+    step(&mut session, stack, "removing");
+    // The shapes: a switch is a step of 1 over 0..1, the blend mode is words.
+    let shape = |kind: EffectKind, name: &str| {
+        let spec = kind.params().iter().find(|p| p.name == name).unwrap();
+        param_shape(kind, spec)
+    };
+    assert_eq!(shape(EffectKind::RectMask, "invert"), ParamShape::Switch);
+    assert_eq!(shape(EffectKind::Blend, "mode"), ParamShape::Mode);
+    assert_eq!(shape(EffectKind::Blur, "radius"), ParamShape::Bar);
+}
+
+/// The card has a Clip menu-bar row, a palette command and the dock's verb, and it is a
+/// picture card: refused over a sound.
+#[test]
+fn the_effects_card_is_reachable_and_for_pictures() {
+    use crate::oracle::{Ctx, Enable, enable};
+    assert!(ActionId::ALL.contains(&ActionId::Effects));
+    assert_eq!(ActionId::Effects.label(), "Effects…");
+    assert!(crate::ui::menubar::Title::Clip.entries().contains(&crate::ui::menubar::Entry::Act(ActionId::Effects)));
+    let picture = Ctx { clip: Some((Clip::source_range(0, 0, 10), Lane::V1)), timeline: true, playable: true, ..Ctx::default() };
+    let sound = Ctx { clip: Some((Clip::source_range(0, 0, 10), Lane::A1)), timeline: true, playable: true, ..Ctx::default() };
+    assert!(!matches!(enable(ActionId::Effects, picture), Enable::Hidden(_)));
+    assert!(matches!(enable(ActionId::Effects, sound), Enable::Hidden(_)));
+}
+
+#[test]
+fn colour_sections_cover_every_band_once_and_their_bands_round_trip() {
+    use crate::color_ui::{
+        band_neutral, band_spec, band_value, section_bands, set_band, ColorSection, COLOR_SLOTS,
+    };
+    let sections = [ColorSection::Basic, ColorSection::Wheels, ColorSection::Curves, ColorSection::Lut];
+    let all: Vec<usize> = sections.iter().flat_map(|&s| section_bands(s)).collect();
+    assert_eq!(all, (0..COLOR_SLOTS).collect::<Vec<_>>());
+
+    let neutral = engine::color::ColorParams::default();
+    for band in 0..COLOR_SLOTS {
+        let (name, lo, hi, _) = band_spec(band);
+        // Neutral reads as neutral, for every wheel and curve pick.
+        for pick in 0..3 {
+            let v = band_value(&neutral, band, pick, pick);
+            assert!((v - band_neutral(band)).abs() < 1e-4, "{name}: {v}");
+        }
+        // A value written reads back, and leaves the rest alone.
+        let target = lo + 0.3 * (hi - lo);
+        let mut p = neutral;
+        set_band(&mut p, band, 1, 2, target);
+        assert!((band_value(&p, band, 1, 2) - target).abs() < 2e-3, "{name}");
+        // (An intensity with no LUT to mix is still the identity.)
+        assert!(band == COLOR_SLOTS - 1 || !p.is_identity(), "{name} changed nothing");
+        // Putting the neutral back is the identity grade again.
+        set_band(&mut p, band, 1, 2, band_neutral(band));
+        assert!(p.is_identity(), "{name} did not reset");
+    }
+}
+
+/// N5: no card changes its layout when a value changes. The shared slider row
+/// keeps its Reset on the row whether or not the value is off its default (dimmed
+/// and inert at rest), and no card hands a row a Reset only once it has changed.
+#[test]
+fn a_slider_rows_reset_never_comes_and_goes_with_its_value() {
+    let widgets = src_text("ui/widgets.rs");
+    let row = &widgets[widgets.find("pub(crate) fn slider_row").unwrap()..];
+    let row = &row[..row.find("pub(crate) fn more_fold").unwrap()];
+    assert!(!row.contains("changed.then_some"), "Reset must not depend on `changed`");
+    assert!(row.contains("on_reset.map("), "Reset is drawn whenever the card gives one");
+    for card in ["speed", "color", "mix", "silence", "transform", "substyle", "effects"] {
+        let src = src_text(&format!("ui/cards/{card}.rs"));
+        assert!(
+            !src.contains("changed.then(") && !src.contains("changed.then_some"),
+            "{card}: a Reset handed over only when changed shifts the layout"
+        );
+    }
+}
+
+/// N5, per card: the rows whose presence follows a value are drawn in a slot of
+/// fixed height (stabilise's Stop/Measure) or are overlays (meter hold, analyser
+/// note), and the card sources carry no `Reset` row built from `when(changed`.
+#[test]
+fn every_card_keeps_its_rows_when_a_value_changes() {
+    for card in ["speed", "color", "effects", "tools", "transform", "silence", "mix", "eq", "markers", "substyle", "keys", "export"] {
+        let src = src_text(&format!("ui/cards/{card}.rs"));
+        assert!(!src.contains(".when(changed"), "{card}: a row appears when a value changes");
+        assert!(!src.contains(".when(!changed"), "{card}: a row disappears when a value changes");
+    }
+    assert!(src_text("ui/cards/transform.rs").contains(".min_h(px(CONTROL_H))"), "stabilise's action slot keeps its height");
+}
+
+/// N9: the Tools card's loudness chips wrap instead of clipping at the card edge.
+#[test]
+fn the_tools_loudness_chips_wrap() {
+    let src = src_text("ui/cards/tools.rs");
+    // The presets are one equal-width segmented row: three short names that always fit.
+    assert!(src.contains("segmented_equal(\n            \"tools-preset\""));
+}
+
+/// N7: the puck's place and the RGB offsets the sliders hold are one mapping.
+#[test]
+fn a_wheel_puck_and_its_rgb_offsets_round_trip() {
+    use crate::color_ui::{wheel_offsets, wheel_puck, WHEEL_REACH};
+    for (x, y) in [(0., 0.), (0.5, 0.), (-0.3, 0.6), (0., -0.9), (0.6, 0.6)] {
+        let [r, g, b] = wheel_offsets(x, y);
+        assert!((r + g + b).abs() < 1e-6, "tints do not move the master");
+        let (px, py) = wheel_puck(r, g, b);
+        assert!((px - x).abs() < 1e-5 && (py - y).abs() < 1e-5, "({x},{y}) -> ({px},{py})");
+    }
+    // Past the rim the puck stays on it.
+    let [r, ..] = wheel_offsets(3., 0.);
+    assert!((r - WHEEL_REACH).abs() < 1e-6);
+    // Red sits at 3 o'clock.
+    let [r, g, b] = wheel_offsets(1., 0.);
+    assert!(r > 0. && g < 0. && b < 0.);
+}
+
+/// N7: the scope tabs are short, and the curve editor has a square of its own
+/// rather than being drawn over the scope.
+#[test]
+fn the_colour_card_has_short_scope_tabs_and_a_curve_square_of_its_own() {
+    use crate::color_ui::SCOPE_VIEWS;
+    assert!(SCOPE_VIEWS.iter().all(|(_, n)| n.len() <= 11));
+    let src = src_text("ui/cards/color.rs");
+    assert!(!src.contains("graph_curve"), "no curve drawn over the scope");
+    assert!(src.contains("color-curve-graph"));
+}
+
+#[test]
+fn a_pan_scrub_sits_on_a_grid_catches_the_centre_and_stays_in_range() {
+    use crate::player::pan::{pan_text, scrub_pan_at};
+    assert_eq!(scrub_pan_at(0., 50., 0.01), 0.5);
+    assert_eq!(scrub_pan_at(0.5, -50., 0.01), 0., "the centre is caught");
+    assert_eq!(scrub_pan_at(0., 2., 0.01), 0., "within 3% of the middle is the middle");
+    assert_eq!(scrub_pan_at(0.9, 500., 0.01), 1.);
+    assert_eq!(scrub_pan_at(-0.9, -500., 0.01), -1.);
+    assert_eq!(pan_text(0.), "Centre");
+    assert_eq!(pan_text(-0.4), "40% L");
+    assert_eq!(pan_text(0.25), "25% R");
+}
+
+#[test]
+fn the_master_meter_reads_at_30_hz_latches_clips_and_falls_when_paused() {
+    use crate::player::cards::{CLIP_LAMP_S, MasterMeter};
+    use std::time::{Duration, Instant};
+    let t0 = Instant::now();
+    let mut m = MasterMeter::default();
+    let mut asked = 0;
+    m.step(true, || { asked += 1; [0.5, 0.1] }, t0);
+    m.step(true, || { asked += 1; [1.0, 1.0] }, t0 + Duration::from_millis(10));
+    assert_eq!(asked, 1, "a second read inside 33 ms is not taken");
+    assert!(m.lr[0].level_db > m.lr[1].level_db, "left is louder than right");
+    assert!(!m.clipped(t0));
+    m.step(true, || [1.0, 0.2], t0 + Duration::from_millis(40));
+    assert!(m.clipped(t0 + Duration::from_millis(41)), "a full-scale peak lights the lamp");
+    assert!(!m.clipped(t0 + Duration::from_secs_f32(CLIP_LAMP_S + 0.1)), "and it goes out");
+    m.step(false, || [0.0; 2], t0 + Duration::from_millis(80));
+    assert_eq!(m.lr[0], crate::player::cards::MixMeter::default());
+    assert!(!m.clipped(t0 + Duration::from_millis(81)));
+}
+
+#[test]
+fn the_loop_hover_names_what_it_loops() {
+    use crate::ui::timeband_stance::{loop_tip_hint, loop_tip_name};
+    assert_eq!(loop_tip_name(Some((10, 40))), "Loop playback");
+    assert_eq!(loop_tip_name(None), "Loop playback");
+    assert!(loop_tip_hint(Some((10, 40))).contains("Between In and Out"));
+    assert!(loop_tip_hint(None).contains("Set In and Out"));
 }

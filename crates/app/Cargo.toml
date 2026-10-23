@@ -8,6 +8,9 @@ name = "edith"
 path = "src/main.rs"
 
 [dependencies]
+# The local clock time an unsaved-edits autosave was written at, for the recovery question.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 engine = { path = "../engine" }
+ec-image = { path = "../../../edith_codecs/crates/ec-image" }
 gpui = "0.2.2"
 image = "0.25"

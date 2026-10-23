@@ -302,6 +302,17 @@ ffmpeg -y -f lavfi -i testsrc2=size=1280x720:rate=30:duration=2 \
     -filter_complex "[1:a][2:a]join=inputs=2:channel_layout=stereo,volume='0.5+0.5*sin(2*PI*t)':eval=frame[a]" \
     -map 0:v -map "[a]" -c:v libaom-av1 -cpu-used 8 -row-mt 1 -g 30 -pix_fmt yuv420p10le \
     -c:a aac -b:a 128k assets/test_av1_10.mkv
+# The AV1 chroma and depth matrix, 64x64 and 3 frames each, in both containers.
+# 4:4:4, 4:2:2 and 12-bit are refused at open by name; the two 4:2:0 files (8 and
+# 10-bit) are the ones that open and decode. `test_av1_gray` is monochrome.
+for fmt in yuv420p:420 yuv420p10le:420_10 yuv444p:444 yuv422p:422 yuv420p12le:12bit gray:gray; do
+    pix=${fmt%%:*}; tag=${fmt##*:}
+    for ext in mkv mp4; do
+        ffmpeg -y -loglevel error -f lavfi -i testsrc2=size=64x64:rate=30:duration=0.1 \
+            -frames:v 3 -c:v libaom-av1 -cpu-used 8 -g 30 -pix_fmt "$pix" \
+            "assets/test_av1_$tag.$ext"
+    done
+done
 # H.264 in Matroska: the same stream the mp4 fixtures carry, in the container
 # that used to refuse it. Baseline profile so `rusty_h264` reads it with nothing
 # installed, `-g 30` for the second keyframe the sync index is checked against,
@@ -799,6 +810,41 @@ ffmpeg -y -f lavfi -i "testsrc2=size=1440x1080:rate=30:duration=2" \
     -vf "setsar=4/3" -c:v libx265 -pix_fmt yuv420p \
     -x265-params "log-level=error:keyint=30:min-keyint=30" \
     assets/test_anamorphic_hevc.mkv
+
+# HEVC on the software seat (`ec-h265`, `tests/hevc_sw.rs`, `decode/hevc.rs`):
+# libx265 at 8-bit and Main 10, in mp4 and Matroska, at 352x288 for one second,
+# B-frames and an IDR every 15 frames. The odd size is 350x286 (a conformance
+# window that crops the coded 352x288). The CRA file is open-GOP, so its GOPs
+# start on CRAs with RASL pictures. The 4:2:2 file is refused by name at open.
+ffmpeg -y -f lavfi -i "testsrc2=size=352x288:rate=30:duration=1" \
+    -c:v libx265 -pix_fmt yuv420p -x265-params "keyint=15:bframes=3:log-level=error" \
+    assets/test_hevcsw_8.mp4
+ffmpeg -y -f lavfi -i "testsrc2=size=352x288:rate=30:duration=1" \
+    -c:v libx265 -pix_fmt yuv420p -x265-params "keyint=15:bframes=3:log-level=error" \
+    assets/test_hevcsw_8.mkv
+ffmpeg -y -f lavfi -i "testsrc2=size=352x288:rate=30:duration=1" \
+    -c:v libx265 -pix_fmt yuv420p10le -x265-params "keyint=15:bframes=3:log-level=error" \
+    assets/test_hevcsw_10.mp4
+ffmpeg -y -f lavfi -i "testsrc2=size=352x288:rate=30:duration=1" \
+    -c:v libx265 -pix_fmt yuv420p10le -x265-params "keyint=15:bframes=3:log-level=error" \
+    assets/test_hevcsw_10.mkv
+ffmpeg -y -f lavfi -i "testsrc2=size=350x286:rate=30:duration=1" \
+    -c:v libx265 -pix_fmt yuv420p -x265-params "keyint=15:bframes=3:log-level=error" \
+    assets/test_hevcsw_odd.mp4
+ffmpeg -y -f lavfi -i "testsrc2=size=352x288:rate=30:duration=1" \
+    -c:v libx265 -pix_fmt yuv420p -x265-params "keyint=15:bframes=3:open-gop=1:log-level=error" \
+    assets/test_hevcsw_cra.mp4
+ffmpeg -y -f lavfi -i "testsrc2=size=352x288:rate=30:duration=1" \
+    -c:v libx265 -pix_fmt yuv422p -x265-params "keyint=15:bframes=3:log-level=error" \
+    assets/test_hevcsw_422.mp4
+# The 10-bit RExt 4:2:2 HEVC the probe refuses by name at open (`hvcC` chroma 2, depth 10).
+ffmpeg -y -f lavfi -i "testsrc2=size=64x64:rate=30:duration=0.1" \
+    -frames:v 3 -c:v libx265 -pix_fmt yuv422p10le -x265-params "log-level=error" \
+    assets/test_hevcsw_422_10.mp4
+# The 1080p 8-bit clip the software seat's per-frame timing is read off.
+ffmpeg -y -f lavfi -i "testsrc2=size=1920x1080:rate=30:duration=2" \
+    -c:v libx265 -pix_fmt yuv420p -x265-params "keyint=15:bframes=3:log-level=error" \
+    assets/test_hevcsw_1080.mp4
 
 
 echo "fixtures written to assets/"

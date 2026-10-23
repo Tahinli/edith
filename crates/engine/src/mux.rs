@@ -1,31 +1,29 @@
 //! Annex-B -> MP4, the mirror of `demux`: encoders emit start-code framed NALs,
 //! an mp4 sample wants 4-byte length prefixes with SPS/PPS living in `avcC`.
 //!
-//! ...and AV1 -> Matroska, the mirror of the *other* half of `demux`, for the
-//! same reason that half exists: `mp4 0.14` has no `av01` sample entry at all,
-//! so an AV1 export is written as EBML by hand exactly as an AV1 import is read
-//! as EBML by hand ([`MkvMuxer`]).
+//! ...and AV1 -> Matroska, the mirror of the *other* half of `demux`: an AV1
+//! export is written as EBML by hand exactly as an AV1 import is read as EBML by
+//! hand ([`MkvMuxer`]). The mp4 side is [`Mp4Muxer`], written through `ec-mp4`,
+//! which carries H.264, HEVC and AV1 sample entries itself.
 //!
-//! AV1 goes into an **mp4** too, and the missing sample entry is written by hand
-//! there as well ([`Mp4Muxer::create_av1`]): the crate writes the file with an
-//! `avc1` entry and this patches that entry into the `av01` + `av1C` pair the
-//! spec asks for, which is the only box in a whole mp4 the crate cannot spell.
 //! Both containers carry the timeline's AAC, so no format here writes a picture
 //! whose sound was silently left behind -- and both carry its subtitles, an mp4
-//! as the `tx3g` timed text `mp4 0.14` *can* spell ([`Mp4Muxer::write_subtitles`])
+//! as the `tx3g` timed text ([`Mp4Muxer::write_subtitles`])
 //! and Matroska as `S_TEXT/UTF8` blocks, so neither is a file whose words were.
 
 use std::collections::VecDeque;
-use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::fs::File;
+use std::io::{BufWriter, Seek, SeekFrom, Write};
+use std::path::Path;
 
-use mp4::{
-    AacConfig, AudioObjectType, AvcConfig, Bytes, ChannelConfig, FourCC, MediaConfig, Mp4Config,
-    Mp4Sample, Mp4Writer, SampleFreqIndex, TrackConfig, TrackType, TtxtConfig,
+use ec_core::{
+    AudioParameters, Buf, ChannelLayout, CodecId, CodecParameters, ColorInfo, MediaParameters,
+    Muxer as _, Packet, StreamInfo, TimeBase, VideoParameters,
 };
 
-use crate::colorspace::ColorDescription;
+use crate::colorspace::{ColorDescription, Tags};
+use crate::demux::mp4_error;
+
 
 /// 90 kHz is the H.264 convention, and it divides exactly at every *integer*
 /// fps (3000 ticks at 30, 3600 at 25). The NTSC rates do not divide into it at
@@ -80,39 +78,74 @@ pub struct AudioParams {
     /// ([`opus_track_entry`]) against `A_AAC` with an `AudioSpecificConfig`
     /// ([`aac_track_entry`]). `None` is AAC, which is every mp4 and every copy.
     pub opus_pre_skip: Option<u16>,
+    /// The track's language as a caller names it (`und` when it names none),
+    /// written to the mp4 `mdhd` through [`mp4_language`].
+    pub language: Option<String>,
 }
 
-/// Writes one H.264 *or* AV1 track plus an optional AAC track. mp4 0.14 ignores
-/// `Mp4Sample::start_time` and builds all timing by accumulating `duration`, so
-/// every sample handed over must carry an exact duration or the tracks drift.
+
+/// The AAC sampling frequencies, indexed by the `samplingFrequencyIndex` an
+/// `AudioSpecificConfig` states (ISO/IEC 14496-3 table 1.16).
+const AAC_RATES: [u32; 13] = [
+    96_000, 88_200, 64_000, 48_000, 44_100, 32_000, 24_000, 22_050, 16_000, 12_000, 11_025, 8_000,
+    7_350,
+];
+
+/// The `tx3g` sample entry's style, after its data reference index: the 30 bytes
+/// `TextSampleEntry` holds from `displayFlags` on, which `ec-mp4` writes as they
+/// are. Bottom-centred, an opaque black background, the text box the whole
+/// picture, and font 1 at size 16 in opaque white -- the entry this writer has
+/// always declared, so a player draws a subtitle exactly as before.
+const TX3G_STYLE: [u8; 30] = [
+    0, 0, 0, 0, // displayFlags
+    1, // horizontal justification: centred
+    0xFF, // vertical justification: bottom
+    0, 0, 0, 255, // background: opaque black
+    0, 0, 0, 0, 0, 0, 0, 0, // text box: left unset, so the whole picture
+    0, 0, // startChar
+    0, 0, // endChar
+    0, 1, // font-ID
+    0, // font flags
+    16, // font size
+    255, 255, 255, 255, // text colour: opaque white
+];
+
+/// The video track is stream 0 and the sound, where there is any, stream 1:
+/// streams are numbered in the order they are declared, and the picture is
+/// declared first.
+const VIDEO_STREAM: u32 = 0;
+const AUDIO_STREAM: u32 = 1;
+/// AAC-LC encoder delay in samples: the first access unit of every AAC track
+/// this writer takes, copied or encoded, is 1024 samples of priming that no
+/// sound should start with. Declared as an `elst` media_time, so a reader plays
+/// the sound from timeline frame 0 and does not run it 21 ms late.
+const AAC_PRIMING: u32 = 1024;
+
+/// Writes one H.264, HEVC or AV1 track plus an optional AAC track, through
+/// `ec-mp4`'s muxer. Timing is carried per sample: every sample is handed over
+/// with its exact decode time and duration, so the tracks cannot drift.
 pub struct Mp4Muxer {
-    writer: Mp4Writer<BufWriter<File>>,
+    writer: ec_mp4::Mp4Muxer<BufWriter<File>>,
     frame_duration: u32,
+    /// Whether the file carries a picture track. A sound-only file
+    /// ([`Mp4Muxer::create_audio_only`]) has none, and then the audio is the
+    /// stream 0 it is declared as.
+    has_video: bool,
     has_audio: bool,
-    /// The sample entry an AV1 or HEVC file's is patched into at
-    /// [`finish`](Mp4Muxer::finish) -- entry type, configuration box type and
-    /// its payload (`av01`/`av1C`, `hvc1`/`hvcC`). `None` for H.264, which the
-    /// crate spells itself. See [`create_av1`](Mp4Muxer::create_av1).
-    entry: Option<([u8; 4], [u8; 4], Vec<u8>)>,
-    /// The `colr` box that entry gets either way -- what the samples in it mean
-    /// ([`colr_nclx`]). `mp4 0.14` writes no `colr` of its own, so this is
-    /// patched in at [`finish`](Mp4Muxer::finish) beside the entry rewrite,
-    /// which is why an H.264 file is patched at all now.
-    colr: [u8; 11],
-    /// Where the file is, for that patch: the writer owns the handle it wrote
-    /// through and the patch reopens the finished file.
-    path: PathBuf,
+    /// The stream index the audio track was declared at, which is what its
+    /// packets are written under: 1 behind a picture, 0 without one.
+    audio_stream: u32,
+    /// How many streams have been declared: the next one's index.
+    streams: u32,
+    /// What the picture's samples mean, applied at [`finish`](Mp4Muxer::finish).
+    colour: ColorInfo,
+    /// HDR static metadata for the `mdcv` / `clli` boxes, written at finish.
+    light: ec_core::ContentLight,
     /// The video track's clock and how many pictures have been written on it --
     /// which is where the file *ends*, and a timed-text track is written out to
     /// that instant ([`write_subtitles`](Mp4Muxer::write_subtitles)).
     timescale: u32,
     frames: u64,
-    /// What the subtitle tracks are *called*, in the order they were written:
-    /// an mp4 states a track's title in a `trak/udta/name` box, which `mp4 0.14`
-    /// has no field for, so it is patched in at [`finish`](Mp4Muxer::finish)
-    /// beside the sample entry. Empty where no track carries a title, which is
-    /// every file that has no subtitles at all.
-    sub_names: Vec<String>,
     /// Coded pictures not yet handed to the writer, oldest first -- how the
     /// overlapped audio pass gets to land *under* the picture instead of
     /// after all of it: every `write_video_au`/`write_coded_sample` queues
@@ -148,20 +181,42 @@ pub struct Mp4Muxer {
     /// has declared one -- `drain`'s clock for `audio_ticks`. 0 until then,
     /// which is also exactly when `audio_queue` can have nothing in it.
     audio_rate: u32,
+    /// The sound's exact length in PCM frames, where the caller knows it
+    /// ([`Mp4Muxer::set_audio_frames`]). Only an audio-only file reads it.
+    audio_frames: Option<u64>,
 }
 
-/// A `ColourInformationBox` payload, ISO/IEC 14496-12 §12.1.5: the `nclx` tag
-/// and the same three H.273 code points Matroska's `Colour` carries, plus the
-/// range as the one-bit flag an mp4 says it with rather than Matroska's code.
-fn colr_nclx(colour: ColorDescription) -> [u8; 11] {
-    let (primaries, transfer, matrix) = colour.codes();
-    let mut out = [0u8; 11];
-    out[..4].copy_from_slice(b"nclx");
-    out[4..6].copy_from_slice(&primaries.to_be_bytes());
-    out[6..8].copy_from_slice(&transfer.to_be_bytes());
-    out[8..10].copy_from_slice(&matrix.to_be_bytes());
-    out[10] = u8::from(colour.full_range) << 7;
+/// The H.273 colour description of a picture, as the `colr` box states it.
+fn color_info(colour: Tags) -> ColorInfo {
+    // H.273's 2 is "unspecified": what a field the source left out stays in the box.
+    ColorInfo {
+        primaries: colour.primaries.unwrap_or(2) as u8,
+        transfer: colour.transfer_code.unwrap_or(2) as u8,
+        matrix: colour.matrix_code.unwrap_or(2) as u8,
+        full_range: colour.full_range.unwrap_or(false),
+    }
+}
+
+/// An H.264 `AVCDecoderConfigurationRecord` (ISO/IEC 14496-15 §5.3.3.1) for one
+/// SPS and one PPS, with four-byte NAL length prefixes -- the framing
+/// [`annex_b_to_avcc`] writes the samples in.
+fn avcc_record(sps: &[u8], pps: &[u8]) -> Vec<u8> {
+    let mut out = vec![1, sps[1], sps[2], sps[3], 0xFF, 0xE1];
+    out.extend_from_slice(&(sps.len() as u16).to_be_bytes());
+    out.extend_from_slice(sps);
+    out.push(1);
+    out.extend_from_slice(&(pps.len() as u16).to_be_bytes());
+    out.extend_from_slice(pps);
     out
+}
+
+/// The `AudioSpecificConfig` of an AAC-LC track at `freq_index` and
+/// `chan_conf`: object type 2, then the two indices packed into two bytes.
+fn audio_specific_config(freq_index: u8, chan_conf: u8) -> [u8; 2] {
+    [
+        (2 << 3) | (freq_index >> 1),
+        ((freq_index & 1) << 7) | (chan_conf << 3),
+    ]
 }
 
 /// The language an mp4 track states, from whatever a caller said the track is
@@ -197,37 +252,80 @@ fn mp4_language(language: &str) -> String {
     code.unwrap_or("und").to_owned()
 }
 
-const VIDEO_TRACK: u32 = 1;
-const AUDIO_TRACK: u32 = 2;
 
 impl Mp4Muxer {
+    /// Declares the sound's exact length in PCM frames per channel, for an
+    /// audio-only file: its `elst` plays `frames` samples from the priming and
+    /// stops there, so the file says what was exported and not what the last
+    /// AAC packet happens to carry. Written at [`finish`](Self::finish).
+    pub fn set_audio_frames(&mut self, frames: u64) -> crate::Result<()> {
+        self.audio_frames = Some(frames);
+        Ok(())
+    }
+
+    /// An audio-only file (`.m4a` or a sound-only `.mp4`). The `ec-mp4` writer
+    /// has no video-less file and no `M4A ` brand yet, so this is refused by name
+    /// rather than written as a file that says the wrong thing.
+    pub fn create_audio_only(path: &Path, audio: &AudioParams, m4a: bool) -> crate::Result<Self> {
+        // The `.m4a` says so in its major brand, which is the one a player picks
+        // an audio parser off; an `.mp4` of sound is the plain `isom` file.
+        let (major, compatible): ([u8; 4], &[[u8; 4]]) = match m4a {
+            true => (*b"M4A ", &[*b"M4A ", *b"mp42", *b"isom"]),
+            false => (*b"isom", &[*b"isom", *b"iso2", *b"mp41"]),
+        };
+        let writer = ec_mp4::Mp4Muxer::with_brands(
+            BufWriter::new(File::create(path)?),
+            major,
+            compatible,
+        )
+        .map_err(mp4_error)?;
+        let mut muxer = Self {
+            writer,
+            frame_duration: 1,
+            has_video: false,
+            has_audio: false,
+            audio_stream: 0,
+            colour: color_info(Tags::default()),
+            light: Default::default(),
+            streams: 0,
+            timescale: 1,
+            frames: 0,
+            hold: VecDeque::new(),
+            hold_ticks: 0,
+            audio_queue: VecDeque::new(),
+            audio_ticks: 0,
+            flushed_video_ticks: 0,
+            audio_rate: 0,
+            audio_frames: None,
+        };
+        muxer.add_audio_track(audio)?;
+        Ok(muxer)
+    }
+
     pub fn create(
         path: &Path,
         video: &VideoParams,
         audio: Option<&AudioParams>,
     ) -> crate::Result<Self> {
-        Self::open(path, video, audio, None)
+        // AvcCBox-style indexing of sps[1..=3] for profile and level: a short
+        // SPS is refused here, where the message still means something.
+        if video.sps.len() < 4 || video.pps.is_empty() {
+            return Err("no usable SPS/PPS for the video track".into());
+        }
+        let config = avcc_record(video.sps, video.pps);
+        Self::open(
+            path,
+            (video.width, video.height, video.frame_rate),
+            CodecId::H264,
+            config,
+            audio,
+        )
     }
 
-    /// The same file with an AV1 track in it. `mp4 0.14` writes no `av01` sample
-    /// entry -- it has no AV1 anything -- so the file is written with an `avc1`
-    /// entry of placeholder parameter sets and that one entry is rewritten at
-    /// [`finish`](Mp4Muxer::finish) into the `av01` + `av1C` pair AV1-ISOBMFF
-    /// §2.2 asks for. Everything else in an mp4 is codec-blind (the sample
-    /// tables, the audio track, the movie header), so the entry is the only box
-    /// this has to spell by hand -- and the `moov` it lives in is written *after*
-    /// `mdat`, so growing it moves no sample and invalidates no chunk offset.
-    ///
-    /// The record's layout is the one OxideAV's `oxideav-mp4` writes
-    /// (`src/sample_entries.rs`, MIT): a `VisualSampleEntry` header verbatim,
-    /// then `av1C` -- the very four bytes and sequence header OBU [`MkvMuxer`]
-    /// puts in `CodecPrivate`, which is what makes the two containers' AV1 one
-    /// stream written twice rather than two.
-    ///
-    /// corner-cut: the ceiling is that one entry. A second video track, or an AV1
-    /// track beside an H.264 one, would need the walk in [`patch_av01`] to be
-    /// told *which* track it is patching; the upgrade path is passing the track
-    /// id it already knows down that walk.
+    /// The same file with an AV1 track in it: an `av01` sample entry with its
+    /// `av1C` record -- the very four bytes and sequence header OBU
+    /// [`MkvMuxer`] puts in `CodecPrivate`, which is what makes the two
+    /// containers' AV1 one stream written twice rather than two.
     pub fn create_av1(
         path: &Path,
         video: &Av1Params,
@@ -236,33 +334,21 @@ impl Mp4Muxer {
         if video.config.is_empty() {
             return Err("no AV1 sequence header for the track's av1C record".into());
         }
-        let mut av1c = AV1C_HEAD.to_vec();
+        let mut av1c = av1c_head(video.ten_bit).to_vec();
         av1c.extend_from_slice(video.config);
         Self::open(
             path,
-            &VideoParams {
-                width: video.width,
-                height: video.height,
-                frame_rate: video.frame_rate,
-                // Never read by anything: the entry that holds them is replaced
-                // whole at `finish`. Four bytes because `AvcCBox::new` indexes
-                // `sps[1..=3]` for the profile it will never be asked for.
-                sps: &[0x67, 0x42, 0x00, 0x1E],
-                pps: &[0x68, 0xCE, 0x3C, 0x80],
-            },
+            (video.width, video.height, video.frame_rate),
+            CodecId::Av1,
+            av1c,
             audio,
-            Some((*b"av01", *b"av1C", av1c)),
         )
     }
 
-    /// ...and the same trick for HEVC, which `mp4 0.14` cannot spell either:
-    /// the file is written with an `avc1` entry and that entry is rewritten at
-    /// [`finish`](Mp4Muxer::finish) into the `hvc1` + `hvcC` pair ISO/IEC
-    /// 14496-15 §8.4.1 asks for -- the record being the very bytes the Matroska
-    /// file puts in `CodecPrivate`, so the two containers carry one stream.
-    /// `hvc1` rather than `hev1`: the samples this writes carry no parameter
-    /// sets (they are dropped into `hvcC`), which is exactly what the `hvc1`
-    /// name promises a reader.
+    /// An HEVC track, its `hvcC` record the very bytes the Matroska file puts
+    /// in `CodecPrivate`, so the two containers carry one stream. The sample
+    /// entry is `hvc1`: the parameter sets are in the `hvcC`, which is exactly
+    /// what the `hvc1` name promises a reader.
     pub fn create_hevc(
         path: &Path,
         video: &HevcParams,
@@ -273,93 +359,69 @@ impl Mp4Muxer {
         }
         Self::open(
             path,
-            &VideoParams {
-                width: video.width,
-                height: video.height,
-                frame_rate: video.frame_rate,
-                sps: &[0x67, 0x42, 0x00, 0x1E],
-                pps: &[0x68, 0xCE, 0x3C, 0x80],
-            },
+            (video.width, video.height, video.frame_rate),
+            CodecId::H265,
+            video.hvcc.to_vec(),
             audio,
-            Some((*b"hvc1", *b"hvcC", video.hvcc.to_vec())),
         )
     }
 
     fn open(
         path: &Path,
-        video: &VideoParams,
+        (width, height, frame_rate): (u32, u32, f64),
+        codec: CodecId,
+        config: Vec<u8>,
         audio: Option<&AudioParams>,
-        entry: Option<([u8; 4], [u8; 4], Vec<u8>)>,
     ) -> crate::Result<Self> {
-        if !video.frame_rate.is_finite() || video.frame_rate <= 0.0 {
-            return Err(format!("bad frame rate {}", video.frame_rate).into());
+        if !frame_rate.is_finite() || frame_rate <= 0.0 {
+            return Err(format!("bad frame rate {frame_rate}").into());
         }
-        if video.width == 0
-            || video.height == 0
-            || video.width > u16::MAX as u32
-            || video.height > u16::MAX as u32
-        {
-            return Err(format!("bad dimensions {}x{}", video.width, video.height).into());
-        }
-        // AvcCBox::new indexes sps[1..=3] for profile/level, so a short SPS panics
-        // inside the mp4 crate; refuse it here where the message still means something.
-        if video.sps.len() < 4 || video.pps.is_empty() {
-            return Err("no usable SPS/PPS for the video track".into());
+        if width == 0 || height == 0 || width > u16::MAX as u32 || height > u16::MAX as u32 {
+            return Err(format!("bad dimensions {width}x{height}").into());
         }
 
-        let (timescale, frame_duration) = frame_timing(video.frame_rate)?;
-        let mut writer = Mp4Writer::write_start(
-            BufWriter::new(File::create(path)?),
-            &Mp4Config {
-                major_brand: FourCC::from(*b"isom"),
-                minor_version: 512,
-                // The codec's own brand among them, so a reader that picks a
-                // parser off `ftyp` is told which of the two this is.
-                compatible_brands: vec![
-                    FourCC::from(*b"isom"),
-                    FourCC::from(*b"iso2"),
-                    FourCC::from(match &entry {
-                        Some((kind, ..)) => *kind,
-                        None => *b"avc1",
-                    }),
-                    FourCC::from(*b"mp41"),
-                ],
-                // The video track's own, deliberately: `mp4` converts every
-                // sample duration into the movie timescale with an integer
-                // division of its own (track.rs:752), so a coarser movie clock
-                // loses a fraction of a millisecond *per frame* -- 1 kHz makes a
-                // 4.000 s export announce itself as 3.960 s. Equal timescales
-                // make the video conversion exact.
-                timescale,
+        let (timescale, frame_duration) = frame_timing(frame_rate)?;
+        let mut writer = ec_mp4::Mp4Muxer::new(BufWriter::new(File::create(path)?))
+            .map_err(mp4_error)?;
+        let video_info = StreamInfo::new(
+            VIDEO_STREAM,
+            TimeBase::new(1, i64::from(timescale)),
+            CodecParameters {
+                codec,
+                extradata: Some(Buf::from(config)),
+                media: MediaParameters::Video(VideoParameters {
+                    width,
+                    height,
+                    format: None,
+                    frame_rate: Some(TimeBase::new(
+                        i64::from(timescale),
+                        i64::from(frame_duration),
+                    )),
+                    sample_aspect_ratio: None,
+                    color: ColorInfo::default(),
+                    light: Default::default(),
+                }),
             },
-        )?;
-        writer.add_track(&TrackConfig {
-            track_type: TrackType::Video,
-            timescale,
-            language: "und".to_string(),
-            media_conf: MediaConfig::AvcConfig(AvcConfig {
-                width: video.width as u16,
-                height: video.height as u16,
-                seq_param_set: video.sps.to_vec(),
-                pic_param_set: video.pps.to_vec(),
-            }),
-        })?;
+        );
+        writer.add_stream(video_info).map_err(mp4_error)?;
         let mut muxer = Self {
             writer,
             frame_duration,
+            has_video: true,
             has_audio: false,
-            entry,
-            colr: colr_nclx(ColorDescription::output(video.height)),
-            path: path.to_path_buf(),
+            audio_stream: AUDIO_STREAM,
+            streams: 1,
+            colour: color_info(Tags::of(ColorDescription::output(height))),
+            light: Default::default(),
             timescale,
             frames: 0,
-            sub_names: Vec::new(),
             hold: VecDeque::new(),
             hold_ticks: 0,
             audio_queue: VecDeque::new(),
             audio_ticks: 0,
             flushed_video_ticks: 0,
             audio_rate: 0,
+            audio_frames: None,
         };
         if let Some(audio) = audio {
             muxer.add_audio_track(audio)?;
@@ -371,70 +433,84 @@ impl Mp4Muxer {
     /// first packet is written: the sample table is built from the samples as
     /// they are handed over, and this file's audio is handed over after the
     /// whole picture ([`write_audio_packet`](Mp4Muxer::write_audio_packet)).
-    ///
-    /// That is what lets an export mix and encode its sound *while* it encodes
-    /// the picture rather than before it: the picture's loop no longer needs to
-    /// know the track's shape to start. Declaring it at the open, which is what
-    /// a caller that already has the sound does, writes the same file --
-    /// `mp4 0.14` builds the movie box at `finish` from tracks in the order
-    /// they were added, and the samples themselves are written in the order the
-    /// caller writes them either way.
     pub fn add_audio_track(&mut self, audio: &AudioParams) -> crate::Result<()> {
-        // The one thing this writer must never do quietly: an `mp4a` sample
-        // entry declares AAC, so Opus packets in it would be a file that says
-        // one codec and holds another. `export` never asks -- Opus is written
-        // for Matroska alone -- and this is the backstop that keeps that true
-        // if a format is ever added on the other side.
+        // An `mp4a` sample entry declares AAC, so Opus packets in it would be a
+        // file that says one codec and holds another. `export` never asks.
         if audio.opus_pre_skip.is_some() {
             return Err("an Opus track in an mp4: this writer declares `mp4a` only".into());
         }
         if self.has_audio {
             return Err("an mp4 declares its audio track once".into());
         }
-        let freq_index = SampleFreqIndex::try_from(audio.freq_index)?;
         // The index's own rate, not `audio.sample_rate`: this is the clock an
-        // `stts` counts in and the `esds` states the index, so the two must not
+        // `stts` counts in and the config states the index, so the two must not
         // be able to disagree.
-        let sample_rate = freq_index.freq();
-        self.writer.add_track(&TrackConfig {
-            track_type: TrackType::Audio,
-            timescale: sample_rate,
-            language: "und".to_string(),
-            media_conf: MediaConfig::AacConfig(AacConfig {
-                bitrate: 0,
-                profile: AudioObjectType::AacLowComplexity,
-                freq_index,
-                chan_conf: ChannelConfig::try_from(audio.chan_conf)?,
-            }),
-        })?;
+        let sample_rate = *AAC_RATES
+            .get(usize::from(audio.freq_index))
+            .ok_or_else(|| format!("no AAC sampling frequency index {}", audio.freq_index))?;
+        let channels = match audio.chan_conf {
+            1..=6 => usize::from(audio.chan_conf),
+            7 => 8,
+            other => return Err(format!("no AAC channel configuration {other}").into()),
+        };
+        let mut params = CodecParameters::new(CodecId::Aac);
+        params.extradata = Some(Buf::from(
+            audio_specific_config(audio.freq_index, audio.chan_conf).to_vec(),
+        ));
+        params.media = MediaParameters::Audio(AudioParameters {
+            sample_rate,
+            layout: ChannelLayout::from_count(channels),
+            ..Default::default()
+        });
+        let mut info = StreamInfo::new(self.streams, TimeBase::from_rate(sample_rate), params);
+        info.language = Some(mp4_language(audio.language.as_deref().unwrap_or("und")));
+        self.audio_stream = self.add_stream(info)?;
         self.has_audio = true;
         self.audio_rate = sample_rate;
         Ok(())
+    }
+
+    /// Declares a stream and returns its index, which is the one its packets
+    /// name.
+    fn add_stream(&mut self, info: StreamInfo) -> crate::Result<u32> {
+        let index = self.writer.add_stream(info).map_err(mp4_error)?;
+        self.streams += 1;
+        Ok(index)
     }
 
     /// Says what this file's samples mean, where that is *not* the rule the
     /// height implies -- a picture written in its source's own space rather
     /// than converted into the output one ([`crate::proxy`] is why: a stand-in
     /// carries the film's colour and lets the screen convert it, once, at
-    /// preview size). The box is written when the file is finished, so this may
-    /// be said any time before then.
-    pub fn set_colour(&mut self, colour: ColorDescription) {
-        self.colr = colr_nclx(colour);
+    /// preview size). Applied when the file is finished, so this may be said
+    /// any time before then.
+    pub fn set_colour(&mut self, colour: Tags) {
+        self.colour = color_info(colour);
+    }
+
+    /// HDR static metadata for the `mdcv` / `clli` boxes, written at finish.
+    pub fn set_hdr(&mut self, hdr: &crate::export::HdrOutput) {
+        self.light = hdr_light(hdr);
+    }
+
+    /// The chapter marks, `(start in ns, title)`, written at [`finish`](Mp4Muxer::finish) as a
+    /// `chpl` box and a chapter text track ([`ec_mp4::Mp4Muxer::set_chapters`]). Empty writes none.
+    pub fn set_chapters(&mut self, chapters: &[(u64, String)]) -> crate::Result<()> {
+        self.writer.set_chapters(chapters).map_err(mp4_error)
     }
 
     /// One coded picture, Annex-B framed. Parameter sets inside it are dropped
-    /// (they are already in `avcC`); an IDR slice marks the sample as a sync point.
+    /// (they are already in the sample entry); an IDR slice marks the sample as
+    /// a sync point.
     pub fn write_video_au(&mut self, annex_b: &[u8]) -> crate::Result<()> {
         let (bytes, is_sync) = annex_b_to_avcc(annex_b)?;
         self.queue_video(bytes, is_sync)
     }
 
     /// One coded picture already framed the way its sample carries it: an AV1
-    /// temporal unit is the low-overhead OBU stream the encoder handed over
-    /// (nothing to reframe, exactly as a Matroska block holds it), and an HEVC
-    /// sample is the length-prefixed NALs [`annex_b_to_hvcc`] made. `key` is the
-    /// encoder's own word for a unit a decoder may start on -- an mp4 says it in
-    /// `stss` where Matroska says it in the block flags.
+    /// temporal unit is the low-overhead OBU stream the encoder handed over, and
+    /// an HEVC sample is the length-prefixed NALs [`annex_b_to_hvcc`] made. `key`
+    /// is the encoder's own word for a unit a decoder may start on.
     pub fn write_coded_sample(&mut self, obus: &[u8], key: bool) -> crate::Result<()> {
         if obus.is_empty() {
             return Err("an empty coded picture".into());
@@ -450,6 +526,23 @@ impl Mp4Muxer {
         self.hold.push_back((bytes, is_sync));
         self.hold_ticks += u64::from(self.frame_duration);
         self.drain()
+    }
+
+    /// Hands one sample to the muxer with its exact decode time and duration.
+    fn put(
+        &mut self,
+        stream: u32,
+        time_base: TimeBase,
+        data: Vec<u8>,
+        dts: u64,
+        duration: u32,
+        keyframe: bool,
+    ) -> crate::Result<()> {
+        let mut packet = Packet::new(stream, time_base, data);
+        packet.dts = Some(dts as i64);
+        packet.duration = Some(i64::from(duration));
+        packet.flags.keyframe = keyframe;
+        self.writer.write_packet(&packet).map_err(mp4_error)
     }
 
     /// Advances the interleave as far as it currently can, called after
@@ -485,6 +578,8 @@ impl Mp4Muxer {
                 (Some(_), None) if self.hold_ticks > HOLD_SECONDS * u64::from(self.timescale) => {
                     self.flush_video_front()?;
                 }
+                // Sound with no picture to wait for is written as it arrives.
+                (None, Some(_)) if !self.has_video => self.flush_audio_front()?,
                 (Some(_), None) | (None, Some(_)) | (None, None) => break,
             }
         }
@@ -496,15 +591,16 @@ impl Mp4Muxer {
             return Ok(());
         };
         self.hold_ticks -= u64::from(self.frame_duration);
-        self.writer.write_sample(
-            VIDEO_TRACK,
-            &Mp4Sample {
-                start_time: 0, // ignored by the writer; timing is duration-accumulated
-                duration: self.frame_duration,
-                rendering_offset: 0, // no B-frames on either encode path
-                is_sync,
-                bytes: Bytes::from(bytes),
-            },
+        let time_base = TimeBase::new(1, i64::from(self.timescale));
+        let dts = self.flushed_video_ticks;
+        // No B-frames on either encode path, so decode and presentation are one.
+        self.put(
+            VIDEO_STREAM,
+            time_base,
+            bytes,
+            dts,
+            self.frame_duration,
+            is_sync,
         )?;
         self.frames += 1;
         self.flushed_video_ticks += u64::from(self.frame_duration);
@@ -515,18 +611,11 @@ impl Mp4Muxer {
         let Some(bytes) = self.audio_queue.pop_front() else {
             return Ok(());
         };
-        self.writer.write_sample(
-            AUDIO_TRACK,
-            &Mp4Sample {
-                start_time: 0,
-                duration: AAC_PACKET_SAMPLES,
-                rendering_offset: 0,
-                // Every AAC packet is a sync point; saying so per-sample would emit
-                // an `stss` listing all of them, while no `stss` means the same thing.
-                is_sync: false,
-                bytes: Bytes::from(bytes),
-            },
-        )?;
+        let time_base = TimeBase::from_rate(self.audio_rate);
+        let dts = self.audio_ticks;
+        // Every AAC packet is a sync point. Saying so per sample is what keeps
+        // the track free of an `stss`, which means the same thing.
+        self.put(self.audio_stream, time_base, bytes, dts, AAC_PACKET_SAMPLES, true)?;
         self.audio_ticks += u64::from(AAC_PACKET_SAMPLES);
         Ok(())
     }
@@ -558,12 +647,10 @@ impl Mp4Muxer {
     /// or one of the hand-written silent ones a gap is filled with. Every AAC-LC
     /// access unit is [`AAC_PACKET_SAMPLES`] frames, gap or not.
     ///
-    /// Queues rather than writes straight through: a caller feeding packets
-    /// while the picture is still running (the overlapped export path,
-    /// [`crate::export::run`]) gets them woven into the file under the
-    /// pictures still queued in [`hold`](Mp4Muxer::hold) instead of parked
-    /// until the picture ends, which is the whole point of calling this
-    /// before the picture loop is done rather than after.
+    /// Queues rather than writes straight through, so a caller feeding packets
+    /// while the picture is still running ([`crate::export::run`]) gets them
+    /// woven into the file under the pictures still queued in
+    /// [`hold`](Mp4Muxer::hold).
     pub fn write_audio_packet(&mut self, bytes: &[u8]) -> crate::Result<()> {
         if !self.has_audio {
             return Err("audio packet written to a video-only file".into());
@@ -573,11 +660,9 @@ impl Mp4Muxer {
     }
 
     /// The soft subtitle tracks this file carries, written after the picture and
-    /// the sound exactly as [`MkvMuxer`] writes its own into the clusters -- one
-    /// `tx3g` timed-text track per [`SubParams`], which is the text an mp4 says
-    /// a cue with and the one `ffmpeg` calls `mov_text`. Called once, before
-    /// [`finish`](Mp4Muxer::finish); an empty list writes nothing at all, which
-    /// is why an export with no pick is the file it always was, byte for byte.
+    /// the sound -- one `tx3g` timed-text track per [`SubParams`], which is the
+    /// text an mp4 says a cue with and the one `ffmpeg` calls `mov_text`. Called
+    /// once, before [`finish`](Mp4Muxer::finish); an empty list writes nothing.
     ///
     /// The samples are *continuous*: a timed-text track states one sample per
     /// instant of the film and nothing between them, so the stretches with
@@ -585,99 +670,108 @@ impl Mp4Muxer {
     /// not holes -- a hole is where a player keeps the last line on screen until
     /// the next one arrives. The run is built out of the cue *boundaries*, so
     /// cues that overlap are one sample of both their lines rather than one of
-    /// them dropped: a `tx3g` track shows one sample at a time where a Matroska
-    /// one may show two blocks at once, and joining them is what keeps the words
-    /// a viewer saw over the picture.
+    /// them dropped.
     ///
-    /// corner-cut: the `tx3g` sample entry is the one `mp4 0.14` writes and there
-    /// is no field to reach into it -- `MediaConfig::TtxtConfig` carries nothing
-    /// -- so its `data_reference_index` is the crate's 0 where §8.5.2 says an
-    /// index into `dref` counts from 1, and it holds no `ftab` font table.
-    /// ffmpeg and mpv both read the track (measured, 2026-08-12); a reader that
-    /// checks the index would not. The upgrade path is the trick the `av01`
-    /// entry already takes: rewrite the 46 fixed bytes of that entry in
-    /// [`patch_entry`] the way the video one is rewritten.
+    /// corner-cut: the `tx3g` sample entry is written with `ec-mp4`'s default
+    /// style and no `ftab` font table.
     pub fn write_subtitles(&mut self, subs: &[SubParams]) -> crate::Result<()> {
         if subs.is_empty() {
             return Ok(());
         }
-        // `self.frames` below counts only pictures already handed to the
-        // writer, and the interleave above can still be holding some back:
-        // drained first, or a text track written under a short hold would
-        // end short of the picture that has not landed yet.
+        // `self.frames` counts only pictures already handed to the writer, and
+        // the interleave can still be holding some back: drained first, or a
+        // text track written under a short hold would end short of the picture.
         self.drain_all()?;
         // Where the picture ends, in the text track's own tick: the last sample
         // runs out to it, so the track covers the film rather than stopping at
         // the last thing anybody says.
         let end = (self.frames * u64::from(self.frame_duration) * u64::from(SUB_TIMESCALE)
             / u64::from(self.timescale)) as i64;
-        // The picture is track 1 and the sound, where there is any, track 2:
-        // `mp4 0.14` numbers a track by the order it was added in, so the text
-        // starts after them and each further track is the next number up.
-        for (track_id, subs) in (2 + u32::from(self.has_audio)..).zip(subs) {
-            self.writer.add_track(&TrackConfig {
-                track_type: TrackType::Subtitle,
-                timescale: SUB_TIMESCALE,
-                // The field's own contract, enforced here rather than trusted:
-                // an mp4 packs exactly three ISO 639-2 letters into 16 bits, and
-                // the `mp4` crate's own `language_code` masks whatever it is
-                // handed into that shape without a word -- a two-letter `en`
-                // comes out as `en` and a backtick, a `pt-BR` tag as `ptm` --
-                // while Matroska may state a BCP-47 tag for the same track.
-                // `mp4_language` is the one place a tag becomes a code, and
-                // `und` (the code that means *undetermined*) is what a tag
-                // nothing names leaves as, rather than a language nobody speaks.
-                language: mp4_language(&subs.language),
-                media_conf: MediaConfig::TtxtConfig(TtxtConfig {}),
-            })?;
-            for (bytes, duration) in timed_text(&subs.cues, end)? {
-                self.writer.write_sample(
-                    track_id,
-                    &Mp4Sample {
-                        start_time: 0, // ignored by the writer, as everywhere here
-                        duration,
-                        rendering_offset: 0,
-                        // Every text sample is one a player may start at, and
-                        // saying so per-sample would emit an `stss` listing all
-                        // of them where no `stss` means the same thing -- the
-                        // audio track's reason, and what ffmpeg's own `tx3g`
-                        // track does.
-                        is_sync: false,
-                        bytes: Bytes::from(bytes),
-                    },
+        for sub in subs {
+            let mut params = CodecParameters::new(CodecId::Tx3g);
+            params.extradata = Some(Buf::from(TX3G_STYLE.to_vec()));
+            params.media = MediaParameters::Subtitle;
+            let mut info = StreamInfo::new(
+                self.streams,
+                TimeBase::from_rate(SUB_TIMESCALE),
+                params,
+            );
+            info.language = Some(mp4_language(&sub.language));
+            let stream = self.add_stream(info)?;
+            if !sub.name.is_empty() {
+                self.writer
+                    .set_track_title(stream, sub.name.clone())
+                    .map_err(mp4_error)?;
+            }
+            let mut dts = 0u64;
+            for (bytes, duration) in timed_text(&sub.cues, end)? {
+                // Every text sample is one a player may start at (no `stss`).
+                self.put(
+                    stream,
+                    TimeBase::from_rate(SUB_TIMESCALE),
+                    bytes,
+                    dts,
+                    duration,
+                    true,
                 )?;
+                dts += u64::from(duration);
             }
         }
-        self.sub_names = subs.iter().map(|subs| subs.name.clone()).collect();
         Ok(())
     }
 
     pub fn finish(mut self) -> crate::Result<()> {
         // Whatever the hold and the audio queue still carry: nothing further
-        // is coming for either to wait on, so this drains both fully rather
-        // than leaving a video-only tail queued.
+        // is coming for either to wait on, so this drains both fully.
         self.drain_all()?;
-        // Both containers refuse a file nobody put a picture in, by name and in
-        // their own container's words ([`MkvMuxer::finish`] is the twin): an mp4
-        // whose picture track holds no sample is a file that opens on a blank
-        // window with nothing said, which is worse than an export that fails.
-        if self.frames == 0 {
-            return Err("no frames were written to the mp4 file".into());
+        if self.has_video {
+            // Refused by name rather than written: an mp4 whose picture track holds
+            // no sample is a file that opens on a blank window with nothing said.
+            if self.frames == 0 {
+                return Err("no frames were written to the mp4 file".into());
+            }
+            self.writer
+                .set_color(VIDEO_STREAM, self.colour)
+                .map_err(mp4_error)?;
+            self.writer
+                .set_content_light(VIDEO_STREAM, self.light)
+                .map_err(mp4_error)?;
         }
-        self.writer.write_end()?;
-        let Self {
-            writer,
-            entry,
-            colr,
-            path,
-            sub_names,
-            ..
-        } = self;
-        // Not a `drop`: the buffered tail of `moov` has to be on disk before the
-        // patch below reads it back, and a `BufWriter` swallows the error of
-        // flushing it on drop.
-        writer.into_writer().flush()?;
-        patch_entry(&path, entry.as_ref(), &colr, &sub_names)
+        if self.has_audio {
+            if self.has_video {
+                // The sound plays for as long as the picture does, not to the end of
+                // its own packets: the copied AAC can run a packet past the picture.
+                // `picture_seconds * rate`, computed in whole ticks and rounded.
+                let picture_ticks = self.frames * u64::from(self.frame_duration);
+                let rate = u64::from(self.audio_rate);
+                let timescale = u64::from(self.timescale);
+                let picture_samples = (picture_ticks * rate * 2 + timescale) / (timescale * 2);
+                let picture_samples = u32::try_from(picture_samples)
+                    .map_err(|_| "the picture is too long for an mp4 audio edit")?;
+                self.writer
+                    .set_edit(self.audio_stream, AAC_PRIMING, picture_samples)
+                    .map_err(mp4_error)?;
+            } else if let Some(frames) = self.audio_frames {
+                // The sound plays for exactly the samples the encoder was fed, and
+                // no further: the last packet's padding and the priming's own tail
+                // past the end are not sound, so the edit states the count rather
+                // than leaving the packets' sum to say it.
+                let frames = u32::try_from(frames)
+                    .map_err(|_| "the sound is too long for an mp4 audio edit")?;
+                self.writer
+                    .set_edit(self.audio_stream, AAC_PRIMING, frames)
+                    .map_err(mp4_error)?;
+            } else {
+                self.writer
+                    .set_audio_delay(self.audio_stream, AAC_PRIMING)
+                    .map_err(mp4_error)?;
+            }
+        }
+        let mut writer = self.writer;
+        ec_core::Muxer::finish(&mut writer).map_err(mp4_error)?;
+        // Not a `drop`: a `BufWriter` swallows the error of flushing on drop.
+        writer.into_inner().flush()?;
+        Ok(())
     }
 }
 
@@ -749,177 +843,6 @@ fn timed_text(cues: &[crate::subtitle::Cue], end: i64) -> crate::Result<Vec<(Vec
     Ok(out)
 }
 
-/// Rewrites the finished file's one video sample entry: `colr` appended to it
-/// always (the crate writes none), and where `entry` says so the `avc1` header
-/// itself replaced by the `av01` + `av1C` an AV1 track declares -- or the `hvc1`
-/// + `hvcC` an HEVC one does. Called once, on a complete file.
-///
-/// `moov` sits after `mdat` (the crate writes it at `write_end`), so this only
-/// ever rewrites the tail of the file: no sample moves and no chunk offset in
-/// `co64` changes. The box tree is rebuilt rather than patched in place, which
-/// is what keeps every ancestor's size right by construction.
-fn patch_entry(
-    path: &Path,
-    entry: Option<&([u8; 4], [u8; 4], Vec<u8>)>,
-    colr: &[u8],
-    sub_names: &[String],
-) -> crate::Result<()> {
-    let mut file = OpenOptions::new().read(true).write(true).open(path)?;
-    let end = file.metadata()?.len();
-    let (at, payload) = top_level(&mut file, end, b"moov")?.ok_or("no moov box to patch")?;
-    let patched = swap_entry(&payload, 0, entry, colr).ok_or("no avc1 sample entry to rewrite")?;
-    let patched = name_subtitles(patched, sub_names);
-    let mut out = Vec::with_capacity(patched.len() + 8);
-    push_box(&mut out, b"moov", &patched);
-    file.seek(SeekFrom::Start(at))?;
-    file.write_all(&out)?;
-    file.set_len(at + out.len() as u64)?;
-    file.flush()?;
-    Ok(())
-}
-
-/// Offset and payload of the first top-level box of type `want`.
-fn top_level(file: &mut File, end: u64, want: &[u8; 4]) -> crate::Result<Option<(u64, Vec<u8>)>> {
-    let mut at = 0u64;
-    while at + 8 <= end {
-        let mut header = [0u8; 8];
-        file.seek(SeekFrom::Start(at))?;
-        file.read_exact(&mut header)?;
-        let (size, head_len) = match u32::from_be_bytes(header[..4].try_into().unwrap()) {
-            0 => (end - at, 8),
-            1 => {
-                let mut large = [0u8; 8];
-                file.read_exact(&mut large)?;
-                (u64::from_be_bytes(large), 16)
-            }
-            size => (u64::from(size), 8),
-        };
-        if size < head_len || at + size > end {
-            return Err("truncated box in the file's top level".into());
-        }
-        if &header[4..8] == want {
-            let mut payload = vec![0u8; (size - head_len) as usize];
-            file.read_exact(&mut payload)?;
-            return Ok(Some((at, payload)));
-        }
-        at += size;
-    }
-    Ok(None)
-}
-
-/// `moov` down to the sample descriptions, which is where the entry lives.
-const STSD_PATH: [&[u8; 4]; 5] = [b"trak", b"mdia", b"minf", b"stbl", b"stsd"];
-
-/// The box at `depth` of [`STSD_PATH`], rebuilt with its `avc1` entry given a
-/// `colr` box and, where `entry` says so, another four-character name and
-/// configuration box. `None` where this branch holds no such entry -- an audio
-/// `trak` is walked into and comes back untouched, which is how the *video*
-/// track is found without being told which id it has.
-fn swap_entry(
-    payload: &[u8],
-    depth: usize,
-    entry: Option<&([u8; 4], [u8; 4], Vec<u8>)>,
-    colr: &[u8],
-) -> Option<Vec<u8>> {
-    if depth == STSD_PATH.len() {
-        // stsd is a FullBox (4) plus entry_count (4), then the sample entries.
-        let mut out = payload.get(..8)?.to_vec();
-        let (kind, sample_entry) = crate::demux::boxes(payload.get(8..)?).next()?;
-        if kind != b"avc1" {
-            return None;
-        }
-        let (name, mut swapped) = match entry {
-            // A `VisualSampleEntry` is 78 bytes of fixed fields (dimensions and
-            // all) before its codec box, and `av01` and `hvc1` carry exactly the
-            // same ones -- so the header is kept and only the configuration box
-            // is swapped.
-            Some((want, config_kind, config)) => {
-                let mut swapped = sample_entry.get(..78)?.to_vec();
-                push_box(&mut swapped, config_kind, config);
-                (want, swapped)
-            }
-            // H.264: the crate spelled the whole entry, `avcC` and all, and only
-            // the colour tag is missing from it.
-            None => (b"avc1", sample_entry.to_vec()),
-        };
-        push_box(&mut swapped, b"colr", colr);
-        push_box(&mut out, name, &swapped);
-        return Some(out);
-    }
-    let mut out = Vec::with_capacity(payload.len());
-    let mut done = false;
-    for (kind, child) in crate::demux::boxes(payload) {
-        let patched = match !done && kind == STSD_PATH[depth] {
-            true => swap_entry(child, depth + 1, entry, colr),
-            false => None,
-        };
-        match patched {
-            Some(child) => {
-                push_box(&mut out, kind, &child);
-                done = true;
-            }
-            None => push_box(&mut out, kind, child),
-        }
-    }
-    done.then_some(out)
-}
-
-/// The title of each subtitle track into the `trak` that carries it, in the
-/// order they were written: a `udta` holding a `name` box, which is where an mp4
-/// says what a track is *called* (`Signs`) beside the `mdhd` language it is in
-/// -- the pair Matroska spells as `Name` and `Language`, and the very boxes
-/// ffmpeg writes a `-metadata:s:s:0 title=` into and reads back out.
-/// `mp4 0.14`'s `TrakBox` has no `udta` field at all, so it is appended here
-/// beside the sample entry rewrite, on the same rebuilt `moov`.
-///
-/// Untouched where no track has a title -- and returned as it came for a file
-/// with no subtitles at all, which is every export that picked none.
-fn name_subtitles(moov: Vec<u8>, names: &[String]) -> Vec<u8> {
-    if names.iter().all(|name| name.is_empty()) {
-        return moov;
-    }
-    let mut names = names.iter();
-    let mut out = Vec::with_capacity(moov.len() + 32 * names.len());
-    for (kind, child) in crate::demux::boxes(&moov) {
-        // A subtitle `trak` is the one whose media handler says `sbtl`, which is
-        // what `TrackType::Subtitle` wrote -- asked of the file rather than
-        // counted, so the picture's and the sound's `trak`s cannot be miscounted
-        // into.
-        let name = match kind == b"trak" && is_subtitle_trak(child) {
-            true => names.next().filter(|name| !name.is_empty()),
-            false => None,
-        };
-        let Some(name) = name else {
-            push_box(&mut out, kind, child);
-            continue;
-        };
-        let mut trak = child.to_vec();
-        let mut udta = Vec::new();
-        push_box(&mut udta, b"name", name.as_bytes());
-        push_box(&mut trak, b"udta", &udta);
-        push_box(&mut out, kind, &trak);
-    }
-    out
-}
-
-/// Whether a `trak` is a subtitle one: its `mdia`'s `hdlr` names the `sbtl`
-/// handler, which sits after the box's version, flags and the four `pre_defined`
-/// bytes.
-fn is_subtitle_trak(trak: &[u8]) -> bool {
-    crate::demux::boxes(trak)
-        .filter(|(kind, _)| *kind == b"mdia")
-        .flat_map(|(_, mdia)| crate::demux::boxes(mdia))
-        .any(|(kind, hdlr)| kind == b"hdlr" && hdlr.get(8..12) == Some(&b"sbtl"[..]))
-}
-
-/// One mp4 box: 32-bit size, four-character type, payload. Every box inside a
-/// `moov` fits that form -- the 64-bit one exists for `mdat`, which this never
-/// rewrites.
-fn push_box(out: &mut Vec<u8>, kind: &[u8; 4], payload: &[u8]) {
-    out.extend_from_slice(&(payload.len() as u32 + 8).to_be_bytes());
-    out.extend_from_slice(kind);
-    out.extend_from_slice(payload);
-}
 
 // Matroska element ids, written with the leading length marker they carry in the
 // file -- the same spelling `demux` reads them back with.
@@ -981,6 +904,16 @@ const TRACK_LANGUAGE: u32 = 0x22B59C;
 const BLOCK_GROUP: u32 = 0xA0;
 const BLOCK: u32 = 0xA1;
 const BLOCK_DURATION: u32 = 0x9B;
+const CHAPTERS: u32 = 0x1043_A770;
+const EDITION_ENTRY: u32 = 0x45B9;
+const EDITION_FLAG_DEFAULT: u32 = 0x45DB;
+const CHAPTER_ATOM: u32 = 0xB6;
+const CHAPTER_UID: u32 = 0x73C4;
+const CHAPTER_TIME_START: u32 = 0x91;
+const CHAPTER_TIME_END: u32 = 0x92;
+const CHAPTER_DISPLAY: u32 = 0x80;
+const CHAP_STRING: u32 = 0x85;
+const CHAP_LANGUAGE: u32 = 0x437C;
 
 /// One millisecond, the tick every Matroska muxer writes and this one's block
 /// timestamps are in. The *rate* is not derived from these -- `DefaultDuration`
@@ -1011,13 +944,31 @@ const AV1C_HEAD: [u8; 4] = [
     0x00, // no initial presentation delay
 ];
 
+/// [`AV1C_HEAD`] for a track at 10 bits: the same record with `high_bitdepth` set,
+/// which is the bit a reader takes the track's depth from (`parse_av1c`).
+fn av1c_head(ten_bit: bool) -> [u8; 4] {
+    let mut head = AV1C_HEAD;
+    if ten_bit {
+        head[2] |= 0x40; // high_bitdepth; the 8-bit record leaves it clear
+    }
+    head
+}
+
 /// What an AV1 Matroska track declares. `config` is the sequence header OBU,
 /// which is [`av1_sequence_header`]'s answer for the first coded keyframe.
 pub struct Av1Params<'a> {
+    /// Whether the sequence header is 10-bit; the `av1C` record says so too.
+    pub ten_bit: bool,
     pub width: u32,
     pub height: u32,
     pub frame_rate: f64,
     pub config: &'a [u8],
+    /// The track's language as a caller names it (`und` when it names none),
+    /// written as the Matroska `Language` of the track ([`track_language`]).
+    pub language: Option<String>,
+    /// The colour the track declares, when it is not the output rule's (a 10-bit
+    /// export of an SDR source states its source's matrix). `None` is the rule.
+    pub colour: Option<Tags>,
 }
 
 /// What an HEVC track declares in either container: the `hvcC` record
@@ -1030,6 +981,16 @@ pub struct HevcParams<'a> {
     pub height: u32,
     pub frame_rate: f64,
     pub hvcc: &'a [u8],
+    /// The track's language as a caller names it (`und` when it names none),
+    /// written as the Matroska `Language` of the track ([`track_language`]).
+    pub language: Option<String>,
+    /// The colour the Matroska `Colour` element declares, where it is not the
+    /// output rule's (an HDR export: BT.2020 and PQ or HLG). `None` keeps the rule.
+    pub colour: Option<Tags>,
+    /// The HDR static metadata the `Colour` element carries beside it
+    /// (MaxCLL/MaxFALL and the `MasteringMetadata`), or the mp4's `mdcv`/`clli`.
+    /// `None` writes nothing, which is every SDR file's header exactly as it was.
+    pub light: Option<ec_core::ContentLight>,
 }
 
 /// What a *copied* track declares: the source's own codec id and configuration
@@ -1046,6 +1007,9 @@ pub struct CopyParams<'a> {
     pub codec_id: &'a [u8],
     /// `CodecPrivate` as the source holds it ([`crate::demux::MkvDemuxer::codec_private`]).
     pub codec_private: &'a [u8],
+    /// The track's language as a caller names it (`und` when it names none),
+    /// written as the Matroska `Language` of the track ([`track_language`]).
+    pub language: Option<String>,
     /// The source's own `Colour`: a copied HDR film leaves as the HDR film it
     /// is, because not one of its samples was touched.
     ///
@@ -1054,7 +1018,7 @@ pub struct CopyParams<'a> {
     /// to write them yet, so a copied HDR file states its curve and not its
     /// grading display. Upgrade path is a `Colour` element written from that
     /// same struct.
-    pub colour: ColorDescription,
+    pub colour: Tags,
     /// The ratio one of the copied samples' pixels is drawn at, written as the
     /// track's `Display*` elements: the aspect is metadata about the samples,
     /// which are the source's own, so it travels instead of being baked in --
@@ -1138,6 +1102,12 @@ pub struct MkvMuxer {
     /// blocks carry their source's timing and a cut can leave the last picture
     /// on screen, so the duration is measured rather than counted.
     last_ts: i64,
+    /// Where the last chapter's `ChapterTimeEnd` sits in the file, and that chapter's start in ns,
+    /// once [`set_chapters`](MkvMuxer::set_chapters) has written them. The film's end is patched
+    /// into the first at [`finish`](MkvMuxer::finish).
+    chapter_end: Option<(u64, u64)>,
+    /// Whether the first cluster has been opened: chapters must be set before it.
+    clusters_started: bool,
     /// The AAC track, if the timeline has sound, and how far it has been
     /// written.
     audio: Option<MkvAudio>,
@@ -1175,7 +1145,7 @@ impl MkvMuxer {
         if video.config.is_empty() {
             return Err("no AV1 sequence header for the track's CodecPrivate".into());
         }
-        let mut av1c = AV1C_HEAD.to_vec();
+        let mut av1c = av1c_head(video.ten_bit).to_vec();
         av1c.extend_from_slice(video.config);
         Self::open(
             path,
@@ -1184,10 +1154,42 @@ impl MkvMuxer {
             video.frame_rate,
             b"V_AV1",
             &av1c,
-            ColorDescription::output(video.height),
+            video.colour.unwrap_or_else(|| Tags::of(ColorDescription::output(video.height))),
             crate::demux::PixelAspect::SQUARE,
             audio,
             subs,
+            false,
+            video.language.as_deref(),
+            None,
+        )
+    }
+
+    /// The same AV1 track as [`MkvMuxer::create`] with no subtitle track, in a
+    /// WebM file: the `webm` DocType, which is the one thing that differs.
+    pub fn create_webm(
+        path: &Path,
+        video: &Av1Params,
+        audio: Option<(&AudioParams, Vec<crate::AacPacket>)>,
+    ) -> crate::Result<Self> {
+        if video.config.is_empty() {
+            return Err("no AV1 sequence header for the track's CodecPrivate".into());
+        }
+        let mut av1c = av1c_head(video.ten_bit).to_vec();
+        av1c.extend_from_slice(video.config);
+        Self::open(
+            path,
+            video.width,
+            video.height,
+            video.frame_rate,
+            b"V_AV1",
+            &av1c,
+            Tags::of(ColorDescription::output_sized(video.width, video.height)),
+            crate::demux::PixelAspect::SQUARE,
+            audio,
+            Vec::new(),
+            true,
+            video.language.as_deref(),
+            None,
         )
     }
 
@@ -1214,10 +1216,13 @@ impl MkvMuxer {
             video.frame_rate,
             b"V_MPEGH/ISO/HEVC",
             video.hvcc,
-            ColorDescription::output(video.height),
+            video.colour.unwrap_or_else(|| Tags::of(ColorDescription::output(video.height))),
             crate::demux::PixelAspect::SQUARE,
             audio,
             subs,
+            false,
+            video.language.as_deref(),
+            video.light,
         )
     }
 
@@ -1251,6 +1256,9 @@ impl MkvMuxer {
             video.pixel_aspect,
             audio,
             subs,
+            false,
+            video.language.as_deref(),
+            None,
         )
     }
 
@@ -1262,10 +1270,13 @@ impl MkvMuxer {
         frame_rate: f64,
         codec_id: &[u8],
         codec_private: &[u8],
-        colour: ColorDescription,
+        colour: Tags,
         pixel_aspect: crate::demux::PixelAspect,
         audio: Option<(&AudioParams, Vec<crate::AacPacket>)>,
         subs: Vec<SubParams>,
+        webm: bool,
+        language: Option<&str>,
+        light: Option<ec_core::ContentLight>,
     ) -> crate::Result<Self> {
         if !frame_rate.is_finite() || frame_rate <= 0.0 {
             return Err(format!("bad frame rate {frame_rate}").into());
@@ -1295,7 +1306,7 @@ impl MkvMuxer {
         uint(&mut ebml, EBML_READ_VERSION, 1);
         uint(&mut ebml, EBML_MAX_ID_LENGTH, 4);
         uint(&mut ebml, EBML_MAX_SIZE_LENGTH, 8);
-        elem(&mut ebml, DOC_TYPE, b"matroska");
+        elem(&mut ebml, DOC_TYPE, if webm { b"webm" } else { b"matroska" });
         uint(&mut ebml, DOC_TYPE_VERSION, 4);
         uint(&mut ebml, DOC_TYPE_READ_VERSION, 2);
         elem(&mut head, EBML, &ebml);
@@ -1323,7 +1334,8 @@ impl MkvMuxer {
         uint(&mut entry, TRACK_UID, 1);
         uint(&mut entry, TRACK_TYPE, 1); // video
         uint(&mut entry, FLAG_LACING, 0);
-        elem(&mut entry, CODEC_ID, codec_id);
+            elem(&mut entry, CODEC_ID, codec_id);
+        track_language(&mut entry, language);
         elem(&mut entry, CODEC_PRIVATE, codec_private);
         uint(&mut entry, DEFAULT_DURATION, frame_ns);
         let mut dims = Vec::new();
@@ -1344,13 +1356,15 @@ impl MkvMuxer {
         // or a scaler downstream has no reason to make it, and an untagged file
         // is how a 601 source ends up displayed as 709. A *copied* track states
         // its source's space instead, which is the one its samples are in.
-        let (primaries, transfer, matrix) = colour.codes();
         let mut tags = Vec::new();
-        uint(&mut tags, MATRIX_COEFFICIENTS, u64::from(matrix));
+        uint(&mut tags, MATRIX_COEFFICIENTS, u64::from(colour.matrix_code.unwrap_or(2)));
         // Matroska says the range as a code, not a flag: 1 limited, 2 full.
-        uint(&mut tags, RANGE, 1 + u64::from(colour.full_range));
-        uint(&mut tags, TRANSFER_CHARACTERISTICS, u64::from(transfer));
-        uint(&mut tags, PRIMARIES, u64::from(primaries));
+        uint(&mut tags, RANGE, 1 + u64::from(colour.full_range.unwrap_or(false)));
+        uint(&mut tags, TRANSFER_CHARACTERISTICS, u64::from(colour.transfer_code.unwrap_or(2)));
+        uint(&mut tags, PRIMARIES, u64::from(colour.primaries.unwrap_or(2)));
+        if let Some(light) = light {
+            write_light(&mut tags, light);
+        }
         elem(&mut dims, COLOUR, &tags);
         elem(&mut entry, VIDEO, &dims);
         let mut tracks = Vec::new();
@@ -1387,6 +1401,8 @@ impl MkvMuxer {
             cluster_ts: 0,
             frames: 0,
             last_ts: 0,
+            chapter_end: None,
+            clusters_started: false,
             audio: audio.map(|(params, packets)| MkvAudio {
                 packets,
                 next: 0,
@@ -1487,6 +1503,7 @@ impl MkvMuxer {
     /// Opens a cluster stating `ts`, closing whatever was open: a cluster's size
     /// is a header field, so it is written whole or not at all.
     fn open_cluster(&mut self, ts: i64) -> crate::Result<()> {
+        self.clusters_started = true;
         self.flush()?;
         self.cluster_ts = ts;
         uint(&mut self.cluster, CLUSTER_TIMESTAMP, ts as u64);
@@ -1637,6 +1654,31 @@ impl MkvMuxer {
 
     /// Closes the last cluster and patches the two fields that could not be
     /// known while writing: the segment's size and the presentation duration.
+    /// The chapter marks, `(start in ns, title)`, written as a `Chapters` element straight after
+    /// the header, where a reader finds it without a SeekHead: before the first cluster. Sorted by
+    /// start. Each chapter ends at the next one's start, and the last at the film's end, which is
+    /// written at [`finish`](MkvMuxer::finish). Empty writes nothing. Must be called before any
+    /// picture or sound is written, and once.
+    pub fn set_chapters(&mut self, chapters: &[(u64, String)]) -> crate::Result<()> {
+        if chapters.is_empty() {
+            return Ok(());
+        }
+        if self.clusters_started {
+            return Err("the chapters must be set before the first picture or sound".into());
+        }
+        if self.chapter_end.is_some() {
+            return Err("the chapters are already set".into());
+        }
+        let mut sorted = chapters.to_vec();
+        sorted.sort_by_key(|(start, _)| *start);
+        let at = self.file.stream_position()?;
+        let (element, end_offset) = chapters_element(&sorted);
+        self.file.write_all(&element)?;
+        let last_start = sorted.last().map_or(0, |(start, _)| *start);
+        self.chapter_end = Some((at + end_offset as u64, last_start));
+        Ok(())
+    }
+
     pub fn finish(mut self) -> crate::Result<()> {
         // Whatever sound outlasts the last picture, before the last cluster is
         // closed: a track cut short here is a file that goes silent at the end.
@@ -1646,22 +1688,65 @@ impl MkvMuxer {
         if self.frames == 0 {
             return Err("no frames were written to the Matroska file".into());
         }
+        // One frame past the last picture shown, which is where the file really
+        // ends: counting the frames instead would cut a copied track short by
+        // however many pictures a cut left the one before it on screen for.
+        let ms = (self.frames as f64 * self.frame_ns as f64 / TIMESTAMP_SCALE_NS as f64)
+            .max(self.last_ts as f64 + self.frame_ns as f64 / TIMESTAMP_SCALE_NS as f64);
+        // The last chapter ends where the film does: the same instant the duration states.
+        if let Some((at, last_start)) = self.chapter_end {
+            let film_ns = ((ms * TIMESTAMP_SCALE_NS as f64).round() as u64).max(last_start);
+            let tail = self.file.stream_position()?;
+            self.file.seek(SeekFrom::Start(at))?;
+            self.file.write_all(&film_ns.to_be_bytes())?;
+            self.file.seek(SeekFrom::Start(tail))?;
+        }
         let end = self.file.stream_position()?;
         let body = end - (self.segment_size_at + 8);
         // The reserved 8-byte size: marker bit in the top byte, value under it.
         let size = (1u64 << 56) | body;
         self.file.seek(SeekFrom::Start(self.segment_size_at))?;
         self.file.write_all(&size.to_be_bytes())?;
-        // One frame past the last picture shown, which is where the file really
-        // ends: counting the frames instead would cut a copied track short by
-        // however many pictures a cut left the one before it on screen for.
-        let ms = (self.frames as f64 * self.frame_ns as f64 / TIMESTAMP_SCALE_NS as f64)
-            .max(self.last_ts as f64 + self.frame_ns as f64 / TIMESTAMP_SCALE_NS as f64);
         self.file.seek(SeekFrom::Start(self.duration_at))?;
         self.file.write_all(&ms.to_be_bytes())?;
         self.file.flush()?;
         Ok(())
     }
+}
+
+/// The Matroska `Chapters` element: one edition with a `ChapterAtom` per chapter. Every time is
+/// eight bytes, so the element never changes size: each chapter ends at the next one's start, and
+/// the last one's end is left at zero to be patched with the film's end. Returns the element and the
+/// offset of that last `ChapterTimeEnd` payload within it.
+fn chapters_element(chapters: &[(u64, String)]) -> (Vec<u8>, usize) {
+    let mut edition = Vec::new();
+    uint(&mut edition, EDITION_FLAG_DEFAULT, 1);
+    let mut last_end = 0;
+    for (i, (start, title)) in chapters.iter().enumerate() {
+        let end = match chapters.get(i + 1) {
+            Some((next, _)) => (*next).max(*start),
+            None => 0,
+        };
+        let mut display = Vec::new();
+        elem(&mut display, CHAP_STRING, title.as_bytes());
+        elem(&mut display, CHAP_LANGUAGE, b"und");
+        let mut atom = Vec::new();
+        elem(&mut atom, CHAPTER_UID, &(i as u64 + 1).to_be_bytes());
+        elem(&mut atom, CHAPTER_TIME_START, &start.to_be_bytes());
+        let end_in_atom = atom.len() + elem_head_len(CHAPTER_TIME_END, 8);
+        elem(&mut atom, CHAPTER_TIME_END, &end.to_be_bytes());
+        elem(&mut atom, CHAPTER_DISPLAY, &display);
+        last_end = edition.len() + elem_head_len(CHAPTER_ATOM, atom.len()) + end_in_atom;
+        elem(&mut edition, CHAPTER_ATOM, &atom);
+    }
+    let mut entries = Vec::new();
+    elem(&mut entries, EDITION_ENTRY, &edition);
+    let mut out = Vec::new();
+    elem(&mut out, CHAPTERS, &entries);
+    let offset = elem_head_len(CHAPTERS, entries.len())
+        + elem_head_len(EDITION_ENTRY, edition.len())
+        + last_end;
+    (out, offset)
 }
 
 /// The `TrackEntry` of the AAC track: `A_AAC`, whose `CodecPrivate` is the
@@ -1690,6 +1775,7 @@ fn aac_track_entry(audio: &AudioParams) -> crate::Result<Vec<u8>> {
     uint(&mut entry, TRACK_TYPE, 2); // audio
     uint(&mut entry, FLAG_LACING, 0);
     elem(&mut entry, CODEC_ID, b"A_AAC");
+    track_language(&mut entry, audio.language.as_deref());
     // 5 bits object type, 4 bits sample rate index, 4 bits channel config, and
     // three zero bits to the byte -- the whole of an AAC-LC AudioSpecificConfig.
     let asc = (2u16 << 11)
@@ -1708,6 +1794,15 @@ fn aac_track_entry(audio: &AudioParams) -> crate::Result<Vec<u8>> {
     uint(&mut audio_elem, CHANNELS, u64::from(audio.chan_conf));
     elem(&mut entry, AUDIO, &audio_elem);
     Ok(entry)
+}
+
+/// The `Language` a Matroska track states: the one it is given, or `und` where
+/// it is given none. A track with no `Language` is `eng` to every reader (the
+/// spec's default), so an undetermined source must say `und` rather than leave
+/// the element out. The code is written as given, as the subtitle track does.
+fn track_language(entry: &mut Vec<u8>, language: Option<&str>) {
+    let language = language.filter(|l| !l.is_empty()).unwrap_or("und");
+    elem(entry, TRACK_LANGUAGE, language.as_bytes());
 }
 
 /// The same track when the sound is Opus: `A_OPUS`, whose `CodecPrivate` is the
@@ -1755,6 +1850,7 @@ fn opus_track_entry(audio: &AudioParams, pre_skip: u16) -> crate::Result<Vec<u8>
     uint(&mut entry, TRACK_TYPE, 2); // audio
     uint(&mut entry, FLAG_LACING, 0);
     elem(&mut entry, CODEC_ID, b"A_OPUS");
+    track_language(&mut entry, audio.language.as_deref());
     elem(&mut entry, CODEC_PRIVATE, &head);
     uint(
         &mut entry,
@@ -1799,9 +1895,10 @@ pub const MAX_SUB_TRACKS: usize = 0x7F - SUB_TRACK_FIRST as usize;
 /// French" setting matches on, `Name` is the title beside it (`Signs`). Both
 /// where the source has both -- a track carrying only a name is an *English*
 /// track to every reader, that being the spec's default, which is how a
-/// multi-language film used to export as several English ones. Either is left
-/// out where it is empty, and [`crate::subtitle::of_matroska`] reads exactly
-/// this back, so a track exported and re-imported keeps what it had.
+/// multi-language film used to export as several English ones. `Language` is
+/// stated as `und` where the track names none; `Name` is left out where it is
+/// empty. [`crate::subtitle::of_matroska`] reads exactly this back, so a track
+/// exported and re-imported keeps what it had.
 fn subtitle_track_entry(language: &str, name: &str, track_no: u8) -> Vec<u8> {
     let mut entry = Vec::new();
     uint(&mut entry, TRACK_NUMBER, u64::from(track_no));
@@ -1809,9 +1906,9 @@ fn subtitle_track_entry(language: &str, name: &str, track_no: u8) -> Vec<u8> {
     uint(&mut entry, TRACK_TYPE, 0x11);
     uint(&mut entry, FLAG_LACING, 0);
     elem(&mut entry, CODEC_ID, b"S_TEXT/UTF8");
-    if !language.is_empty() {
-        elem(&mut entry, TRACK_LANGUAGE, language.as_bytes());
-    }
+    // Always stated: a track with no `Language` is `eng` to every reader, so a
+    // subtitle the source names no language for says `und`.
+    track_language(&mut entry, Some(language));
     if !name.is_empty() {
         elem(&mut entry, TRACK_NAME, name.as_bytes());
     }
@@ -1875,6 +1972,57 @@ fn put_size(out: &mut Vec<u8>, size: u64) {
     }
     let value = (1u64 << (7 * len)) | size;
     out.extend_from_slice(&value.to_be_bytes()[8 - len..]);
+}
+
+/// The `Colour` children that state HDR static metadata, in ffmpeg's order:
+/// MaxCLL, MaxFALL, then the `MasteringMetadata` master. Chromaticities are
+/// 8-byte floats (the 0.00002 steps over 50000), luminance in nits rounded to
+/// the 0.0001 the SEI carries.
+fn write_light(tags: &mut Vec<u8>, l: ec_core::ContentLight) {
+    if let Some(v) = l.max_cll {
+        uint(tags, 0x55BC, v.round() as u64);
+    }
+    if let Some(v) = l.max_fall {
+        uint(tags, 0x55BD, v.round() as u64);
+    }
+    let mut m = Vec::new();
+    let chroma = |o: &mut Vec<u8>, id: u32, raw: u16| elem(o, id, &(f64::from(raw) / 50_000.0).to_be_bytes());
+    if let Some(p) = l.mastering_primaries {
+        chroma(&mut m, 0x55D1, p.red.0);
+        chroma(&mut m, 0x55D2, p.red.1);
+        chroma(&mut m, 0x55D3, p.green.0);
+        chroma(&mut m, 0x55D4, p.green.1);
+        chroma(&mut m, 0x55D5, p.blue.0);
+        chroma(&mut m, 0x55D6, p.blue.1);
+        chroma(&mut m, 0x55D7, p.white.0);
+        chroma(&mut m, 0x55D8, p.white.1);
+    }
+    let nits = |v: f32| ((f64::from(v) * 1e4).round() / 1e4).to_be_bytes();
+    if let Some(v) = l.mastering_max {
+        elem(&mut m, 0x55D9, &nits(v));
+    }
+    if let Some(v) = l.mastering_min {
+        elem(&mut m, 0x55DA, &nits(v));
+    }
+    if !m.is_empty() {
+        elem(tags, 0x55D0, &m);
+    }
+}
+
+/// `HdrOutput` in ec-core's units (nits; chromaticities in 0.00002 steps).
+pub(crate) fn hdr_light(hdr: &crate::export::HdrOutput) -> ec_core::ContentLight {
+    ec_core::ContentLight {
+        max_cll: hdr.max_cll.map(f32::from),
+        max_fall: hdr.max_fall.map(f32::from),
+        mastering_max: hdr.mastering_display.map(|m| m.max_luminance as f32 / 10_000.0),
+        mastering_min: hdr.mastering_display.map(|m| m.min_luminance as f32 / 10_000.0),
+        mastering_primaries: hdr.mastering_display.map(|m| ec_core::MasteringPrimaries {
+            green: m.primaries[0],
+            blue: m.primaries[1],
+            red: m.primaries[2],
+            white: m.white_point,
+        }),
+    }
 }
 
 fn elem(out: &mut Vec<u8>, id: u32, payload: &[u8]) {
@@ -1946,9 +2094,27 @@ pub fn parameter_sets(annex_b: &[u8]) -> Option<(&[u8], &[u8])> {
 /// `None` where the unit carries no VPS, SPS or PPS -- the first coded intra AU
 /// always carries all three.
 pub fn hvcc_record(annex_b: &[u8]) -> Option<Vec<u8>> {
+    hvcc_record_at(annex_b, false)
+}
+
+/// [`hvcc_record`] at either depth: `ten_bit` writes `bit_depth_luma_minus8` and
+/// `bit_depth_chroma_minus8` as 2, which is what a Main 10 stream declares. The
+/// profile itself is the SPS's own, copied with the rest of the PTL.
+pub fn hvcc_record_at(annex_b: &[u8], ten_bit: bool) -> Option<Vec<u8>> {
     let nals = split_annex_b(annex_b);
     let of = |kind: u8| nals.iter().copied().find(|n| hevc_nal_type(n) == kind);
-    let (vps, sps, pps) = (of(HEVC_VPS)?, of(HEVC_SPS)?, of(HEVC_PPS)?);
+    let (vps, sps) = (of(HEVC_VPS)?, of(HEVC_SPS)?);
+    // Every picture parameter set the first unit carries: an I+P stream's P
+    // pictures refer to a second one, and samples drop theirs, so this record is
+    // all a decoder has of it.
+    let ppss: Vec<&[u8]> = nals
+        .iter()
+        .copied()
+        .filter(|n| hevc_nal_type(n) == HEVC_PPS)
+        .collect();
+    if ppss.is_empty() {
+        return None;
+    }
     // The SPS as a decoder reads it: the emulation-prevention bytes the encoder
     // escaped it with are not part of the syntax, and a run of zeros in the
     // constraint flags is exactly where one lands.
@@ -1958,18 +2124,21 @@ pub fn hvcc_record(annex_b: &[u8]) -> Option<Vec<u8>> {
     rec.extend_from_slice(&[0xF0, 0x00]); // min_spatial_segmentation_idc = 0
     rec.push(0xFC); // parallelismType = 0 (unknown)
     rec.push(0xFC | 1); // chroma_format_idc = 1 (4:2:0)
-    rec.push(0xF8); // bit_depth_luma_minus8 = 0
-    rec.push(0xF8); // bit_depth_chroma_minus8 = 0
+    let depth = if ten_bit { 0xFA } else { 0xF8 }; // minus8 = 2 at 10 bits, 0 at 8
+    rec.push(depth); // bit_depth_luma_minus8
+    rec.push(depth); // bit_depth_chroma_minus8
     rec.extend_from_slice(&0u16.to_be_bytes()); // avgFrameRate: unstated
                                                 // constantFrameRate 0, numTemporalLayers 1, temporalIdNested 1,
                                                 // lengthSizeMinusOne 3 -- the same 4-byte prefix `annex_b_to_hvcc` writes.
-    rec.push(0b00_001_1_11);
+    rec.push(0b0000_1111);
     rec.push(3); // numOfArrays
-    for (kind, nal) in [(HEVC_VPS, vps), (HEVC_SPS, sps), (HEVC_PPS, pps)] {
+    for (kind, units) in [(HEVC_VPS, vec![vps]), (HEVC_SPS, vec![sps]), (HEVC_PPS, ppss)] {
         rec.push(0x80 | kind); // array_completeness = 1, NAL_unit_type
-        rec.extend_from_slice(&1u16.to_be_bytes()); // numNalus
-        rec.extend_from_slice(&(nal.len() as u16).to_be_bytes());
-        rec.extend_from_slice(nal);
+        rec.extend_from_slice(&(units.len() as u16).to_be_bytes()); // numNalus
+        for nal in units {
+            rec.extend_from_slice(&(nal.len() as u16).to_be_bytes());
+            rec.extend_from_slice(nal);
+        }
     }
     Some(rec)
 }
@@ -2083,11 +2252,11 @@ fn nal_type(nal: &[u8]) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use std::io::BufReader;
 
     use crate::scratch::Scratch;
 
     use super::*;
+    use ec_core::Demuxer as _;
 
     const SPS: &[u8] = &[0x67, 0x42, 0x00, 0x1E, 0xAB];
     const PPS: &[u8] = &[0x68, 0xCE, 0x3C, 0x80];
@@ -2107,6 +2276,8 @@ mod tests {
             end_us: end_ms * 1_000,
             text: text.into(),
             image: None,
+            words: Vec::new(),
+            karaoke: Vec::new(),
         }
     }
 
@@ -2290,6 +2461,7 @@ mod tests {
                 chan_conf: 2,
                 sample_rate: 44_100,
                 opus_pre_skip: None,
+                language: None,
             }),
         )
         .unwrap();
@@ -2300,33 +2472,37 @@ mod tests {
         muxer.write_audio_packet(&[0x24, 0x25]).unwrap();
         muxer.finish().unwrap();
 
-        let file = File::open(&out).unwrap();
-        let size = file.metadata().unwrap().len();
-        let mut reader = mp4::Mp4Reader::read_header(BufReader::new(file), size).unwrap();
-        let (video_id, audio_id) = (VIDEO_TRACK, AUDIO_TRACK);
-        assert_eq!(reader.sample_count(video_id).unwrap(), 3);
-        assert_eq!(reader.sample_count(audio_id).unwrap(), 2);
+        let mut reader = crate::mp4track::open(&out).unwrap();
+        let (video_id, audio_id) = (VIDEO_STREAM, AUDIO_STREAM);
+        assert_eq!(reader.samples(video_id).len(), 3);
+        assert_eq!(reader.samples(audio_id).len(), 2);
         {
-            let track = &reader.tracks()[&video_id];
-            assert_eq!((track.width(), track.height()), (1280, 720));
-            assert_eq!(track.frame_rate().round(), 30.0);
-            assert_eq!(track.sequence_parameter_set().unwrap(), SPS);
-            assert_eq!(track.picture_parameter_set().unwrap(), PPS);
+            let video = &reader.streams()[0];
+            let ec_core::MediaParameters::Video(v) = &video.params.media else {
+                panic!("the first stream is the picture");
+            };
+            assert_eq!((v.width, v.height), (1280, 720));
+            let fps = v.frame_rate.unwrap();
+            assert_eq!((fps.num() as f64 / fps.den() as f64).round(), 30.0);
+            let avcc = video.params.extradata.as_deref().unwrap();
+            assert!(avcc.windows(SPS.len()).any(|w| w == SPS), "SPS in avcC");
+            assert!(avcc.windows(PPS.len()).any(|w| w == PPS), "PPS in avcC");
         }
-        let first = reader.read_sample(video_id, 1).unwrap().unwrap();
-        assert!(first.is_sync, "IDR unit is a sync sample");
-        assert_eq!(first.duration, 3000, "90000 / 30 fps");
-        assert_eq!(&first.bytes[..], [0, 0, 0, 4, 0x65, 0x01, 0x02, 0x03]);
-        assert!(!reader.read_sample(video_id, 2).unwrap().unwrap().is_sync);
+        let first = crate::mp4track::sample(&mut reader, video_id, 1).unwrap().unwrap();
+        assert!(first.flags.keyframe, "IDR unit is a sync sample");
+        assert_eq!(first.duration, Some(3000), "90000 / 30 fps");
+        assert_eq!(&first.data[..], [0, 0, 0, 4, 0x65, 0x01, 0x02, 0x03]);
+        assert!(!crate::mp4track::sample(&mut reader, video_id, 2).unwrap().unwrap().flags.keyframe);
         assert_eq!(
-            &reader.read_sample(audio_id, 1).unwrap().unwrap().bytes[..],
+            &crate::mp4track::sample(&mut reader, audio_id, 1).unwrap().unwrap().data[..],
             [0x21, 0x22, 0x23],
             "audio packets copied verbatim"
         );
-        let second = reader.read_sample(audio_id, 2).unwrap().unwrap();
-        assert_eq!(&second.bytes[..], [0x24, 0x25], "verbatim");
+        let second = crate::mp4track::sample(&mut reader, audio_id, 2).unwrap().unwrap();
+        assert_eq!(&second.data[..], [0x24, 0x25], "verbatim");
         assert_eq!(
-            second.duration, AAC_PACKET_SAMPLES,
+            second.duration,
+            Some(i64::from(AAC_PACKET_SAMPLES)),
             "every AAC-LC packet is one 1024-frame stts entry"
         );
 
@@ -2424,6 +2600,9 @@ mod tests {
         let mut muxer = MkvMuxer::create(
             &out,
             &Av1Params {
+            colour: None,
+                ten_bit: false,
+                language: None,
                 width: 640,
                 height: 360,
                 frame_rate: 30.0,
@@ -2435,6 +2614,7 @@ mod tests {
                     chan_conf: 2,
                     sample_rate: 48_000,
                     opus_pre_skip: None,
+                    language: None,
                 },
                 packets,
             )),
@@ -2503,6 +2683,9 @@ mod tests {
             let mut muxer = MkvMuxer::create(
                 &out,
                 &Av1Params {
+            colour: None,
+                    ten_bit: false,
+                    language: None,
                     width: 640,
                     height: 360,
                     frame_rate: 30.0,
@@ -2514,6 +2697,7 @@ mod tests {
                         chan_conf: channels as u8,
                         sample_rate: 48_000,
                         opus_pre_skip: None,
+                        language: None,
                     },
                     packets,
                 )),
@@ -2590,6 +2774,9 @@ mod tests {
         let mut muxer = Mp4Muxer::create_av1(
             &out,
             &Av1Params {
+            colour: None,
+                ten_bit: false,
+                language: None,
                 width: 640,
                 height: 360,
                 frame_rate: 30.0,
@@ -2600,6 +2787,7 @@ mod tests {
                 chan_conf: 2,
                 sample_rate: 48_000,
                 opus_pre_skip: None,
+                language: None,
             }),
         )
         .unwrap();
@@ -2654,6 +2842,9 @@ mod tests {
         let mut muxer = MkvMuxer::create(
             &out,
             &Av1Params {
+            colour: None,
+                ten_bit: false,
+                language: None,
                 width: 640,
                 height: 360,
                 frame_rate: 30.0,
@@ -2697,6 +2888,9 @@ mod tests {
         assert!(MkvMuxer::create(
             &out,
             &Av1Params {
+            colour: None,
+                ten_bit: false,
+                language: None,
                 width: 640,
                 height: 360,
                 frame_rate: 30.0,
@@ -2736,12 +2930,10 @@ mod tests {
         muxer.write_video_au(&au(&[&[0x41, 0x02]])).unwrap();
         muxer.finish().unwrap();
 
-        let file = File::open(&out).unwrap();
-        let size = file.metadata().unwrap().len();
-        let mut reader = mp4::Mp4Reader::read_header(BufReader::new(file), size).unwrap();
-        assert_eq!(reader.tracks()[&VIDEO_TRACK].timescale(), 24_000);
-        let first = reader.read_sample(VIDEO_TRACK, 1).unwrap().unwrap();
-        assert_eq!(first.duration, 1_001, "one frame is a whole 1001 ticks");
+        let mut reader = crate::mp4track::open(&out).unwrap();
+        assert_eq!(crate::mp4track::timescale(&reader, VIDEO_STREAM), 24_000);
+        let first = crate::mp4track::sample(&mut reader, VIDEO_STREAM, 1).unwrap().unwrap();
+        assert_eq!(first.duration, Some(1_001), "one frame is a whole 1001 ticks");
 
         let (meta, _) = crate::demux::Demuxer::open(&out).unwrap();
         assert!(
@@ -2771,6 +2963,9 @@ mod tests {
         let mut muxer = MkvMuxer::create(
             &out,
             &Av1Params {
+            colour: None,
+                ten_bit: false,
+                language: None,
                 width: 640,
                 height: 360,
                 frame_rate: 30.0,
@@ -2847,13 +3042,11 @@ mod tests {
             .unwrap();
         muxer.finish().unwrap();
 
-        let file = File::open(&out).unwrap();
-        let size = file.metadata().unwrap().len();
-        let reader = mp4::Mp4Reader::read_header(BufReader::new(file), size).unwrap();
+        let reader = crate::mp4track::open(&out).unwrap();
         let text = 2; // no audio track: the text is the track after the picture
         assert_eq!(
-            reader.tracks()[&text].language(),
-            "por",
+            crate::mp4track::language(&reader, text).as_deref(),
+            Some("por"),
             "the tag's own language, not a mangling of it"
         );
         std::fs::remove_file(&out).unwrap();

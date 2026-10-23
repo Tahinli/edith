@@ -1,144 +1,41 @@
-//! VA-API decode (H.264, HEVC, VP9 and AV1) -- and VP8, which decodes on
-//! `ec-vp8` ([`vpx`], this project's own, software, no VA-API anything),
-//! linked into the plugin itself -- and encode (H.264 and HEVC, and AV1
-//! where the GPU has an entrypoint for it), shipped as a
-//! `dlopen`-able plugin so the main binary never gets a DT_NEEDED on
-//! libva/gbm/drm. VP8's seat is the one codec with no runtime dlopen
-//! behind it anywhere: the old libvpx FFI is gone with the library it
-//! loaded. Every entry point is
-//! `extern "C"`, catches unwinds and reports failure as a null pointer or a
-//! negative code: the caller's contract is "any failure means use the software
-//! codec".
+//! Hardware decode and encode, held in a child process. This library is the
+//! whole world of the `hw-child` binary ([`child`]), the one process a video
+//! driver is allowed to kill: VA-API decode (H.264, HEVC, VP9 and AV1), VP8
+//! decode on `ec-vp8` ([`vpx`], software, linked in), and the encode seats
+//! (H.264, HEVC, and AV1 where the GPU has the entrypoint).
 //!
-//! That guarantee rests on `panic = "unwind"`, and it has a floor it can never
-//! reach whatever the panic strategy is: Mesa runs its own C worker threads and
-//! calls libc `abort()` from them when the video ring resets (measured
-//! 2026-08-13, `vcn_unified_0`, mesa 26.1.6). No `catch_unwind` can see a
-//! foreign thread's `abort`. So no *encode* entry point of this plugin is
-//! called in the editor's process any more: the editor still `dlopen`s the
-//! library to see whether the `vh_enc_*` symbols are there at all, which opens
-//! no VA-API display and starts no driver thread, and every call through them is
-//! made by the `hw-encode-child` helper, one process per session. A driver that
-//! aborts now costs an export its seat rather than costing a person their
-//! session ([`engine::hwproc`](../engine/hwproc/index.html)).
-//!
-//! corner-cut: *decode* is still in the editor's own address space, where the
-//! same abort would still be fatal -- and the same ring hangs it (mmhub page
-//! faults, this box, 2026-08-13). The upgrade path is the seam that already
-//! exists: give `vh_open_at`/`vh_next_frame` the message tags `vh_enc_*` have in
-//! `hwproc` and let the same helper hold both.
+//! It is a plain safe Rust crate: there is no `extern "C"` surface, no
+//! `dlopen`, and no `unsafe` anywhere in it. The editor never links it; it
+//! spawns the binary and speaks [`engine::hwproc`]'s wire to it, so an
+//! `abort()` from a driver costs the caller a fallback and nothing more.
 
-mod slice_fix;
+#![forbid(unsafe_code)]
+
+pub mod child;
+mod enc_ec;
 mod vpx;
 
 use std::collections::VecDeque;
-use std::ffi::{CStr, c_char, c_void};
-use std::os::fd::IntoRawFd;
-use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::{Path, PathBuf};
+use std::os::fd::OwnedFd;
+use std::path::Path;
 use std::rc::Rc;
 
-use cros_codecs::backend::vaapi::decoder::VaapiBackend;
-use cros_codecs::backend::vaapi::encoder::VaapiBackend as VaapiEncBackend;
-use cros_codecs::codec::av1::parser::Profile as Av1Profile;
-use cros_codecs::codec::h264::parser::Profile as H264Profile;
-use cros_codecs::codec::h265::parser::Profile as H265Profile;
-use cros_codecs::decoder::stateless::av1::Av1;
-use cros_codecs::decoder::stateless::h264::H264;
-use cros_codecs::decoder::stateless::h265::H265;
-use cros_codecs::decoder::stateless::vp9::Vp9;
-use cros_codecs::decoder::stateless::{DecodeError, StatelessDecoder, StatelessVideoDecoder};
-use cros_codecs::decoder::{BlockingMode, DecodedHandle, DecoderEvent, StreamInfo};
-use cros_codecs::encoder::av1::EncoderConfig as Av1Config;
-use cros_codecs::encoder::h264::EncoderConfig as H264Config;
-use cros_codecs::encoder::h265::ColourDescription as H265Colour;
-use cros_codecs::encoder::h265::EncoderConfig as H265Config;
-use cros_codecs::encoder::stateless::av1::StatelessEncoder as Av1StatelessEncoder;
-use cros_codecs::encoder::stateless::h264::StatelessEncoder;
-use cros_codecs::encoder::stateless::h265::StatelessEncoder as H265StatelessEncoder;
-use cros_codecs::encoder::{
-    FrameMetadata, PredictionStructure, RateControl, Tunings, VideoEncoder,
-};
-use cros_codecs::image_processing::nv12_to_i420;
-use cros_codecs::libva::{
-    Display, Image, Surface, VA_FOURCC_NV12, VA_FOURCC_P010, VAEntrypoint, VAImageFormat,
-    VAProfile,
-};
-use cros_codecs::video_frame::VideoFrame;
-use cros_codecs::video_frame::frame_pool::{FramePool, PooledVideoFrame};
-use cros_codecs::video_frame::generic_dma_video_frame::GenericDmaVideoFrame;
-use cros_codecs::video_frame::{UV_PLANE, Y_PLANE};
-use cros_codecs::{Fourcc, FrameLayout, PlaneLayout, Resolution};
-use gbm::{BufferObjectFlags, Format as GbmFormat};
-
+use ec_hw::Frame;
+use ec_hw::enc::EncCodec as EcCodec;
+use ec_va::caps::Profile;
+use enc_ec::{EcEncSession, EcOpen};
 use engine::demux::{Codec, Demuxer, VideoMeta};
-use engine::hw::{CAP_AV1, CAP_H264, CAP_HEVC, CAP_VP8, CAP_VP9, VhCaps, VhDma, VhFrame, VhMeta};
-
-type PooledFrame = PooledVideoFrame<GenericDmaVideoFrame>;
-type Dec<C> = StatelessDecoder<C, VaapiBackend<PooledFrame>>;
-type Handle = <Dec<H264> as StatelessVideoDecoder>::Handle;
-
-/// One decoder per codec the demuxer can hand us. They all share the VA-API
-/// backend and therefore the same [`Handle`], so everything past `decode` is
-/// common; which one exists is decided by the container, never by the caller --
-/// which is why the plugin's C ABI is unchanged and an older `libengine_hw.so`
-/// still loads and still decodes H.264 (it simply refuses the newer codecs'
-/// files at `Demuxer`).
-///
-/// 4:2:0 only, 8- or 10-bit: HEVC Main and Main 10, VP9 profile 0 and 2, AV1
-/// Main at either depth.
-/// A 10-bit stream decodes into a P010 pool and is read back down to the 8-bit
-/// I420 every frame here is ([`Session::emit`]).
-///
-/// corner-cut: 10-bit is *carried* 8-bit, because [`VhFrame`] is a byte-per-sample
-/// interface all the way to the renderer. That costs the low two bits of a Main
-/// 10 source; the upgrade path is a 16-bit `VhFrame`, which is a change to every
-/// stage between here and the texture upload, not to this file.
-/// VP9 profile 2 reaches the P010 pool like the rest: a VP9 stream states its
-/// depth in no container record the way an `av1C` or an `hvcC` does, so
-/// `Demuxer` reads it off the first keyframe's uncompressed header
-/// (`demux::vp9_bit_depth`) rather than assuming the 8 bits of profile 0.
-enum Decoder {
-    H264(Dec<H264>),
-    Hevc(Dec<H265>),
-    Vp9(Dec<Vp9>),
-    Av1(Dec<Av1>),
-}
-
-impl Decoder {
-    fn get(&mut self) -> &mut dyn StatelessVideoDecoder<Handle = Handle> {
-        match self {
-            Self::H264(d) => d,
-            Self::Hevc(d) => d,
-            Self::Vp9(d) => d,
-            Self::Av1(d) => d,
-        }
-    }
-}
-
-type Encoder = StatelessEncoder<
-    GenericDmaVideoFrame,
-    VaapiEncBackend<GenericDmaVideoFrame, Surface<GenericDmaVideoFrame>>,
->;
-type Av1Encoder = Av1StatelessEncoder<
-    GenericDmaVideoFrame,
-    VaapiEncBackend<GenericDmaVideoFrame, Surface<GenericDmaVideoFrame>>,
->;
-type HevcEncoder = H265StatelessEncoder<
-    GenericDmaVideoFrame,
-    VaapiEncBackend<GenericDmaVideoFrame, Surface<GenericDmaVideoFrame>>,
->;
-
-/// Ceiling on decode/drain iterations that make no progress. VA-API in blocking
-/// mode should always either hand back an event or accept input; this only
-/// exists so a misbehaving driver returns an error instead of hanging the app.
-const STALL_LIMIT: u32 = 10_000;
+use engine::hw::{CAP_AV1, CAP_H264, CAP_HEVC, CAP_VP8, CAP_VP9, VhCaps, VhDma, VhMeta};
 
 /// How many undecodable access units a seek may drop before the session gives
 /// up and calls the stream broken. An open GOP's leading pictures are a handful
 /// (a Blu-ray remux's are 8-16); a file that keeps failing past this is not one
 /// we restarted in the middle of, so the error is real and the caller still
 /// hears it.
+/// `VA_FOURCC_NV12` and `VA_FOURCC_P010`: the four characters, little-endian.
+const VA_FOURCC_NV12: u32 = u32::from_le_bytes(*b"NV12");
+const VA_FOURCC_P010: u32 = u32::from_le_bytes(*b"P010");
+
 const LEADING_LIMIT: u32 = 64;
 
 /// How many pictures handed out as DRM-PRIME buffers stay un-decoded-over, and
@@ -161,15 +58,6 @@ const DMA_HOLD: usize = 6;
 /// second of walking, the skip-decode run alone approaches that bill and a
 /// real seek wins.
 const FORWARD_SECS: f64 = 0.5;
-
-/// Whether `data` still holds a NAL unit: the same `00 00 01` scan
-/// cros-codecs' `Nalu::next`/`find_start_code` uses to frame Annex B. `false`
-/// for the `trailing_zero_8bits` / `cabac_zero_word` that may trail the last
-/// NAL of an access unit -- bytes that are part of the stream but not a unit
-/// any decoder will parse.
-fn has_start_code(data: &[u8]) -> bool {
-    data.windows(3).any(|w| w == [0x00, 0x00, 0x01])
-}
 
 /// The forward reach in frames: [`FORWARD_SECS`] at the stream's own rate.
 /// `0` for a rate the stream does not really state, which is "never forward"
@@ -217,25 +105,19 @@ fn forward_skip(_standing: u32, ahead: u32) -> u32 {
 }
 
 struct Session {
-    decoder: Decoder,
-    /// NV12 (or, for a 10-bit stream, P010) descriptor for `vaGetImage`,
-    /// queried once at open.
-    nv12_format: VAImageFormat,
-    /// Whether the surfaces are P010 rather than NV12, which is the one thing
-    /// the read-back has to do differently.
-    ten_bit: bool,
-    pool: FramePool<GenericDmaVideoFrame>,
+    decoder: ec_hw::Decoder,
+    /// The VA-API display the decoder's context and surfaces live on: kept
+    /// alive for as long as the session is.
+    _display: Rc<ec_va::Display>,
     demuxer: Demuxer,
     meta: VhMeta,
-    ready: VecDeque<Handle>,
-    /// Remaining bytes of the access unit currently being fed, if any.
-    pending: Vec<u8>,
-    timestamp: u64,
+    timestamp: i64,
+    /// `flush` has been called: the next empty `pump` is end of stream.
     flushed: bool,
     /// Pictures still to be decoded and thrown away to land on a seek target.
     skip: u32,
     /// The display frame the next `pump` would hand out, however it gets
-    /// there: one further along for every handle taken off `ready`, skipped
+    /// there: one further along for every frame taken from the decoder, skipped
     /// past and delivered alike. The one thing that can tell a reposition
     /// *ahead* of the decoder from one behind it ([`Session::seek_to`]).
     position: i64,
@@ -244,8 +126,8 @@ struct Session {
     /// tolerance ends somewhere, and raised to [`LEADING_LIMIT`] the moment a
     /// picture is handed out, which is where the window closes.
     leading: u32,
-    /// Tightly packed I420 handed out through [`VhFrame`]; reused every frame,
-    /// which is exactly why the pointers are only valid until the next call.
+    /// Tightly packed I420 handed out as the picture; reused every frame,
+    /// which is exactly why a picture is only valid until the next pump.
     out: Vec<u8>,
     luma: usize,
     chroma: usize,
@@ -254,98 +136,17 @@ struct Session {
     want: Option<VhDma>,
     /// The descriptor the last such call produced, its file descriptor already
     /// belonging to the caller. `None` says that picture was read back instead.
-    dma: Option<VhDma>,
-    /// Pictures handed out as DRM-PRIME buffers, newest last: the pool takes a
-    /// buffer back the moment its handle drops, and the decoder would write the
-    /// next picture straight into the one an encoder is still reading. Bounded
-    /// by [`Session::hold`], which is what the pool reserved for it.
-    held: VecDeque<Handle>,
-    /// Extra pool buffers reserved for [`Session::held`]: [`DMA_HOLD`] once a
-    /// caller has asked for a buffer *before* the pool was sized, and 0
-    /// otherwise -- a session whose pool is already sized may not hold anything
-    /// back, because those buffers are the decoder's own.
-    hold: usize,
-    /// Whether the pool has been sized, which happens once, at the first
-    /// `FormatChanged`.
-    sized: bool,
+    dma: Option<(VhDma, Vec<OwnedFd>)>,
+    /// Pictures handed out as DRM-PRIME buffers, newest last. Holding a frame
+    /// holds its surface out of the decoder's pool, so the decoder would write
+    /// the next picture into the one an encoder is still reading unless this
+    /// keeps the last [`DMA_HOLD`] of them alive.
+    held: VecDeque<Frame>,
 }
 
-/// Mesa's GBM cannot allocate an NV12 buffer object at all (measured on
-/// radeonsi: every flag/modifier combination returns NULL), so we allocate one
-/// linear single-plane R8 buffer big enough for luma + chroma and describe the
-/// NV12 layout inside it ourselves. VA-API imports it as one DRM-PRIME object
-/// with two planes at known offsets, which is exactly what the descriptor in
-/// `GenericDmaVideoFrame` emits.
-///
-/// `ten_bit` asks for the same thing in P010: the very same two-plane 4:2:0
-/// shape with 16-bit samples, so the buffer is simply twice as wide.
-fn alloc_nv12(
-    gbm: &gbm::Device<std::fs::File>,
-    coded: Resolution,
-    ten_bit: bool,
-) -> Result<GenericDmaVideoFrame, String> {
-    let rows = coded.height + coded.height.div_ceil(2);
-    let width = coded.width * if ten_bit { 2 } else { 1 };
-    let bo = gbm
-        .create_buffer_object::<()>(width, rows, GbmFormat::R8, BufferObjectFlags::LINEAR)
-        .map_err(|e| format!("gbm R8 {width}x{rows} allocation failed: {e}"))?;
-    let pitch = bo.stride().map_err(|e| e.to_string())? as usize;
-    let fd = bo.fd().map_err(|e| e.to_string())?;
-    GenericDmaVideoFrame::new(
-        vec![std::fs::File::from(fd)],
-        nv12_layout(coded, pitch, ten_bit),
-    )
-}
-
-/// Two NV12 (or P010) planes packed one after the other in a single buffer
-/// object.
-fn nv12_layout(coded: Resolution, pitch: usize, ten_bit: bool) -> FrameLayout {
-    FrameLayout {
-        format: (
-            Fourcc::from(if ten_bit { b"P010" } else { b"NV12" }),
-            0, /* DRM_FORMAT_MOD_LINEAR */
-        ),
-        size: coded,
-        planes: vec![
-            PlaneLayout {
-                buffer_index: 0,
-                offset: 0,
-                stride: pitch,
-            },
-            PlaneLayout {
-                buffer_index: 0,
-                offset: pitch * coded.height as usize,
-                stride: pitch,
-            },
-        ],
-    }
-}
-
-/// First render node that gives us both a VA display and a GBM device. Which
-/// node is the right one is a per-machine question, so we probe rather than
-/// hardcode renderD128.
-fn open_devices() -> Option<(Rc<Display>, gbm::Device<std::fs::File>)> {
-    let mut nodes: Vec<PathBuf> = std::fs::read_dir("/dev/dri")
-        .ok()?
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("renderD"))
-        })
-        .collect();
-    nodes.sort();
-    nodes.into_iter().find_map(|node| {
-        let display = Display::open_drm_display(&node).ok()?;
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&node)
-            .ok()?;
-        let gbm = gbm::Device::new(file).ok()?;
-        Some((display, gbm))
-    })
+/// The VA-API display the decoders run on: the first render node that opens.
+fn open_decode_display() -> Option<Rc<ec_va::Display>> {
+    ec_va::open().ok()
 }
 
 impl Session {
@@ -353,50 +154,22 @@ impl Session {
     /// [`OpenSession::open_at`] owns the read and routes VP8 away from here
     /// before any device is opened.
     fn opened(meta: VideoMeta, demuxer: Demuxer) -> Option<Self> {
-        let (display, gbm) = open_devices()?;
-        // A 10-bit stream decodes into P010 surfaces and is read back through a
-        // P010 image; a driver that has no such image format is one this cannot
-        // read 10-bit off at all, which is a null session and a software
-        // fallback like any other refusal here.
-        let ten_bit = demuxer.bit_depth() > 8;
-        let want = if ten_bit {
-            VA_FOURCC_P010
-        } else {
-            VA_FOURCC_NV12
+        let display = open_decode_display()?;
+        let codec = match meta.codec {
+            Codec::H264 => ec_hw::Codec::H264,
+            Codec::Hevc => ec_hw::Codec::H265,
+            Codec::Vp9 => ec_hw::Codec::Vp9,
+            Codec::Av1 => ec_hw::Codec::Av1,
+            // Routed to [`VpxSession`] by [`OpenSession::open_at`] before
+            // this half is ever built.
+            Codec::Vp8 => return None,
+            // Never offered to VA-API: `decode::hw_decodes` refuses it first.
+            Codec::Mpeg2 | Codec::ProRes | Codec::Dnxhd | Codec::Mjpeg | Codec::Dv | Codec::Mpeg4 | Codec::MsMpeg4 | Codec::Raw => return None,
         };
-        let nv12_format = display
-            .query_image_formats()
-            .ok()?
-            .into_iter()
-            .find(|f| f.fourcc == want)?;
-        let decoder = match meta.codec {
-            Codec::H264 => {
-                Decoder::H264(Dec::<H264>::new_vaapi(display, BlockingMode::Blocking).ok()?)
-            }
-            Codec::Hevc => {
-                Decoder::Hevc(Dec::<H265>::new_vaapi(display, BlockingMode::Blocking).ok()?)
-            }
-            Codec::Vp9 => {
-                Decoder::Vp9(Dec::<Vp9>::new_vaapi(display, BlockingMode::Blocking).ok()?)
-            }
-            Codec::Av1 => {
-                Decoder::Av1(Dec::<Av1>::new_vaapi(display, BlockingMode::Blocking).ok()?)
-            }
-            Codec::Vp8 => {
-                // Routed to [`VpxSession`] by [`OpenSession::open_at`] before
-                // this half is ever built; the arm exists so the match stays
-                // exhaustive about it.
-                return None;
-            }
-        };
-        let pool = FramePool::new(move |info: &StreamInfo| {
-            alloc_nv12(&gbm, info.coded_resolution, ten_bit).expect("output frame allocation failed")
-        });
+        let decoder = ec_hw::Decoder::new(&display, codec).ok()?;
         Some(Self {
             decoder,
-            nv12_format,
-            ten_bit,
-            pool,
+            _display: display,
             demuxer,
             meta: VhMeta {
                 width: meta.width,
@@ -408,15 +181,13 @@ impl Session {
                 pixel_aspect_h: meta.pixel_aspect.h,
                 pixel_aspect_v: meta.pixel_aspect.v,
             },
-            ready: VecDeque::new(),
-            pending: Vec::new(),
             timestamp: 0,
             flushed: false,
             skip: 0,
             position: 0,
             // A stream read from its own beginning has no missing references
             // and therefore no leading pictures to forgive: the window opens
-            // only for a session positioned somewhere else ([`Session::open_at`]),
+            // only for a session positioned somewhere else ([`OpenSession::open_at`]),
             // so a file whose first picture will not decode is still refused at
             // the door rather than opening onto nothing.
             leading: LEADING_LIMIT,
@@ -426,8 +197,6 @@ impl Session {
             want: None,
             dma: None,
             held: VecDeque::new(),
-            hold: 0,
-            sized: false,
         })
     }
 
@@ -435,23 +204,10 @@ impl Session {
     /// positions a new one: the next [`Session::pump`] hands back sample
     /// `target_sample`.
     ///
-    /// This is what a seek costs when the session is kept, and most of it is
-    /// skippable: a target *ahead* of where the decoder stands, within
-    /// [`FORWARD_SECS`] of it, is reached by decoding on and dropping the
-    /// pictures in between ([`reposition`]) -- no flush, no demuxer seek, no
-    /// re-prime -- which is the landing a silence cut leaves at every boundary
-    /// it cuts to, a fraction of a second ahead of the clip that just ended.
-    /// Everything else pays the demuxer seek and the decoder flush, and *not*
-    /// the VA-API initialisation (~90 ms measured), the render node probe, the
-    /// container parse and the surface pool that opening one again pays for.
-    ///
-    /// The flush is the whole of the decoder's reset: cros-codecs finishes what
-    /// is in flight and goes to `Reset`, from where it resumes on the next
-    /// parameter set or key frame -- and every sync sample this demuxer hands
-    /// out carries the parameter sets in front of it (`demux`'s `is_sync`
-    /// re-injection), which is exactly where a seek lands. The pictures the
-    /// flush makes ready are dropped with `ready`: they belong to where the
-    /// session *was*.
+    /// A target *ahead* of where the decoder stands, within [`FORWARD_SECS`]
+    /// of it, is reached by decoding on and dropping the pictures in between
+    /// ([`reposition`]) -- no reset, no demuxer seek, no re-prime. Everything
+    /// else pays the demuxer seek and the decoder reset.
     fn seek_to(&mut self, target_sample: u32) -> Result<(), String> {
         // The same arithmetic `open_at` does, for the same reason.
         let target_frame = target_sample.saturating_sub(1);
@@ -461,34 +217,15 @@ impl Session {
             self.meta.frame_count,
             forward_limit(self.meta.frame_rate),
         ) {
-            // Nothing about the session moves but the skip: not the decoder,
-            // not the access unit half-fed to it, not the pictures already
-            // waiting in `ready` -- the skip walks past all of them exactly
-            // as it walks past the ones still to decode, one `position` step
-            // per handle either way. It *replaces* whatever skip was
-            // standing, never adds to it: `position` already counts every
-            // handle popped, dropped ones included, so the picture delivered
-            // is always `position + skip` ([`forward_skip`]) -- an accumulate
-            // would land `ahead` frames past the target, silently.
+            // Nothing about the session moves but the skip: it *replaces*
+            // whatever skip was standing, never adds to it ([`forward_skip`]).
             self.skip = forward_skip(self.skip, ahead);
             return Ok(());
         }
-        self.decoder.get().flush().map_err(|e| e.to_string())?;
-        // Drain what the flush completed, dropping every handle: each one holds
-        // a pool buffer out of circulation, and none of them is ours to show.
-        while let Some(event) = self.decoder.get().next_event() {
-            if let DecoderEvent::FormatChanged = event {
-                let info = self
-                    .decoder
-                    .get()
-                    .stream_info()
-                    .ok_or("format changed without stream info")?
-                    .clone();
-                self.pool.resize(&info);
-            }
-        }
-        self.ready.clear();
-        self.pending.clear();
+        // Discard all picture state, and whatever the decoder had completed
+        // but not yet handed out: those pictures belong to where the session
+        // *was*.
+        self.decoder.reset();
         self.flushed = false;
         let first = self.demuxer.seek_to_sync_at_or_before(target_frame);
         self.skip = (i64::from(target_frame) - first).max(0) as u32;
@@ -501,41 +238,18 @@ impl Session {
 
     /// Pumps the decoder until one picture is ready. `Ok(false)` is clean EOF.
     fn pump(&mut self) -> Result<bool, String> {
-        let mut stalls = 0u32;
         loop {
-            // Stop draining as soon as we have a picture: every handle we hold
-            // keeps a pool buffer out of circulation.
-            while self.ready.is_empty() {
-                match self.decoder.get().next_event() {
-                    Some(DecoderEvent::FrameReady(handle)) => self.ready.push_back(handle),
-                    Some(DecoderEvent::FormatChanged) => {
-                        let mut info = self
-                            .decoder
-                            .get()
-                            .stream_info()
-                            .ok_or("format changed without stream info")?
-                            .clone();
-                        // The buffers a caller may hold on to are *extra*: the
-                        // count the decoder asks for is what it needs to keep
-                        // decoding, and lending one of those out is a stall.
-                        info.min_num_frames += self.hold;
-                        self.pool.resize(&info);
-                        self.sized = true;
-                    }
-                    None => break,
-                }
-            }
-            if let Some(handle) = self.ready.pop_front() {
+            if let Some(frame) = self.decoder.next_frame() {
                 // One picture further along, shown or skipped past alike:
                 // this is the only place [`Session::position`] walks.
                 self.position += 1;
-                // Seek discards: dropping the handle skips the `vaGetImage`
-                // read-back (~1.2 ms/picture) and frees its pool buffer.
+                // Seek discards: dropping the frame skips the read-back and
+                // frees its pool surface.
                 if self.skip > 0 {
                     self.skip -= 1;
                     continue;
                 }
-                self.deliver(handle);
+                self.deliver(frame)?;
                 // Past the random access point's leading pictures: a decode
                 // error from here on is a real one again.
                 self.leading = LEADING_LIMIT;
@@ -544,72 +258,28 @@ impl Session {
             if self.flushed {
                 return Ok(false);
             }
-
-            if self.pending.is_empty() {
-                match self.demuxer.next_access_unit() {
-                    Ok(Some(au)) => self.pending = au,
-                    Ok(None) => {
-                        self.decoder.get().flush().map_err(|e| e.to_string())?;
-                        self.flushed = true;
-                        continue;
+            match self.demuxer.next_access_unit() {
+                Ok(Some(au)) => {
+                    match self.decoder.decode(&au, self.timestamp) {
+                        Ok(()) => {}
+                        // A picture that references pictures we never decoded,
+                        // which is what an open GOP's leading pictures are after
+                        // a seek: they display *before* the random access point
+                        // we restarted at, so they are not ours to show and the
+                        // stream is not broken. Drop the access unit and walk on.
+                        Err(e) if self.leading < LEADING_LIMIT => {
+                            if self.leading == 0 {
+                                eprintln!("engine_hw: skipping leading pictures after seek ({e})");
+                            }
+                            self.leading += 1;
+                        }
+                        Err(e) => return Err(e.to_string()),
                     }
-                    Err(e) => return Err(e.to_string()),
+                    self.timestamp += 1;
                 }
-            }
-
-            let Self {
-                decoder,
-                pool,
-                pending,
-                timestamp,
-                leading,
-                ..
-            } = self;
-            match decoder
-                .get()
-                .decode(*timestamp, pending, &mut || pool.alloc())
-            {
-                Ok(0) => return Err("decoder consumed no input".into()),
-                Ok(n) => {
-                    pending.drain(..n.min(pending.len()));
-                    // cros-codecs reports the bytes of the NAL it consumed, and
-                    // that length excludes the `trailing_zero_8bits` /
-                    // `cabac_zero_word` an encoder may append after the *last*
-                    // NAL of an access unit (H.264 7.4.1.2.3). Those leftovers
-                    // are not a NAL: feeding them back makes `Nalu::next` fail
-                    // with "No NAL found", which is a hard session failure for
-                    // an otherwise decodable file -- measured on a phone-camera
-                    // mp4 whose every sample ends in zero words. The access unit
-                    // is consumed when no start code is left in it.
-                    if !has_start_code(pending) {
-                        pending.clear();
-                    }
-                    if pending.is_empty() {
-                        *timestamp += 1;
-                    }
-                    stalls = 0;
-                }
-                // Both mean "handle pending events, then resubmit the same data".
-                Err(DecodeError::CheckEvents) | Err(DecodeError::NotEnoughOutputBuffers(_)) => {
-                    stalls += 1;
-                    if stalls > STALL_LIMIT {
-                        return Err("decoder stalled waiting for output buffers".into());
-                    }
-                }
-                // A picture that references pictures we never decoded, which is
-                // what an open GOP's leading pictures are after a seek: they
-                // display *before* the random access point we restarted at, so
-                // they are not ours to show and the stream is not broken. Drop
-                // the rest of the access unit (they are picture-aligned) and
-                // walk on -- failing here is what used to make a Blu-ray remux
-                // fall back to software on 17 seeks out of 20.
-                Err(e) if *leading < LEADING_LIMIT => {
-                    if *leading == 0 {
-                        eprintln!("engine_hw: skipping leading pictures after seek ({e})");
-                    }
-                    *leading += 1;
-                    pending.clear();
-                    *timestamp += 1;
+                Ok(None) => {
+                    self.decoder.flush().map_err(|e| e.to_string())?;
+                    self.flushed = true;
                 }
                 Err(e) => return Err(e.to_string()),
             }
@@ -619,21 +289,23 @@ impl Session {
     /// Hands one decoded picture to the caller: as the buffer it was decoded
     /// into where that is what the caller asked for and the encoder on the
     /// other side can read it, and as read-back I420 everywhere else.
-    fn deliver(&mut self, handle: Handle) {
+    fn deliver(&mut self, frame: Frame) -> Result<(), String> {
         self.dma = None;
-        if self.hold > 0 && let Some(dma) = self.export_dma(&handle) {
-            self.meta.width = dma.width;
-            self.meta.height = dma.height;
+        if self.want.is_some()
+            && let Some(dma) = self.export_dma(&frame)
+        {
+            self.meta.width = dma.0.width;
+            self.meta.height = dma.0.height;
             self.dma = Some(dma);
             // Kept out of the pool until the caller is [`DMA_HOLD`] pictures
             // past it, by which time nothing is reading it any more.
-            self.held.push_back(handle);
-            while self.held.len() > self.hold {
+            self.held.push_back(frame);
+            while self.held.len() > DMA_HOLD {
                 self.held.pop_front();
             }
-            return;
+            return Ok(());
         }
-        self.emit(handle);
+        self.emit(&frame)
     }
 
     /// This picture's surface as a DRM-PRIME buffer, if it *is* the shape the
@@ -641,172 +313,87 @@ impl Session {
     /// objects, the fourcc and both sizes it asked for. `None` for every other
     /// answer, and the caller then gets the pixels it always got rather than a
     /// failure.
-    fn export_dma(&self, handle: &Handle) -> Option<VhDma> {
+    fn export_dma(&self, frame: &Frame) -> Option<(VhDma, Vec<OwnedFd>)> {
         let want = self.want?;
-        let res = handle.display_resolution();
-        if (res.width, res.height) != (want.width, want.height) {
+        let (w, h) = frame.display_size;
+        if (w, h) != (want.width, want.height) {
             return None;
         }
-        // Cheap no-op in blocking mode, but the encoder must never read a
-        // surface the decoder has not finished writing.
-        let _ = DecodedHandle::sync(handle);
-        let borrowed = handle.borrow();
-        // The *display* surface for the same reason [`Session::emit`] reads it:
-        // an AV1 picture with film grain is displayed from a second surface.
-        let mut desc = borrowed.display_surface().export_prime().ok()?;
-        let layer = desc.layers.first()?;
-        if desc.layers.len() != 1
-            || layer.num_planes != 2
-            || desc.fourcc != want.fourcc
-            || desc.width != want.coded_width
-            || desc.height != want.coded_height
+        let prime = frame.export_prime().ok()?;
+        // The driver describes the NV12 buffer as one layer per plane (R8 and
+        // GR88, each one plane into the same object), or as one composed layer
+        // holding both: either is the same two planes, in that order.
+        let planes: Vec<(u32, u32, u32)> = match prime.layers.as_slice() {
+            [layer] => layer.planes.clone(),
+            [luma, chroma] => {
+                let ([y], [uv]) = (luma.planes.as_slice(), chroma.planes.as_slice()) else {
+                    return None;
+                };
+                vec![*y, *uv]
+            }
+            _ => return None,
+        };
+        let [(obj0, off0, pitch0), (obj1, off1, pitch1)] = planes.as_slice() else {
+            return None;
+        };
+        if prime.fourcc != want.fourcc
+            || prime.width != want.coded_width
+            || prime.height != want.coded_height
+            || *obj0 != 0
+            || *obj1 > 1
+            || prime.objects.len() != *obj1 as usize + 1
         {
             return None;
         }
+        let planes = [*obj0, *obj1];
+        let (offset, stride) = ([*off0, *off1], [*pitch0, *pitch1]);
         // Whatever the driver says the two planes live in, said back to it
         // unchanged on the import: radeonsi answers with an object per plane,
         // other drivers with one for both, and neither is ours to reinterpret.
-        let (offset, stride) = (
-            [layer.offset[0], layer.offset[1]],
-            [layer.pitch[0], layer.pitch[1]],
-        );
-        let planes = [layer.object_index[0] as usize, layer.object_index[1] as usize];
-        if planes[0] != 0 || planes[1] > 1 || desc.objects.len() != planes[1] + 1 {
-            return None;
+        let modifier = prime.objects[0].modifier;
+        let mut objects = prime.objects.into_iter();
+        // Owned by the caller from here: they travel to the encoder with the
+        // descriptor, one per plane object.
+        let mut fds = vec![objects.next()?.fd];
+        if planes[1] == 1 {
+            fds.push(objects.next()?.fd);
         }
-        let modifier = desc.objects[0].drm_format_modifier;
-        // Handed over with the descriptor: the caller closes them.
-        let second = (planes[1] == 1)
-            .then(|| desc.objects.pop().map(|object| object.fd.into_raw_fd()))
-            .flatten()
-            .unwrap_or(-1);
-        let first = desc.objects.remove(0).fd.into_raw_fd();
-        Some(VhDma {
-            fd: [first, second],
-            fourcc: desc.fourcc,
-            modifier,
-            coded_width: desc.width,
-            coded_height: desc.height,
-            width: res.width,
-            height: res.height,
-            offset,
-            stride,
-        })
+        Some((
+            VhDma {
+                fourcc: prime.fourcc,
+                modifier,
+                coded_width: prime.width,
+                coded_height: prime.height,
+                width: w,
+                height: h,
+                offset,
+                stride,
+            },
+            fds,
+        ))
     }
 
-    /// Copies a decoded NV12 surface into `self.out` as packed I420.
-    fn emit(&mut self, handle: Handle) {
-        let res = handle.display_resolution();
-        let (w, h) = (res.width as usize, res.height as usize);
-        let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
-        if self.luma != w * h || self.chroma != cw * ch {
-            self.luma = w * h;
-            self.chroma = cw * ch;
-            self.out = vec![0u8; self.luma + 2 * self.chroma];
-        }
-        self.meta.width = res.width;
-        self.meta.height = res.height;
-
-        // Read back with vaGetImage rather than mapping our own DMA-BUF: on a
-        // discrete GPU that buffer lives in VRAM and a CPU read of it runs at
-        // ~44 MB/s over the PCIe BAR (measured), which costs 350 ms/frame. The
-        // driver copies into host-visible memory for us instead.
-        // Cheap no-op in blocking mode, but pixels must never be read early.
-        let _ = DecodedHandle::sync(&handle);
-        let borrowed = handle.borrow();
-        let size = (w as u32, h as u32);
-        // The *display* surface, which is the reconstructed picture for every
-        // codec here but the second, grain-synthesized one for an AV1 frame that
-        // asks for film grain -- reading the reconstructed surface of such a
-        // frame would show the film with its grain stripped off.
-        let image = Image::create_from(borrowed.display_surface(), self.nv12_format, size, size)
-            .expect("vaGetImage failed");
-        let va = *image.image();
-        let data: &[u8] = image.as_ref();
-
-        let (dst_y, rest) = self.out.split_at_mut(self.luma);
-        let (dst_u, dst_v) = rest.split_at_mut(self.chroma);
-        if self.ten_bit {
-            p010_to_i420(
-                &data[va.offsets[Y_PLANE] as usize..],
-                va.pitches[Y_PLANE] as usize,
-                dst_y,
-                &data[va.offsets[UV_PLANE] as usize..],
-                va.pitches[UV_PLANE] as usize,
-                dst_u,
-                dst_v,
-                w,
-                h,
-            );
-            return;
-        }
-        nv12_to_i420(
-            &data[va.offsets[Y_PLANE] as usize..],
-            va.pitches[Y_PLANE] as usize,
-            dst_y,
-            w,
-            &data[va.offsets[UV_PLANE] as usize..],
-            va.pitches[UV_PLANE] as usize,
-            dst_u,
-            cw,
-            dst_v,
-            cw,
-            w,
-            h,
-        );
+    /// Copies a decoded picture into `self.out` as packed I420.
+    fn emit(&mut self, frame: &Frame) -> Result<(), String> {
+        // The read-back goes through the driver's image copy (`vaGetImage`)
+        // rather than a CPU map of the surface: on a discrete GPU that buffer
+        // lives in VRAM, and a CPU read of it runs over the PCIe BAR.
+        let i420 = frame.to_i420().map_err(|e| e.to_string())?;
+        self.luma = i420.y.len();
+        self.chroma = i420.u.len();
+        self.out.clear();
+        self.out.extend_from_slice(&i420.y);
+        self.out.extend_from_slice(&i420.u);
+        self.out.extend_from_slice(&i420.v);
+        self.meta.width = i420.width;
+        self.meta.height = i420.height;
+        Ok(())
     }
 
-    fn fill(&self, out: &mut VhFrame) {
-        let w = self.meta.width as usize;
-        let cw = w.div_ceil(2);
-        out.y = self.out.as_ptr();
-        // SAFETY: `out` was sized to luma + 2 * chroma just above in `emit`.
-        unsafe {
-            out.u = self.out.as_ptr().add(self.luma);
-            out.v = self.out.as_ptr().add(self.luma + self.chroma);
-        }
-        out.y_stride = w;
-        out.u_stride = cw;
-        out.v_stride = cw;
-        out.width = self.meta.width;
-        out.height = self.meta.height;
-    }
-}
-
-/// One P010 picture down to packed 8-bit I420: [`nv12_to_i420`] for a surface
-/// whose samples are 16-bit little-endian with the value in the **high** bits,
-/// which is what P010 means. The high byte of each pair is therefore the 10-bit
-/// sample shifted down by two, i.e. the 8-bit one -- no rounding, because a
-/// second read of the low byte costs more than the half-bit it would buy.
-fn p010_to_i420(
-    src_y: &[u8],
-    src_y_pitch: usize,
-    dst_y: &mut [u8],
-    src_uv: &[u8],
-    src_uv_pitch: usize,
-    dst_u: &mut [u8],
-    dst_v: &mut [u8],
-    width: usize,
-    height: usize,
-) {
-    for row in 0..height {
-        let src = &src_y[row * src_y_pitch..];
-        let dst = &mut dst_y[row * width..row * width + width];
-        for (x, out) in dst.iter_mut().enumerate() {
-            *out = src[2 * x + 1];
-        }
-    }
-    let (cw, ch) = (width.div_ceil(2), height.div_ceil(2));
-    for row in 0..ch {
-        let src = &src_uv[row * src_uv_pitch..];
-        let (u, v) = (
-            &mut dst_u[row * cw..row * cw + cw],
-            &mut dst_v[row * cw..row * cw + cw],
-        );
-        for x in 0..cw {
-            u[x] = src[4 * x + 1];
-            v[x] = src[4 * x + 3];
-        }
+    /// The picture [`Session::pump`] or [`VpxSession::pump`] just delivered, as
+    /// packed I420 (Y, then U, then V), with its width and height.
+    fn picture(&self) -> (&[u8], u32, u32) {
+        (&self.out, self.meta.width, self.meta.height)
     }
 }
 
@@ -820,12 +407,12 @@ fn p010_to_i420(
 /// Everything past the split is written twice -- [`Session`] for the VA-API
 /// decoders and [`VpxSession`] for libvpx -- rather than folded into one
 /// shape: the halves share the *contract* (open at a sample, pump one
-/// picture, fill a [`VhFrame`]) and nothing underneath it, and a trait over
+/// picture, read it back) and nothing underneath it, and a trait over
 /// "a `vaGetImage`" versus "a memcpy" is the kind of seam that hides which
 /// path a measurement ran on.
 enum OpenSession {
-    Vaapi(Session),
-    Vpx(VpxSession),
+    Vaapi(Box<Session>),
+    Vpx(Box<VpxSession>),
 }
 
 impl OpenSession {
@@ -837,8 +424,18 @@ impl OpenSession {
     fn open_at(path: &Path, target_sample: u32) -> Option<Self> {
         let (meta, demuxer) = Demuxer::open(path).ok()?;
         let session = match meta.codec {
-            Codec::Vp8 => Self::Vpx(VpxSession::opened(meta, demuxer)?),
-            _ => Self::Vaapi(Session::opened(meta, demuxer)?),
+            Codec::Vp8 => Self::Vpx(Box::new(VpxSession::opened(meta, demuxer)?)),
+            _ => {
+                // The GPU was reset moments ago (a hung ring: every VA context
+                // alive then was reset with it, and Mesa aborts the process on
+                // the next submit to one). A session opened now would be one of
+                // them, so it is refused and the caller takes the software seat
+                // until the grace period is over.
+                if ec_hw::gpu_recently_reset() {
+                    return None;
+                }
+                Self::Vaapi(Box::new(Session::opened(meta, demuxer)?))
+            }
         };
         // The ABI still speaks 1-based sample ids, the demuxer speaks 0-based
         // display frames -- and answers with a signed one, since a sync sample
@@ -877,20 +474,37 @@ impl OpenSession {
         }
     }
 
-    /// Pumps the decoder until one picture is ready, delivered into the
-    /// session's own buffer. `Ok(false)` is clean end of stream.
-    fn pump(&mut self) -> Result<bool, String> {
+    /// The picture the last successful [`OpenSession::next_frame`] delivered as
+    /// read-back I420, with its width and height.
+    fn picture(&self) -> (&[u8], u32, u32) {
         match self {
-            Self::Vaapi(session) => session.pump(),
+            Self::Vaapi(session) => session.picture(),
+            Self::Vpx(session) => session.picture(),
+        }
+    }
+
+    /// Pumps the next picture in display order. `want` describes what the
+    /// caller's encoder can read straight off the GPU; it is only ever honoured
+    /// by the VA-API half, and it is cleared again before this returns.
+    fn next_frame(&mut self, want: Option<VhDma>) -> Result<bool, String> {
+        match self {
+            Self::Vaapi(session) => {
+                session.want = want;
+                let pumped = session.pump();
+                session.want = None;
+                pumped
+            }
             Self::Vpx(session) => session.pump(),
         }
     }
 
-    /// Points `out` at the picture [`OpenSession::pump`] just delivered.
-    fn fill(&self, out: &mut VhFrame) {
+    /// The DRM-PRIME buffer the last [`OpenSession::next_frame`] left on the
+    /// GPU, if it did: its descriptor and the descriptors that go with it.
+    /// `None` means that picture is in [`OpenSession::picture`] instead.
+    fn take_dma(&mut self) -> Option<(VhDma, Vec<OwnedFd>)> {
         match self {
-            Self::Vaapi(session) => session.fill(out),
-            Self::Vpx(session) => session.fill(out),
+            Self::Vaapi(session) => session.dma.take(),
+            Self::Vpx(_) => None,
         }
     }
 }
@@ -899,7 +513,7 @@ impl OpenSession {
 /// same job [`Session`] does for the VA-API codecs. No display, no GBM, no
 /// surface pool -- `ec-vp8` hands the planes back in memory, and the only
 /// shapes worth carrying over from the other half are the ones the caller
-/// sees: [`VhMeta`], one picture per `pump`, the same [`VhFrame`] layout, the
+/// sees: [`VhMeta`], one picture per `pump`, the same packed layout, the
 /// same skip/position arithmetic a seek is.
 ///
 /// VP8 reorders nothing: every access unit fed is *at most* one picture out,
@@ -918,9 +532,9 @@ struct VpxSession {
     /// field, again: one further along for every picture pulled, skipped past
     /// and delivered alike.
     position: i64,
-    /// Tightly packed I420 handed out through [`VhFrame`]; reused every
-    /// frame, which is exactly why the pointers are only valid until the
-    /// next call.
+    /// Tightly packed I420 handed out as the picture; reused every
+    /// frame, which is exactly why a picture is only valid until the next
+    /// pump.
     out: Vec<u8>,
     luma: usize,
     chroma: usize,
@@ -961,36 +575,37 @@ impl VpxSession {
 
     fn pump(&mut self) -> Result<bool, String> {
         loop {
-            // Whatever the last fed unit produced is the picture this call
-            // hands back. The slot is taken, not peeked -- the next fed unit
-            // overwrites it, because VP8 queues nothing: one unit in, at
-            // most one picture out.
-            if let Some(pic) = self.dec.get_frame() {
-                // One picture further along, shown or skipped past alike --
-                // the same walk [`Session::pump`] makes.
-                self.position += 1;
-                if self.skip > 0 {
-                    self.skip -= 1;
-                    continue;
-                }
-                self.emit(&pic);
-                return Ok(true);
-            }
             if self.flushed {
                 return Ok(false);
             }
-            match self.demuxer.next_access_unit() {
-                Ok(Some(au)) => self.decode(&au)?,
+            let au = match self.demuxer.next_access_unit() {
+                Ok(Some(au)) => au,
+                // End of the track. VP8 holds nothing back -- the flush is the
+                // formality [`vpx::Decoder::flush`] documents -- so the next
+                // pass finds nothing and ends the stream.
                 Ok(None) => {
-                    // End of the track. VP8 holds nothing back -- the flush
-                    // is the formality [`vpx::Decoder::flush`] documents --
-                    // and it costs no iteration of its own: the pull at the
-                    // top of the loop finds the slot empty and ends the
-                    // stream.
                     self.dec.flush()?;
                     self.flushed = true;
+                    continue;
                 }
                 Err(e) => return Err(e.to_string()),
+            };
+            self.decode(&au)?;
+            // Every fed unit is one container slot, shown or hidden: a hidden
+            // alt-ref frame takes a slot and sends no picture, exactly as the
+            // software seat's index counts it. The slot is taken, not peeked --
+            // the next fed unit overwrites it, because VP8 queues nothing.
+            let shown = self.dec.get_frame();
+            self.position += 1;
+            // Both the skip and the walk count slots, so a seek that lands
+            // past a hidden frame drops the right number of pictures.
+            if self.skip > 0 {
+                self.skip -= 1;
+                continue;
+            }
+            if let Some(pic) = shown {
+                self.emit(&pic);
+                return Ok(true);
             }
         }
     }
@@ -1019,20 +634,10 @@ impl VpxSession {
         copy_plane(&pic.v, pic.uv_stride, dst_v, cw, ch);
     }
 
-    fn fill(&self, out: &mut VhFrame) {
-        let w = self.meta.width as usize;
-        let cw = w.div_ceil(2);
-        out.y = self.out.as_ptr();
-        // SAFETY: `out` was sized to luma + 2 * chroma just above in `emit`.
-        unsafe {
-            out.u = self.out.as_ptr().add(self.luma);
-            out.v = self.out.as_ptr().add(self.luma + self.chroma);
-        }
-        out.y_stride = w;
-        out.u_stride = cw;
-        out.v_stride = cw;
-        out.width = self.meta.width;
-        out.height = self.meta.height;
+    /// The picture [`Session::pump`] or [`VpxSession::pump`] just delivered, as
+    /// packed I420 (Y, then U, then V), with its width and height.
+    fn picture(&self) -> (&[u8], u32, u32) {
+        (&self.out, self.meta.width, self.meta.height)
     }
 
     /// Repositions the session, exactly [`Session::seek_to`]: the same
@@ -1073,258 +678,50 @@ fn copy_plane(src: &[u8], src_stride: usize, dst: &mut [u8], w: usize, h: usize)
     }
 }
 
-/// Opens `path` for hardware decode, positioned so the first
-/// [`vh_next_frame`] returns sample `target_sample` (1-based; 0 and 1 both mean
-/// the start of the stream). Returns null on any failure at all: no libva
-/// runtime, no render node, unsupported profile, unreadable file, a VP8
-/// stream the decoder rejects.
-///
-/// # Safety
-/// `path` must be a valid NUL-terminated C string.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn vh_open_at(path: *const c_char, target_sample: u32) -> *mut c_void {
-    catch_unwind(AssertUnwindSafe(|| {
-        if path.is_null() {
-            return std::ptr::null_mut();
-        }
-        // SAFETY: caller-guaranteed NUL-terminated string, read before return.
-        let path = unsafe { CStr::from_ptr(path) };
-        let Ok(path) = path.to_str() else {
-            return std::ptr::null_mut();
-        };
-        match OpenSession::open_at(Path::new(path), target_sample) {
-            Some(session) => Box::into_raw(Box::new(session)) as *mut c_void,
-            None => std::ptr::null_mut(),
-        }
-    }))
-    .unwrap_or(std::ptr::null_mut())
-}
-
-/// Fills `out` with stream metadata. 0 on success, negative on failure.
-///
-/// # Safety
-/// `session` must come from [`vh_open_at`] and `out` must be writable.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn vh_meta(session: *mut c_void, out: *mut VhMeta) -> i32 {
-    catch_unwind(AssertUnwindSafe(|| {
-        if session.is_null() || out.is_null() {
-            return -1;
-        }
-        // SAFETY: caller-guaranteed live session and writable destination.
-        unsafe {
-            let session = &*(session as *const OpenSession);
-            let meta = session.meta();
-            (*out).width = meta.width;
-            (*out).height = meta.height;
-            (*out).frame_rate = meta.frame_rate;
-            (*out).frame_count = meta.frame_count;
-            (*out).coded_width = meta.coded_width;
-            (*out).coded_height = meta.coded_height;
-            (*out).pixel_aspect_h = meta.pixel_aspect_h;
-            (*out).pixel_aspect_v = meta.pixel_aspect_v;
-        }
-        0
-    }))
-    .unwrap_or(-1)
-}
-
-/// 1 when `out` holds the next picture in display order, 0 at clean end of
-/// stream, negative on error. Plane pointers stay valid until the next call.
-///
-/// # Safety
-/// `session` must come from [`vh_open_at`] and `out` must be writable.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn vh_next_frame(session: *mut c_void, out: *mut VhFrame) -> i32 {
-    catch_unwind(AssertUnwindSafe(|| {
-        if session.is_null() || out.is_null() {
-            return -1;
-        }
-        // SAFETY: caller-guaranteed live session and writable destination.
-        let session = unsafe { &mut *(session as *mut OpenSession) };
-        match session.pump() {
-            Ok(true) => {
-                // SAFETY: `out` is non-null and writable per the contract.
-                session.fill(unsafe { &mut *out });
-                1
-            }
-            Ok(false) => 0,
-            Err(e) => {
-                eprintln!("engine_hw: {e}");
-                -2
-            }
-        }
-    }))
-    .unwrap_or(-1)
-}
-
-/// Repositions an open session so the next [`vh_next_frame`] returns sample
-/// `target_sample` (1-based, as [`vh_open_at`]). 0 on success, negative on
-/// failure -- and a caller that gets one closes the session and opens another,
-/// which is what it did for every seek before this symbol existed.
-///
-/// # Safety
-/// `session` must come from [`vh_open_at`] and still be open.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn vh_seek(session: *mut c_void, target_sample: u32) -> i32 {
-    catch_unwind(AssertUnwindSafe(|| {
-        if session.is_null() {
-            return -1;
-        }
-        // SAFETY: caller-guaranteed live session.
-        let session = unsafe { &mut *(session as *mut OpenSession) };
-        match session.seek_to(target_sample) {
-            Ok(()) => 0,
-            Err(e) => {
-                eprintln!("engine_hw: seek failed: {e}");
-                -2
-            }
-        }
-    }))
-    .unwrap_or(-1)
-}
-
-/// As [`vh_next_frame`], but hands the picture over *on the GPU* where it can
-/// be: `dma` is filled and its `fd` belongs to the caller (who closes it) when
-/// the decoded surface is exactly what an encoder of `coded_width` x
-/// `coded_height` carrying a `width` x `height` picture reads, and `out` is
-/// filled with read-back I420 exactly as [`vh_next_frame`] fills it otherwise.
-/// `dma.fd` below zero is what says which happened.
-///
-/// The buffer stays out of the decoder's pool for [`DMA_HOLD`] further
-/// pictures and no longer: encode it before asking for that many more. Only a
-/// session that has never read a frame back may hand buffers over at all --
-/// those extra pool buffers are reserved at the first picture, and a decoder
-/// robbed of its own would stall.
-///
-/// # Safety
-/// `session` must come from [`vh_open_at`]; `out` and `dma` must be writable.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn vh_next_frame_dma(
-    session: *mut c_void,
-    out: *mut VhFrame,
-    dma: *mut VhDma,
-    coded_width: u32,
-    coded_height: u32,
-    width: u32,
-    height: u32,
-) -> i32 {
-    catch_unwind(AssertUnwindSafe(|| {
-        if session.is_null() || out.is_null() || dma.is_null() {
-            return -1;
-        }
-        // SAFETY: caller-guaranteed live session and writable destinations.
-        let session = unsafe { &mut *(session as *mut OpenSession) };
-        // SAFETY: as above.
-        unsafe { *dma = VhDma::default() };
-        // A VP8 picture has no GPU buffer to hand over: this session reads
-        // back, exactly as `vh_next_frame` does, and the caller's `dma` keeps
-        // the fd-below-zero default that says so.
-        match session {
-            OpenSession::Vpx(session) => match session.pump() {
-                Ok(true) => {
-                    // SAFETY: `out` is non-null and writable per the contract.
-                    session.fill(unsafe { &mut *out });
-                    1
-                }
-                Ok(false) => 0,
-                Err(e) => {
-                    eprintln!("engine_hw: {e}");
-                    -2
-                }
-            },
-            OpenSession::Vaapi(session) => {
-                // A pool sized without the reserve has nothing to lend: this
-                // session has been read back from, so it stays that way.
-                if !session.sized || session.hold > 0 {
-                    session.hold = DMA_HOLD;
-                    session.want = Some(VhDma {
-                        fourcc: VA_FOURCC_NV12,
-                        coded_width,
-                        coded_height,
-                        width,
-                        height,
-                        ..VhDma::default()
-                    });
-                }
-                let pumped = session.pump();
-                session.want = None;
-                match pumped {
-                    Ok(true) => {
-                        match session.dma.take() {
-                            // SAFETY: `dma` is non-null and writable per the contract.
-                            Some(desc) => unsafe { *dma = desc },
-                            // SAFETY: as above, for `out`.
-                            None => session.fill(unsafe { &mut *out }),
-                        }
-                        1
-                    }
-                    Ok(false) => 0,
-                    Err(e) => {
-                        eprintln!("engine_hw: {e}");
-                        -2
-                    }
-                }
-            }
-        }
-    }))
-    .unwrap_or(-1)
-}
-
-/// Releases a session. Safe to call with null.
-///
-/// # Safety
-/// `session` must come from [`vh_open_at`] and must not be used afterwards.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn vh_close(session: *mut c_void) {
-    let _ = catch_unwind(AssertUnwindSafe(|| {
-        if !session.is_null() {
-            // SAFETY: pointer came from `Box::into_raw` in `vh_open_at`.
-            drop(unsafe { Box::from_raw(session as *mut OpenSession) });
-        }
-    }));
-}
+/// One row of [`CAP_TABLE`]: the capability bit, its 8-bit and 10-bit decode profiles, and its encode profile.
+type CapRow = (u32, &'static [Profile], &'static [Profile], Option<Profile>);
 
 /// What each codec needs of the driver before this plugin can claim it: the
 /// 8-bit decode profiles, the 10-bit ones, and the profile the *encoder* here
 /// would open -- `None` for the one this plugin has no encoder for at all, so a
 /// GPU with a VP9 encode entrypoint is never reported as one edith can
-/// reach. The encode profiles are the very ones [`EncSession::open_codec`]
-/// asks for, which is what keeps this a description of the plugin rather than a
+/// reach. The encode profiles are the very ones the seats in [`enc_ec`] and
+/// [`EncSession::open_seat`] ask for, which is what keeps this a description of the plugin rather than a
 /// second opinion about it.
-const CAP_TABLE: [(u32, &[VAProfile::Type], &[VAProfile::Type], Option<VAProfile::Type>); 4] = [
+const CAP_TABLE: [CapRow; 4] = [
     (
         CAP_H264,
         &[
-            VAProfile::VAProfileH264ConstrainedBaseline,
-            VAProfile::VAProfileH264Main,
-            VAProfile::VAProfileH264High,
+            Profile::H264ConstrainedBaseline,
+            Profile::H264Main,
+            Profile::H264High,
         ],
         &[],
-        Some(VAProfile::VAProfileH264Main),
+        Some(Profile::H264Main),
     ),
     (
         CAP_HEVC,
-        &[VAProfile::VAProfileHEVCMain],
-        &[VAProfile::VAProfileHEVCMain10],
+        &[Profile::HEVCMain],
+        &[Profile::HEVCMain10],
         // 8-bit Main only: the encoder here opens Main whatever the source was,
         // so a Main 10 entrypoint is a *decode* claim on this line and nothing
         // more. Main 10 encode would be a second profile here and a 10-bit input
         // buffer in `EncSession`, neither of which exists yet.
-        Some(VAProfile::VAProfileHEVCMain),
+        Some(Profile::HEVCMain),
     ),
     (
         CAP_VP9,
-        &[VAProfile::VAProfileVP9Profile0],
-        &[VAProfile::VAProfileVP9Profile2],
+        &[Profile::VP9Profile0],
+        &[Profile::VP9Profile2],
         None,
     ),
     (
         CAP_AV1,
-        &[VAProfile::VAProfileAV1Profile0],
+        &[Profile::AV1Profile0],
         // AV1 carries 8- and 10-bit in the same profile 0, so the profile bit
         // is the same one and the P010 read-back is what decides.
-        &[VAProfile::VAProfileAV1Profile0],
-        Some(VAProfile::VAProfileAV1Profile0),
+        &[Profile::AV1Profile0],
+        Some(Profile::AV1Profile0),
     ),
 ];
 
@@ -1345,19 +742,11 @@ const CAP_TABLE: [(u32, &[VAProfile::Type], &[VAProfile::Type], Option<VAProfile
 /// `None` when there is no display to ask at all, which is the same "software
 /// only" a missing plugin means.
 fn query_caps() -> Option<VhCaps> {
-    let (display, _gbm) = open_devices()?;
-    let profiles = display.query_config_profiles().ok()?;
-    let p010 = display
-        .query_image_formats()
-        .is_ok_and(|formats| formats.iter().any(|f| f.fourcc == VA_FOURCC_P010));
-    let has = |profile: VAProfile::Type, entrypoint: VAEntrypoint::Type| {
-        profiles.contains(&profile)
-            && display
-                .query_config_entrypoints(profile)
-                .is_ok_and(|e| e.contains(&entrypoint))
-    };
-    let decodes =
-        |list: &[VAProfile::Type]| list.iter().any(|&p| has(p, VAEntrypoint::VAEntrypointVLD));
+    use ec_va::caps::Entrypoint;
+    let display = open_decode_display()?;
+    let report = ec_va::CapReport::probe(&display).ok()?;
+    let p010 = report.image_formats.contains(&VA_FOURCC_P010);
+    let decodes = |list: &[Profile]| list.iter().any(|&p| report.supports(p, Entrypoint::VLD));
     let mut caps = VhCaps::default();
     for (bit, eight, ten, encode) in CAP_TABLE {
         if decodes(eight) {
@@ -1368,7 +757,7 @@ fn query_caps() -> Option<VhCaps> {
         }
         // Both entrypoints, exactly as the encoder's own open takes either.
         if encode.is_some_and(|p| {
-            has(p, VAEntrypoint::VAEntrypointEncSlice) || has(p, VAEntrypoint::VAEntrypointEncSliceLP)
+            report.supports(p, Entrypoint::EncSlice) || report.supports(p, Entrypoint::EncSliceLP)
         }) {
             caps.encode |= bit;
         }
@@ -1379,30 +768,6 @@ fn query_caps() -> Option<VhCaps> {
     // machine this plugin runs on.
     caps.decode |= CAP_VP8;
     Some(caps)
-}
-
-/// Fills `out` with what this machine and this plugin can do together. 0 on
-/// success, negative when there is nothing to report -- an *optional* symbol on
-/// purpose, so the caller resolving it is free to be older or newer than this.
-///
-/// Costs one VA-API init; the caller caches the answer.
-///
-/// # Safety
-/// `out` must be writable.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn vh_caps(out: *mut VhCaps) -> i32 {
-    catch_unwind(AssertUnwindSafe(|| {
-        if out.is_null() {
-            return -1;
-        }
-        let Some(caps) = query_caps() else {
-            return -1;
-        };
-        // SAFETY: caller-guaranteed writable destination.
-        unsafe { *out = caps };
-        0
-    }))
-    .unwrap_or(-1)
 }
 
 /// How many pictures a group of them holds -- the low-delay predictor's
@@ -1417,8 +782,8 @@ pub unsafe extern "C" fn vh_caps(out: *mut VhCaps) -> i32 {
 ///
 /// Forcing a key frame per picture is a different thing and does *not* make an
 /// intra file: that path passes `idr = false`, writes no parameter sets, and
-/// [`fix_slice_nal_headers`] then marks the slice non-IDR -- how a 60-picture
-/// "all-intra" hardware proxy came out with one sync point in it.
+/// the slice is an ordinary I picture -- how a 60-picture "all-intra" hardware
+/// proxy came out with one sync point in it.
 fn gop_limit(framerate: u32, intra_only: bool) -> u16 {
     match intra_only {
         true => 1,
@@ -1429,892 +794,34 @@ fn gop_limit(framerate: u32, intra_only: bool) -> u16 {
     }
 }
 
-fn align16(v: u32) -> u32 {
-    v.div_ceil(16) * 16
-}
-
-fn align64(v: u32) -> u32 {
-    v.div_ceil(64) * 64
-}
-
-/// Fills in slice NAL header bytes the driver left at zero.
-///
-/// Mesa's radeonsi encoder writes `forbidden_zero_bit`, `nal_ref_idc` and
-/// `nal_unit_type` from state it only ever populates out of a *packed* slice
-/// header, and cros-codecs supplies none (`h264/vaapi.rs` says as much in its
-/// "use packed headers" TODO). Every other bit of the slice is correct, so the
-/// whole damage is one byte per slice: measured on radeonsi, patching it turns
-/// a stream neither ffmpeg nor the `rusty_h264` then in the tree would touch
-/// into one both decode (the crate has since left; the fix's proof stands).
-///
-/// An all-zero byte after a start code is never valid H.264, so drivers that do
-/// write the header (Intel's, which is what cros-codecs was built against) fall
-/// straight through this.
-///
-/// corner-cut: the real fix is a `VAEncPackedHeaderH264_Slice` buffer in the
-/// vendored cros-codecs backend, which means synthesizing the entire slice
-/// header there rather than correcting two fields here.
-fn fix_slice_nal_headers(au: &mut [u8]) {
-    // cros-codecs prepends SPS+PPS to the access unit at every IDR and only
-    // there, so an SPS seen earlier in this unit is what makes the slice one.
-    let mut idr = false;
-    let mut i = 0;
-    while i + 3 < au.len() {
-        if au[i..i + 3] != [0, 0, 1] {
-            i += 1;
-            continue;
+/// Opens the encode seat `open` names, or `None` where the driver has no such
+/// entrypoint or refuses the size -- the caller then takes the software encoder.
+pub(crate) fn open_encoder(open: &engine::hwproc::Open) -> Option<EcEncSession> {
+    use engine::hwproc::Seat;
+    let (codec, intra_only, colour) = match open.seat {
+        Seat::H264 => (EcCodec::H264, false, None),
+        Seat::Intra => (EcCodec::H264, true, None),
+        Seat::Av1 => (EcCodec::Av1, false, None),
+        Seat::Hevc => {
+            let (p, t, m) = open.colour.codes();
+            let narrow = |code: u16| u8::try_from(code).unwrap_or(u8::MAX);
+            (
+                EcCodec::H265,
+                true,
+                Some((narrow(p), narrow(t), narrow(m), open.colour.full_range)),
+            )
         }
-        let nal = &mut au[i + 3];
-        if *nal == 0 {
-            // nal_ref_idc 3 + IDR, or 2 + non-IDR: every picture this encoder
-            // emits is a short-term reference (no B-frames, no disposables).
-            *nal = if idr { 0x65 } else { 0x41 };
-        } else if *nal & 0x1f == 7 {
-            idr = true;
-        }
-        i += 3;
-    }
-}
-
-/// One hardware H.264 encode session.
-///
-/// Pictures the caller already has on the GPU go straight in
-/// ([`EncSession::encode_dma`]) and touch none of what follows. The rest --
-/// pixels in the caller's memory -- go through [`enc_depth`] reusable NV12
-/// buffer objects: the caller's
-/// I420 planes are interleaved into the next one and the encoder imports it as a
-/// VA surface. Reuse is safe because a buffer is only written again once the
-/// access unit coded *from* it has been polled back -- the encoder runs in
-/// blocking mode and a coded unit in hand means the GPU has finished reading its
-/// input -- and [`EncSession::encode`] holds exactly that many pictures in
-/// flight, no more.
-///
-/// **Why more than one.** With a single buffer the picture had to be coded
-/// before the next one could be written into it, so a frame cost the CPU's
-/// interleave *plus* the GPU's encode end to end (6.7 ms + 2.5 ms at 1080p on
-/// radeonsi, measured 2026-08-13). With two, the interleave of the next picture
-/// runs while the GPU codes this one and the frame costs the longer of them.
-struct EncSession {
-    /// Boxed because the three codecs are three types and everything past
-    /// `encode` is the same trait: one session type serves them all, which is
-    /// what keeps the C ABI at one new symbol per codec (the open) instead of
-    /// four.
-    encoder: Box<dyn VideoEncoder<GenericDmaVideoFrame>>,
-    /// Which codec the open picked, kept because one thing past it still
-    /// differs: the H.264 driver leaves a *NAL* header byte at zero, and
-    /// neither an HEVC access unit nor an AV1 temporal unit has that one.
-    codec: EncCodec,
-    /// The H.264 counters the driver zeroes, rewritten per access unit
-    /// ([`slice_fix`]).
-    counters: slice_fix::SliceCounters,
-    /// Owns the DRM node the buffer objects below were allocated from.
-    _gbm: gbm::Device<std::fs::File>,
-    /// [`enc_depth`] input buffers, used round-robin.
-    frames: Vec<GenericDmaVideoFrame>,
-    /// How many of them there are, which is how many pictures may be in the
-    /// encoder at once.
-    depth: usize,
-    /// Which of them the next picture is written into.
-    slot: usize,
-    /// Pictures submitted whose access unit has not been polled back yet, which
-    /// is what says whether the buffer about to be written is free.
-    in_flight: usize,
-    layout: FrameLayout,
-    /// Macroblock-aligned surface size; `width`/`height` are what is encoded.
-    coded: Resolution,
-    width: usize,
-    height: usize,
-    timestamp: u64,
-    drained: bool,
-    /// Coded access units the encoder has finished but the caller has not
-    /// collected yet, in encode order (which is display order: no B-frames).
-    ready: VecDeque<Vec<u8>>,
-    /// The access unit currently handed out, kept alive until the next call.
-    out: Vec<u8>,
-    /// One padded output row, staged in ordinary memory and copied across whole
-    /// -- [`EncSession::upload`] says why.
-    row: Vec<u8>,
-}
-
-/// How many pictures may be in the encoder at once. Two is what it takes to
-/// overlap the CPU's interleave with the GPU's encode; more would buy nothing,
-/// since the interleave is the longer of the two and a third buffer would only
-/// hold a picture waiting for a lane that is never idle.
-const ENC_DEPTH: usize = 2;
-
-/// How many pictures *this* seat may hold, which is [`ENC_DEPTH`] for H.264 and
-/// one for the other two.
-///
-/// Depth 2 means a submitted picture must hand its access unit back on the next
-/// poll, and [`EncSession::encode`] treats a seat that does not as an error --
-/// it cannot write into a buffer the GPU may still be reading. That contract
-/// was measured on the H.264 seat and only there. HEVC and AV1 on this plugin
-/// are intra-only and go through the same driver, so they very probably behave
-/// the same way; "very probably" is not what a hard error should rest on, and
-/// the GPU has been unavailable since the measurement was possible. They keep
-/// the old one-buffer behaviour -- the picture coded before the next is
-/// written, exactly as every seat did before -- until someone measures them.
-///
-/// The intra-only seat ([`vh_enc_open_intra`]) is keyed by codec like any other
-/// and therefore takes the two, which is the answer and not an oversight: it is
-/// the same H.264 entrypoint with every inter dependency removed, so a picture
-/// there is finished no later than one on the seat the two was measured on.
-fn enc_depth(codec: EncCodec) -> usize {
-    match codec {
-        EncCodec::H264 => ENC_DEPTH,
-        EncCodec::Hevc | EncCodec::Av1 => 1,
-    }
-}
-
-/// Which codec an [`EncSession`] was opened for. Decided once, at the open, the
-/// way the H.264 seat's dimensions are -- everything after it is one trait.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum EncCodec {
-    H264,
-    Hevc,
-    Av1,
-}
-
-impl EncSession {
-    fn open(width: u32, height: u32, fps_num: u32, fps_den: u32, bitrate: u64) -> Option<Self> {
-        Self::open_codec(width, height, fps_num, fps_den, bitrate, EncCodec::H264)
-    }
-
-    fn open_codec(
-        width: u32,
-        height: u32,
-        fps_num: u32,
-        fps_den: u32,
-        bitrate: u64,
-        codec: EncCodec,
-    ) -> Option<Self> {
-        Self::open_seat(width, height, fps_num, fps_den, bitrate, codec, false, None)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn open_seat(
-        width: u32,
-        height: u32,
-        fps_num: u32,
-        fps_den: u32,
-        bitrate: u64,
-        codec: EncCodec,
-        intra_only: bool,
-        colour: Option<H265Colour>,
-    ) -> Option<Self> {
-        // NV12 chroma is half resolution, so odd dimensions have no packing;
-        // and radeonsi refuses encode contexts below 64x64 (measured).
-        if width < 64 || height < 64 || width % 2 != 0 || height % 2 != 0 {
-            return None;
-        }
-        // The HEVC entrypoint's own floor, which is a different number: the same
-        // driver that takes a 128x128 H.264 context answers `VaError(19)` to an
-        // HEVC one below 384x384 (measured 2026-08-13 on radeonsi). Said here so
-        // a small export falls back to software at the open rather than through
-        // a driver refusal, and so the C ABI never claims a seat it has not got.
-        if codec == EncCodec::Hevc && (width < 384 || height < 384) {
-            return None;
-        }
-        if fps_num == 0 || fps_den == 0 || bitrate == 0 {
-            return None;
-        }
-        let (display, gbm) = open_devices()?;
-        // A macroblock is 16 wide; an HEVC coding tree block is 64, and that
-        // seat's parameter sets declare the picture at coding-tree size (see the
-        // vendored `h265/predictor.rs`), so the surface has to carry every row
-        // those sets promise.
-        let align = match codec {
-            EncCodec::Hevc => align64,
-            _ => align16,
-        };
-        let coded = Resolution {
-            width: align(width),
-            height: align(height),
-        };
-        let framerate = ((fps_num as f64 / fps_den as f64).round() as i64).clamp(1, 240) as u32;
-        let profile = match codec {
-            EncCodec::Av1 => VAProfile::VAProfileAV1Profile0,
-            EncCodec::Hevc => VAProfile::VAProfileHEVCMain,
-            EncCodec::H264 => VAProfile::VAProfileH264Main,
-        };
-        // The driver's own answer to "can you encode this at all": a GPU with no
-        // AV1 encode entrypoint is what makes the caller fall back to `rav1e`,
-        // and asking here is what turns that into a null rather than a failed
-        // encode session halfway through an export.
-        let entrypoints = display.query_config_entrypoints(profile).ok()?;
-        if !entrypoints.contains(&VAEntrypoint::VAEntrypointEncSlice)
-            && !entrypoints.contains(&VAEntrypoint::VAEntrypointEncSliceLP)
-        {
-            return None;
-        }
-        let low_power = entrypoints.contains(&VAEntrypoint::VAEntrypointEncSliceLP);
-        // No B-frames on either codec: coded order stays display order, which is
-        // what both muxers' duration-only timing assumes.
-        //
-        // A limit of **1** is what makes a seat intra-only, and it is the whole
-        // mechanism: the low-delay predictor counts `counter % limit`, so with a
-        // limit of one that counter is always zero, every picture takes the
-        // keyframe branch *with `idr` set*, and each access unit is therefore an
-        // IDR carrying a fresh SPS and PPS
-        // (`cros-codecs/encoder/stateless/predictor.rs:107` and
-        // `h264/predictor.rs:139-163`). Forcing a key frame per picture is not
-        // the same thing and does not do it: `force_keyframe` takes the same
-        // branch with `idr` **false**, so no parameter sets are written, and a
-        // driver that leaves the NAL header byte at zero then gets its slices
-        // marked non-IDR by [`fix_slice_nal_headers`] -- which is exactly how a
-        // 60-frame "all-intra" hardware proxy came out with one sync point in it.
-        let pred_structure = PredictionStructure::LowDelay {
-            limit: gop_limit(framerate, intra_only),
-        };
-        let encoder: Box<dyn VideoEncoder<GenericDmaVideoFrame>> = match codec {
-            EncCodec::Av1 => {
-                // Constant quality, because that is the only rate control the
-                // vendored AV1 backend takes (`stateless/av1/vaapi.rs` refuses
-                // anything else outright); 128 of 255 is its own reference
-                // value. The caller's bitrate therefore does not reach this
-                // seat -- it reaches `rav1e`, which is the other one.
-                //
-                // corner-cut: bitrate-driven AV1 on the GPU needs `VA_RC_CBR`
-                // wired through that backend, which is a change in the vendored
-                // crate rather than here.
-                let config = Av1Config {
-                    profile: Av1Profile::Profile0,
-                    resolution: Resolution { width, height },
-                    pred_structure,
-                    initial_tunings: Tunings {
-                        rate_control: RateControl::ConstantQuality(128),
-                        framerate,
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                };
-                Box::new(
-                    Av1Encoder::new_vaapi(
-                        display,
-                        config,
-                        Fourcc::from(b"NV12"),
-                        coded,
-                        low_power,
-                        BlockingMode::Blocking,
-                    )
-                    .ok()?,
-                )
-            }
-            EncCodec::Hevc => {
-                // **Every picture an IDR**, which is the one place this seat
-                // does not mirror the H.264 one. A GOP's P slices come out of
-                // this driver undecodable: the slice segment headers are the
-                // *driver's* to write (as they are for H.264) and radeonsi
-                // writes a constant picture order count into every one of them,
-                // so a decoder sees frame after frame claiming to be the same
-                // output picture. Measured 2026-08-13: with the default GOP,
-                // only the leading IDR of each group decodes.
-                //
-                // So the hardware seat is intra-only exactly as the software one
-                // is (`export::Enc::open_hevc`), and an HEVC export is an
-                // intraframe master either way -- the same file, coded by the
-                // GPU instead of by twelve cores.
-                //
-                // corner-cut: inter HEVC on this GPU needs the slice segment
-                // header written here rather than by the driver
-                // (`VAEncPackedHeaderSlice`), which is a change in the vendored
-                // backend; upgrade path is that, or a driver that writes a
-                // correct POC.
-                let config = H265Config {
-                    resolution: Resolution { width, height },
-                    profile: H265Profile::Main,
-                    level: slice_fix::hevc_level(width, height, fps_num, fps_den),
-                    pred_structure: PredictionStructure::LowDelay { limit: 1 },
-                    initial_tunings: Tunings {
-                        rate_control: RateControl::ConstantBitrate(bitrate),
-                        framerate,
-                        ..Default::default()
-                    },
-                    // What the SPS tells a decoder the samples mean. Without it
-                    // libavcodec reads this stream's colour as "unspecified" and
-                    // renders it BT.601 whatever the container says -- the HEVC
-                    // decoder takes the bitstream's answer and overwrites the
-                    // container's with it, so an untagged 709 export is a
-                    // visible shift (`engine::export::video_signal_type` writes
-                    // the same three code points on the software seat).
-                    colour,
-                };
-                Box::new(
-                    HevcEncoder::new_vaapi(
-                        display,
-                        config,
-                        Fourcc::from(b"NV12"),
-                        coded,
-                        low_power,
-                        BlockingMode::Blocking,
-                    )
-                    .ok()?,
-                )
-            }
-            EncCodec::H264 => {
-                let config = H264Config {
-                    resolution: Resolution { width, height },
-                    profile: H264Profile::Main,
-                    level: slice_fix::h264_level(width, height, fps_num, fps_den),
-                    pred_structure,
-                    initial_tunings: Tunings {
-                        rate_control: RateControl::ConstantBitrate(bitrate),
-                        framerate,
-                        ..Default::default()
-                    },
-                };
-                Box::new(
-                    Encoder::new_vaapi(
-                        display,
-                        config,
-                        Fourcc::from(b"NV12"),
-                        coded,
-                        low_power,
-                        BlockingMode::Blocking,
-                    )
-                    .ok()?,
-                )
-            }
-        };
-        // Allocated at the aligned size, so the buffer's pitch is never smaller
-        // than a padded row.
-        let depth = enc_depth(codec);
-        let frames: Vec<_> = (0..depth)
-            .map(|_| alloc_nv12(&gbm, coded, false))
-            .collect::<Result<_, _>>()
-            .ok()?;
-        let layout = nv12_layout(coded, frames[0].get_plane_pitch()[0], false);
-        Some(Self {
-            encoder,
-            codec,
-            _gbm: gbm,
-            frames,
-            depth,
-            slot: 0,
-            in_flight: 0,
-            counters: slice_fix::SliceCounters::default(),
-            layout,
-            coded,
-            width: width as usize,
-            height: height as usize,
-            timestamp: 0,
-            drained: false,
-            ready: VecDeque::new(),
-            out: Vec::new(),
-            row: Vec::new(),
-        })
-    }
-
-    /// Interleaves one packed I420 picture into the NV12 input buffer `slot`.
-    ///
-    /// **Row at a time, through ordinary memory.** The mapping below is the
-    /// GPU's own buffer, which is write-combining: a store of a byte or two
-    /// costs a partial-buffer flush, while one `memcpy` of a whole row costs a
-    /// burst. Interleaving the chroma directly into it was 8.2 ms a picture at
-    /// 1080p against 6.7 ms staged (measured 2026-08-13 on radeonsi, alternating
-    /// the two paths frame by frame inside one export so the machine's load
-    /// weighed on both), and the picture is four fifths of what a hardware
-    /// export spends per frame. The padding is written the same way and for the
-    /// same reason: it used to be a four-byte second store per row.
-    ///
-    /// # Safety
-    /// `src`'s planes must cover `height` (resp. `height / 2`) rows of their
-    /// declared stride.
-    unsafe fn upload(&mut self, src: &VhFrame, slot: usize) -> Result<(), String> {
-        let (w, h) = (self.width, self.height);
-        let (cw, ch) = (w / 2, h / 2);
-        let (aw, ah) = (self.coded.width as usize, self.coded.height as usize);
-        // Two fields at once: the buffer is mapped for writing while the staging
-        // row is written into, and they are not the same field.
-        let Self { frames, row, .. } = self;
-        let frame = &mut frames[slot];
-        let pitch = frame.get_plane_pitch();
-        let mapping = frame.map_mut()?;
-        let planes = mapping.get();
-        row.resize(aw, 0);
-        let row_buf = &mut row[..];
-        {
-            let mut dst = planes[0].borrow_mut();
-            for row in 0..ah {
-                // SAFETY: caller contract; rows past the picture repeat the last.
-                let s = unsafe {
-                    std::slice::from_raw_parts(src.y.add(row.min(h - 1) * src.y_stride), w)
-                };
-                row_buf[..w].copy_from_slice(s);
-                // Macroblock padding: replicate the edge rather than leave the
-                // buffer's garbage there, which would cost bitrate for nothing.
-                row_buf[w..].fill(s[w - 1]);
-                dst[row * pitch[0]..row * pitch[0] + aw].copy_from_slice(row_buf);
-            }
-        }
-        let mut dst = planes[1].borrow_mut();
-        for row in 0..ah / 2 {
-            let src_row = row.min(ch - 1);
-            // SAFETY: as above, for the two chroma planes.
-            let (u, v) = unsafe {
-                (
-                    std::slice::from_raw_parts(src.u.add(src_row * src.u_stride), cw),
-                    std::slice::from_raw_parts(src.v.add(src_row * src.v_stride), cw),
-                )
-            };
-            for x in 0..cw {
-                row_buf[2 * x] = u[x];
-                row_buf[2 * x + 1] = v[x];
-            }
-            for x in w..aw {
-                row_buf[x] = row_buf[x - 2];
-            }
-            dst[row * pitch[1]..row * pitch[1] + aw].copy_from_slice(row_buf);
-        }
-        Ok(())
-    }
-
-    /// # Safety
-    /// As [`EncSession::upload`].
-    unsafe fn encode(&mut self, src: &VhFrame, force_keyframe: bool) -> Result<(), String> {
-        // The buffer this picture is written into is the one whose own access
-        // unit is already in hand -- `in_flight` is held below `depth` at the
-        // end of every call, so the round-robin never catches the GPU up. At
-        // depth 1 that is the picture just coded, which is the one-buffer
-        // behaviour every seat had before ([`enc_depth`]).
-        let slot = self.slot;
-        // SAFETY: caller contract, forwarded.
-        unsafe { self.upload(src, slot)? };
-        self.slot = (self.slot + 1) % self.depth;
-        let meta = FrameMetadata {
-            timestamp: self.timestamp,
-            layout: self.layout.clone(),
-            force_keyframe,
-        };
-        self.timestamp += 1;
-        self.encoder
-            .encode(meta, self.frames[slot].clone())
-            .map_err(|e| e.to_string())?;
-        self.in_flight += 1;
-        // ...and the picture before it is collected here rather than this one:
-        // that is the whole overlap, the GPU coding what was just submitted
-        // while the caller decodes and interleaves the next picture.
-        while self.in_flight >= self.depth {
-            if !self.pull()? {
-                // Blocking mode: a picture accepted and no coded unit for the
-                // one before it means the encoder is not answering, and the
-                // next upload would overwrite a buffer the GPU still reads.
-                return Err("the encoder took a picture and returned nothing coded".into());
-            }
-        }
-        Ok(())
-    }
-
-    /// Encodes a picture the decoder left on the GPU: the buffer is imported as
-    /// a surface of this session's own shape and read there, so nothing of it
-    /// ever passes through the CPU -- no `vaGetImage` on the way out of the
-    /// decoder and no interleave on the way in here.
-    ///
-    /// The geometry is checked rather than trusted: a buffer of another shape
-    /// would be coded as garbage, and the caller asked
-    /// [`vh_enc_dma_geometry`] what this seat takes before the decoder ever
-    /// handed one over.
-    ///
-    /// **No deferred poll here, unlike [`EncSession::encode`].** That one holds
-    /// [`enc_depth`] pictures in flight to overlap the *next* picture's CPU
-    /// interleave with this one's encode; a picture arriving on the GPU has no
-    /// interleave to overlap, so there is nothing to defer for and the access
-    /// units are collected as soon as they exist. What the depth still buys is
-    /// the input buffer, and this path uses none of `frames`: the surface is the
-    /// decoder's, held for us by its own [`DMA_HOLD`] contract, and draining
-    /// every call is what keeps that hold short.
-    ///
-    /// It is counted in `in_flight` all the same, because one session takes both
-    /// kinds -- an untouched clip hands buffers over while a graded one or a gap
-    /// goes through the pixel path -- and a submission missing from the count is
-    /// a `frames` slot the pixel path would believe free one picture too early.
-    fn encode_dma(&mut self, dma: &VhDma, force_keyframe: bool) -> Result<(), String> {
-        if dma.fd[0] < 0
-            || dma.fourcc != VA_FOURCC_NV12
-            || (dma.coded_width, dma.coded_height) != (self.coded.width, self.coded.height)
-            || (dma.width as usize, dma.height as usize) != (self.width, self.height)
-        {
-            return Err(format!(
-                "imported buffer is {}x{} in {} coded {}x{}, not {}x{} coded {}x{}",
-                dma.width,
-                dma.height,
-                dma.fourcc,
-                dma.coded_width,
-                dma.coded_height,
-                self.width,
-                self.height,
-                self.coded.width,
-                self.coded.height
-            ));
-        }
-        // One object or two, exactly as the decoder's driver described them:
-        // the buffers stay the caller's, so each is dup'd for the frame below.
-        let mut files = Vec::new();
-        for fd in dma.fd.iter().copied().take_while(|fd| *fd >= 0) {
-            // SAFETY: the descriptor's handles are the caller's, open for the
-            // length of the call.
-            let owned = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) }
-                .try_clone_to_owned()
-                .map_err(|e| format!("dup of the imported buffer failed: {e}"))?;
-            files.push(std::fs::File::from(owned));
-        }
-        let objects = files.len();
-        let layout = FrameLayout {
-            format: (Fourcc::from(b"NV12"), dma.modifier),
-            size: self.coded,
-            planes: (0..2)
-                .map(|plane| PlaneLayout {
-                    buffer_index: plane.min(objects - 1),
-                    offset: dma.offset[plane] as usize,
-                    stride: dma.stride[plane] as usize,
-                })
-                .collect(),
-        };
-        let frame = GenericDmaVideoFrame::new(files, layout.clone())?;
-        let meta = FrameMetadata {
-            timestamp: self.timestamp,
-            layout,
-            force_keyframe,
-        };
-        self.timestamp += 1;
-        self.encoder
-            .encode(meta, frame)
-            .map_err(|e| e.to_string())?;
-        self.in_flight += 1;
-        self.collect()
-    }
-
-    /// Moves every access unit the encoder has finished into `ready`.
-    fn collect(&mut self) -> Result<(), String> {
-        while self.pull()? {}
-        Ok(())
-    }
-
-    /// One finished access unit into `ready`; `false` where the encoder has
-    /// none to give.
-    fn pull(&mut self) -> Result<bool, String> {
-        let Some(coded) = self.encoder.poll().map_err(|e| e.to_string())? else {
-            return Ok(false);
-        };
-        let mut au = coded.bitstream;
-        if self.codec == EncCodec::H264 {
-            fix_slice_nal_headers(&mut au);
-            self.counters.fix_au(&mut au);
-        }
-        self.ready.push_back(au);
-        self.in_flight = self.in_flight.saturating_sub(1);
-        Ok(true)
-    }
-
-    /// Hands the oldest finished access unit to the caller, or reports that
-    /// there is none.
-    fn take(&mut self, out: *mut *const u8, out_len: *mut usize) -> i32 {
-        let Some(au) = self.ready.pop_front() else {
-            return 0;
-        };
-        self.out = au;
-        // SAFETY: caller-guaranteed writable destinations.
-        unsafe {
-            *out = self.out.as_ptr();
-            *out_len = self.out.len();
-        }
-        1
-    }
-}
-
-/// Opens a hardware H.264 encoder for `width`x`height` at `fps_num / fps_den`,
-/// constant bitrate `bitrate` bits per second. Returns null on any failure at
-/// all -- no VA-API runtime, no render node, no encode entrypoint, dimensions
-/// the driver will not take -- and the caller falls back to software.
-#[unsafe(no_mangle)]
-pub extern "C" fn vh_enc_open(
-    width: u32,
-    height: u32,
-    fps_num: u32,
-    fps_den: u32,
-    bitrate: u64,
-) -> *mut c_void {
-    catch_unwind(AssertUnwindSafe(|| {
-        match EncSession::open(width, height, fps_num, fps_den, bitrate) {
-            Some(session) => Box::into_raw(Box::new(session)) as *mut c_void,
-            None => std::ptr::null_mut(),
-        }
-    }))
-    .unwrap_or(std::ptr::null_mut())
-}
-
-/// The same H.264 seat, **intra-only**: every access unit it hands back is an
-/// IDR carrying its own SPS and PPS, so every frame of the file is a frame a
-/// decoder may be started from. What a proxy is coded with
-/// (`engine::proxy`), and never a delivery -- the file is much bigger for it.
-///
-/// A symbol of its own rather than a flag on [`vh_enc_open`], so that a plugin
-/// built before this existed simply has no intra seat and the caller falls back
-/// to the software encoder (whose `gop_size = 1` says the same thing) instead of
-/// being handed a long-GOP file that claims to be all-intra. The session it
-/// returns is fed, drained and closed through the very same three entry points.
-#[unsafe(no_mangle)]
-pub extern "C" fn vh_enc_open_intra(
-    width: u32,
-    height: u32,
-    fps_num: u32,
-    fps_den: u32,
-    bitrate: u64,
-) -> *mut c_void {
-    catch_unwind(AssertUnwindSafe(|| {
-        match EncSession::open_seat(
-            width,
-            height,
-            fps_num,
-            fps_den,
-            bitrate,
-            EncCodec::H264,
-            true,
-            None,
-        ) {
-            Some(session) => Box::into_raw(Box::new(session)) as *mut c_void,
-            None => std::ptr::null_mut(),
-        }
-    }))
-    .unwrap_or(std::ptr::null_mut())
-}
-
-/// The same, coding AV1 instead of H.264: null unless this GPU has an AV1
-/// encode entrypoint, which is recent hardware -- the caller then encodes AV1 in
-/// software instead. `bitrate` is not used by this codec (see `EncSession::open`:
-/// the vendored backend is constant-quality only) and is taken all the same, so
-/// the two opens stay one signature.
-///
-/// The session it returns is fed, drained and closed through `vh_enc_frame`,
-/// `vh_enc_drain` and `vh_enc_close` exactly as an H.264 one is; what comes back
-/// out of them is AV1 temporal units rather than Annex-B access units.
-#[unsafe(no_mangle)]
-pub extern "C" fn vh_enc_av1_open(
-    width: u32,
-    height: u32,
-    fps_num: u32,
-    fps_den: u32,
-    bitrate: u64,
-) -> *mut c_void {
-    catch_unwind(AssertUnwindSafe(|| {
-        match EncSession::open_codec(width, height, fps_num, fps_den, bitrate, EncCodec::Av1) {
-            Some(session) => Box::into_raw(Box::new(session)) as *mut c_void,
-            None => std::ptr::null_mut(),
-        }
-    }))
-    .unwrap_or(std::ptr::null_mut())
-}
-
-/// The same, coding HEVC: null unless this GPU has an HEVC encode entrypoint and
-/// the picture is at least 384x384 ([`EncSession::open_codec`] states that floor
-/// and where it was measured), and the caller then encodes HEVC in software
-/// instead.
-///
-/// **Intra-only**: every picture it hands back is an IDR carrying its own VPS,
-/// SPS and PPS, which is what makes the file decodable at all on this driver --
-/// see the `EncCodec::Hevc` arm of [`EncSession::open_codec`]. `bitrate` is the
-/// constant bitrate the GPU codes at, as the H.264 seat's is.
-///
-/// The session it returns is fed, drained and closed through `vh_enc_frame`,
-/// `vh_enc_drain` and `vh_enc_close` exactly as an H.264 one is; what comes back
-/// out of them is Annex-B HEVC access units.
-///
-/// The last four arguments are what the SPS says the samples mean -- the three
-/// H.273 code points and the range flag -- and they are part of the *symbol*
-/// rather than a later setter because the parameter sets are built when the
-/// sequence starts. A seat that signalled nothing is read back as "unspecified"
-/// and rendered BT.601, the container's own tag notwithstanding, which is why
-/// this replaced the colourless `vh_enc_hevc_open`: an engine older than this
-/// symbol finds none and takes the software intra seat, which has always
-/// written the VUI.
-#[unsafe(no_mangle)]
-pub extern "C" fn vh_enc_hevc_open_colour(
-    width: u32,
-    height: u32,
-    fps_num: u32,
-    fps_den: u32,
-    bitrate: u64,
-    colour_primaries: u32,
-    transfer_characteristics: u32,
-    matrix_coeffs: u32,
-    full_range: i32,
-) -> *mut c_void {
-    catch_unwind(AssertUnwindSafe(|| {
-        match EncSession::open_seat(
-            width,
-            height,
-            fps_num,
-            fps_den,
-            bitrate,
-            EncCodec::Hevc,
-            false,
-            Some(H265Colour {
-                colour_primaries,
-                transfer_characteristics,
-                matrix_coeffs,
-                full_range: full_range != 0,
-            }),
-        ) {
-            Some(session) => Box::into_raw(Box::new(session)) as *mut c_void,
-            None => std::ptr::null_mut(),
-        }
-    }))
-    .unwrap_or(std::ptr::null_mut())
-}
-
-/// Encodes one tightly-strided I420 picture. 1 when `out`/`out_len` describe one
-/// Annex-B access unit, 0 when the encoder has nothing coded yet, negative on
-/// error. The bytes stay valid until the next call on this session.
-///
-/// # Safety
-/// `session` must come from [`vh_enc_open`], `frame`'s planes must cover the
-/// picture at their declared strides, and `out`/`out_len` must be writable.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn vh_enc_frame(
-    session: *mut c_void,
-    frame: *const VhFrame,
-    force_key: i32,
-    out: *mut *const u8,
-    out_len: *mut usize,
-) -> i32 {
-    catch_unwind(AssertUnwindSafe(|| {
-        if session.is_null() || frame.is_null() || out.is_null() || out_len.is_null() {
-            return -1;
-        }
-        // SAFETY: caller-guaranteed live session and readable frame.
-        let (session, frame) = unsafe { (&mut *(session as *mut EncSession), &*frame) };
-        if frame.y.is_null() || frame.u.is_null() || frame.v.is_null() {
-            return -1;
-        }
-        if frame.width as usize != session.width
-            || frame.height as usize != session.height
-            || frame.y_stride < session.width
-            || frame.u_stride < session.width / 2
-            || frame.v_stride < session.width / 2
-        {
-            return -1;
-        }
-        // SAFETY: caller contract on the plane pointers, sizes checked above.
-        match unsafe { session.encode(frame, force_key != 0) } {
-            Ok(()) => session.take(out, out_len),
-            Err(e) => {
-                eprintln!("engine_hw: {e}");
-                -2
-            }
-        }
-    }))
-    .unwrap_or(-1)
-}
-
-/// What a decoded buffer must look like to reach this encoder without a copy:
-/// the surface size it codes in, written to `coded_width`/`coded_height`. 1 on
-/// an answer, negative on none. NV12 and the size this session was opened for
-/// are the rest of the shape, and the caller already knows both.
-///
-/// # Safety
-/// `session` must come from [`vh_enc_open`]; both outputs must be writable.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn vh_enc_dma_geometry(
-    session: *mut c_void,
-    coded_width: *mut u32,
-    coded_height: *mut u32,
-) -> i32 {
-    catch_unwind(AssertUnwindSafe(|| {
-        if session.is_null() || coded_width.is_null() || coded_height.is_null() {
-            return -1;
-        }
-        // SAFETY: caller-guaranteed live session and writable destinations.
-        unsafe {
-            let session = &*(session as *const EncSession);
-            *coded_width = session.coded.width;
-            *coded_height = session.coded.height;
-        }
-        1
-    }))
-    .unwrap_or(-1)
-}
-
-/// Encodes one picture the decoder left on the GPU, described by `dma` -- whose
-/// file descriptor stays the *caller's*, borrowed for the length of the call.
-/// Same answer and same lifetime rule as [`vh_enc_frame`]; a buffer of a shape
-/// this session cannot read is an error and not a silent re-shape.
-///
-/// # Safety
-/// `session` must come from [`vh_enc_open`], `dma` must be readable and its
-/// descriptor open, and `out`/`out_len` must be writable.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn vh_enc_frame_dma(
-    session: *mut c_void,
-    dma: *const VhDma,
-    force_key: i32,
-    out: *mut *const u8,
-    out_len: *mut usize,
-) -> i32 {
-    catch_unwind(AssertUnwindSafe(|| {
-        if session.is_null() || dma.is_null() || out.is_null() || out_len.is_null() {
-            return -1;
-        }
-        // SAFETY: caller-guaranteed live session and readable descriptor.
-        let (session, dma) = unsafe { (&mut *(session as *mut EncSession), &*dma) };
-        match session.encode_dma(dma, force_key != 0) {
-            Ok(()) => session.take(out, out_len),
-            Err(e) => {
-                eprintln!("engine_hw: {e}");
-                -2
-            }
-        }
-    }))
-    .unwrap_or(-1)
-}
-
-/// Flushes the encoder: 1 while `out`/`out_len` describe another access unit,
-/// 0 once every picture fed has been handed back, negative on error. Same
-/// lifetime rule as [`vh_enc_frame`].
-///
-/// # Safety
-/// `session` must come from [`vh_enc_open`]; `out`/`out_len` must be writable.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn vh_enc_drain(
-    session: *mut c_void,
-    out: *mut *const u8,
-    out_len: *mut usize,
-) -> i32 {
-    catch_unwind(AssertUnwindSafe(|| {
-        if session.is_null() || out.is_null() || out_len.is_null() {
-            return -1;
-        }
-        // SAFETY: caller-guaranteed live session.
-        let session = unsafe { &mut *(session as *mut EncSession) };
-        if !session.drained {
-            if let Err(e) = session.encoder.drain().map_err(|e| e.to_string()) {
-                eprintln!("engine_hw: {e}");
-                return -2;
-            }
-            session.drained = true;
-        }
-        match session.collect() {
-            Ok(()) => session.take(out, out_len),
-            Err(e) => {
-                eprintln!("engine_hw: {e}");
-                -2
-            }
-        }
-    }))
-    .unwrap_or(-1)
-}
-
-/// Releases an encode session. Safe to call with null.
-///
-/// # Safety
-/// `session` must come from [`vh_enc_open`] and must not be used afterwards.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn vh_enc_close(session: *mut c_void) {
-    let _ = catch_unwind(AssertUnwindSafe(|| {
-        if !session.is_null() {
-            // SAFETY: pointer came from `Box::into_raw` in `vh_enc_open`.
-            drop(unsafe { Box::from_raw(session as *mut EncSession) });
-        }
-    }));
+    };
+    EcEncSession::open(EcOpen {
+        codec,
+        width: open.width,
+        height: open.height,
+        fps_num: open.fps_num,
+        fps_den: open.fps_den,
+        bitrate: open.bitrate,
+        intra_only,
+        colour,
+    })
 }
 
 #[cfg(test)]
@@ -2348,36 +855,127 @@ mod tests {
     /// picture is an IDR. No GPU: this is the bitstream side of the seat.
     #[test]
     fn an_intra_seat_writes_a_sequence_header_a_decoder_can_read() {
-        use cros_codecs::codec::h264::parser::SpsBuilder;
-
-        let limit = u32::from(gop_limit(30, true));
-        let sps = SpsBuilder::new().max_frame_num(limit).max_pic_order_cnt_lsb(limit * 2).build();
-        assert_eq!(sps.log2_max_frame_num_minus4, 0, "252 is what a wrap looks like");
-        assert_eq!(sps.log2_max_pic_order_cnt_lsb_minus4, 0);
-        // The ordinary export's limit is untouched by the saturation, and a
-        // limit at the top of the `u16` stays inside the spec's 0..=12.
-        let long = u32::from(gop_limit(30, false));
-        assert_eq!(SpsBuilder::new().max_frame_num(long).build().log2_max_frame_num_minus4, 1);
-        assert!(
-            SpsBuilder::new().max_frame_num(u32::MAX).build().log2_max_frame_num_minus4 <= 12
+        // The limit the intra seat asks for is one picture, and the SPS the
+        // encoder writes for it must declare the smallest frame_num the spec
+        // allows (`minus4 = 0`). A wrap would read as 252 here.
+        assert_eq!(gop_limit(30, true), 1);
+        let open = EcOpen {
+            codec: EcCodec::H264,
+            width: 320,
+            height: 240,
+            fps_num: 30,
+            fps_den: 1,
+            bitrate: 2_000_000,
+            intra_only: true,
+            colour: None,
+        };
+        // No VA-API on this machine: nothing to encode, nothing to claim.
+        let Some(mut session) = EcEncSession::open(open) else {
+            return;
+        };
+        let luma = vec![128u8; 320 * 240];
+        let chroma = vec![128u8; 160 * 120];
+        session
+            .encode(&luma, &chroma, &chroma, false)
+            .expect("the intra seat encodes a picture");
+        let au = session.next_au().expect("one access unit").to_vec();
+        let au = au.as_slice();
+        assert_eq!(
+            sps_log2_max_frame_num_minus4(au),
+            Some(0),
+            "log2_max_frame_num_minus4 = 0; 252 is what a wrap looks like"
         );
     }
 
-    /// The other half of the same fault: a slice is marked IDR only where the
-    /// access unit carries an SPS, so a "forced key frame" that writes no
-    /// parameter sets reads back as an ordinary I picture -- no decoder starts
-    /// there, and `sync_points` does not count it.
+    /// `log2_max_frame_num_minus4` from the first SPS in an Annex-B access unit.
+    /// Main profile only (no chroma-format fields between the level and the
+    /// sequence parameter set id), which is the only profile this seat writes.
+    fn sps_log2_max_frame_num_minus4(au: &[u8]) -> Option<u32> {
+        let at = au.windows(4).position(|w| w == [0, 0, 1, 0x67])?;
+        // Undo emulation prevention: 0x00 0x00 0x03 -> 0x00 0x00.
+        let mut rbsp = Vec::new();
+        let mut zeros = 0;
+        for &b in &au[at + 4..] {
+            if zeros >= 2 && b == 3 {
+                zeros = 0;
+                continue;
+            }
+            zeros = if b == 0 { zeros + 1 } else { 0 };
+            if zeros > 2 && b == 1 {
+                break;
+            }
+            rbsp.push(b);
+        }
+        let bits: Vec<u8> = rbsp
+            .iter()
+            .flat_map(|b| (0..8).rev().map(move |i| (b >> i) & 1))
+            .collect();
+        fn read(bits: &[u8], pos: &mut usize, n: usize) -> Option<u32> {
+            let mut v = 0;
+            for _ in 0..n {
+                v = v << 1 | u32::from(*bits.get(*pos)?);
+                *pos += 1;
+            }
+            Some(v)
+        }
+        fn ue(bits: &[u8], pos: &mut usize) -> Option<u32> {
+            let mut zeros = 0;
+            while read(bits, pos, 1)? == 0 {
+                zeros += 1;
+            }
+            Some((1u32 << zeros) - 1 + read(bits, pos, zeros)?)
+        }
+        let mut pos = 0;
+        if read(&bits, &mut pos, 8)? != 77 {
+            return None;
+        }
+        read(&bits, &mut pos, 16)?; // constraint flags, level_idc
+        ue(&bits, &mut pos)?; // seq_parameter_set_id
+        ue(&bits, &mut pos)
+    }
+
+    /// The other half of the same fault: every picture of an intra-only seat
+    /// is an IDR, and each access unit carries its own SPS, so no decoder can
+    /// read a later picture as a non-sync one. Two pictures, each checked for a
+    /// parameter set and an IDR slice and no non-IDR slice. Needs a GPU.
     #[test]
-    fn only_a_unit_carrying_parameter_sets_is_marked_idr() {
-        // SPS (0x67) + PPS (0x68) + a slice the driver left at zero.
-        let mut with_sets = vec![0, 0, 1, 0x67, 9, 0, 0, 1, 0x68, 9, 0, 0, 1, 0x00, 9];
-        fix_slice_nal_headers(&mut with_sets);
-        assert_eq!(with_sets[13], 0x65, "IDR slice after an SPS");
-        // The same unit without them: a key frame the encoder was merely asked
-        // for, which is what the hardware proxy used to be full of.
-        let mut bare = vec![0, 0, 1, 0x00, 9];
-        fix_slice_nal_headers(&mut bare);
-        assert_eq!(bare[3], 0x41, "no parameter sets, no IDR");
+    fn every_intra_only_access_unit_is_an_idr_with_parameter_sets() {
+        let open = EcOpen {
+            codec: EcCodec::H264,
+            width: 320,
+            height: 240,
+            fps_num: 30,
+            fps_den: 1,
+            bitrate: 2_000_000,
+            intra_only: true,
+            colour: None,
+        };
+        let Some(mut session) = EcEncSession::open(open) else {
+            return;
+        };
+        let luma = vec![128u8; 320 * 240];
+        let chroma = vec![128u8; 160 * 120];
+        for picture in 0..2 {
+            session
+                .encode(&luma, &chroma, &chroma, false)
+                .expect("the intra seat encodes a picture");
+            let au = session.next_au().expect("one access unit").to_vec();
+            let au = au.as_slice();
+            let kinds: Vec<u8> = au
+                .windows(4)
+                .filter(|w| w[..3] == [0, 0, 1])
+                .map(|w| w[3] & 0x1f)
+                .collect();
+            assert!(
+                kinds.contains(&7),
+                "picture {picture} carries an SPS: {kinds:?}"
+            );
+            assert!(kinds.contains(&5), "picture {picture} is an IDR: {kinds:?}");
+            assert!(
+                !kinds.contains(&1),
+                "picture {picture} has no non-IDR slice: {kinds:?}"
+            );
+        }
     }
 
     /// Runs against whatever GPU this machine has -- and passes on one with no
@@ -2481,7 +1079,11 @@ mod tests {
             panic!("208 is within the reach of 200")
         };
         skip = forward_skip(skip, ahead);
-        assert_eq!(land(position, skip), 208, "a flush's undrained skip does not compound");
+        assert_eq!(
+            land(position, skip),
+            208,
+            "a flush's undrained skip does not compound"
+        );
 
         // ...and a reseek to exactly where the decoder stands cancels
         // whatever was standing: the next handle is shown, not skipped past.

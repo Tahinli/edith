@@ -42,7 +42,8 @@ const SDR: ColorDescription = ColorDescription {
 /// with a grade on it, which is the other branch of the funnel. Measured on
 /// `main`; an SDR stream may not move by one byte.
 const SDR_PASSTHROUGH: u64 = 0x9EF1_6F6F_5310_BCEE;
-const SDR_GRADED_AND_PLACED: u64 = 0xAFA6_6394_3937_DE5B;
+/// Re-pinned at the colour merge: lane-colour keeps graded samples inside the valid code range (1-254), which moves a graded SDR picture; the passthrough hash is unchanged.
+const SDR_GRADED_AND_PLACED: u64 = 0x6078_31F1_73F3_1AEF;
 
 fn asset(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -60,7 +61,7 @@ fn fnv(b: &[u8]) -> u64 {
 /// are the same on a machine with a VA-API plugin and one without (hence
 /// `--test-threads=1`).
 fn open(name: &str) -> PlaybackSession {
-    unsafe { std::env::set_var("VE_SW", "1") };
+    engine::envcfg::set("VE_SW", "1");
     let session = PlaybackSession::open(asset(name)).expect("open");
     session.set_gain(0.0);
     session
@@ -111,11 +112,11 @@ fn by_hand(
     let mut u = vec![codes[1]; w / 2 * h / 2];
     let mut v = vec![codes[2]; w / 2 * h / 2];
     if before {
-        apply_yuv(grade, &mut y, &mut u, &mut v);
+        apply_yuv(grade, &mut y, &mut u, &mut v, w, false);
     }
     ToneMapper::new(Hdr::Pq, preset, peak).map(&mut y, &mut u, &mut v, w, h);
     if !before {
-        apply_yuv(grade, &mut y, &mut u, &mut v);
+        apply_yuv(grade, &mut y, &mut u, &mut v, w, false);
     }
     let bgra = i420_to_bgra(&SDR, &y, &u, &v, w, h);
     [bgra[0], bgra[1], bgra[2]]

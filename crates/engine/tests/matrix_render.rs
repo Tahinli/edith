@@ -39,7 +39,7 @@ fn fnv(b: &[u8]) -> u64 {
 /// to the software decoder so the bytes are the same on a machine with a VA-API
 /// plugin and one without -- hence `--test-threads=1`.
 fn frame0(name: &str) -> (Matrix, Vec<u8>) {
-    unsafe { std::env::set_var("VE_SW", "1") };
+    engine::envcfg::set("VE_SW", "1");
     let mut session = PlaybackSession::open(asset(name)).expect("open");
     session.set_gain(0.0);
     let matrix = session.meta().color.matrix;

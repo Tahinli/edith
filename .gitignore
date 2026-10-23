@@ -1,4 +1,6 @@
 /target
-/assets
+/assets/*
+!/assets/fonts/
+!/assets/icons/
 /real_library.toml
 /graphify-out

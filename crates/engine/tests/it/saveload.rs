@@ -1,0 +1,2067 @@
+//! Saving a project and opening it again: the timeline that comes back is the
+//! one that went in, a folder of media plus its `.edith` can be moved
+//! anywhere, and every way the files on disk can have changed underneath is a
+//! refusal that says which file and why.
+//!
+//! ```text
+//! cargo test -p engine --release --test saveload -- --nocapture
+//! ```
+
+use std::path::{Path, PathBuf};
+
+use engine::PlaybackSession;
+use engine::project::{GainKey, Lane, LaneKind, Source};
+use engine::scratch::Scratch;
+
+fn asset(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../assets")
+        .join(name)
+}
+
+/// A fresh directory to litter, deleted when the test that holds it ends.
+fn scratch(name: &str) -> Scratch {
+    Scratch::dir(&format!("ve_saveload_{name}"))
+}
+
+fn copy_in(dir: &Path, name: &str) -> PathBuf {
+    let to = dir.join(name);
+    std::fs::copy(asset(name), &to).expect("copy the fixture");
+    to
+}
+
+/// The whole of what a picked audio stream has to survive: a file's second
+/// language goes on the timeline beside its first, the project says so on
+/// disk, and reopening it plays the same two streams. This is the file-level
+/// half of what a library row does -- `place_stream_at` is the one door that
+/// row goes through.
+#[test]
+fn a_picked_audio_stream_lands_saves_and_comes_back() {
+    let dir = scratch("streams");
+    let media = copy_in(&dir, "test_multilang.mp4");
+    let mut session = PlaybackSession::open(&media).expect("open the fixture");
+    session.set_gain(0.0); // silent like the rest of the suites
+    let end = session.timeline_duration();
+
+    // Stream 1 is the French track, same rate and layout as stream 0, so it
+    // can join this timeline; it lands as a second source of the same file.
+    assert!(
+        session
+            .place_stream_at(end, &media, 1, None)
+            .expect("stream 1 matches the timeline")
+    );
+    assert_eq!(
+        session
+            .sources()
+            .iter()
+            .map(|s| s.audio_stream)
+            .collect::<Vec<_>>(),
+        [0, 1],
+        "the same file twice, on two streams"
+    );
+    assert_eq!(session.timeline_duration(), end * 2.0);
+
+    let path = dir.join("langs.edith");
+    session.save_project(&path).expect("save");
+    let text = std::fs::read_to_string(&path).expect("read back");
+    assert!(
+        text.contains("source 0 test_multilang.mp4")
+            && text.contains("source 1 test_multilang.mp4"),
+        "the streams did not reach the file:\n{text}"
+    );
+
+    let loaded = PlaybackSession::open_project(&path).expect("reopen the project");
+    assert_eq!(loaded.sources(), session.sources());
+    assert_eq!(loaded.timeline_duration(), session.timeline_duration());
+
+    // And the refusal left, in the engine's own words: a file that is not on
+    // this timeline. Its *layout* (stream 1 is mono, the timeline stereo) is no
+    // longer one (DEBT #46): the mono stream up-mixes onto both channels.
+    let other = copy_in(&dir, "test_multiaudio.mp4");
+    let mut session = PlaybackSession::open(&other).expect("open the fixture");
+    session.set_gain(0.0);
+    session
+        .place_stream_at(0.0, &other, 1, None)
+        .expect("a mono stream up-mixes onto a stereo timeline");
+    assert!(
+        session
+            .place_stream_at(0.0, &media, 1, None)
+            .expect_err("a file that is not a source")
+            .to_string()
+            .contains("not on this timeline")
+    );
+    assert_eq!(
+        session.sources().len(),
+        2,
+        "the mono stream landed, the not-a-source refusal added nothing more"
+    );
+    std::fs::remove_dir_all(&dir).expect("cleanup");
+}
+
+/// Both stand-in switches through the front door: what the picture is cut on
+/// and whether an import makes one at all are two settings, saved and reopened
+/// as the pair they are -- and a session that was never told keeps making them,
+/// which is what every project did before there was a switch.
+#[test]
+fn both_proxy_switches_survive_a_save_and_a_reopen() {
+    let dir = scratch("proxyswitches");
+    let media = copy_in(&dir, "test_av.mp4");
+    let mut session = PlaybackSession::open(&media).expect("open the fixture");
+    session.set_gain(0.0);
+    assert!(
+        session.auto_proxies(),
+        "a fresh project makes them by itself"
+    );
+    assert!(!session.proxies(), "and is cut on the film itself");
+
+    session.set_proxies(true);
+    session.set_auto_proxies(false);
+    let path = dir.join("switches.edith");
+    session.save_project(&path).expect("save");
+    let text = std::fs::read_to_string(&path).expect("read back");
+    assert!(text.contains("proxy on\nautoproxy off\n"), "{text}");
+
+    let loaded = PlaybackSession::open_project(&path).expect("reopen");
+    assert!(loaded.proxies(), "cut on the stand-ins came back");
+    assert!(!loaded.auto_proxies(), "and so did making none of them");
+
+    // ...and the default is the line left out, which is what a v12 file is.
+    session.set_auto_proxies(true);
+    session.save_project(&path).expect("save");
+    let text = std::fs::read_to_string(&path).expect("read back");
+    assert!(
+        !text.contains("autoproxy"),
+        "on is written by saying nothing"
+    );
+    assert!(
+        PlaybackSession::open_project(&path)
+            .expect("reopen")
+            .auto_proxies()
+    );
+    std::fs::remove_dir_all(&dir).expect("cleanup");
+}
+
+/// The export card's encoder pick through the same front door: which seat a
+/// delivery is written on is the project's, so it survives a save and a reopen
+/// -- and a project nobody picked for exports on whatever this machine has,
+/// which is what every project did before the row existed.
+#[test]
+fn the_encoder_seat_survives_a_save_and_a_reopen() {
+    use engine::export::EncoderSeat;
+
+    let dir = scratch("encoderseat");
+    let media = copy_in(&dir, "test_av.mp4");
+    let mut session = PlaybackSession::open(&media).expect("open the fixture");
+    session.set_gain(0.0);
+    assert_eq!(
+        session.encoder_seat(),
+        EncoderSeat::Auto,
+        "a fresh project takes the seat this machine has"
+    );
+
+    let path = dir.join("seat.edith");
+    for seat in [EncoderSeat::Software, EncoderSeat::Hardware] {
+        session.set_encoder_seat(seat);
+        session.save_project(&path).expect("save");
+        let text = std::fs::read_to_string(&path).expect("read back");
+        assert!(
+            text.contains(&format!("encoder {}\n", seat.name())),
+            "{text}"
+        );
+        assert_eq!(
+            PlaybackSession::open_project(&path)
+                .expect("reopen")
+                .encoder_seat(),
+            seat
+        );
+    }
+
+    // ...and the default is the line left out, which is what a v13 file is.
+    session.set_encoder_seat(EncoderSeat::Auto);
+    session.save_project(&path).expect("save");
+    let text = std::fs::read_to_string(&path).expect("read back");
+    assert!(
+        !text.contains("encoder"),
+        "auto is written by saying nothing"
+    );
+    assert_eq!(
+        PlaybackSession::open_project(&path)
+            .expect("reopen")
+            .encoder_seat(),
+        EncoderSeat::Auto
+    );
+    std::fs::remove_dir_all(&dir).expect("cleanup");
+}
+
+/// Why a trim's tail stops where the file ends: a clip reaching past the last
+/// frame of its source is a project that will not open again (`open_project`
+/// refuses it by name). Pulled in on both ends and then dragged out as far as
+/// the pointer can ask for, the save still comes back as itself.
+#[test]
+fn a_trimmed_timeline_saves_and_opens_again() {
+    use engine::project::Edge;
+
+    let dir = scratch("trim");
+    let media = copy_in(&dir, "test_av.mp4");
+    let mut session = PlaybackSession::open(&media).expect("open the fixture");
+    session.set_gain(0.0);
+    let whole = session.clip_at(0).expect("one clip");
+
+    assert!(session.trim_clip(Lane::V1, 0, Edge::End, whole.end() / 2));
+    assert!(session.trim_clip(Lane::V1, 0, Edge::Start, 5));
+    let path = dir.join("trimmed.edith");
+    session.save_project(&path).expect("save");
+    let loaded = PlaybackSession::open_project(&path).expect("a trimmed project opens");
+    assert_eq!(
+        loaded
+            .clip_at(0)
+            .map(|c| (c.start, c.in_frame, c.out_frame)),
+        Some((5, 5, whole.end() / 2)),
+        "the trimmed range is what came back"
+    );
+
+    // A hand that keeps pulling: the tail stops at the file's own last frame,
+    // and the save of *that* opens too.
+    assert!(session.trim_clip(Lane::V1, 0, Edge::End, u32::MAX));
+    assert_eq!(
+        session.clip_at(0).expect("still one clip").out_frame,
+        whole.out_frame,
+        "as far as the file goes and not one frame further"
+    );
+    session.save_project(&path).expect("save");
+    PlaybackSession::open_project(&path).expect("and it still opens");
+    std::fs::remove_dir_all(&dir).expect("cleanup");
+}
+
+/// Two files, four clips, one of them deleted, playhead at 3 s -- a timeline
+/// with something to lose in every field.
+fn edited(dir: &Path) -> PlaybackSession {
+    let mut session = PlaybackSession::open(copy_in(dir, "test_av.mp4")).expect("open");
+    // Imported into the library, then dragged onto the end -- the two acts a
+    // second file on the timeline takes.
+    let second = copy_in(dir, "test_av2.mp4");
+    session.import(&second).expect("import the second file");
+    let end = session.timeline_duration();
+    assert!(
+        session
+            .place_stream_at(end, &second, 0, None)
+            .expect("a file just imported is on this timeline"),
+        "drag it onto the end"
+    );
+    assert!(session.cut_at(2.0), "cut inside the first file");
+    assert!(session.cut_at(6.5), "cut inside the second file");
+    assert!(
+        session.delete_clip(Lane::V1, 1),
+        "drop the second half of the first"
+    );
+    session.seek(3.0);
+    assert_eq!(session.timeline_duration(), 6.0);
+    session
+}
+
+/// What has to survive a round trip, all of it public API.
+fn shape(session: &PlaybackSession) -> (Vec<(f64, f64, usize)>, Vec<Source>, f64) {
+    (
+        session.clip_spans_by_source(),
+        session.sources().to_vec(),
+        session.timeline_duration(),
+    )
+}
+
+/// The version-1 promise: a file written before the lanes existed still opens,
+/// as one grouped video+audio pair per clip laid end to end, and saving it
+/// again writes version 7 -- which reopens as the same timeline.
+#[test]
+fn a_version_1_project_loads_fully_grouped_and_saves_as_version_7() {
+    let dir = scratch("v1");
+    copy_in(&dir, "test_av.mp4");
+    let path = dir.join("old.edith");
+    // 60 frames of picture from two clips: [0,30) then [60,90) of the source.
+    std::fs::write(
+        &path,
+        "edith 1\nplayhead 45\nsource test_av.mp4\nclip 0 30 0\nclip 60 90 0\n",
+    )
+    .expect("write a v1 file");
+
+    let loaded = PlaybackSession::open_project(&path).expect("a v1 file still opens");
+    let fps = loaded.meta().frame_rate;
+    assert_eq!(
+        loaded.clip_spans_by_source(),
+        vec![(0.0, 30.0 / fps, 0), (30.0 / fps, 30.0 / fps, 0)],
+        "v1 clips queue up, the second starting where the first ended"
+    );
+    assert_eq!(
+        loaded.lane_spans_by_source(engine::project::Lane::A1),
+        loaded.clip_spans_by_source(),
+        "both lanes, fully grouped: a v1 timeline had no holes"
+    );
+    assert!(
+        (loaded.now() - 45.0 / fps).abs() < 1.0 / fps,
+        "playhead kept"
+    );
+
+    // Saved again it is v7, and v7 round-trips to the same timeline.
+    let v2 = dir.join("new.edith");
+    loaded.save_project(&v2).expect("save");
+    let text = std::fs::read_to_string(&v2).expect("read back");
+    assert!(text.starts_with("edith 30\n"), "{text}");
+    assert!(
+        text.contains("\nresolution 1280 720\n"),
+        "a project with no resolution of its own is saved at source 0's: {text}"
+    );
+    assert_eq!(
+        text.lines().filter(|l| l.starts_with("video ")).count(),
+        2,
+        "{text}"
+    );
+    assert_eq!(
+        text.lines().filter(|l| l.starts_with("audio ")).count(),
+        2,
+        "{text}"
+    );
+    let again = PlaybackSession::open_project(&v2).expect("open the v2 file");
+    assert_eq!(shape(&again), shape(&loaded));
+    // ...and re-saving it is byte-identical, so a round trip is stable.
+    let third = dir.join("third.edith");
+    again.save_project(&third).expect("save");
+    assert_eq!(std::fs::read(&third).expect("read"), text.as_bytes());
+
+    // And the same promise one version on: a v2 file names no audio stream and
+    // opens on stream 0, which is the only one that dialect could play.
+    let v2 = dir.join("v2.edith");
+    std::fs::write(
+        &v2,
+        "edith 2\nplayhead 0\nsource test_av.mp4\nvideo 0 0 30 0 0\naudio 0 0 30 0 0\n",
+    )
+    .expect("write a v2 file");
+    let loaded = PlaybackSession::open_project(&v2).expect("a v2 file still opens");
+    assert_eq!(loaded.sources().len(), 1);
+    assert_eq!(loaded.sources()[0].audio_stream, 0);
+    loaded.save_project(&v2).expect("save");
+    assert!(
+        std::fs::read_to_string(&v2)
+            .expect("read back")
+            .contains("source 0 test_av.mp4"),
+        "a re-saved v2 project says the stream it always meant"
+    );
+}
+
+/// What version 4 is for: a project file holds any number of lanes, in the
+/// order they are displayed in, and one holding nothing is still a lane. The
+/// timeline is built by hand because the format is what this checks -- no UI
+/// adds a lane yet -- and the file it writes back has to be the one it read.
+#[test]
+fn a_version_4_project_holds_more_than_two_lanes() {
+    use engine::project::{Lane, LaneKind};
+
+    let dir = scratch("v4_lanes");
+    copy_in(&dir, "test_av.mp4");
+    let path = dir.join("many.edith");
+    // V1, A1, V2, A2 in display order: a take grouped across V1 and A2 (link 3,
+    // one span on two lanes that are not a pair), a lone clip on V2, and an
+    // empty A1 that has only its own line to say it is there.
+    let text = "edith 4\nplayhead 0\nsource 0 test_av.mp4\n\
+                video 1 0 0 30 0 3\naudio 1\nvideo 2 40 0 20 0 -\naudio 2 0 0 30 0 3\n";
+    std::fs::write(&path, text).expect("write a v4 file");
+
+    let loaded = PlaybackSession::open_project(&path).expect("a four-lane project opens");
+    let v2 = Lane::new(LaneKind::Video, 1);
+    let a2 = Lane::new(LaneKind::Audio, 1);
+    assert_eq!(loaded.lane_clips(Lane::V1).len(), 1);
+    assert!(loaded.lane_clips(Lane::A1).is_empty(), "A1 holds nothing");
+    assert_eq!(
+        loaded
+            .lane_clips(v2)
+            .iter()
+            .map(|c| (c.start, c.end()))
+            .collect::<Vec<_>>(),
+        vec![(40, 60)],
+        "V2 is a lane of its own, gap and all"
+    );
+    assert_eq!(
+        loaded.lane_clips(a2)[0].link,
+        loaded.lane_clips(Lane::V1)[0].link,
+        "the group spans V1 and A2, which are not a pair"
+    );
+    assert_eq!(loaded.timeline_duration(), 60.0 / loaded.meta().frame_rate);
+
+    // ...and saving it writes the v7 twin of what it read: the lane list, its
+    // order and the empty lane all survive, each clip now saying it plays flat,
+    // ungraded and fitted, under a project resolution taken from the media.
+    let again = dir.join("again.edith");
+    loaded.save_project(&again).expect("save");
+    assert_eq!(
+        std::fs::read_to_string(&again).expect("read back"),
+        "edith 30\nplayhead 0\nresolution 1280 720\nfps 30.0\nsource 0 test_av.mp4\n\
+         video 1 0 0 30 0 3 - - fit 1000 0 0 0 - 0 0\naudio 1\n\
+         video 2 40 0 20 0 - - - fit 1000 0 0 0 - 0 0\naudio 2 0 0 30 0 3 - - fit 1000 0 0 0 - 0 0\n",
+        "a four-lane project is written as it was read, three versions on"
+    );
+}
+
+/// What version 5 is for: a clip carries equalizer settings, the file names
+/// them once for however many clips share them, and the whole thing survives
+/// the engine's own door -- open, save, every curve and index of it intact one
+/// version on.
+#[test]
+fn a_version_5_project_carries_per_clip_equalizers() {
+    let dir = scratch("v5_eq");
+    copy_in(&dir, "test_av.mp4");
+    let path = dir.join("eq.edith");
+    // Two clips on one curve, one on another, one flat.
+    let text = "edith 5\nplayhead 0\nsource 0 test_av.mp4\n\
+                eq 80.0:-3.0:0.707:ls 1000.0:4.5:1.0:pk\n\
+                eq 12000.0:6.25:0.5:hs\n\
+                video 1 0 0 30 0 - 0\nvideo 1 30 30 60 0 - 1\n\
+                audio 1 0 0 30 0 - 0\naudio 1 30 30 60 0 - -\n";
+    std::fs::write(&path, text).expect("write a v5 file");
+
+    let loaded = PlaybackSession::open_project(&path).expect("a v5 project opens");
+    assert_eq!(loaded.lane_clips(engine::project::Lane::V1).len(), 2);
+    let again = dir.join("again.edith");
+    loaded.save_project(&again).expect("save");
+    assert_eq!(
+        std::fs::read_to_string(&again).expect("read back"),
+        "edith 30\nplayhead 0\nresolution 1280 720\nfps 30.0\nsource 0 test_av.mp4\n\
+         eq 80.0:-3.0:0.707:ls 1000.0:4.5:1.0:pk\n\
+         eq 12000.0:6.25:0.5:hs\n\
+         video 1 0 0 30 0 - 0 - fit 1000 0 0 0 - 0 0\nvideo 1 30 30 60 0 - 1 - fit 1000 0 0 0 - 0 0\n\
+         audio 1 0 0 30 0 - 0 - fit 1000 0 0 0 - 0 0\naudio 1 30 30 60 0 - - - fit 1000 0 0 0 - 0 0\n",
+        "the equalizer table and every clip's index survive a round trip"
+    );
+}
+
+/// What version 6 is for, the same claim one version on: a clip carries a
+/// colour grade beside its equalizer and the file names each once for however
+/// many clips share it. A format bump necessarily rewrites the file, so what is
+/// asserted here is the v7 twin of what was read; the byte-identity claim lives
+/// in `a_version_7_project_carries_a_resolution_and_fit_policies` below.
+#[test]
+fn a_version_6_project_carries_per_clip_colours() {
+    let dir = scratch("v6_color");
+    copy_in(&dir, "test_av.mp4");
+    let path = dir.join("color.edith");
+    // Two clips on one grade, one on another, one ungraded -- and an equalizer
+    // on a clip that is graded too, so the two tables are seen not to collide.
+    let text = "edith 6\nplayhead 0\nsource 0 test_av.mp4\n\
+                eq 80.0:-3.0:0.707:ls\n\
+                color 0.1:1.2:0.9:-0.3\n\
+                color -0.25:1.0:0.0:0.5\n\
+                video 1 0 0 30 0 - 0 0\nvideo 1 30 30 60 0 - - 1\n\
+                audio 1 0 0 30 0 - - 0\naudio 1 30 30 60 0 - - -\n";
+    std::fs::write(&path, text).expect("write a v6 file");
+
+    let loaded = PlaybackSession::open_project(&path).expect("a v6 project opens");
+    assert_eq!(loaded.lane_clips(engine::project::Lane::V1).len(), 2);
+    let again = dir.join("again.edith");
+    loaded.save_project(&again).expect("save");
+    assert_eq!(
+        std::fs::read_to_string(&again).expect("read back"),
+        "edith 30\nplayhead 0\nresolution 1280 720\nfps 30.0\nsource 0 test_av.mp4\n\
+         eq 80.0:-3.0:0.707:ls\n\
+         color 0.1:1.2:0.9:-0.3\n\
+         color -0.25:1.0:0.0:0.5\n\
+         video 1 0 0 30 0 - 0 0 fit 1000 0 0 0 - 0 0\nvideo 1 30 30 60 0 - - 1 fit 1000 0 0 0 - 0 0\n\
+         audio 1 0 0 30 0 - - 0 fit 1000 0 0 0 - 0 0\naudio 1 30 30 60 0 - - - fit 1000 0 0 0 - 0 0\n",
+        "the colour table and every clip's index survive a round trip"
+    );
+    // A dialect that could not say either one means the defaults, and those are
+    // what such a project always was: the media's own size, nothing letterboxed.
+    assert_eq!(loaded.resolution(), (1280, 720));
+    assert_eq!(
+        loaded.fit_of(engine::project::Lane::V1, 0),
+        engine::scale::FitPolicy::Fit
+    );
+}
+
+/// What version 7 is for: the project's picture size is its own, not source 0's,
+/// and each clip says how it meets it. Both survive the engine's door byte for
+/// byte -- and a project whose resolution is nobody's media size is exactly the
+/// case that could not be written down before.
+#[test]
+fn a_version_7_project_carries_a_resolution_and_fit_policies() {
+    let dir = scratch("v7_resolution");
+    copy_in(&dir, "test_av.mp4");
+    let path = dir.join("mixed.edith");
+    let text = "edith 7\nplayhead 0\nresolution 960 720\nsource 0 test_av.mp4\n\
+                video 1 0 0 30 0 - - - fill\nvideo 1 30 30 60 0 - - - center\n\
+                audio 1 0 0 60 0 - - - fit\n";
+    std::fs::write(&path, text).expect("write a v7 file");
+
+    let loaded = PlaybackSession::open_project(&path).expect("a v7 project opens");
+    assert_eq!(
+        loaded.resolution(),
+        (960, 720),
+        "the project's own size, which is not the media's 1280x720"
+    );
+    assert_eq!(
+        loaded.native_resolution(),
+        (1280, 720),
+        "...and the media's own size is still known"
+    );
+    let v1 = engine::project::Lane::V1;
+    assert_eq!(loaded.fit_of(v1, 0), engine::scale::FitPolicy::Fill);
+    assert_eq!(loaded.fit_of(v1, 1), engine::scale::FitPolicy::Center);
+
+    let again = dir.join("again.edith");
+    loaded.save_project(&again).expect("save");
+    assert_eq!(
+        std::fs::read_to_string(&again).expect("read back"),
+        "edith 30\nplayhead 0\nresolution 960 720\nfps 30.0\nsource 0 test_av.mp4\n\
+         video 1 0 0 30 0 - - - fill 1000 0 0 0 - 0 0\nvideo 1 30 30 60 0 - - - center 1000 0 0 0 - 0 0\n\
+         audio 1 0 0 60 0 - - - fit 1000 0 0 0 - 0 0\n",
+        "a v7 project is written back as the v8 it now is: the same clips, each \
+         saying it plays at real time, which is what it always played at"
+    );
+
+    // The refusals the new grammar adds, each naming its line.
+    for (bad, want) in [
+        (
+            "edith 7\nresolution 0 720\nsource 0 test_av.mp4\nvideo 1 0 0 30 0 - - - fit\n",
+            "0x720 is not a picture",
+        ),
+        (
+            "edith 7\nresolution 960 720\nresolution 960 720\nsource 0 test_av.mp4\n\
+          video 1 0 0 30 0 - - - fit\n",
+            "resolution belongs once",
+        ),
+        // Past 8K is refused by the same bound the keystroke has: unbounded,
+        // this line reached `open_black` and panicked on a capacity overflow.
+        (
+            "edith 7\nresolution 4294967295 4294967295\nsource 0 test_av.mp4\n\
+          video 1 0 0 30 0 - - - fit\n",
+            "4294967295x4294967295 is not a picture",
+        ),
+        (
+            "edith 7\nresolution 7681 1080\nsource 0 test_av.mp4\n\
+          video 1 0 0 30 0 - - - fit\n",
+            "7681x1080 is not a picture",
+        ),
+        (
+            "edith 7\nresolution 960 720\nsource 0 test_av.mp4\nvideo 1 0 0 30 0 - - - squish\n",
+            "not a fit policy",
+        ),
+    ] {
+        let path = dir.join("bad.edith");
+        std::fs::write(&path, bad).expect("write");
+        let err = PlaybackSession::open_project(&path)
+            .err()
+            .expect("a malformed v7 file must be refused")
+            .to_string();
+        assert!(err.contains(want), "wanted {want:?}, got {err:?}");
+    }
+}
+
+#[test]
+fn a_saved_project_reopens_as_the_same_timeline() {
+    let dir = scratch("round_trip");
+    let saved = edited(&dir);
+    let path = dir.join("edit.edith");
+    saved.save_project(&path).expect("save");
+
+    let mut loaded = PlaybackSession::open_project(&path).expect("open the project");
+    assert_eq!(shape(&loaded), shape(&saved), "clips, sources and duration");
+    assert!(
+        (loaded.now() - saved.now()).abs() < 1.0 / loaded.meta().frame_rate,
+        "playhead landed at {:.3}s, saved at {:.3}s",
+        loaded.now(),
+        saved.now()
+    );
+    assert!(!loaded.is_playing(), "a loaded project starts paused");
+    assert!(!loaded.undo(), "history is not saved");
+
+    // Saving what was loaded reproduces the file byte for byte -- the format
+    // has no state the round trip drops.
+    let again = dir.join("again.edith");
+    loaded
+        .save_project(&again)
+        .expect("save the loaded project");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        std::fs::read(&again).unwrap(),
+        "save -> load -> save is not a fixed point"
+    );
+    assert!(!path.with_extension("edith.part").exists(), "left a .part");
+}
+
+#[test]
+fn a_folder_of_media_and_its_project_can_be_moved() {
+    let from = scratch("relocate_from");
+    let saved = edited(&from);
+    saved.save_project(&from.join("edit.edith")).expect("save");
+    drop(saved);
+
+    let to = scratch("relocate_to");
+    for name in ["test_av.mp4", "test_av2.mp4", "edit.edith"] {
+        std::fs::copy(from.join(name), to.join(name)).expect("copy");
+    }
+    // The originals go away entirely: nothing absolute can be resolving here.
+    std::fs::remove_dir_all(&from).expect("remove the original folder");
+
+    let moved = PlaybackSession::open_project(&to.join("edit.edith")).expect("open the copy");
+    assert_eq!(moved.timeline_duration(), 6.0);
+    assert!(
+        moved.sources().iter().all(|s| s.path.starts_with(&to)),
+        "sources did not follow the folder: {:?}",
+        moved.sources()
+    );
+}
+
+#[test]
+fn imported_sources_are_written_even_when_no_clip_plays_them() {
+    let dir = scratch("orphans");
+    let mut session = PlaybackSession::open(copy_in(&dir, "test_av.mp4")).expect("open");
+    // An import that was never dragged onto a lane *is* the orphan: a library
+    // row with no clip naming it. (So is one whose clip was undone -- the same
+    // entry, reached the other way.)
+    session
+        .import(&copy_in(&dir, "test_av2.mp4"))
+        .expect("import");
+    assert_eq!(
+        session.sources().len(),
+        2,
+        "the orphan entry stays in-session"
+    );
+
+    let path = dir.join("orphan.edith");
+    session.save_project(&path).expect("save");
+    let text = std::fs::read_to_string(&path).expect("read back");
+    assert_eq!(
+        text.lines().filter(|l| l.starts_with("source ")).count(),
+        2,
+        "the imported source did not reach the file:\n{text}"
+    );
+    let loaded = PlaybackSession::open_project(&path).expect("open the project");
+    assert_eq!(
+        loaded.sources(),
+        session.sources(),
+        "same indices after reopen"
+    );
+    assert_eq!(loaded.timeline_duration(), 5.0);
+}
+
+/// A vanished source no longer refuses the project: it opens with that source
+/// offline, its clips kept, and the session names the file. Export refusal by
+/// name is the front end's job (the MCP export tool refuses while any source is
+/// offline); the engine only reports which sources are offline.
+#[test]
+fn a_source_that_vanished_opens_offline_and_is_named() {
+    let dir = scratch("missing");
+    let session = edited(&dir);
+    let path = dir.join("edit.edith");
+    session.save_project(&path).expect("save");
+    drop(session);
+
+    let gone = dir.join("test_av2.mp4");
+    std::fs::remove_file(&gone).expect("unlink");
+    let opened = PlaybackSession::open_project(&path)
+        .expect("a project with one source gone opens with it offline");
+    let offline = opened.offline_sources();
+    assert_eq!(offline.len(), 1, "{offline:?}");
+    assert!(
+        offline[0].1.ends_with("test_av2.mp4"),
+        "the offline source must be named by file: {offline:?}"
+    );
+    assert!(!opened.lanes().is_empty(), "the clips stay on the timeline");
+    drop(opened);
+
+    // The first source is no different -- it is offline too, and both are named.
+    std::fs::remove_file(dir.join("test_av.mp4")).expect("unlink");
+    let opened = PlaybackSession::open_project(&path).expect("every source gone still opens");
+    let names: Vec<String> = opened
+        .offline_sources()
+        .iter()
+        .map(|(_, p)| p.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names.len(), 2, "{names:?}");
+    assert!(names.iter().any(|n| n == "test_av.mp4"), "{names:?}");
+    assert!(names.iter().any(|n| n == "test_av2.mp4"), "{names:?}");
+}
+
+#[test]
+fn a_source_that_shrank_is_refused_by_clip() {
+    let dir = scratch("shrunk");
+    copy_in(&dir, "test_av.mp4");
+    let path = dir.join("shrunk.edith");
+    // Hand-written: a clip that ran to frame 10000 of a 150-frame file, which
+    // is what re-encoding a source shorter leaves behind. It opens: the clip is
+    // clamped to the file's end and the load says so, rather than refusing the
+    // whole project.
+    std::fs::write(
+        &path,
+        "edith 1\nplayhead 0\nsource test_av.mp4\nclip 0 30 0\nclip 30 10000 0\n",
+    )
+    .expect("write");
+    let clamped = PlaybackSession::open_project(&path).expect("an overrun clip still opens");
+    assert_eq!(clamped.timeline_duration(), 5.0, "clip 1 is cut to the 120 frames left after clip 0");
+    let warnings = clamped.load_warnings();
+    // The picture and its sound are one take, so each lane's clip is clamped and reported.
+    assert_eq!(warnings.len(), 2, "{warnings:?}");
+    assert!(
+        warnings[0].contains("clip 1") && warnings[0].contains("test_av.mp4") && warnings[0].contains("150"),
+        "the warning names the clip, the file and its length: {warnings:?}"
+    );
+
+    // One frame short of the end is still inside the file, and says nothing.
+    std::fs::write(
+        &path,
+        "edith 1\nplayhead 0\nsource test_av.mp4\nclip 0 150 0\n",
+    )
+    .expect("write");
+    let whole = PlaybackSession::open_project(&path).expect("the exact length is legal");
+    assert_eq!(whole.timeline_duration(), 5.0);
+    assert!(whole.load_warnings().is_empty());
+}
+
+/// A refusal must *return*. Opening a project starts decoding source 0 before
+/// it has validated anything, so by the time a later source is refused the
+/// worker is several frames in -- and with a two-frame channel that nobody is
+/// draining, it is parked in `send`. Tearing that down in the wrong order joins
+/// a thread that is waiting for a receiver the same scope still holds, and the
+/// app hangs on a bad project file instead of showing the error.
+///
+/// The many sources are what make the park a certainty rather than a race: each
+/// one is opened and probed before the clip check that refuses, which is far
+/// longer than the few frames it takes to fill the channel.
+#[test]
+fn a_refused_project_does_not_hang_on_its_own_decoder() {
+    let dir = scratch("refusal_hang");
+    copy_in(&dir, "test_av.mp4");
+    let path = dir.join("refused.edith");
+    let mut text = String::from("edith 1\nplayhead 0\n");
+    for _ in 0..1024 {
+        text.push_str("source test_av.mp4\n");
+    }
+    // The last source is not media at all: it is refused after the 1024 real ones
+    // have each been opened and probed, which is the same shape of refusal.
+    std::fs::write(dir.join("notes.txt"), "not a video\n").expect("write");
+    text.push_str("source notes.txt\n");
+    text.push_str("clip 0 150 0\n");
+    std::fs::write(&path, &text).expect("write");
+
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let probe = path.clone();
+    std::thread::spawn(move || {
+        let err = PlaybackSession::open_project(&probe)
+            .err()
+            .map(|e| e.to_string());
+        let _ = tx.send(err);
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(60)) {
+        Ok(Some(err)) => assert!(err.contains("notes.txt"), "refused, but not by name: {err}"),
+        Ok(None) => panic!("a project with a non-media source must not open"),
+        Err(_) => panic!(
+            "open_project hung on a refusal: its own decode worker is parked in \
+             send and the teardown is waiting for it"
+        ),
+    }
+}
+
+#[test]
+fn a_project_that_names_itself_is_refused() {
+    let dir = scratch("self_reference");
+    let path = dir.join("ouroboros.edith");
+    std::fs::write(
+        &path,
+        "edith 1\nplayhead 0\nsource ouroboros.edith\nclip 0 30 0\n",
+    )
+    .expect("write");
+    let err = PlaybackSession::open_project(&path)
+        .err()
+        .expect("a project is not a video")
+        .to_string();
+    assert!(err.contains("ouroboros.edith"), "{err}");
+}
+
+#[test]
+fn malformed_files_are_numbered_errors_and_never_panics() {
+    let dir = scratch("malformed");
+    copy_in(&dir, "test_av.mp4");
+    let path = dir.join("bad.edith");
+    let good = "edith 1\nplayhead 0\nsource test_av.mp4\nclip 0 30 0\n";
+
+    for (text, want) in [
+        (
+            "edith 17\nsource 0 test_av.mp4\nvideo 1 0 0 30 0 - - - fit\n",
+            "line 3",
+        ),
+        // An eq index the table does not hold, and a band shape there is none.
+        (
+            "edith 5\nsource 0 test_av.mp4\nvideo 1 0 0 30 0 - 0\n",
+            "line 3",
+        ),
+        (
+            "edith 5\nsource 0 test_av.mp4\neq 80.0:0.0:0.707:band\nvideo 1 0 0 30 0 - 0\n",
+            "line 3",
+        ),
+        // A lane number that skips one of its kind: V2 was never declared.
+        (
+            "edith 4\nsource 0 test_av.mp4\nvideo 2 0 0 30 0 -\n",
+            "line 3",
+        ),
+        // A v2 source line in a v3 file: the stream field is not optional.
+        ("edith 3\nsource test_av.mp4\nvideo 0 0 30 0 -\n", "line 2"),
+        ("not a project at all\n", "line 1"),
+        // Dialects do not mix: lane lines are v2's, `clip` is v1's.
+        ("edith 2\nsource test_av.mp4\nclip 0 30 0\n", "line 3"),
+        ("edith 1\nsource test_av.mp4\nvideo 0 0 30 0 -\n", "line 3"),
+        ("edith 2\nsource test_av.mp4\nvideo 0 0 30 0\n", "line 3"),
+        (
+            "edith 2\nsource test_av.mp4\nvideo 0 0 30 0 -\nvideo 10 0 30 0 -\n",
+            "line 4",
+        ),
+        ("edith 1\nsource test_av.mp4\nclip 0 30\n", "line 3"),
+        ("edith 1\nsource test_av.mp4\nclip 0 30 4\n", "line 3"),
+        ("edith 1\nsource test_av.mp4\nclip 30 30 0\n", "line 3"),
+        ("edith 1\nsource test_av.mp4\n\nclip 0 30 0\n", "line 3"),
+        ("edith 1\nsource test_av.mp4\nwhat 1\n", "line 3"),
+        // Crafted numbers: `start + len` used to wrap past the top of `u32`,
+        // and a wrapped end walks straight through the overlap check.
+        (
+            "edith 2\nsource test_av.mp4\nvideo 4294967290 0 30 0 -\n",
+            "line 3",
+        ),
+    ] {
+        std::fs::write(&path, text).expect("write");
+        let err = PlaybackSession::open_project(&path)
+            .err()
+            .unwrap_or_else(|| panic!("accepted {text:?}"))
+            .to_string();
+        assert!(err.starts_with(want), "{text:?} -> {err}");
+    }
+
+    // Every truncation of a good file: some are valid shorter projects, none
+    // may panic or be reported as anything but an error.
+    for cut in 0..good.len() {
+        std::fs::write(&path, &good[..cut]).expect("write");
+        let _ = PlaybackSession::open_project(&path);
+    }
+    // ...and a file that is not there at all.
+    std::fs::remove_file(&path).expect("unlink");
+    assert!(PlaybackSession::open_project(&path).is_err());
+}
+
+#[test]
+fn a_stereo_source_that_joins_a_mono_timeline_reopens() {
+    // `test_av.mp4` -- source 0, which sets the timeline's norm -- is substituted
+    // with the mono fixture, so the norm this reload settles on is mono;
+    // `test_av2.mp4` is the real, stereo file. It used to be refused here ("audio
+    // 2 ch does not match the timeline's 1 ch") while `import` let it in, which
+    // is how a project could be saved and then never opened again. Now the pair
+    // is averaged to the timeline's one channel, so the reload accepts it.
+    let dir = scratch("mismatch");
+    std::fs::copy(asset("test_ac3.mp4"), dir.join("test_av.mp4")).expect("substitute");
+    copy_in(&dir, "test_av2.mp4");
+    let path = dir.join("swapped.edith");
+    std::fs::write(
+        &path,
+        "edith 1\nplayhead 0\nsource test_av.mp4\nsource test_av2.mp4\nclip 0 30 0\nclip 0 30 1\n",
+    )
+    .expect("write");
+    let loaded =
+        PlaybackSession::open_project(&path).expect("a stereo source on a mono timeline opens");
+    assert_eq!(loaded.sources().len(), 2);
+    std::fs::remove_dir_all(&dir).expect("cleanup");
+}
+
+/// Import and open agree on a stereo file joining a mono timeline: the import is
+/// accepted, the save writes it, and the reload opens it -- with the stereo
+/// pair folded to one channel, so the sound is the same length as before.
+#[test]
+fn a_stereo_wav_imported_into_a_mono_project_saves_and_reopens() {
+    let dir = scratch("stereo_on_mono");
+    let mono = copy_in(&dir, "test_audio_only.mp4"); // 1 ch AAC, 44100 Hz
+    let wav = copy_in(&dir, "test_tone.wav"); // stereo
+    let mut session = PlaybackSession::open(&mono).expect("open the mono fixture");
+    session.set_gain(0.0);
+    let end = session.timeline_duration();
+    session
+        .import(&wav)
+        .expect("a stereo file imports into a mono timeline");
+    assert!(
+        session
+            .place_stream_at(end, &wav, 0, None)
+            .expect("a stereo file joins a mono timeline"),
+        "the stereo wav landed on the timeline"
+    );
+    let length = session.timeline_duration();
+    let path = dir.join("stereo_on_mono.edith");
+    session.save_project(&path).expect("save");
+    let loaded = PlaybackSession::open_project(&path).expect("the saved project reopens");
+    assert_eq!(loaded.sources(), session.sources());
+    assert!((loaded.timeline_duration() - length).abs() < 1e-6);
+    std::fs::remove_dir_all(&dir).expect("cleanup");
+}
+
+/// Sources nothing plays are written too, in session order: a file imported
+/// into the library and never placed keeps its index across a save and a reopen.
+#[test]
+fn unused_sources_keep_their_index_across_save_and_open() {
+    let dir = scratch("stable_indices");
+    let media = copy_in(&dir, "test_multilang.mp4");
+    let other = copy_in(&dir, "test_multiaudio.mp4");
+    let mut session = PlaybackSession::open(&media).expect("open the fixture");
+    session.set_gain(0.0);
+    session.import(&other).expect("import, unplaced");
+    let placed = session.sources().to_vec();
+    assert_eq!(placed.len(), 2);
+    let path = dir.join("library.edith");
+    session.save_project(&path).expect("save");
+    let loaded = PlaybackSession::open_project(&path).expect("reopen");
+    assert_eq!(
+        loaded.sources(),
+        &placed[..],
+        "every imported source comes back, in order"
+    );
+    std::fs::remove_dir_all(&dir).expect("cleanup");
+}
+
+/// The mix a project was left at comes back with it: a track's fader, the
+/// master limiter and the rate the timeline was cut at. A fader that vanished
+/// on a reload would be a setting nobody could keep.
+#[test]
+fn the_mix_survives_a_save_and_an_open() {
+    use engine::project::{Lane, LaneKind};
+    let dir = scratch("mix");
+    let source = copy_in(&dir, "test_av.mp4");
+    let mut saved = PlaybackSession::open(&source).expect("open the fixture");
+    let a2 = saved.add_lane(LaneKind::Audio);
+    assert!(saved.set_lane_gain_db(Lane::A1, -6.0));
+    assert!(saved.set_lane_gain_db(a2, 3.0));
+    let limiter = engine::limiter::Limiter {
+        ceiling_db: -2.0,
+        on: true,
+    };
+    assert!(saved.set_limiter(limiter));
+    let path = dir.join("mix.edith");
+    saved.save_project(&path).expect("save");
+
+    let mut loaded = PlaybackSession::open_project(&path).expect("open the project");
+    assert_eq!(loaded.lane_gain_db(Lane::A1), -6.0, "A1's fader");
+    assert_eq!(loaded.lane_gain_db(a2), 3.0, "A2's own, not A1's");
+    assert_eq!(loaded.limiter(), limiter);
+    assert!(!loaded.undo(), "a loaded mix is not an undo step");
+    // ...and saving it again is the same bytes: the format holds all of it.
+    let again = dir.join("again.edith");
+    loaded
+        .save_project(&again)
+        .expect("save the loaded project");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        std::fs::read(&again).unwrap(),
+        "save -> load -> save is not a fixed point"
+    );
+}
+
+/// The duck is a mix setting like a volume: it is written, comes back as the
+/// same numbers, and saving the loaded project again is the same bytes.
+#[test]
+fn a_duck_survives_a_save_and_an_open() {
+    use engine::duck::Duck;
+    use engine::project::{Lane, LaneKind};
+    let dir = scratch("duck");
+    let source = copy_in(&dir, "test_av.mp4");
+    let mut saved = PlaybackSession::open(&source).expect("open the fixture");
+    let a2 = saved.add_lane(LaneKind::Audio);
+    let duck = Duck {
+        under: 0,
+        depth_db: -15.0,
+        threshold_db: -35.0,
+        attack_ms: 50.0,
+        release_ms: 600.0,
+    };
+    // A2 is empty, which a volume does not mind and a duck does not need: the
+    // key it names (A1) is the lane with the sound in it.
+    assert!(saved.set_lane_duck(a2, Some(duck)), "ducked under A1");
+    let path = dir.join("duck.edith");
+    saved.save_project(&path).expect("save");
+
+    let mut loaded = PlaybackSession::open_project(&path).expect("open the project");
+    assert_eq!(
+        loaded.lane_duck(a2),
+        Some(duck),
+        "the same numbers come back"
+    );
+    assert_eq!(loaded.lane_duck(Lane::A1), None, "and A1 is not ducked");
+    assert!(!loaded.undo(), "a loaded duck is not an undo step");
+    let again = dir.join("again.edith");
+    loaded
+        .save_project(&again)
+        .expect("save the loaded project");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        std::fs::read(&again).unwrap(),
+        "save -> load -> save is not a fixed point"
+    );
+}
+
+/// The v11 bump's own round trip: the HDR rendition a project was left in comes
+/// back with it, and a file written before there were any is the reference one.
+/// A picked look that vanished on a reload would be a setting nobody could keep
+/// -- the mix test's claim, for the picture.
+#[test]
+fn the_tone_map_preset_survives_a_save_and_an_open() {
+    use engine::tonemap::Preset;
+    let dir = scratch("tone");
+    let source = copy_in(&dir, "test_av.mp4");
+    let mut saved = PlaybackSession::open(&source).expect("open the fixture");
+    assert_eq!(saved.tone(), Preset::Reference, "nobody has picked yet");
+    assert!(saved.set_tone(Preset::Vivid));
+    let path = dir.join("tone.edith");
+    saved.save_project(&path).expect("save");
+
+    let mut loaded = PlaybackSession::open_project(&path).expect("open the project");
+    assert_eq!(loaded.tone(), Preset::Vivid);
+    assert!(!loaded.undo(), "a loaded rendition is not an undo step");
+    // ...and saving it again is the same bytes, as the mix is.
+    let again = dir.join("again.edith");
+    loaded
+        .save_project(&again)
+        .expect("save the loaded project");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        std::fs::read(&again).unwrap(),
+        "save -> load -> save is not a fixed point"
+    );
+
+    // A project written before v11 says nothing about a rendition, and means the
+    // published one -- the picture it was always shown in.
+    let old = dir.join("old.edith");
+    std::fs::write(
+        &old,
+        "edith 10\nplayhead 0\nresolution 1920 1080\nsource 0 test_av.mp4\n\
+         video 1 0 0 24 0 - - - fit 1000\naudio 1 0 0 24 0 - - - fit 1000\n",
+    )
+    .expect("write a v10 project");
+    let older = PlaybackSession::open_project(&old).expect("open the v10 project");
+    assert_eq!(older.tone(), Preset::Reference);
+}
+
+/// The other half of the v9 bump, and the debt it pays: a timeline holding
+/// nothing but a song has no file to take a frame rate from, so it used to come
+/// back at the canvas rate whatever it was cut at. The written `fps` is now
+/// preferred over that inference -- and a project whose scaffold *does* have a
+/// picture still takes the rate from the file, which is what every clip on it
+/// was conformed to.
+#[test]
+fn a_song_only_project_comes_back_at_the_rate_it_names() {
+    let dir = scratch("song_fps");
+    copy_in(&dir, "test_tone.mp3");
+    let path = dir.join("song.edith");
+    std::fs::write(
+        &path,
+        "edith 10\nplayhead 0\nresolution 1920 1080\nfps 24.0\nsource 0 test_tone.mp3\n\
+         video 1\naudio 1 0 0 24 0 - - - fit 1000\n",
+    )
+    .expect("write a v9 song project");
+    let loaded = PlaybackSession::open_project(&path).expect("a song-only project opens");
+    assert_eq!(loaded.meta().frame_rate, 24.0, "the rate the file names");
+    assert_eq!(loaded.timeline_duration(), 1.0, "one second at 24 fps");
+
+    // The same file without the line -- which is every dialect before v9 --
+    // still comes back at the canvas rate, so an old project is unchanged.
+    let old = dir.join("song8.edith");
+    std::fs::write(
+        &old,
+        "edith 8\nplayhead 0\nresolution 1920 1080\nsource 0 test_tone.mp3\n\
+         video 1\naudio 1 0 0 24 0 - - - fit 1000\n",
+    )
+    .expect("write a v8 song project");
+    let loaded = PlaybackSession::open_project(&old).expect("a v8 song project opens");
+    assert_eq!(loaded.meta().frame_rate, 30.0, "the canvas rate, as before");
+}
+
+/// A hand-edited `.edith` whose caption names a microsecond window no project
+/// can hold: the whole load, the same edit a 30-second window survives, and the
+/// refusal the loader owes for it.
+///
+/// A caption's window is the one unbounded number this format takes. The
+/// never-empty check at `edith.rs` asks whether `out_us > in_us` and never how
+/// large either is, so `out_us = i64::MAX` was a legal line -- and every split,
+/// ripple and group trim since cuts the window *by proportion*
+/// (`SubClip::window_at`), a plain `window_us() * into` that overflows on the
+/// first frame inside the caption. That is a panic on the UI thread the first
+/// time a hand ripple-deletes across the caption, and in a release build the
+/// same line wraps the caption's clock to a negative number instead. So the
+/// window is bounded at the door, by name, and the arithmetic behind the cut
+/// is made total as well.
+#[test]
+fn a_caption_window_no_project_can_hold_is_refused_by_name() {
+    let dir = scratch("caption_window");
+    let media = copy_in(&dir, "test_av.mp4");
+    let subs = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/data/test_subs.srt")
+        .canonicalize()
+        .expect("the subtitle fixture");
+
+    // The control first: a 30-second window over 30 frames, the shape every
+    // save writes, and the shape this file's whole edit path is proved on.
+    let ok = dir.join("window_ok.edith");
+    std::fs::write(
+        &ok,
+        format!(
+            "edith 24\nplayhead 0\nresolution 1280 720\nsource 0 {}\nsubtitle - {}\n\
+             video 1 0 0 30 0 - - - fit 1000 0 0 0 - 0 0\n\
+             sub 1 0 30 0 0 30000000\n",
+            media.display(),
+            subs.display(),
+        ),
+    )
+    .expect("write");
+    let mut control = PlaybackSession::open_project(&ok).expect("a 30s caption window opens");
+    assert_eq!(control.sub_lane(Lane::S1)[0].out_us, 30_000_000);
+    // The edits the unbounded window used to survive: a split inside the
+    // caption and a ripple across it. Both cut the window by proportion.
+    assert!(
+        control.cut_at(0.5),
+        "the playhead splits the caption under it"
+    );
+    assert_eq!(
+        control.sub_lane(Lane::S1).len(),
+        2,
+        "the split cut the caption in two"
+    );
+    control.undo();
+    control
+        .cut_regions(&[(0, 10)], &[Lane::S1])
+        .expect("a ripple across the caption, scoped to its own lane");
+    let after = control.sub_lane(Lane::S1);
+    assert_eq!(after.len(), 1, "the caption's tail is still there");
+    assert_eq!(
+        (after[0].start, after[0].frames),
+        (0, 20),
+        "and it closed the hole the cut left"
+    );
+
+    // The same file, the same lane, the same edit -- with a window no project
+    // can hold. This is the line that used to load and then panic.
+    let huge = dir.join("window_huge.edith");
+    std::fs::write(
+        &huge,
+        format!(
+            "edith 24\nplayhead 0\nresolution 1280 720\nsource 0 {}\nsubtitle - {}\n\
+             video 1 0 0 30 0 - - - fit 1000 0 0 0 - 0 0\n\
+             sub 1 0 30 0 0 9223372036854775807\n",
+            media.display(),
+            subs.display(),
+        ),
+    )
+    .expect("write");
+    let err = PlaybackSession::open_project(&huge)
+        .err()
+        .unwrap_or_else(|| {
+            panic!(
+                "a caption window of {}us loaded, and the first split across it \
+                 panics in SubClip::window_at",
+                i64::MAX
+            )
+        })
+        .to_string();
+    assert!(
+        err.contains("window") && err.contains("9223372036854775807"),
+        "the refusal names the window it is refusing, and the value: {err}"
+    );
+    assert!(err.starts_with("line 7"), "and which line said it: {err}");
+
+    // The same bound at the other two doors a caption comes through, because a
+    // caller is not more trustworthy than a file: the placement a hand drags
+    // out of the palette is a `SubClip` somebody built, and it goes through
+    // `place_sub` rather than the parse.
+    let mut session = PlaybackSession::open(&media).expect("open the fixture");
+    session
+        .import_subtitles(&subs)
+        .expect("the fixture's one track");
+    let s1 = session.add_lane(engine::project::LaneKind::Subtitle);
+    let err = session
+        .place_sub(
+            s1,
+            0,
+            engine::project::SubClip {
+                start: 0,
+                frames: 30,
+                track: 0,
+                in_us: 0,
+                out_us: i64::MAX,
+                link: None,
+            },
+        )
+        .expect_err("a window no project can hold is refused by name, not clamped")
+        .to_string();
+    assert!(
+        err.contains("window") && err.contains(&i64::MAX.to_string()),
+        "the placement refusal names the window and the value: {err}"
+    );
+    assert!(
+        session.sub_lane(s1).is_empty(),
+        "and a refusal places nothing: {:?}",
+        session.sub_lane(s1)
+    );
+}
+
+/// A subtitle track whose last cue ends `hours` in, written into `dir`.
+///
+/// A caption's window is a window into SOURCE media, so its width is however
+/// long the recording was. Nothing in the format bounds that, and a lecture
+/// archive or a conference stream is tens of hours -- which is what a ceiling
+/// under a day refuses back at the user. The hour field is parsed as a plain
+/// `u32` with no digit limit, so 960 is a legal 40 days.
+fn long_srt(dir: &Path, hours: u32) -> PathBuf {
+    let path = dir.join(format!("subs_{hours}h.srt"));
+    std::fs::write(
+        &path,
+        format!(
+            "1\n00:00:00,500 --> 00:00:01,500\nfirst line\n\n\
+             2\n00:00:01,600 --> {hours}:00:00,000\nlast line of a long recording\n"
+        ),
+    )
+    .expect("write a long subtitle track");
+    path
+}
+
+/// The round trip a trim has to survive: grow a caption's window to the room
+/// the engine itself offers, save, and open the file that was just written.
+///
+/// This is the hole a ceiling on its own leaves. Every door -- the parse,
+/// `with_subs`, `place_sub` -- only ever sees a window on the way *in*, so a
+/// project could load legally and then be trimmed past the ceiling: `save`
+/// wrote the line and the loader refused it again, which is the user's own
+/// saved work stopping, with no in-app way back (the trim is committed and the
+/// undo does not survive a restart). So growth clamps (`grow_window`) and the
+/// room the front-end drags against is walled by the same number, and the two
+/// agree by construction rather than by luck.
+#[test]
+fn a_trim_grown_to_the_offered_room_saves_and_reopens() {
+    use engine::project::{Edge, MAX_WINDOW_US, SubClip};
+
+    let dir = scratch("caption_growth");
+    let media = copy_in(&dir, "test_av.mp4");
+    // 40 days of track, comfortably past the 30-day ceiling: only the growth
+    // clamp can keep this inside it, never the ceiling itself.
+    let subs = long_srt(&dir, 960);
+
+    let mut session = PlaybackSession::open(&media).expect("open the fixture");
+    session
+        .import_subtitles(&subs)
+        .expect("a 40-day subtitle track imports");
+    let s1 = session.add_lane(engine::project::LaneKind::Subtitle);
+    session
+        .place_sub(
+            s1,
+            60,
+            SubClip {
+                start: 0,
+                frames: 90,
+                track: 0,
+                in_us: 0,
+                out_us: 30_000_000,
+                link: None,
+            },
+        )
+        .expect("a 30s window places");
+
+    // The room the drag is drawn against. It must itself stop at the ceiling:
+    // an engine that offers a trim its own `trim_sub` would clamp is a drag
+    // that snaps back at the end of the gesture.
+    let (_, last) = session
+        .trim_sub_room(s1, 0, Edge::End)
+        .expect("a room for a caption that is there");
+    session
+        .trim_sub(s1, 0, Edge::End, last)
+        .expect("the trim to its own offered room");
+
+    let grown = session.sub_lane(s1)[0];
+    assert!(
+        (grown.out_us - grown.in_us) <= MAX_WINDOW_US,
+        "trimming to the offered room gave a {}us window, past the {}us ceiling",
+        grown.out_us - grown.in_us,
+        MAX_WINDOW_US
+    );
+
+    let saved = dir.join("grown.edith");
+    session.save_project(&saved).expect("save");
+    let reopened = PlaybackSession::open_project(&saved)
+        .expect("a project the editor wrote must open again -- that is the whole claim");
+    let back = reopened.sub_lane(s1)[0];
+    assert_eq!(
+        (back.in_us, back.out_us),
+        (grown.in_us, grown.out_us),
+        "and the window came back as it was saved"
+    );
+}
+
+/// The ceiling itself, against the case it was measured on: a 25-hour
+/// recording. `place_sub` is the door a palette row's drag comes through
+/// (`sub_of_track` builds the placement from the track's own last cue), so a
+/// ceiling under the length of real media refuses the user's own file back at
+/// them, with nothing placed.
+#[test]
+fn a_caption_over_a_day_of_track_places_and_round_trips() {
+    use engine::project::MAX_WINDOW_US;
+
+    let dir = scratch("caption_long_track");
+    let media = copy_in(&dir, "test_av.mp4");
+    let subs = long_srt(&dir, 25);
+    let whole_track_us = 25i64 * 60 * 60 * 1_000_000;
+    assert!(
+        whole_track_us > 86_400_000_000,
+        "the fixture must really be over a day, or this test proves nothing"
+    );
+    assert!(
+        whole_track_us < MAX_WINDOW_US,
+        "and comfortably under the ceiling, or the test is not about the ceiling"
+    );
+
+    let mut session = PlaybackSession::open(&media).expect("open the fixture");
+    assert_eq!(
+        session
+            .import_subtitles(&subs)
+            .expect("a 25-hour track imports"),
+        1,
+        "one track"
+    );
+    let s1 = session.add_lane(engine::project::LaneKind::Subtitle);
+    // Exactly what `Player::sub_of_track` hands `place_sub` for palette row 0.
+    let fps = session.meta().frame_rate;
+    session
+        .place_sub(
+            s1,
+            0,
+            engine::project::SubClip {
+                start: 0,
+                frames: ((whole_track_us as f64) * fps / 1e6).round() as u32,
+                track: 0,
+                in_us: 0,
+                out_us: whole_track_us,
+                link: None,
+            },
+        )
+        .expect("a caption over a 25-hour recording places -- that is the claim");
+
+    let saved = dir.join("long.edith");
+    session.save_project(&saved).expect("save");
+    let reopened = PlaybackSession::open_project(&saved).expect("and reopens");
+    assert_eq!(
+        reopened.sub_lane(s1)[0].out_us,
+        whole_track_us,
+        "the whole window survived the round trip"
+    );
+}
+
+/// The second writer, which is the one a primary-trim-only fix would miss.
+///
+/// [`write_sub_edge`] carries a *sibling* in a group by the same delta as the
+/// member that was dragged, and reaches the same `out_us`. `follow_group`
+/// skips the dragged member, so the route here is a second caption in the
+/// group on another lane: it is not the one whose `trim_sub` arm is fixed, so
+/// nothing about the dragged caption's own clamp bounds it.
+///
+/// The sibling starts deep into the track -- 20 days in -- so the same delta
+/// that stops the dragged caption exactly at the ceiling carries the sibling
+/// past it. Without the clamp on this writer the sibling is 20 days wider than
+/// the ceiling when `save_project` runs, and the file it writes will not open.
+#[test]
+fn a_group_trim_carries_its_sibling_no_further_than_the_ceiling() {
+    use engine::project::{Edge, LaneKind, MAX_WINDOW_US, SubClip};
+
+    let dir = scratch("caption_group_growth");
+    let media = copy_in(&dir, "test_av.mp4");
+    let subs = long_srt(&dir, 960);
+    let day = 24 * 60 * 60 * 1_000_000i64;
+
+    let mut session = PlaybackSession::open(&media).expect("open the fixture");
+    session
+        .import_subtitles(&subs)
+        .expect("a 40-day track imports");
+    let s1 = session.add_lane(LaneKind::Subtitle);
+    let s2 = session.add_lane(LaneKind::Subtitle);
+    let caption = |in_us| SubClip {
+        start: 0,
+        frames: 90,
+        track: 0,
+        in_us,
+        out_us: in_us + 30_000_000,
+        link: None,
+    };
+    session
+        .place_sub(s1, 60, caption(0))
+        .expect("the dragged caption places");
+    session
+        .place_sub(s2, 60, caption(20 * day))
+        .expect("its sibling, 20 days into the track");
+    session
+        .group_all(&[(s1, 0), (s2, 0)])
+        .expect("the two captions into one group");
+
+    // Drag the first caption's tail out to the room the engine offers it, which
+    // is a 40-day track so the room is the ceiling, not the track.
+    let (_, last) = session
+        .trim_sub_room(s1, 0, Edge::End)
+        .expect("a room for the dragged caption");
+    session
+        .trim_sub(s1, 0, Edge::End, last)
+        .expect("the drag commits");
+
+    let dragged = session.sub_lane(s1)[0];
+    assert_eq!(
+        dragged.out_us - dragged.in_us,
+        MAX_WINDOW_US,
+        "the dragged caption stops exactly at the ceiling, which is the room it was offered"
+    );
+    let sibling = session.sub_lane(s2)[0];
+    assert!(
+        (sibling.out_us - sibling.in_us) <= MAX_WINDOW_US,
+        "the group carried the sibling to a {}us window, past the {}us ceiling -- \
+         the dragged caption's own clamp does not reach here",
+        sibling.out_us - sibling.in_us,
+        MAX_WINDOW_US
+    );
+
+    let saved = dir.join("group.edith");
+    session.save_project(&saved).expect("save");
+    PlaybackSession::open_project(&saved).expect("and the file the editor wrote reopens");
+}
+
+/// The composer that no per-arm check finds: a **rejoin** takes the left
+/// half's `in_us` and the right half's `out_us`, and `sub_joinable` has just
+/// established that the two halves are consecutive in the *source* -- so the
+/// joined width is the SUM of two widths that each passed their own door.
+///
+/// Neither half is illegal and the whole is. Two 20-day windows, one ordinary
+/// undo-a-split keystroke, a 40-day window, and a file the editor writes and
+/// cannot reopen.
+#[test]
+fn a_rejoin_of_two_legal_windows_stays_inside_the_ceiling() {
+    use engine::project::{MAX_WINDOW_US, SubClip};
+
+    let dir = scratch("caption_rejoin");
+    let media = copy_in(&dir, "test_av.mp4");
+    let subs = long_srt(&dir, 960);
+    let twenty_days = 20 * 24 * 60 * 60 * 1_000_000i64;
+
+    let mut session = PlaybackSession::open(&media).expect("open the fixture");
+    session
+        .import_subtitles(&subs)
+        .expect("a 40-day track imports");
+    let s1 = session.add_lane(engine::project::LaneKind::Subtitle);
+    // Two adjacent halves, each a legal 20-day window, the second starting
+    // exactly where the first's window ends -- which is what `sub_joinable`
+    // requires, and what makes the join a sum.
+    for (at, frames, in_us) in [(0u32, 10_000u32, 0i64), (10_000, 10_000, twenty_days)] {
+        session
+            .place_sub(
+                s1,
+                at,
+                SubClip {
+                    start: 0,
+                    frames,
+                    track: 0,
+                    in_us,
+                    out_us: in_us + twenty_days,
+                    link: None,
+                },
+            )
+            .unwrap_or_else(|e| panic!("a 20-day half at {at} places: {e}"));
+    }
+    let halves: Vec<i64> = session
+        .sub_lane(s1)
+        .iter()
+        .map(|s| s.out_us - s.in_us)
+        .collect();
+    assert!(
+        halves.iter().all(|&w| w <= MAX_WINDOW_US),
+        "both halves must be legal for this to be about the join: {halves:?}"
+    );
+
+    // `regroup_at` is in seconds, like every other front-end door; the
+    // boundary is the frame the second half starts on.
+    let at_secs = 10_000.0 / session.meta().frame_rate;
+    assert!(
+        session.regroup_at(at_secs),
+        "the two halves rejoin -- the inverse of the split that made them"
+    );
+    let joined = &session.sub_lane(s1)[0];
+    assert!(
+        (joined.out_us - joined.in_us) <= MAX_WINDOW_US,
+        "the rejoin summed two {}us windows into {}us, past the {}us ceiling",
+        MAX_WINDOW_US / 2,
+        joined.out_us - joined.in_us,
+        MAX_WINDOW_US
+    );
+
+    let saved = dir.join("rejoined.edith");
+    session.save_project(&saved).expect("save");
+    PlaybackSession::open_project(&saved).expect("and the file the editor wrote reopens");
+}
+
+/// The other half of the ceiling: it bounds a **difference**, so a head trim
+/// grows the width as surely as a tail trim does, and from the other side.
+///
+/// A caption placed a year into its source with a 30-second window is legal.
+/// One head drag pulling its start back by 200 days of frames makes the
+/// window 200 days wide while `out_us` never moves -- so bounding `in_us`
+/// from above, which is all the head arm's own clamp does, says nothing at all
+/// about the ceiling.
+#[test]
+fn a_head_drag_no_further_than_the_ceiling() {
+    use engine::project::{Edge, MAX_WINDOW_US, SubClip};
+
+    let dir = scratch("caption_head_drag");
+    let media = copy_in(&dir, "test_av.mp4");
+    let subs = long_srt(&dir, 960);
+    let day = 24 * 60 * 60 * 1_000_000i64;
+
+    let mut session = PlaybackSession::open(&media).expect("open the fixture");
+    session
+        .import_subtitles(&subs)
+        .expect("a 40-day track imports");
+    let s1 = session.add_lane(engine::project::LaneKind::Subtitle);
+    // A year into the source, 30 seconds of window: legal, and the only kind
+    // of caption a head drag can make enormous.
+    session
+        .place_sub(
+            s1,
+            90_000_000,
+            SubClip {
+                start: 0,
+                frames: 900,
+                track: 0,
+                in_us: 365 * day,
+                out_us: 365 * day + 30_000_000,
+                link: None,
+            },
+        )
+        .expect("a year-deep caption places");
+
+    // The head room the engine offers, then the drag to its far end: 200 days
+    // of source at 30 fps, which the Start arm's own `in_us <= out_us - 1`
+    // clamp is perfectly happy with.
+    let (lo, _) = session
+        .trim_sub_room(s1, 0, Edge::Start)
+        .expect("a head room");
+    session
+        .trim_sub(s1, 0, Edge::Start, lo)
+        .expect("the head drag commits");
+
+    let dragged = session.sub_lane(s1)[0];
+    assert!(
+        (dragged.out_us - dragged.in_us) <= MAX_WINDOW_US,
+        "a head drag onto a year-deep caption gave a {}us window, past the {}us ceiling",
+        dragged.out_us - dragged.in_us,
+        MAX_WINDOW_US
+    );
+
+    let saved = dir.join("head.edith");
+    session.save_project(&saved).expect("save");
+    PlaybackSession::open_project(&saved).expect("and the file the editor wrote reopens");
+}
+
+/// The lane switches -- hidden, muted, locked -- are the project's and not the
+/// machine's: each one a person set comes back set on a reload, the file says
+/// which lane carries which, and saving the reloaded project is the same bytes.
+#[test]
+fn the_lane_switches_survive_a_save_and_an_open() {
+    use engine::project::LaneKind;
+    let dir = scratch("switches");
+    let source = copy_in(&dir, "test_av.mp4");
+    let mut saved = PlaybackSession::open(&source).expect("open the fixture");
+    let v2 = saved.add_lane(LaneKind::Video);
+    assert!(saved.set_lane_hidden(v2, true), "a video lane hides");
+    assert!(saved.set_lane_muted(Lane::A1, true), "an audio lane mutes");
+    assert!(saved.set_lane_locked(Lane::A1, true), "any lane locks");
+    let path = dir.join("switches.edith");
+    saved.save_project(&path).expect("save");
+    let text = std::fs::read_to_string(&path).expect("read back");
+    assert!(text.starts_with("edith 30\n"), "{text}");
+    assert!(text.contains("\nflags video 2 hidden\n"), "{text}");
+    assert!(text.contains("\nflags audio 1 muted locked\n"), "{text}");
+
+    let mut loaded = PlaybackSession::open_project(&path).expect("open the project");
+    assert!(loaded.lane_hidden(v2), "V2 is still hidden");
+    assert!(!loaded.lane_hidden(Lane::V1), "and V1 is not");
+    assert!(loaded.lane_muted(Lane::A1), "A1 is still muted");
+    assert!(loaded.lane_locked(Lane::A1), "and still locked");
+    assert!(!loaded.undo(), "a loaded switch is not an undo step");
+
+    let again = dir.join("again.edith");
+    loaded
+        .save_project(&again)
+        .expect("save the loaded project");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        std::fs::read(&again).unwrap(),
+        "save -> load -> save is not a fixed point"
+    );
+}
+
+/// A version 23 project has no switches, so every lane opens showing and audible
+/// and unlocked, and saving it writes the same lines at version 24 with no
+/// `flags` line in them.
+#[test]
+fn a_version_23_project_opens_with_every_lane_showing_and_audible() {
+    let dir = scratch("v23_switches");
+    copy_in(&dir, "test_av.mp4");
+    let path = dir.join("v23.edith");
+    let text = "edith 23\nplayhead 0\nresolution 1280 720\nfps 30.0\nsource 0 test_av.mp4\n\
+                video 1 0 0 30 0 - - - fit 1000 0 0 0 - 0 0\n\
+                audio 1 0 0 30 0 - - - fit 1000 0 0 0 - 0 0\n";
+    std::fs::write(&path, text).expect("write a v23 file");
+
+    let loaded = PlaybackSession::open_project(&path).expect("a v23 project opens");
+    assert!(!loaded.lane_hidden(Lane::V1));
+    assert!(!loaded.lane_muted(Lane::A1));
+    assert!(!loaded.lane_locked(Lane::A1));
+    let again = dir.join("again.edith");
+    loaded.save_project(&again).expect("save");
+    assert_eq!(
+        std::fs::read_to_string(&again).expect("read back"),
+        text.replace("edith 23", "edith 30"),
+        "the same project, at the current version, with no switch line"
+    );
+}
+
+/// A retyped cue is the file's words no longer: it saves as a `cue` line that
+/// names its track and cue, reopens with the typed words over the file's own,
+/// survives a re-save of the reopened project, and one undo takes it back.
+#[test]
+fn a_retyped_cue_saves_reopens_and_undoes_in_one_step() {
+    let dir = scratch("cue_text");
+    let mut session = PlaybackSession::open(copy_in(&dir, "test_av.mp4")).expect("open");
+    session.set_gain(0.0);
+    let srt = dir.join("subs.srt");
+    std::fs::write(
+        &srt,
+        "1\n00:00:01,000 --> 00:00:02,000\nFirst\n\n2\n00:00:03,000 --> 00:00:04,000\nSecond\n\n",
+    )
+    .expect("write the subtitle file");
+    assert_eq!(session.import_subtitles(&srt).expect("import"), 1);
+    assert_eq!(session.subtitles()[0].cues.len(), 2, "two cues in the file");
+
+    let typed = "Ça va?\nback\\slash";
+    assert!(session.set_cue_text(0, 1, typed));
+    assert_eq!(session.subtitles()[0].cues[1].text, typed);
+    assert!(
+        !session.set_cue_text(0, 1, typed),
+        "the same words are no edit"
+    );
+    assert!(!session.set_cue_text(0, 9, "x"), "a cue that is not there");
+
+    let path = dir.join("cues.edith");
+    session.save_project(&path).expect("save");
+    let text = std::fs::read_to_string(&path).expect("read back");
+    assert!(
+        text.contains("cue 0 1 Ça va?\\nback\\\\slash\n"),
+        "the override reached the file:\n{text}"
+    );
+
+    let loaded = PlaybackSession::open_project(&path).expect("reopen");
+    assert_eq!(
+        loaded.subtitles()[0].cues[1].text,
+        typed,
+        "the typed words come back"
+    );
+    assert_eq!(
+        loaded.subtitles()[0].cues[0].text,
+        "First",
+        "the rest is the file's"
+    );
+
+    loaded.save_project(&path).expect("re-save");
+    let again = PlaybackSession::open_project(&path).expect("reopen the re-save");
+    assert_eq!(
+        again.subtitles()[0].cues[1].text,
+        typed,
+        "a re-save keeps the override"
+    );
+
+    assert!(session.undo(), "one step back takes the retype");
+    assert_eq!(session.subtitles()[0].cues[1].text, "Second");
+    std::fs::remove_dir_all(&dir).expect("cleanup");
+}
+
+/// A cue added to a track is no file's cue: it saves as a `cueadd` line, reopens
+/// in its place among the file's cues, and one undo takes the add back. A cue
+/// that overlaps one already there is refused, changing nothing, unless it is
+/// `overwrite`, which replaces the overlapped cues in the same step.
+#[test]
+fn an_added_cue_saves_reopens_in_place_and_undoes_in_one_step() {
+    let dir = scratch("cue_add");
+    let mut session = PlaybackSession::open(copy_in(&dir, "test_av.mp4")).expect("open");
+    session.set_gain(0.0);
+    let srt = dir.join("subs.srt");
+    std::fs::write(
+        &srt,
+        "1\n00:00:01,000 --> 00:00:02,000\nFirst\n\n2\n00:00:03,000 --> 00:00:04,000\nSecond\n\n",
+    )
+    .expect("write the subtitle file");
+    assert_eq!(session.import_subtitles(&srt).expect("import"), 1);
+
+    let at = session
+        .add_cue(0, 2_200_000, 2_800_000, "Added\nline two", false)
+        .expect("a gap between the two cues takes a cue");
+    assert_eq!(at, 1, "sorted by start, so it lands between the two");
+    assert!(
+        session.add_cue(0, 1_500_000, 2_500_000, "Clash", false).is_err(),
+        "an overlap is refused without overwrite"
+    );
+    assert_eq!(session.subtitles()[0].cues.len(), 3, "the refusal changed nothing");
+
+    let path = dir.join("cues_add.edith");
+    session.save_project(&path).expect("save");
+    let text = std::fs::read_to_string(&path).expect("read back");
+    assert!(
+        text.contains("cueadd 0 2200000 2800000 Added\\nline two\n"),
+        "the added cue reached the file:\n{text}"
+    );
+
+    let loaded = PlaybackSession::open_project(&path).expect("reopen");
+    let cues = loaded.subtitles()[0].cues.clone();
+    assert_eq!(cues.len(), 3, "the added cue is back among the file's two");
+    assert_eq!(
+        (cues[0].text.as_str(), cues[1].text.as_str(), cues[2].text.as_str()),
+        ("First", "Added\nline two", "Second")
+    );
+    assert_eq!((cues[1].start_us, cues[1].end_us), (2_200_000, 2_800_000));
+
+    // An overwrite replaces the cue it overlaps, and the replacement survives a re-save.
+    loaded.save_project(&path).expect("re-save");
+    let mut again = PlaybackSession::open_project(&path).expect("reopen the re-save");
+    assert_eq!(again.subtitles()[0].cues.len(), 3, "the re-save keeps the added cue");
+    again.add_cue(0, 2_500_000, 2_900_000, "Over", true).expect("overwrite replaces the cue it overlaps");
+    let texts: Vec<String> = again.subtitles()[0].cues.iter().map(|c| c.text.clone()).collect();
+    assert_eq!(texts, ["First", "Over", "Second"], "the added cue it overlapped is gone");
+    assert!(again.undo(), "one step back takes the overwrite");
+    assert_eq!(
+        again.subtitles()[0].cues.iter().map(|c| c.text.as_str()).collect::<Vec<_>>(),
+        ["First", "Added\nline two", "Second"],
+        "and brings the replaced cue back"
+    );
+
+    assert!(session.undo(), "one step back takes the add");
+    assert_eq!(session.subtitles()[0].cues.len(), 2, "the file's two cues again");
+    std::fs::remove_dir_all(&dir).expect("cleanup");
+}
+
+#[test]
+fn an_empty_project_takes_a_clip_and_comes_back_the_same() {
+    let dir = scratch("empty");
+    let media = copy_in(&dir, "test_av.mp4");
+    let mut session = PlaybackSession::empty(640, 360, 25.0).expect("an empty timeline");
+    assert!(session.is_empty(), "nothing on any lane yet");
+    assert_eq!(session.timeline_duration(), 0.0);
+    session.set_gain(0.0);
+    session.import(&media).expect("import");
+    assert!(
+        session
+            .place_stream_at(0.0, &media, 0, None)
+            .expect("place")
+    );
+    let file = dir.join("empty.edith");
+    session.save_project(&file).expect("save");
+    let back = PlaybackSession::open_project(&file).expect("reopen");
+    assert_eq!(back.resolution(), (640, 360));
+    assert_eq!(back.sources().len(), 1);
+    assert_eq!(back.clip_spans(), session.clip_spans());
+    assert!(
+        back.timeline_duration() > 4.5,
+        "{}",
+        back.timeline_duration()
+    );
+}
+
+/// Titles survive a save and an open in list order, with their text and style
+/// exactly as typed -- a newline, a backslash and a percent sign included -- and
+/// a save of the reopened project is the same bytes.
+#[test]
+fn titles_survive_a_save_and_an_open() {
+    use engine::project::Title;
+    use engine::text::{Outline, Place, TextStyle};
+    let dir = scratch("titles");
+    let source = copy_in(&dir, "test_av.mp4");
+    let mut saved = PlaybackSession::open(&source).expect("open the fixture");
+    let card = Title {
+        start: 150,
+        frames: 90,
+        text: "Episode 17\n100% \\ done".into(),
+        style: TextStyle {
+            size: 80,
+            outline: Outline::Thick,
+            boxed: false,
+            place: Place::Centre,
+            ..TextStyle::default()
+        },
+        fade_in: 10,
+        fade_out: 5,
+        in_anim: Default::default(),
+        out_anim: Default::default(),
+        anim_frames: 0,
+    };
+    let lower = Title {
+        start: 60,
+        frames: 120,
+        text: "Jane Doe \u{2014} Engineer".into(),
+        style: TextStyle::default(),
+        fade_in: 0,
+        fade_out: 0,
+        in_anim: Default::default(),
+        out_anim: Default::default(),
+        anim_frames: 0,
+    };
+    saved.add_title(card.clone()).expect("the card is added");
+    saved
+        .add_title(lower.clone())
+        .expect("the lower third is added");
+    assert_eq!(
+        saved.titles(),
+        [lower.clone(), card.clone()],
+        "sorted by start"
+    );
+    let path = dir.join("titles.edith");
+    saved.save_project(&path).expect("save");
+
+    let mut loaded = PlaybackSession::open_project(&path).expect("open the project");
+    assert_eq!(loaded.titles(), [lower, card], "the same titles come back");
+    assert!(!loaded.undo(), "a loaded title is not an undo step");
+    let again = dir.join("again.edith");
+    loaded
+        .save_project(&again)
+        .expect("save the loaded project");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        std::fs::read(&again).unwrap(),
+        "save -> load -> save is not a fixed point"
+    );
+}
+
+/// A title's colour, weight, alignment, side and box colour survive a save and an open as format
+/// v49; a project whose titles keep the default look is still a v25-era file bar its header.
+#[test]
+fn a_title_look_survives_a_save_and_an_open_as_v49() {
+    use engine::project::Title;
+    use engine::text::{Align, HPlace, Outline, Place, TextStyle, Weight};
+    let dir = scratch("title_look");
+    let source = copy_in(&dir, "test_av.mp4");
+    let mut plain = PlaybackSession::open(&source).expect("open the fixture");
+    let mk = |style: TextStyle| Title { start: 30, frames: 60, text: "Jane\nDirector".into(), style, fade_in: 0, fade_out: 0, in_anim: Default::default(), out_anim: Default::default(), anim_frames: 0 };
+    plain.add_title(mk(TextStyle::default())).expect("added");
+    let p0 = dir.join("plain.edith");
+    plain.save_project(&p0).expect("save");
+    let text = std::fs::read_to_string(&p0).unwrap();
+    assert!(!text.starts_with("edith 49") && !text.contains("titlestyle"), "{}", text.lines().next().unwrap());
+
+    let look = TextStyle {
+        outline: Outline::None,
+        place: Place::Bottom,
+        hplace: HPlace::Left,
+        align: Align::Left,
+        weight: Weight::Bold,
+        ink: [255, 204, 0],
+        box_color: [17, 34, 51, 200],
+        ..TextStyle::default()
+    };
+    let mut saved = PlaybackSession::open(&source).expect("open the fixture");
+    saved.add_title(mk(look.clone())).expect("added");
+    let path = dir.join("look.edith");
+    saved.save_project(&path).expect("save");
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.starts_with("edith 49\n"), "{}", text.lines().next().unwrap());
+    let loaded = PlaybackSession::open_project(&path).expect("open the project");
+    assert_eq!(loaded.titles()[0].style, look);
+    // Older edith refuses the newer line by its header, and this one refuses it under an old header.
+    let old = text.replacen("edith 49", "edith 48", 1);
+    let old_path = dir.join("old.edith");
+    std::fs::write(&old_path, old).unwrap();
+    assert!(PlaybackSession::open_project(&old_path).is_err());
+    let again = dir.join("again.edith");
+    loaded.save_project(&again).expect("save the loaded project");
+    assert_eq!(std::fs::read(&path).unwrap(), std::fs::read(&again).unwrap());
+}
+
+/// A clip's own gain is a per-clip setting like an equalizer: it is written on
+/// its own `clipgain` line only where it is not unity, comes back on the same
+/// clip, and saving the loaded project again is the same bytes. Version 27 is
+/// the dialect that says so.
+#[test]
+fn a_clip_gain_survives_a_save_and_an_open() {
+    use engine::project::{Lane, LaneKind};
+    let dir = scratch("clip_gain");
+    let source = copy_in(&dir, "test_av.mp4");
+    let mut saved = PlaybackSession::open(&source).expect("open the fixture");
+    assert!(
+        saved.cut_at(2.0),
+        "two clips on A1, so the index means something"
+    );
+    let a1 = Lane::new(LaneKind::Audio, 0);
+    assert!(saved.set_clip_gain(a1, 0, -6.0), "the first clip down 6 dB");
+    assert!(saved.set_clip_gain(a1, 1, 3.0), "the second up 3 dB");
+    assert!(
+        !saved.set_clip_gain(Lane::V1, 0, -6.0),
+        "a picture has no gain"
+    );
+    let path = dir.join("clip_gain.edith");
+    saved.save_project(&path).expect("save");
+
+    let text = std::fs::read_to_string(&path).expect("read back");
+    assert!(text.starts_with("edith 30\n"), "written as version 29");
+    assert!(text.contains("clipgain audio 1 0 -6\n"), "{text}");
+    assert!(text.contains("clipgain audio 1 1 3\n"), "{text}");
+    assert_eq!(
+        text.matches("clipgain ").count(),
+        2,
+        "unity is never written"
+    );
+
+    let mut loaded = PlaybackSession::open_project(&path).expect("open the project");
+    assert_eq!(loaded.clip_gain_of(a1, 0), Some(-6.0));
+    assert_eq!(loaded.clip_gain_of(a1, 1), Some(3.0));
+    assert_eq!(
+        loaded.clip_gain_of(Lane::V1, 0),
+        Some(0.0),
+        "a picture is unity"
+    );
+    assert!(!loaded.undo(), "a loaded gain is not an undo step");
+    let again = dir.join("again.edith");
+    loaded
+        .save_project(&again)
+        .expect("save the loaded project");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        std::fs::read(&again).unwrap(),
+        "save -> load -> save is not a fixed point"
+    );
+}
+
+/// A volume envelope saves as one `gainkeys` line, reopens with its points in
+/// order, and one undo takes a point back out. A flat clip writes no such line.
+#[test]
+fn a_gain_envelope_saves_reopens_and_undoes_in_one_step() {
+    let dir = scratch("gain_keys");
+    let mut session = PlaybackSession::open(copy_in(&dir, "test_av.mp4")).expect("open");
+    let a1 = Lane::new(LaneKind::Audio, 0);
+    let flat = dir.join("flat.edith");
+    session.save_project(&flat).expect("save a flat project");
+    assert!(
+        !std::fs::read_to_string(&flat)
+            .expect("read")
+            .contains("gainkeys"),
+        "a clip with no points writes no gainkeys line"
+    );
+
+    assert!(session.set_gain_keys(
+        a1,
+        0,
+        vec![GainKey::new(0, 0.0), GainKey::new(30, -20.0),],
+    ));
+    assert!(session.add_gain_key(a1, 0, GainKey::new(60, -6.5)));
+    let path = dir.join("keys.edith");
+    session.save_project(&path).expect("save");
+    let text = std::fs::read_to_string(&path).expect("read back");
+    assert!(text.starts_with("edith 30\n"), "the current version");
+    assert!(
+        text.contains("gainkeys audio 1 0 0:0 30:-20 60:-6.5\n"),
+        "one line for the clip's points: {text}"
+    );
+
+    let reopened = PlaybackSession::open_project(&path).expect("reopen");
+    assert_eq!(
+        reopened.gain_keys_of(a1, 0),
+        &[
+            GainKey::new(0, 0.0),
+            GainKey::new(30, -20.0),
+            GainKey::new(60, -6.5),
+        ]
+    );
+
+    assert!(session.remove_gain_key(a1, 0, 60));
+    assert!(session.undo(), "the removal is one undo");
+    assert_eq!(session.gain_keys_of(a1, 0).len(), 3, "the point is back");
+}
+
+/// A version 27 project has no envelopes: it loads at flat, and a `gainkeys`
+/// line in it is refused as a line that version does not have.
+#[test]
+fn a_version_27_project_loads_flat_and_refuses_a_gainkeys_line() {
+    let dir = scratch("v27_gain_keys");
+    copy_in(&dir, "test_av.mp4");
+    let path = dir.join("old.edith");
+    let text = "edith 27\nplayhead 0\nresolution 1280 720\nfps 30.0\nsource 0 test_av.mp4\n\
+                video 1 0 0 30 0 - - - fit 1000 0 0 0 - 0 0\n\
+                audio 1 0 0 30 0 - - - fit 1000 0 0 0 - 0 0\n\
+                clipgain audio 1 0 -6\n";
+    std::fs::write(&path, text).expect("write a v27 file");
+    let loaded = PlaybackSession::open_project(&path).expect("a v27 project opens");
+    assert!(
+        loaded
+            .gain_keys_of(Lane::new(LaneKind::Audio, 0), 0)
+            .is_empty()
+    );
+    assert_eq!(
+        loaded.clip_gain_of(Lane::new(LaneKind::Audio, 0), 0),
+        Some(-6.0)
+    );
+
+    let refused = dir.join("refused.edith");
+    std::fs::write(
+        &refused,
+        text.replace("clipgain audio 1 0 -6\n", "gainkeys audio 1 0 0:-6\n"),
+    )
+    .expect("write");
+    let err = PlaybackSession::open_project(&refused)
+        .err()
+        .expect("refused");
+    assert!(err.to_string().contains("gainkeys"), "{err}");
+}
+
+/// The v52 bump's own round trip: the notes and the still length a project was left with come back
+/// with it, a save of the loaded project is the same bytes, neither is an undo step, and an edit to
+/// either is one. A file written before v52 has no notes and means the five-second still.
+#[test]
+fn the_notes_and_the_still_length_survive_a_save_and_an_open() {
+    let dir = scratch("notes");
+    let source = copy_in(&dir, "test_av.mp4");
+    let mut saved = PlaybackSession::open(&source).expect("open the fixture");
+    assert_eq!((saved.notes(), saved.still_secs()), ("", 5.0), "nothing picked yet");
+    let notes = "Cut the intro.\nTitle card: \"Day 2\" \\ tbd\r\n";
+    assert!(saved.set_notes(notes));
+    assert!(!saved.set_notes(notes), "the same text changes nothing");
+    assert!(saved.set_still_secs(2.5));
+    let path = dir.join("notes.edith");
+    saved.save_project(&path).expect("save");
+
+    let mut loaded = PlaybackSession::open_project(&path).expect("open the project");
+    assert_eq!(loaded.notes(), notes);
+    assert_eq!(loaded.still_secs(), 2.5);
+    assert!(!loaded.undo(), "loaded notes and a loaded still length are not undo steps");
+    let again = dir.join("again.edith");
+    loaded.save_project(&again).expect("save the loaded project");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        std::fs::read(&again).unwrap(),
+        "save -> load -> save is not a fixed point"
+    );
+
+    // Each edit is one undo step, and undo puts the old value back.
+    assert!(loaded.set_notes("changed"));
+    assert!(loaded.undo());
+    assert_eq!(loaded.notes(), notes);
+    assert!(loaded.set_still_secs(9.0));
+    assert!(loaded.undo());
+    assert_eq!(loaded.still_secs(), 2.5);
+
+    // The still length is clamped to what a still may be.
+    assert!(loaded.set_still_secs(10_000.0));
+    assert_eq!(loaded.still_secs(), 600.0);
+
+    // A v51 project says nothing about notes or a still length: empty, and five seconds. A plain
+    // project saved today has no v52 line, so its header is relabelled as the v51 one it still is.
+    let plain = dir.join("plain.edith");
+    PlaybackSession::open(&source)
+        .expect("open the fixture")
+        .save_project(&plain)
+        .expect("save a plain project");
+    let text = std::fs::read_to_string(&plain).expect("read it back");
+    let (_, body) = text.split_once('\n').expect("a header line");
+    let old = dir.join("old.edith");
+    std::fs::write(&old, format!("edith 51\n{body}")).expect("write a v51 project");
+    let older = PlaybackSession::open_project(&old).expect("open the v51 project");
+    assert_eq!((older.notes(), older.still_secs()), ("", 5.0));
+}

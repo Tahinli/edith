@@ -70,7 +70,7 @@ pub(crate) fn span_partner(
     lane: Lane,
     idx: usize,
 ) -> Option<(Lane, usize)> {
-    let clip = *session.lane_clips(lane).get(idx)?;
+    let clip = session.lane_clips(lane).get(idx)?.clone();
     let matches = |other: Lane| {
         let i = session.lane_clips(other).iter().position(|c| {
             (c.start, c.end()) == (clip.start, clip.end())
@@ -190,6 +190,14 @@ impl Selection {
     }
 }
 
+/// A hole the bed may offer as a gap: one with a placement on both sides of it. The stretch
+/// before a lane's first placement starts at frame 0 and is not a gap a hand made by moving
+/// clips apart, so it is never drawn, picked or closed -- an empty track reads as empty.
+/// `gap_at` still answers it for the engine; the bed asks this before it offers one.
+pub(crate) fn between_clips(hole: Option<(u32, u32)>) -> Option<(u32, u32)> {
+    hole.filter(|&(start, _)| start > 0)
+}
+
 /// Whether a click marks this box: any pick on it always, and any box sharing
 /// a group id with a pick -- the clip the anchor was ctrl-clicked beside, and
 /// the caption a hand pinned to a clip. A group whose only member is picked
@@ -240,7 +248,7 @@ pub(crate) fn trimmed_clip(clip: Clip, edge: Edge, to: u32, still: bool) -> Clip
         Edge::Start => {
             // What survives is measured from the *end* -- the frames that stay
             // play what they always played, which is what makes this a trim.
-            let Some(keep) = clip.speed.fit(clip.end().saturating_sub(to)) else {
+            let Some(keep) = clip.fit_source(clip.end().saturating_sub(to)) else {
                 return clip;
             };
             match still {
@@ -261,7 +269,7 @@ pub(crate) fn trimmed_clip(clip: Clip, edge: Edge, to: u32, still: bool) -> Clip
                 },
             }
         }
-        Edge::End => match clip.speed.fit(to.saturating_sub(clip.start)) {
+        Edge::End => match clip.fit_source(to.saturating_sub(clip.start)) {
             Some(keep) => Clip {
                 fade_in: 0,
                 fade_out: 0,
@@ -300,6 +308,13 @@ pub(crate) fn nudge_edge(current: u32, dir: i32, lo: u32, hi: u32) -> u32 {
     (i64::from(current) + i64::from(dir)).clamp(i64::from(lo), i64::from(hi)) as u32
 }
 
+/// Where a pro trim's anchor (a cut's frame, a clip's start) lands when moved
+/// `by` frames, held inside the room `(lo, hi)` the engine answered
+/// ([`engine::PlaybackSession::roll_room`], [`engine::PlaybackSession::slide_room`]).
+pub(crate) fn pro_target(base: u32, by: i64, lo: u32, hi: u32) -> u32 {
+    (i64::from(base) + by).clamp(i64::from(lo), i64::from(hi)) as u32
+}
+
 /// Whether a loop-trim window ([`ActionId::LoopTrim`]) has been played out to
 /// its far edge and wants restarting at its near one: pure so the pump's own
 /// tick ([`Player::pump`]) is one `if` over a fact this decides. `None` --
@@ -324,6 +339,31 @@ pub(crate) fn active_loop_window(
     }
     range.or(loop_trim)
 }
+
+/// How far a Play Around ([`ActionId::PlayAround`]) runs before the playhead and
+/// after it, in seconds.
+pub(crate) const PLAY_AROUND_PAD: f64 = 2.0;
+
+/// A Play Around in flight: where the playhead was when it began, and the second
+/// the run stops on. Kept on the [`Player`] until the run ends.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct PlayAround {
+    pub(crate) return_to: f64,
+    pub(crate) stop_at: f64,
+}
+
+/// The run a Play Around from `playhead` covers on a timeline `duration` seconds
+/// long: [`PLAY_AROUND_PAD`] before the playhead to the same after it, clamped to
+/// the timeline. `(start, stop)` in seconds.
+pub(crate) fn play_around_span(playhead: f64, duration: f64) -> (f64, f64) {
+    let start = (playhead - PLAY_AROUND_PAD).max(0.);
+    let stop = (playhead + PLAY_AROUND_PAD).min(duration.max(0.));
+    (start, stop)
+}
+
+/// How close to its stop a run must read before it counts as having reached it.
+/// The clock can stop a hair short of the timeline's end when play runs out.
+pub(crate) const PLAY_AROUND_SLACK: f64 = 0.05;
 
 /// Where a play resumes from on crossing into [`Transport::Ended`]
 /// (`Player::pump`): the active window's own near edge
@@ -364,6 +404,86 @@ pub(crate) fn fade_delta_frames(dx: f32, pps: f64, fps: f64) -> i64 {
     ((f64::from(dx) / pps) * fps).round() as i64
 }
 
+/// The spacing a ruler tick is drawn at, and so how its label reads
+/// (DESIGN §6.5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RulerStep {
+    /// Whole frames: a tick on a whole second reads as that second (`1s`),
+    /// the ones between read as frames past it (`+10f`).
+    Frames(u32),
+    /// Whole seconds, read as `2s`, `30s`, then `1:00`, `1:30` past a minute.
+    Seconds(u32),
+}
+
+/// Frame steps, in frames, for zoomed-in views where a whole second is still
+/// too wide to clear the pitch. Only the ones that divide the frame rate are
+/// used (`1, 5` at 25fps; `1, 2, 4, 6, 12` at 24fps; `1, 2, 5, 6, 10, 15` at
+/// 30fps), so every whole second is itself a tick and the `+Nf` labels count
+/// up to it and start over -- ten-frame ticks at 25fps would read `+20f`,
+/// `+5f`, `+15f` with the second never landing on one.
+const RULER_FRAME_STEPS: [u32; 10] = [1, 2, 4, 5, 6, 10, 12, 15, 20, 30];
+/// Second steps: the human ones -- 1 s, 2 s, 5 s, 10 s, 30 s, a minute, then
+/// 2, 5, 10 and 30 minutes and an hour. Never 15 s or 20 s, which a reader
+/// cannot count along.
+const RULER_SECOND_STEPS: [u32; 11] = [1, 2, 5, 10, 30, 60, 120, 300, 600, 1800, 3600];
+
+impl RulerStep {
+    /// The spacing in seconds at the project's frame rate.
+    pub(crate) fn secs(self, fps: f64) -> f64 {
+        match self {
+            RulerStep::Frames(n) => f64::from(n) / fps.max(1.),
+            RulerStep::Seconds(s) => f64::from(s),
+        }
+    }
+}
+
+/// The finest step whose pixel width at `pps` clears `min_px`, walking frame
+/// steps first, then the second steps up to an hour. Frame steps only appear
+/// once a whole second is wider than the pitch allows, so the far zoom never
+/// shows frame labels and the near zoom never shows minutes.
+pub(crate) fn ruler_step(pps: f64, fps: f64, min_px: f64) -> RulerStep {
+    let per_sec = (fps.ceil() as u32).max(1);
+    RULER_FRAME_STEPS
+        .iter()
+        .filter(|&&n| per_sec.is_multiple_of(n))
+        .map(|&n| RulerStep::Frames(n))
+        .chain(RULER_SECOND_STEPS.iter().map(|&s| RulerStep::Seconds(s)))
+        .find(|step| step.secs(fps) * pps >= min_px)
+        .unwrap_or(RulerStep::Seconds(3600))
+}
+
+/// A whole-second ruler label that cannot be misread as a timecode: `0s`,
+/// `2s`, `30s` under a minute, `1:00`, `1:30` past it, `1:00:00` past an
+/// hour. The transport's own `HH:MM:SS:FF` readout stays where it is; this
+/// is the ruler's shorter voice.
+pub(crate) fn ruler_seconds_label(secs: u64) -> String {
+    match secs {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}:{:02}", s / 60, s % 60),
+        s => format!("{}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60),
+    }
+}
+
+/// The label of the `index`th tick at `step`: a second step reads the whole
+/// second, a frame step reads the whole second when it lands on one and
+/// `+Nf` frames past the last whole second otherwise. Indexed rather than
+/// timed so a frame tick never drifts onto the wrong frame over a long bed.
+pub(crate) fn ruler_label(step: RulerStep, index: u64, fps: f64) -> String {
+    match step {
+        RulerStep::Seconds(s) => ruler_seconds_label(index * u64::from(s)),
+        RulerStep::Frames(n) => {
+            let per_sec = (fps.ceil() as u64).max(1);
+            let frames = index * u64::from(n);
+            match frames % per_sec {
+                0 => ruler_seconds_label(frames / per_sec),
+                f => format!("+{f}f"),
+            }
+        }
+    }
+}
+
+/// Only the app's tests call this; the GUI path no longer does.
+#[cfg(test)]
 pub(crate) fn frames_of_us(us: i64, fps: f64) -> u32 {
     match fps.is_finite() && fps > 0. {
         true => ((us as f64) * fps / 1e6)
@@ -406,10 +526,10 @@ pub(crate) fn trimmed_sub(sub: SubClip, edge: Edge, to: u32) -> SubClip {
 /// ask for. A lane's clips are disjoint and sorted, so at most one of them can
 /// be the clip that was picked up. Generic over what a lane holds, because a
 /// [`SubClip`] is dragged under exactly the same rule.
-pub(crate) fn live_idx<T: Copy + PartialEq>(clips: &[T], idx: usize, clip: T) -> Option<usize> {
+pub(crate) fn live_idx<T: PartialEq>(clips: &[T], idx: usize, clip: &T) -> Option<usize> {
     match clips.get(idx) {
-        Some(&at) if at == clip => Some(idx),
-        _ => clips.iter().position(|&c| c == clip),
+        Some(at) if at == clip => Some(idx),
+        _ => clips.iter().position(|c| c == clip),
     }
 }
 
@@ -574,6 +694,8 @@ pub(crate) fn snapped(raw: u32, len: u32, tol: u32, marks: &[u32]) -> u32 {
 /// read off a caption by the caller, whose drag has no clip for `skip` to
 /// name. The playhead and the head of the timeline go on the end: a clip meets
 /// the cursor and the start of the show as readily as it meets another take.
+/// `markers` are the comment markers' edges and the chapter starts, which the
+/// caller reads off the project ([`Player::snap_targets`]).
 ///
 /// All lanes rather than the one being dropped on, because a cut is made across
 /// the timeline: a title on V2 lines up with the shot under it, and a sound
@@ -584,6 +706,7 @@ pub(crate) fn snap_marks(
     skip_link: Option<u32>,
     playhead: u32,
     range: Option<(u32, u32)>,
+    markers: &[u32],
 ) -> Vec<u32> {
     let mut marks: Vec<u32> = lanes
         .iter()
@@ -607,6 +730,9 @@ pub(crate) fn snap_marks(
         marks.push(in_);
         marks.push(out);
     }
+    // The comment markers' starts and ends and the chapter starts: a title lines
+    // up with the note it answers, and a chapter with a cut.
+    marks.extend_from_slice(markers);
     marks
 }
 
@@ -739,21 +865,91 @@ pub(crate) fn lane_refuses(path: &Path, lane: Lane, has_video: bool) -> Option<S
     let name = file_name(path);
     let label = lane.label();
     match lane.kind {
-        LaneKind::Video if !has_video => Some(format!(
-            "NOT ON {label} — {name} has no picture"
-        )),
-        LaneKind::Audio if engine::is_image(path) => Some(format!(
-            "NOT ON {label} — {name} is a still image"
-        )),
+        LaneKind::Video if !has_video => Some(format!("Not on {label} — {name} has no picture")),
+        LaneKind::Audio if engine::is_image(path) => {
+            Some(format!("Not on {label} — {name} is a still image"))
+        }
         // A subtitle lane holds words and no media at all: the refusal is here
         // rather than at the engine's door so the shadow is tinted red on the
         // way down, like every other lane a file cannot go on.
         LaneKind::Subtitle => Some(format!(
-            "NOT ON {label} — {name} is a file; a subtitle track takes captions, dragged from the \
+            "Not on {label} — {name} is a file; a subtitle track takes captions, dragged from the \
              Subtitles list"
         )),
         _ => None,
     }
+}
+
+/// What a three-point edit needs to know, gathered from the window so the plan
+/// itself ([`plan_source_edit`]) is arithmetic and can be tested without one.
+pub(crate) struct SourceEditAsk<'a> {
+    pub(crate) fps: f64,
+    /// Every media lane, with whether it is locked.
+    pub(crate) lanes: &'a [(Lane, bool)],
+    pub(crate) playhead: u32,
+    /// The timeline's in/out marks, in frames.
+    pub(crate) range: Option<(u32, u32)>,
+    /// The item's own marks, in seconds of the file.
+    pub(crate) marks: (Option<f64>, Option<f64>),
+    /// The source's index in the project, and its length in timeline frames.
+    pub(crate) source: usize,
+    pub(crate) total: u32,
+    pub(crate) picture: bool,
+    pub(crate) sound: bool,
+    pub(crate) still: bool,
+    /// The source patch: the video lane the picture goes to and the audio lane the sound goes
+    /// to. `None` falls to the first unlocked lane of the kind, as it always did.
+    pub(crate) video_patch: Option<Lane>,
+    pub(crate) audio_patch: Option<Lane>,
+}
+
+/// The three-point edit the keys ask for: where it lands (`at`, a frame) and
+/// the `(lane, clip)` halves of the take.
+///
+/// Where: the timeline's in mark when one is set, else the playhead. How long:
+/// the source's marked in..out when it has an out mark; else the timeline's
+/// in..out length when that is set (the classic three-point: source in plus a
+/// timeline range); else to the end of the file. A still takes no marks and
+/// shows for the timeline range, else five seconds. Lanes: the first unlocked
+/// video lane for the picture and the first unlocked audio lane for the sound,
+/// whichever halves the source has.
+pub(crate) fn plan_source_edit(ask: &SourceEditAsk) -> Result<(u32, Vec<(Lane, Clip)>), String> {
+    let free = |kind: LaneKind, patch: Option<Lane>| match patch.filter(|p| ask.lanes.iter().any(|(l, _)| l == p)) {
+        Some(lane) => Some(lane),
+        None => ask.lanes.iter().find(|(l, locked)| l.kind == kind && !locked).map(|(l, _)| *l),
+    };
+    let frame = |t: f64| (t.max(0.) * ask.fps).round() as u32;
+    let (at, tl_len) = match ask.range {
+        Some((a, b)) if b > a => (a, Some(b - a)),
+        _ => (ask.playhead, None),
+    };
+    let (in_f, out_f) = if ask.still {
+        (0, tl_len.unwrap_or_else(|| (5. * ask.fps).ceil() as u32))
+    } else {
+        let in_f = ask.marks.0.map_or(0, frame);
+        let out_f = match (ask.marks.1, tl_len) {
+            (Some(t), _) => frame(t),
+            (None, Some(len)) => in_f.saturating_add(len),
+            (None, None) => ask.total,
+        };
+        (in_f, out_f.min(ask.total))
+    };
+    if out_f <= in_f {
+        return Err("The marked range is empty".into());
+    }
+    let mut items = Vec::new();
+    if ask.picture {
+        let lane = free(LaneKind::Video, ask.video_patch).ok_or("Every video track is locked")?;
+        items.push((lane, Clip::source_range(ask.source, in_f, out_f)));
+    }
+    if ask.sound {
+        let lane = free(LaneKind::Audio, ask.audio_patch).ok_or("Every audio track is locked")?;
+        items.push((lane, Clip::source_range(ask.source, in_f, out_f)));
+    }
+    if items.is_empty() {
+        return Err("That source has neither picture nor sound".into());
+    }
+    Ok((at, items))
 }
 
 /// Where down an element a pointer sits, 0..1 from the top: the vertical twin
@@ -778,7 +974,7 @@ mod drop_landing_tests {
     /// missing mark.
     #[test]
     fn a_pull_near_the_head_of_an_empty_timeline_snaps_to_frame_0() {
-        let marks = snap_marks(&[&[]], None, None, 0, None);
+        let marks = snap_marks(&[&[]], None, None, 0, None, &[]);
         assert!(marks.contains(&0), "an empty timeline still offers frame 0");
         assert_eq!(snapped(4, 0, 10, &marks), 0);
         // Outside the tolerance, the raw ask stands: this is a magnet, not a
@@ -800,7 +996,7 @@ mod drop_landing_tests {
     /// where the timeline is parked.
     #[test]
     fn a_pull_near_the_playhead_snaps_onto_it() {
-        let marks = snap_marks(&[&[]], None, None, 500, None);
+        let marks = snap_marks(&[&[]], None, None, 500, None, &[]);
         assert!(marks.contains(&500));
         assert_eq!(snapped(493, 0, 10, &marks), 500);
     }
@@ -875,7 +1071,10 @@ mod drop_landing_tests {
             snap_cue(snap_live(on, true), 297, 0, 10, &marks),
             (297, None)
         );
-        assert_eq!(snap_cue(snap_live(on, false), 297, 0, 10, &marks), (300, Some(300)));
+        assert_eq!(
+            snap_cue(snap_live(on, false), 297, 0, 10, &marks),
+            (300, Some(300))
+        );
         // The switch off stays off however the modifier is held.
         assert!(!snap_live(false, false));
     }
@@ -885,11 +1084,24 @@ mod drop_landing_tests {
     #[test]
     fn the_targets_are_zero_the_playhead_the_edges_and_the_marks() {
         let clip = |start: u32, frames: u32| Clip {
+            speed_keys: Vec::new(),
+            reversed: false,
+            stabilise: None, deinterlace: Default::default(), mark: Default::default(),
+            angle: Default::default(),
             fade_in: 0,
             fade_out: 0,
             transition_out: 0,
+            transition_kind: Default::default(),
             visualizer: 0,
             viz_paint: 0,
+            gain_db: 0.0,
+            gain_keys: Vec::new(),
+            pan: 0,
+            pitch: 0,
+            transform_keys: Vec::new(),
+            opacity_keys: Vec::new(),
+            color_keys: Vec::new(),
+            effects: Vec::new(),
             start,
             in_frame: 0,
             out_frame: frames,
@@ -903,7 +1115,7 @@ mod drop_landing_tests {
         };
         let v1 = [clip(100, 50), clip(400, 50)];
         let a1 = [clip(700, 20)];
-        let marks = snap_marks(&[&v1, &a1], None, None, 900, Some((250, 600)));
+        let marks = snap_marks(&[&v1, &a1], None, None, 900, Some((250, 600)), &[]);
         for want in [0, 900, 100, 150, 400, 450, 700, 720, 250, 600] {
             assert!(marks.contains(&want), "{want} is not a snap target");
         }
@@ -924,7 +1136,11 @@ mod drop_landing_tests {
         // The head column is part of the row, so the row over it is the answer.
         assert_eq!(held_lane(None, v1, v1), Some(v1));
         assert_eq!(held_lane(Some(v1), v2, v1), Some(v2));
-        assert_eq!(held_lane(Some(v2), a1, v1), Some(v2), "audio cannot hold it");
+        assert_eq!(
+            held_lane(Some(v2), a1, v1),
+            Some(v2),
+            "audio cannot hold it"
+        );
         // Nothing promised yet and nothing that can hold it: no landing.
         assert_eq!(held_lane(None, a1, v1), None);
     }
@@ -938,7 +1154,11 @@ mod drop_landing_tests {
         let others = [(0, 375), (900, 1000)];
         assert_eq!(gap_clamp(375, 500, 0, &others), 375, "flush with its tail");
         assert_eq!(gap_clamp(375, 500, 380, &others), 380, "room to spare");
-        assert_eq!(gap_clamp(375, 500, 800, &others), 400, "flush with the next");
+        assert_eq!(
+            gap_clamp(375, 500, 800, &others),
+            400,
+            "flush with the next"
+        );
         // An empty lane clamps at the head of the timeline and nowhere else.
         assert_eq!(gap_clamp(500, 100, 0, &[]), 0);
         assert_eq!(gap_clamp(500, 100, 9_000, &[]), 9_000);
@@ -952,12 +1172,152 @@ mod drop_landing_tests {
     #[test]
     fn a_cross_lane_landing_clamps_into_the_gap_the_engine_leaves() {
         let others = [(360, 420)];
-        assert_eq!(cross_room(315, 90, &others), Some(270), "clamped, not refused");
+        assert_eq!(
+            cross_room(315, 90, &others),
+            Some(270),
+            "clamped, not refused"
+        );
         assert_eq!(cross_room(380, 90, &others), None, "head inside the take");
         assert_eq!(cross_room(100, 90, &others), Some(100), "room to spare");
         let tight = [(0, 100), (150, 300)];
-        assert_eq!(cross_room(120, 90, &tight), None, "the gap is 50 frames wide");
-        assert_eq!(cross_room(120, 50, &tight), Some(100), "and holds a 50-frame clip");
-        assert_eq!(cross_room(500, 90, &[]), Some(500), "an empty lane takes it as asked");
+        assert_eq!(
+            cross_room(120, 90, &tight),
+            None,
+            "the gap is 50 frames wide"
+        );
+        assert_eq!(
+            cross_room(120, 50, &tight),
+            Some(100),
+            "and holds a 50-frame clip"
+        );
+        assert_eq!(
+            cross_room(500, 90, &[]),
+            Some(500),
+            "an empty lane takes it as asked"
+        );
+    }
+}
+
+#[cfg(test)]
+mod ruler_label_tests {
+    use super::*;
+
+    /// The pitch a ruler label needs, the ruler's own constant.
+    const MIN: f64 = 80.;
+
+    /// The pitch a step gives at `pps`, in pixels.
+    fn pitch(step: RulerStep, pps: f64, fps: f64) -> f64 {
+        step.secs(fps) * pps
+    }
+
+    #[test]
+    fn the_steps_are_human_at_every_zoom_and_rate() {
+        // 24, 25, 30 and 60 fps at the default 60px/s: a second is 60px and
+        // misses, so two seconds (120px) is the step at every rate.
+        for fps in [24., 25., 30., 60.] {
+            assert_eq!(ruler_step(60., fps, MIN), RulerStep::Seconds(2), "{fps}");
+        }
+        // 300px/s: at 30fps ten frames is 100px; at 24fps ten does not divide
+        // the rate, so twelve (150px); at 25fps five frames is 60px and the
+        // next divisor is the second itself (300px); at 60fps ten frames is
+        // only 50px, so twenty (a third of a second, 100px).
+        assert_eq!(ruler_step(300., 30., MIN), RulerStep::Frames(10));
+        assert_eq!(ruler_step(300., 24., MIN), RulerStep::Frames(12));
+        assert_eq!(ruler_step(300., 25., MIN), RulerStep::Seconds(1));
+        assert_eq!(ruler_step(300., 60., MIN), RulerStep::Frames(20));
+        // 600px/s at 25fps: five frames is 120px, the audit's own case.
+        assert_eq!(ruler_step(600., 25., MIN), RulerStep::Frames(5));
+        // 2000px/s: one frame at 24fps is 83px and clears; at 30fps it is 67px
+        // so two frames; at 60fps it is 33px so four frames (133px).
+        assert_eq!(ruler_step(2000., 24., MIN), RulerStep::Frames(1));
+        assert_eq!(ruler_step(2000., 30., MIN), RulerStep::Frames(2));
+        assert_eq!(ruler_step(2000., 60., MIN), RulerStep::Frames(4));
+        // A frame step always divides its rate, at every zoom and rate.
+        for fps in [24., 25., 30., 60.] {
+            for pps in [100., 200., 500., 1000., 3000., 10_000.] {
+                if let RulerStep::Frames(n) = ruler_step(pps, fps, MIN) {
+                    assert_eq!((fps as u32) % n, 0, "{n} frames at {fps}fps, {pps}px/s");
+                }
+            }
+        }
+        // Zoomed out: 4px/s wants 30s (120px), never a 15s or 20s stop.
+        assert_eq!(ruler_step(4., 25., MIN), RulerStep::Seconds(30));
+        // 1px/s: a minute is 60px, so two minutes.
+        assert_eq!(ruler_step(1., 25., MIN), RulerStep::Seconds(120));
+        assert_eq!(ruler_step(0.1, 25., MIN), RulerStep::Seconds(1800));
+        // A zoom no view allows still answers with the far stop.
+        assert_eq!(ruler_step(0.001, 25., MIN), RulerStep::Seconds(3600));
+    }
+
+    #[test]
+    fn every_zoom_gives_a_pitch_of_at_least_the_minimum() {
+        for fps in [24., 25., 29.97, 30., 60.] {
+            let mut pps = crate::layout::PPS_MIN;
+            while pps <= 10_000. {
+                let step = ruler_step(pps, fps, MIN);
+                let got = pitch(step, pps, fps);
+                assert!(
+                    got >= MIN || step == RulerStep::Seconds(3600),
+                    "pps {pps} fps {fps}: {step:?} gives {got}px"
+                );
+                pps *= 1.1;
+            }
+        }
+    }
+
+    #[test]
+    fn second_labels_read_as_seconds_then_as_minutes() {
+        assert_eq!(ruler_seconds_label(0), "0s");
+        assert_eq!(ruler_seconds_label(1), "1s");
+        assert_eq!(ruler_seconds_label(30), "30s");
+        assert_eq!(ruler_seconds_label(59), "59s");
+        assert_eq!(ruler_seconds_label(60), "1:00");
+        assert_eq!(ruler_seconds_label(90), "1:30");
+        assert_eq!(ruler_seconds_label(600), "10:00");
+        assert_eq!(ruler_seconds_label(3600), "1:00:00");
+        assert_eq!(ruler_seconds_label(3723), "1:02:03");
+        // A second step walks in its own units.
+        let labels: Vec<_> = (0..4).map(|i| ruler_label(RulerStep::Seconds(2), i, 25.)).collect();
+        assert_eq!(labels, ["0s", "2s", "4s", "6s"]);
+        let labels: Vec<_> = (0..4).map(|i| ruler_label(RulerStep::Seconds(30), i, 25.)).collect();
+        assert_eq!(labels, ["0s", "30s", "1:00", "1:30"]);
+    }
+
+    #[test]
+    fn frame_labels_read_as_frames_past_the_second_and_never_as_a_timecode() {
+        // The 2s-at-25fps clip the audit saw: five-frame ticks read 0s, +5f,
+        // +10f, +15f, +20f, 1s, +5f -- never `00:01:00`.
+        let labels: Vec<_> = (0..7).map(|i| ruler_label(RulerStep::Frames(5), i, 25.)).collect();
+        assert_eq!(labels, ["0s", "+5f", "+10f", "+15f", "+20f", "1s", "+5f"]);
+        // 24fps in twos: the twelfth tick is the whole second.
+        assert_eq!(ruler_label(RulerStep::Frames(2), 12, 24.), "1s");
+        assert_eq!(ruler_label(RulerStep::Frames(2), 11, 24.), "+22f");
+        // 30fps in fives, 60fps in tens.
+        assert_eq!(ruler_label(RulerStep::Frames(5), 7, 30.), "+5f");
+        assert_eq!(ruler_label(RulerStep::Frames(10), 6, 60.), "1s");
+        assert_eq!(ruler_label(RulerStep::Frames(10), 7, 60.), "+10f");
+        // Single frames at 24fps, deep into the bed, stay on their frame.
+        assert_eq!(ruler_label(RulerStep::Frames(1), 24 * 61 + 3, 24.), "+3f");
+        assert_eq!(ruler_label(RulerStep::Frames(1), 24 * 61, 24.), "1:01");
+        // A fractional rate counts frames to its ceiling, as the timecode does.
+        assert_eq!(ruler_label(RulerStep::Frames(1), 29, 29.97), "+29f");
+        assert_eq!(ruler_label(RulerStep::Frames(1), 30, 29.97), "1s");
+        for label in (0..200).map(|i| ruler_label(RulerStep::Frames(5), i, 25.)) {
+            assert!(!label.starts_with("00:"), "{label} reads like a timecode");
+        }
+    }
+}
+
+#[cfg(test)]
+mod between_clips_tests {
+    use super::*;
+
+    /// The stretch before a lane's first placement is not a gap a hand can close, so the bed
+    /// never draws it on an empty-looking track; a hole with a placement on each side is.
+    #[test]
+    fn a_hole_before_the_first_placement_is_not_a_gap() {
+        assert_eq!(between_clips(Some((0, 30))), None);
+        assert_eq!(between_clips(Some((30, 10))), Some((30, 10)));
+        assert_eq!(between_clips(None), None);
     }
 }

@@ -3,6 +3,9 @@
 
 use crate::*;
 
+/// How long the dropped-frames words stay up after playback stops ([`Player::dropped_words`]).
+const DROP_LINGER: Duration = Duration::from_secs(3);
+
 impl Player {
     /// The session the transport, the pump and the clock all read: the
     /// preview while one is showing, the timeline otherwise -- never both, so
@@ -66,12 +69,12 @@ impl Player {
             // A session swap is not a change: the new session's own open line
             // carries its reason, so only a line left over from the session
             // before is taken back -- and only when this one's sound is up.
-            if self.audio_reason.is_none() {
-                if let Some(was) = was {
-                    let line = audio_lost_line(&was);
-                    self.notices
-                        .retain(|notice| notice.as_ref() != line.as_str());
-                }
+            if self.audio_reason.is_none()
+                && let Some(was) = was
+            {
+                let line = audio_lost_line(&was);
+                self.notices
+                    .retain(|notice| notice.as_ref() != line.as_str());
             }
             return;
         }
@@ -137,12 +140,33 @@ impl Player {
             .and_then(PlaybackSession::video_failure_reason)
     }
 
+    /// The status bar's dropped-frames words, `Dropped 12 frames · try Half quality`, while the
+    /// run is playing and for [`DROP_LINGER`] after it stops. `None` when no frame dropped, and
+    /// the way out is named only while the picture is at full quality (there is a lower one).
+    pub(crate) fn dropped_words(&self) -> Option<String> {
+        let shown = self.playing_last || self.drop_stop.is_some_and(|t| t.elapsed() < DROP_LINGER);
+        if self.dropped == 0 || !shown {
+            return None;
+        }
+        let word = if self.dropped == 1 { "frame" } else { "frames" };
+        let way_out = match self.viewer.quality {
+            crate::viewer_view::Quality::Full => " · try Half quality",
+            _ => "",
+        };
+        Some(format!("Dropped {} {word}{way_out}", self.dropped))
+    }
+
+    /// Whether the dropped-frames words are still inside their linger after a stop.
+    pub(crate) fn drop_lingers(&self) -> bool {
+        self.drop_stop.is_some_and(|t| t.elapsed() < DROP_LINGER)
+    }
+
     /// Catches the display up to the clock: everything already due is taken off
     /// the channel and only the last of them is shown, which *is* the
     /// drop-when-behind policy. A frame that is not due yet waits in `held`, and
     /// while the clock is paused *nothing* is due -- a repaint re-presents the
     /// frame already on screen, whatever asked for the repaint.
-    pub(crate) fn pump(&mut self, window: &mut Window) {
+    pub(crate) fn pump(&mut self) {
         // Before the drain, on the one read that does not need the session
         // mutably: the sound can die at any point in a frame, and the notice it
         // earns is owed to the frame it died in. The picture can fail for the
@@ -153,6 +177,19 @@ impl Player {
         // `Ended` can be recognised as the one transition it is.
         let was = self.transport();
         let fps = self.active_fps();
+        // A Play Around run that has reached its stop goes back to where it began,
+        // paused. One that stopped on its own (Space, or the timeline running out
+        // short of the stop) just ends where it stopped.
+        if let Some(run) = self.play_around {
+            match self.active_session().map(|s| (s.is_playing(), s.now())) {
+                Some((_, now)) if now >= run.stop_at - PLAY_AROUND_SLACK => {
+                    self.play_around = None;
+                    self.finish_play_around(run.return_to);
+                }
+                Some((true, _)) => {}
+                _ => self.play_around = None,
+            }
+        }
         // No timeline, nothing to catch up to: the window is showing its empty
         // state and there is no decoder to drain.
         // A direct field borrow rather than the `active_session_mut` helper: the
@@ -164,6 +201,17 @@ impl Player {
         let Some(session) = self.preview_session.as_mut().or(self.session.as_mut()) else {
             return;
         };
+        // The dropped-frames count is per run of playing: it starts again at each play, and
+        // the words stay up for DROP_LINGER after a stop.
+        let playing = session.is_playing();
+        if playing && !self.playing_last {
+            self.dropped = 0;
+            self.drop_stop = None;
+        }
+        if !playing && self.playing_last {
+            self.drop_stop = Some(Instant::now());
+        }
+        self.playing_last = playing;
         // Loop-trim and the i/o range (DESIGN.md §6): the transport is kept
         // inside the active window while one is armed, so a trim or a marked
         // range can be heard and seen without a manual replay after every
@@ -172,7 +220,12 @@ impl Player {
         // a frame counter this pump keeps -- the same `now()`
         // [`Player::step`] reads.
         let loop_window = active_loop_window(self.loop_on, self.range, self.loop_trim);
-        if session.is_playing() && should_loop_restart(frame_at(session.now(), fps), loop_window) {
+        // A Play Around run is not a loop: it plays to its own stop, and the
+        // loop's restart stays out of its way.
+        if session.is_playing()
+            && self.play_around.is_none()
+            && should_loop_restart(frame_at(session.now(), fps), loop_window)
+        {
             let start = loop_window.map_or(0, |(lo, _)| lo);
             session.seek(f64::from(start) / fps);
         }
@@ -183,6 +236,9 @@ impl Player {
         // another reopen.
         let priming = session.picture_priming();
         let target = session.now() * fps;
+        // Backward the pictures arrive from the playhead down, so one is due once
+        // the clock has come down to it, and is late when it still stands above.
+        let backward = session.backward();
         let mut newest: Option<Frame> = None;
         // A frame the screen is owed: a seek's landing, and the one readiness
         // signal there is ([`Player::reset_after_reseek`]).
@@ -208,8 +264,12 @@ impl Player {
                     None => break,
                 },
             };
-            if f64::from(frame.index) <= target {
-                self.dropped += u32::from(newest.is_some());
+            if frame_due(frame.index, target, backward) {
+                // A frame that is replaced by a newer due one before it was ever shown: the
+                // picture skipped it. Counted only while playing, not for a paused scrub.
+                if newest.is_some() && playing {
+                    self.dropped += 1;
+                }
                 newest = Some(frame);
             } else {
                 self.held = Some(frame);
@@ -224,7 +284,15 @@ impl Player {
         // waiting on.
         let late = newest
             .as_ref()
-            .map_or(0., |f| (target - f64::from(f.index)) / fps);
+            .map_or(0., |f| (target - f64::from(f.index)) / fps * if backward { -1. } else { 1. });
+
+        // A frame owed that no span is working on: the seek landed on the picture already
+        // shown (or on nothing to decode), so nothing is coming and the wait is over. Left set,
+        // the window would go on saying it is opening a picture that is not being opened.
+        let nothing_coming = owed && newest.is_none() && self.held.is_none() && !session.picture_priming();
+        if nothing_coming {
+            self.seek_since = None;
+        }
 
         if let Some(frame) = newest {
             self.displayed += 1;
@@ -233,6 +301,8 @@ impl Player {
                 eprintln!("first frame displayed (index {})", frame.index);
                 Instant::now()
             });
+            // Where the compare view reads the picture as shot for this same frame.
+            self.shown_frame = Some((frame.index, frame.width, frame.height));
             let buf = image::RgbaImage::from_raw(frame.width, frame.height, frame.bgra)
                 .expect("frame buffer sized width*height*4");
             // Counted here rather than under `color_open`, because the card
@@ -241,11 +311,18 @@ impl Player {
             // thousandth of the pixels, against a conversion that just touched
             // all of them.
             self.histogram = histogram(buf.as_raw());
+            // The scopes only while one is on show: the strided count reads
+            // sixteen thousand pixels, well under a millisecond, so it runs here
+            // on the frame that just arrived rather than on a thread of its own.
+            self.scopes = (self.scope_view != ScopeView::Histogram).then(|| {
+                engine::scopes::compute(buf.as_raw(), frame.width as usize, frame.height as usize, SCOPE_COLS)
+            });
             let next = Arc::new(RenderImage::new(vec![image::Frame::new(buf)]));
             if let Some(old) = self.image.replace(next) {
                 // Every RenderImage gets a fresh id and its own atlas tile:
-                // without this the sprite atlas grows for the whole video.
-                let _ = window.drop_image(old);
+                // without this the sprite atlas grows for the whole video. Dropped
+                // in `render`, from every window: the output window paints it too.
+                self.retired_images.push(old);
             }
         }
 
@@ -296,7 +373,7 @@ impl Player {
             // an export mark first ([`active_loop_window`]) -- so `range`
             // only ever widens `armed` through the `loop_on`/`loop_trim`
             // terms already here, never past them.
-            let armed = self.loop_on || self.loop_trim.is_some();
+            let armed = (self.loop_on || self.loop_trim.is_some()) && self.play_around.is_none();
             if crosses_into_loop(was, Transport::Ended, armed) {
                 // The same door the restart button and key use
                 // ([`Player::toggle_or_restart`]), minus the `cx` that door
@@ -312,7 +389,9 @@ impl Player {
                 if let Some(session) = self.active_session_mut() {
                     session.play();
                 }
-            } else if was != Transport::Ended {
+            } else if was != Transport::Ended && !self.record_running() {
+                // A take keeps the clock running past the last frame, as a recording
+                // does: the playhead moves on in step with the voice, and Stop pauses it.
                 // Ended is a *stopped* transport, so the clock stops with it,
                 // on the out point the timecode and the playhead have been
                 // showing all along. Nothing else ever stopped it: past the
@@ -410,6 +489,15 @@ impl Player {
         self.seek(target as f64 / fps, cx);
     }
 
+    /// The position the big transport timecode reads: the source's own while the source
+    /// viewer is up (its clock is the one the transport buttons drive), the timeline's
+    /// playhead `timeline` otherwise.
+    pub(crate) fn hero_position(&self, timeline: f64) -> f64 {
+        self.preview_session
+            .as_ref()
+            .map_or(timeline, |s| s.now().clamp(0., s.timeline_duration()))
+    }
+
     /// [`scrub_to`](Player::scrub_to) for the preview's own seek bar: the
     /// mapping is `preview_seek_seconds` rather than a `Scale`, because a
     /// preview bar spans the file's whole length and never zooms. Seeks
@@ -430,7 +518,8 @@ impl Player {
         }
     }
 
-    /// Seeks to where the pointer sits along the ruler. `commit` is the press
+    /// Seeks to where the pointer sits along the ruler, snapped to the edges the
+    /// timeline offers while the magnet is on. `commit` is the press
     /// and the release, which must land exactly even when the throttle below
     /// would have skipped them.
     pub(crate) fn scrub_to(&mut self, x: Pixels, commit: bool, cx: &mut Context<Self>) {
@@ -439,15 +528,34 @@ impl Player {
         };
         // Clamped to the timeline here rather than in the mapping: there is bed
         // past the last frame now, and a seek out there is a seek to the end.
-        let t = self
+        let raw = self
             .scale
             .time_at(px_along(x, self.ruler.get()))
             .clamp(0., session.timeline_duration());
+        // The magnet holds the playhead too: a scrub lands on a cut, a marker or a
+        // chapter it passes, the same edges a clip drag meets (`snap_targets`).
+        let t = match self.snap_live() {
+            true => {
+                let raw_frame = (raw * self.fps) as u32;
+                let frame = snapped(raw_frame, 0, self.snap_frames(), &self.snap_targets(None));
+                f64::from(frame) / self.fps
+            }
+            false => raw,
+        };
         let target = (t * self.fps) as u32;
         if commit || scrub_due(target, self.last_target, self.last_scrub.elapsed()) {
             self.last_target = target;
             self.last_scrub = Instant::now();
             self.seek(t, cx);
+            // Paused, the scrub is heard too: a short snippet at the new place. Playing, the
+            // sound is already the timeline's own and a snippet would only double it. The
+            // snippet is read off the UI thread (`PlaybackSession::scrub_audio`), and this
+            // runs no faster than the seeks above do.
+            let paused = self.session.as_ref().is_some_and(|s| !s.is_playing());
+            let wanted = scrub_snippet_wanted(self.scrub_audio, paused);
+            if let (true, Some(session)) = (wanted, self.session.as_mut()) {
+                session.scrub_audio(t);
+            }
         }
     }
 
@@ -495,6 +603,89 @@ impl Player {
         self.set_volume(|volume| volume.set_along(along), cx);
     }
 
+    /// L (`forward`) or J: plays that way, or -- when it is already running that
+    /// way -- steps the rate 1x, 2x, 4x. A press the other way turns round at 1x.
+    /// The sound is silent off 1x (the engine's rule), and a run that reaches the
+    /// start going backward stops there.
+    pub(crate) fn shuttle(&mut self, forward: bool, cx: &mut Context<Self>) {
+        if self.exporting().is_some() {
+            return;
+        }
+        if nothing_to_play(self.active_session()) {
+            self.notify_user(NOTHING_TO_PLAY.into());
+            cx.notify();
+            return;
+        }
+        self.panned = false;
+        let ended = self.transport().restarts();
+        let Some(session) = self.active_session_mut() else {
+            return;
+        };
+        let rate = shuttle_rate(forward, session.is_playing(), session.rate());
+        // Played out: forward starts over from the top (as Play does), backward
+        // from the last frame.
+        if ended {
+            let at = if forward { 0.0 } else { session.timeline_duration() };
+            session.seek(at);
+            self.reset_after_reseek();
+        }
+        let Some(session) = self.active_session_mut() else {
+            return;
+        };
+        session.set_rate(rate);
+        session.play();
+        cx.notify();
+    }
+
+    /// Shift+K (Premiere's Play Around): plays from [`PLAY_AROUND_PAD`] before the
+    /// playhead to the same after it, then returns the playhead to where it was.
+    /// Pressed again during a run, it stops the run where it is, as Space does.
+    pub(crate) fn play_around(&mut self, cx: &mut Context<Self>) {
+        if self.exporting().is_some() {
+            return;
+        }
+        if nothing_to_play(self.active_session()) {
+            self.notify_user(NOTHING_TO_PLAY.into());
+            cx.notify();
+            return;
+        }
+        let playing = self.active_session().is_some_and(|s| s.is_playing());
+        if self.play_around.take().is_some() || playing {
+            if let Some(session) = self.active_session_mut() {
+                session.pause();
+                session.set_rate(1.0);
+            }
+            cx.notify();
+            return;
+        }
+        self.panned = false;
+        let Some(session) = self.active_session() else {
+            return;
+        };
+        let playhead = session.now();
+        let (start, stop_at) = play_around_span(playhead, session.timeline_duration());
+        self.play_around = Some(PlayAround { return_to: playhead, stop_at });
+        if let Some(session) = self.active_session_mut() {
+            session.seek(start);
+        }
+        self.reset_after_reseek();
+        if let Some(session) = self.active_session_mut() {
+            session.set_rate(1.0);
+            session.play();
+        }
+        cx.notify();
+    }
+
+    /// Ends a Play Around run at its stop: paused, and the playhead put back on the
+    /// frame the run began on.
+    fn finish_play_around(&mut self, return_to: f64) {
+        if let Some(session) = self.active_session_mut() {
+            session.pause();
+            session.seek(return_to);
+        }
+        self.reset_after_reseek();
+    }
+
     pub(crate) fn toggle_or_restart(&mut self, cx: &mut Context<Self>) {
         if self.exporting().is_some() {
             return;
@@ -530,12 +721,36 @@ impl Player {
             _ => {
                 if let Some(session) = self.active_session_mut() {
                     session.toggle();
+                    // A pause ends a shuttle: the next press plays at real time.
+                    if !session.is_playing() {
+                        session.set_rate(1.0);
+                    }
                     // A paused timeline animates nothing; this is the repaint
                     // that puts the new glyph up.
                     cx.notify();
                 }
             }
         }
+    }
+}
+
+/// The rate a J (`forward == false`) or L press leaves the transport at: 1x to
+/// start or to turn round, then doubling to 4x for each press the same way.
+pub(crate) fn shuttle_rate(forward: bool, playing: bool, rate: f64) -> f64 {
+    let sign = if forward { 1.0 } else { -1.0 };
+    match playing && rate * sign > 0.0 {
+        true => (rate * 2.0).clamp(-4.0, 4.0),
+        false => sign,
+    }
+}
+
+/// Whether the picture stamped `index` is due at `target` (timeline frames,
+/// fractional): forward once the clock has reached it, backward once the clock
+/// has come down to its frame.
+pub(crate) fn frame_due(index: u32, target: f64, backward: bool) -> bool {
+    match backward {
+        false => f64::from(index) <= target,
+        true => f64::from(index) >= target.floor(),
     }
 }
 
@@ -572,6 +787,12 @@ pub(crate) fn push_gain<const N: usize>(gain: f32, sessions: [Option<&PlaybackSe
     for session in sessions.into_iter().flatten() {
         session.set_gain(gain);
     }
+}
+
+/// Whether a ruler scrub should also be heard: the View switch is on and playback is paused.
+/// Playing, the timeline's own sound is already there, and a snippet would only double it.
+pub(crate) fn scrub_snippet_wanted(enabled: bool, paused: bool) -> bool {
+    enabled && paused
 }
 
 #[cfg(test)]

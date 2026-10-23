@@ -3,34 +3,62 @@
 //! stays here is what every part of it shares -- the imports, the fixtures,
 //! and the source scans the guards read.
 
+mod autosave;
 mod cards;
+mod clip_envelope;
+mod capsel;
+mod caps;
+mod creator;
+mod dlg;
 mod editing;
+mod editkeys;
+mod export_sheet;
+mod hspeed;
+mod fixes1;
+mod follow;
+mod generators;
+mod lane_names;
 mod layout;
+mod left;
 mod media;
+mod medfix;
+mod menu_wire;
+mod polish4;
+mod polish5;
+mod reg;
+mod seq2;
+mod multicam;
+mod nocycle;
+mod titles;
+mod audio_lane;
+mod track_height;
+mod tlfix;
+mod touch;
 mod view;
 
 use super::{
-    ACCENT_PRIMARY, AUDIO_KBPS, BENCH_ITEMS, BG_RAISED, BPS_COARSE, BPS_FINE, BPS_MAX, BPS_MIN,
-    COLOR_BANDS, COLOR_BAR_W, COLOR_STEP, COLOR_W, CONTROL_H, Clip, ColorEdit, Ctx,
-    DEFAULT_AUDIO_KBPS, Decoder, EQ_BANDS_MAX, EQ_CURVE_STEPS, EQ_FFT, EQ_FREQ_HIGH, EQ_FREQ_LOW,
-    EQ_FREQ_STEP, EQ_GAIN_LIMIT, EQ_GRAPH_H, EQ_HANDLE, EQ_Q_HIGH, EQ_Q_LOW, EQ_Q_STEP,
-    EQ_SPECTRUM_DB, EQ_TICKS, EQ_W_MAX, ESCAPE, EXPORT_DONE, EXPORT_MOMENT_H, Enable, EncoderSeat,
-    FORMATS, Format, HEADER_H, HIST_BINS, HIST_H, HIST_SAMPLES, HIT_MIN, KEYS_ROW_H, KEYS_W,
-    KeyRow, LABEL_H, LANE_H, LANES_MAX, LATE_RESYNC, LIBRARY_MAX_W, LIBRARY_MIN_W, Lane, MB_FLOOR,
-    MENU_ITEMS, MENU_PAD, MENU_ROW_H, MENU_W, NO_FILE, NOTICES_MAX, NumberEdit, OVERLAID, PANEL_H,
-    RESYNC_GAP, ROW_ITEMS, RULER_HIT_H, RowCtx, RowItem, SCROLL_NOTCH_SHARE, SILENCE_ROWS,
-    SOURCE_TINTS, SPEED_PRESETS, SPEED_STEP, STATUS_ERROR, STATUS_SUCCESS, STATUS_WARNING,
-    SUB_PLAN_CHARS, Source, Speed, StreamInfo, SubPickKey, TIMELINE_SHARE, Transport, VOLUME_W,
-    VizSlot, Volume, WAVE_BPS, WAVE_COL, WAVE_COLS_MAX, Wave, ZOOM_MIN_FRAMES, active_lane,
-    auto_bps, band_label, bitrate_detail, clipboard_after_remove, color_snap, containers,
-    destructive, enable, enable_lane, envelope, eq_card_w, eq_freq, eq_freq_label, eq_graph_h,
-    eq_spectrum, eq_x, eq_y, estimated_bytes, export_path, export_settings, format_refusal,
-    fps_choices, fps_label, frac_along, frac_down, frame_at, frame_rate_ladder, histogram,
-    inserted_band, is_project, keymap, keys_rows, keys_rows_matching, lane_items, lanes_h, marked,
-    menu_at, menu_items, menu_rows_h, next_container, normalise, nothing_to_play, notice_tone,
-    panel_h, parse_budget, project_path, proxies_to_start, push_notice, px_below, range_word,
+    AUDIO_KBPS, BENCH_ITEMS, BG_RAISED, BPS_COARSE, BPS_FINE, BPS_MAX, BPS_MIN, COLOR_BANDS,
+    COLOR_BAR_W, COLOR_STEP, COLOR_W, CONTROL_H, Clip, ColorEdit, Ctx, DEFAULT_AUDIO_KBPS, Decoder,
+    EQ_BANDS_MAX, EQ_CURVE_STEPS, EQ_FFT, EQ_FREQ_HIGH, EQ_FREQ_LOW, EQ_FREQ_STEP, EQ_GAIN_LIMIT,
+    EQ_GRAPH_H, EQ_HANDLE, EQ_Q_HIGH, EQ_Q_LOW, EQ_Q_STEP, EQ_SPECTRUM_DB, EQ_TICKS, EQ_W_MAX,
+    ESCAPE, EXPORT_DONE, Enable, EncoderSeat, FORMATS, Format, HEADER_H,
+    HIST_BINS, HIST_H, HIST_SAMPLES, HIT_MIN, KEYS_ROW_H, KEYS_W, KeyRow, LABEL_H, LANE_H,
+    LANES_MAX, LATE_RESYNC, LIBRARY_MAX_W, LIBRARY_MIN_W, Lane, MENU_ITEMS, MENU_PAD, MENU_ROW_H,
+    MENU_W, NO_FILE, NOTICES_MAX, OVERLAID, PANEL_H, RESYNC_GAP, ROW_ITEMS,
+    RULER_HIT_H, RowCtx, RowItem, SCROLL_NOTCH_SHARE, SILENCE_ROWS, SOURCE_TINTS, SPEED_PRESETS,
+    SPEED_STEP, SUB_PLAN_CHARS, Source, Speed, StreamInfo, SubPickKey, TIMELINE_SHARE, Transport,
+    VOLUME_W, VizSlot, Volume, WAVE_BPS, WAVE_COL, WAVE_COLS_MAX, Wave, ZOOM_MIN_FRAMES,
+    active_lane, audio_detail, auto_bps, band_label, bits_label, clipboard_after_remove,
+    color_snap, containers, destructive, enable, enable_lane, envelope, eq_card_w, eq_freq,
+    eq_freq_label, eq_graph_h, eq_spectrum, eq_x, eq_y,
+    export_settings, file_properties, format_refusal, fps_choices, fps_label, frac_along,
+    frac_down, frame_at, frame_rate_ladder,
+    histogram, inserted_band, is_project, keymap, keys_rows, keys_rows_matching, lane_items,
+    lanes_h, marked, menu_at, menu_items, menu_rows_h, next_container, normalise, nothing_to_play,
+    panel_h, parse_budget, project_path, proxies_to_start, push_notice, px_below,
+    resolution_label, size_human, video_detail, span_word, gui_default_seat,
     rate_label, retarget, row_enable, row_items, scrub_due, secs_label, should_resync,
-    silence_rate, size_label, snap_cue, snap_marks, snapped, source_tint, span_partner, speed_at,
+    silence_rate, snap_cue, snap_marks, snapped, source_tint, span_partner,
     sub_pick_after_removal, sub_pick_after_restore, subtitle_plan, timecode, timeline_fixed_h,
     tip_may_paint, transport, typed, unseen_paths, unseen_sources, viz_held_paint, whole_take,
     window_title,
@@ -38,13 +66,13 @@ use super::{
 
 use super::{
     ActionId, Choice, EDGE_W, ETA_SPAN, Edge, FITS, FRAME_RATES, IMPORT_STALL, Import, ImportStage,
-    Landing, LaneKind, PPS_DEFAULT, PPS_MIN, Preset, RESOLUTIONS, Repeat, SAMPLE_RATES, SEEK_STALL,
+    Landing, LaneKind, PPS_DEFAULT, PPS_MIN, Preset, RESOLUTIONS, Repeat, SAMPLE_RATES, SEEK_GIVE_UP, SEEK_STALL,
     Scale, ScanKey, ScanPlan, SilenceScan, SubClip, View, ZOOM_OUT_MARGIN, ZOOM_STEP, arrival,
     audio_rate_choices, av1_hw_warning, clip_width, clock, encoder_choices, encoder_label,
     eta_secs, file_name, file_uri, fit_choices, frames_of_us, full_scan_key, import_line, landing,
-    lane_refuses, launch_queue, library_rows, live_idx, next_fit, next_resolution, note_progress,
+    lane_refuses, launch_queue, library_rows, live_idx, note_progress,
     pending_fps_choices, pending_resolution_choices, px_along, read_ahead, repeats,
-    resolution_choices, resolution_ladder, sample_rate_choices, scan_plan, seek_line,
+    resolution_choices, resolution_ladder, sample_rate_choices, size_row_label, scan_plan, seek_line,
     silence_cached, silence_line, slice_whole_levels, source_secs, stash_or_write, tone_choices,
     tone_label, trimmed_clip, trimmed_sub, trims, unscannable, unusable,
 };
@@ -67,7 +95,7 @@ use std::path::{Path, PathBuf};
 
 use std::time::{Duration, Instant};
 
-use std::sync::{LazyLock, Mutex, MutexGuard, Once};
+use std::sync::{LazyLock, Mutex, MutexGuard};
 
 static CONFIG_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
@@ -83,13 +111,7 @@ use crate::player::transport::push_gain;
 /// binary under `target/*/deps/`; this pin is the documented door and the
 /// source-scan guard below.
 fn pin_silent_output() {
-    static PIN: Once = Once::new();
-    PIN.call_once(|| {
-        // SAFETY: this process is the test binary; no other thread has
-        // opened a device yet because `asset()` (every session fixture)
-        // calls this first.
-        unsafe { std::env::set_var("VE_NO_AO", "1") };
-    });
+    engine::ao::set_silent_output();
 }
 
 /// Every line of the window's source there is, as one string. The regions have
@@ -112,7 +134,7 @@ fn ui_source() -> String {
 /// The one file `needle` is written in, from the needle to the end of *that*
 /// file. Every scan that slices starts here, because the alternative is
 /// slicing [`ui_source()`]: 42 files with 42 seams between them, and the last
-/// fn of any of them -- `silence_card` in `ui/cards.rs` -- read as running on
+/// fn of any of them -- `silence_card` in `ui/cards/` -- read as running on
 /// into the file that happens to follow it. The file is found and not named,
 /// so the code may move house without this going blind.
 fn source_from(needle: &str) -> String {
@@ -137,9 +159,25 @@ fn fn_body(name: &str) -> String {
     text[..end].to_string()
 }
 
-/// One named file of that source, for the scans about a single region.
+/// One named file of that source, for the scans about a single region. A
+/// directory reads as its `.rs` files together, in name order -- a module
+/// split into parts is still one region to the scans.
 fn src_text(rel: &str) -> String {
-    std::fs::read_to_string(src_dir().join(rel)).expect("a source file")
+    let path = src_dir().join(rel);
+    if !path.is_dir() {
+        return std::fs::read_to_string(path).expect("a source file");
+    }
+    let mut files: Vec<PathBuf> = std::fs::read_dir(&path)
+        .expect("a source directory")
+        .map(|entry| entry.expect("a source entry").path())
+        .filter(|p| p.extension() == Some("rs".as_ref()))
+        .collect();
+    files.sort();
+    files
+        .iter()
+        .map(|p| std::fs::read_to_string(p).expect("a source file"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn src_dir() -> PathBuf {
@@ -184,7 +222,7 @@ fn asset(name: &str) -> PathBuf {
 fn source(path: &str, stream: usize) -> Source {
     Source {
         path: PathBuf::from(path),
-        audio_stream: stream,
+        audio_stream: stream, ..Default::default()
     }
 }
 
@@ -196,6 +234,8 @@ fn info(index: usize, rate: u32, channels: u16, lang: Option<&str>, decodable: b
         sample_rate: rate,
         lang: lang.map(str::to_string),
         decodable,
+        bit_depth: None,
+        bitrate: None,
     }
 }
 
@@ -270,7 +310,7 @@ fn sub(path: &str, track: Option<u64>, label: &str) -> engine::subtitle::Subtitl
 fn the_suite_pins_a_silent_output() {
     pin_silent_output();
     assert!(
-        src_text("tests/mod.rs").contains("VE_NO_AO"),
+        src_text("tests/mod.rs").contains("set_silent_output"),
         "the fixture no longer pins silent output"
     );
     let session = PlaybackSession::open(asset("test_av.mp4")).expect("open");
@@ -281,3 +321,4 @@ fn the_suite_pins_a_silent_output() {
         "a test opened the speakers"
     );
 }
+mod vis;

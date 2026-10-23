@@ -1,0 +1,22 @@
+[package]
+name = "edith_mcp"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+# No runnable doc examples; skip the rustdoc test pass.
+doctest = false
+
+[[bin]]
+name = "edith_mcp"
+path = "src/main.rs"
+
+[dependencies]
+engine = { path = "../engine" }
+serde_json = "1"
+chrono = "0.4"
+rustix = { version = "1", features = ["stdio"] }
+signal-hook = "0.3"
+
+[dev-dependencies]
+libc = "0.2"

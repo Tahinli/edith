@@ -66,11 +66,23 @@ fn track() -> SubtitleTrack {
 
 fn clip(start: u32, in_frame: u32, out_frame: u32) -> Clip {
     Clip {
+        speed_keys: Vec::new(),
+        reversed: false,
+        stabilise: None, deinterlace: Default::default(), mark: Default::default(),
+        angle: Default::default(),
         fade_in: 0,
         fade_out: 0,
         transition_out: 0,
+        transition_kind: Default::default(),
         visualizer: 0,
         viz_paint: 0,
+        gain_db: 0.0,
+        gain_keys: Vec::new(),
+        pan: 0,
+        transform_keys: Vec::new(),
+        opacity_keys: Vec::new(),
+        color_keys: Vec::new(),
+        effects: Vec::new(),
         start,
         in_frame,
         out_frame,
@@ -81,6 +93,7 @@ fn clip(start: u32, in_frame: u32, out_frame: u32) -> Clip {
         transform: None,
         fit: FitPolicy::Fit,
         speed: Speed::NORMAL,
+        pitch: 0,
     }
 }
 
@@ -212,7 +225,7 @@ fn the_sweep_speed_keeps_the_group_and_the_playhead_scene() {
             // The map the write itself is a shape of, built from the
             // member's own old geometry -- NOT from the playhead's answer,
             // which is what it will be checked against.
-            let held = p.lane(Lane::V1)[0];
+            let held = p.lane(Lane::V1)[0].clone();
             let new_len = (f64::from(held.len()) / speed.as_f64()).round() as u32;
             let map = TimelineMap::piece(
                 (held.start, held.start + held.frames()),
@@ -233,7 +246,7 @@ fn the_sweep_speed_keeps_the_group_and_the_playhead_scene() {
             // Survivor continuity through the map: the clip's old span maps
             // onto exactly the span it landed in -- the piece's own ends, on
             // the lane, not inferred back from anything the write produced.
-            let landed = p.lane(Lane::V1)[0];
+            let landed = p.lane(Lane::V1)[0].clone();
             assert_eq!(
                 (landed.start, landed.start + landed.frames()),
                 (map.apply(held.start), map.apply(held.start + held.frames())),
@@ -386,12 +399,12 @@ fn the_sweep_move_sub_and_trim_sub_keep_their_own_law() {
         let (mut p, s1) = project(shape);
         let s1 = s1.expect("aligned and offset both carry a caption");
         let pre = p.parts();
-        let v1_before = p.lane(Lane::V1)[0];
+        let v1_before = p.lane(Lane::V1)[0].clone();
         let sub_before = p.sub_lane(s1)[0].start;
         let to = sub_before + 5;
         assert!(p.move_sub(s1, 0, s1, to).is_ok(), "{shape}: room to drag");
         laws(&p, &format!("{shape} after move_sub"));
-        let v1_after = p.lane(Lane::V1)[0];
+        let v1_after = p.lane(Lane::V1)[0].clone();
         assert_eq!(
             i64::from(v1_after.start) - i64::from(v1_before.start),
             i64::from(p.sub_lane(s1)[0].start) - i64::from(sub_before),

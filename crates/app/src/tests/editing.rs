@@ -2,6 +2,9 @@
 //! track can be handed.
 
 use super::*;
+use crate::GapPick;
+use crate::player::timeline_edit::live_gap;
+use crate::ui::stance::{clip_readout, fps_label, gap_readout};
 
 /// What the file manager is handed: the parts a path keeps as they are, and
 /// the ones the bus would otherwise read as something else.
@@ -66,8 +69,8 @@ fn an_import_adds_a_row_at_its_own_length_and_leaves_the_lanes_alone() {
     assert_eq!(rows[1].frames, 120, "4 s at 30 fps, never placed");
     // The swatch is the clip colour, by the same index and the same
     // function -- what makes the panel and the lanes one association.
-    for row in 0..rows.len() {
-        assert_eq!(rows[row].tint, row);
+    for (row, r) in rows.iter().enumerate() {
+        assert_eq!(r.tint, row);
         assert_eq!(source_tint(row), SOURCE_TINTS()[row % SOURCE_TINTS().len()]);
     }
 }
@@ -117,21 +120,21 @@ fn a_song_opens_the_window_by_itself() {
     assert_eq!(session.lane_clips(Lane::A1).len(), 2);
     assert!(session.lane_clips(Lane::V1).is_empty(), "still no picture");
 
-    // Both picture rows carry the reason rather than the format's detail
-    // line, each naming itself; the audio formats are what this timeline is
-    // and are never refused.
-    assert_eq!(
-        format_refusal(&session, Format::Mp4).as_deref(),
-        Some("no picture — an mp4 would be black; export WAV, FLAC, MP3 or OGG")
-    );
+    // The Matroska and WebM rows carry the reason rather than the format's
+    // detail line, each naming itself. The mp4 rows are not refused: the engine
+    // writes an mp4 of a picture-less timeline as the sound alone. The audio
+    // formats are what this timeline is and are never refused.
     assert_eq!(
         format_refusal(&session, Format::Av1).as_deref(),
-        Some("no picture — an AV1 Matroska would be black; export WAV, FLAC, MP3 or OGG")
+        Some("no picture — an AV1 Matroska would be black; export an mp4, M4A, WAV, FLAC, MP3 or Ogg")
     );
     assert_eq!(
-        format_refusal(&session, Format::Av1Mp4).as_deref(),
-        Some("no picture — an AV1 mp4 would be black; export WAV, FLAC, MP3 or OGG")
+        format_refusal(&session, Format::Webm).as_deref(),
+        Some("no picture — a WebM would be black; export an mp4, M4A, WAV, FLAC, MP3 or Ogg")
     );
+    assert_eq!(format_refusal(&session, Format::Mp4), None, "an mp4 of it is the sound alone");
+    assert_eq!(format_refusal(&session, Format::Av1Mp4), None, "an AV1 mp4 of it is the sound alone");
+    assert_eq!(format_refusal(&session, Format::M4a), None);
     assert_eq!(format_refusal(&session, Format::Wav), None);
     assert_eq!(format_refusal(&session, Format::Flac), None);
     assert_eq!(format_refusal(&session, Format::Mp3), None);
@@ -269,7 +272,7 @@ fn every_audio_stream_of_a_file_is_a_row_usable_or_not() {
 /// engine really produces.
 #[test]
 fn a_refused_file_names_the_refusal_on_its_row() {
-    let junk = std::env::temp_dir().join("edith-lane-j-refused.mkv");
+    let junk = std::env::temp_dir().join(format!("edith-lane-j-refused-{}.mkv", std::process::id()));
     std::fs::write(&junk, b"not a container, and never will be").expect("write the junk file");
     let words = engine::decode::probe(&junk)
         .expect_err("a file that is not a stream is refused")
@@ -284,7 +287,7 @@ fn a_refused_file_names_the_refusal_on_its_row() {
     let rows = library_rows(
         &[Source {
             path: junk.clone(),
-            audio_stream: 0,
+            audio_stream: 0, ..Default::default()
         }],
         &HashMap::new(),
         &decoders,
@@ -303,7 +306,7 @@ fn a_refused_file_names_the_refusal_on_its_row() {
     let rows = library_rows(
         &[Source {
             path: junk.clone(),
-            audio_stream: 0,
+            audio_stream: 0, ..Default::default()
         }],
         &HashMap::new(),
         &pending,
@@ -337,7 +340,7 @@ fn a_caption_is_deleted_by_the_same_row_and_stroke_every_box_is() {
     };
     assert!(cap.clip.is_none(), "a caption is never a clip");
     assert_eq!(
-        enable(ActionId::Delete, cap),
+        enable(ActionId::Delete, cap.clone()),
         Enable::Yes,
         "the one thing a placed caption could always be asked to do",
     );
@@ -345,7 +348,7 @@ fn a_caption_is_deleted_by_the_same_row_and_stroke_every_box_is() {
     // them out rather than drawing "nothing selected" over a clicked box.
     for clip_only in [ActionId::Copy, ActionId::Lift, ActionId::Equalizer] {
         assert_eq!(
-            enable(clip_only, cap),
+            enable(clip_only, cap.clone()),
             Enable::Hidden("this is a caption"),
             "{clip_only:?} is not a row on a caption",
         );
@@ -353,10 +356,10 @@ fn a_caption_is_deleted_by_the_same_row_and_stroke_every_box_is() {
     // The group rows are the caption's now: a caption out of any group says so
     // in the detach's own words, and Group over one pick is the partner hunt.
     assert_eq!(
-        enable(ActionId::Detach, cap),
+        enable(ActionId::Detach, cap.clone()),
         Enable::No("this caption is not grouped")
     );
-    assert_eq!(enable(ActionId::Group, cap), Enable::Yes);
+    assert_eq!(enable(ActionId::Group, cap.clone()), Enable::Yes);
     // ...and a caption in a group detaches like a clip does.
     let grouped = Ctx {
         caption: true,
@@ -379,7 +382,7 @@ fn a_caption_is_deleted_by_the_same_row_and_stroke_every_box_is() {
         ActionId::Silence,
     ] {
         assert_eq!(
-            enable(playhead, cap),
+            enable(playhead, cap.clone()),
             Enable::Yes,
             "{playhead:?} is about the playhead and not about the mark",
         );
@@ -389,7 +392,7 @@ fn a_caption_is_deleted_by_the_same_row_and_stroke_every_box_is() {
     // that offered a grade would read as the caption's. The caption's menu is
     // its own rows and the global pair the card already names as global.
     assert_eq!(
-        menu_items(cap),
+        menu_items(cap.clone()),
         vec![
             ActionId::Paste,
             ActionId::Group,
@@ -526,17 +529,18 @@ fn a_caption_grouped_with_a_clip_pairs_it_for_the_whole_take_question() {
     session
         .group_all(&[(Lane::V1, 0), (lane, 0)])
         .expect("a clip and a caption are a group");
-    // Paired through the caption alone: the sound half is gone (the fixture's
-    // take was split above), and the question is the picture's to answer.
+    // Paired through the caption it was grouped with, and the question is the
+    // picture's to answer.
     assert!(
         whole_take(&session, Lane::V1, 0),
         "the caption the clip was grouped with pairs it"
     );
-    // ...and the detach takes the pairing off again.
+    // ...and the ungroup keeps the picture with its take: the caption comes
+    // off, the clip stays linked to what it was grouped with.
     assert!(session.ungroup(lane, 0));
     assert!(
-        !whole_take(&session, Lane::V1, 0),
-        "ungrouped, the clip is a half like any other"
+        whole_take(&session, Lane::V1, 0),
+        "ungrouped, the clip stays linked: the take stays linked"
     );
 }
 
@@ -662,8 +666,8 @@ fn the_playhead_actions_still_work_with_a_caption_marked() {
         timeline: true,
         ..Ctx::default()
     };
-    assert_eq!(enable(ActionId::Cut, cap), Enable::Yes);
-    assert_eq!(enable(ActionId::Regroup, cap), Enable::Yes);
+    assert_eq!(enable(ActionId::Cut, cap.clone()), Enable::Yes);
+    assert_eq!(enable(ActionId::Regroup, cap.clone()), Enable::Yes);
 
     // And the edits themselves, on a timeline holding a placed caption: the
     // split at the playhead and the rejoin at the seam it leaves.
@@ -676,7 +680,7 @@ fn the_playhead_actions_still_work_with_a_caption_marked() {
     assert_eq!(session.lane_clips(Lane::V1).len(), clips + 1);
     // The refusal is a real state and not a defence against nothing: the
     // playhead is standing on the seam the split just left, which is exactly the
-    // stroke `Player::cut` words as "NOTHING TO SPLIT — the playhead is already
+    // stroke `Player::cut` words as "Nothing to split — the playhead is already
     // on a cut".
     assert!(
         !session.cut_at(2.0),
@@ -698,11 +702,24 @@ fn the_clip_menu_dims_what_the_playhead_is_not_on_and_stays_in_the_window() {
     use keymap::{ActionId, Keymap};
     // Frames 30..90 of the timeline, taken from the head of its source.
     let clip = Clip {
+        speed_keys: Vec::new(),
+        reversed: false,
+        stabilise: None, deinterlace: Default::default(), mark: Default::default(),
+        angle: Default::default(),
         fade_in: 0,
         fade_out: 0,
         transition_out: 0,
+        transition_kind: Default::default(),
         visualizer: 0,
         viz_paint: 0,
+        gain_db: 0.0,
+        gain_keys: Vec::new(),
+        pan: 0,
+        pitch: 0,
+        transform_keys: Vec::new(),
+        opacity_keys: Vec::new(),
+        color_keys: Vec::new(),
+        effects: Vec::new(),
         start: 30,
         in_frame: 0,
         out_frame: 60,
@@ -723,7 +740,7 @@ fn the_clip_menu_dims_what_the_playhead_is_not_on_and_stays_in_the_window() {
         enable(
             action,
             Ctx {
-                clip: Some((*clip, lane)),
+                clip: Some((clip.clone(), lane)),
                 playhead,
                 timeline: true,
                 ..Ctx::default()
@@ -747,7 +764,7 @@ fn the_clip_menu_dims_what_the_playhead_is_not_on_and_stays_in_the_window() {
         fade_in: 0,
         fade_out: 0,
         speed: Speed::MIN,
-        ..clip
+        ..clip.clone()
     };
     assert_eq!(slow.frames(), 240, "a quarter speed is four times as long");
     assert!(
@@ -776,7 +793,7 @@ fn the_clip_menu_dims_what_the_playhead_is_not_on_and_stays_in_the_window() {
         fade_in: 0,
         fade_out: 0,
         link: Some(3),
-        ..clip
+        ..clip.clone()
     };
     assert!(offered(&grouped, v1, ActionId::Detach, 60));
     assert!(offered(&clip, a1, ActionId::Group, 0));
@@ -795,6 +812,12 @@ fn the_clip_menu_dims_what_the_playhead_is_not_on_and_stays_in_the_window() {
     // clip wherever the playhead is, dimmed on a waveform.
     assert!(offered(&clip, v1, ActionId::Color, 0));
     assert!(!offered(&clip, a1, ActionId::Color, 60));
+    // The transition kinds are the dissolve's family: picture only, so the
+    // palette offers all sixteen over a picture clip and none over a waveform.
+    for action in ActionId::ALL.into_iter().filter(|a| a.transition_kind().is_some()) {
+        assert!(offered(&clip, v1, action, 0), "{action:?} on picture");
+        assert!(!offered(&clip, a1, action, 60), "{action:?} on sound");
+    }
     // The two kinds of no, which is what the row is told apart by: a grade
     // on a waveform is a *class* answer -- an audio clip has no picture and
     // never will, so the menu leaves the item out entirely -- where a cut at
@@ -810,7 +833,7 @@ fn the_clip_menu_dims_what_the_playhead_is_not_on_and_stays_in_the_window() {
                 enable(
                     action,
                     Ctx {
-                        clip: Some((clip, lane)),
+                        clip: Some((clip.clone(), lane)),
                         image,
                         playhead,
                         timeline: true,
@@ -826,9 +849,12 @@ fn the_clip_menu_dims_what_the_playhead_is_not_on_and_stays_in_the_window() {
     let sound = menu(a1, false, 60);
     assert!(!sound.contains(&ActionId::Color), "{sound:?}");
     assert!(!sound.contains(&ActionId::Fit), "{sound:?}");
+    assert!(!sound.contains(&ActionId::Reframe), "a sound clip has no subject to follow: {sound:?}");
     assert!(sound.contains(&ActionId::Equalizer));
     assert!(sound.contains(&ActionId::Silence));
     assert!(sound.contains(&ActionId::Visualizer));
+    // Either half of a take reverses the take.
+    assert!(sound.contains(&ActionId::Reverse), "{sound:?}");
     // Picture: the mirror of it. The sound of a take is the audio lane's,
     // clip for clip, so the equalizer is not this clip's business -- but the
     // silence scan is, because it opens on the half it is grouped with.
@@ -837,7 +863,9 @@ fn the_clip_menu_dims_what_the_playhead_is_not_on_and_stays_in_the_window() {
     assert!(picture.contains(&ActionId::Visualizer), "{picture:?}");
     assert!(picture.contains(&ActionId::Color));
     assert!(picture.contains(&ActionId::Fit));
+    assert!(picture.contains(&ActionId::Reframe), "{picture:?}");
     assert!(picture.contains(&ActionId::Silence));
+    assert!(picture.contains(&ActionId::Reverse), "{picture:?}");
     // A still: picture with no sound anywhere, ever. Graded, fitted and
     // re-timed like any other clip (a speed reaches a still through the same
     // rewrite), scanned like none.
@@ -845,14 +873,16 @@ fn the_clip_menu_dims_what_the_playhead_is_not_on_and_stays_in_the_window() {
     assert!(!still.contains(&ActionId::Silence), "{still:?}");
     assert!(!still.contains(&ActionId::Visualizer), "{still:?}");
     assert!(!still.contains(&ActionId::Equalizer), "{still:?}");
+    assert!(!still.contains(&ActionId::Reframe), "a still has no motion to follow: {still:?}");
     assert!(still.contains(&ActionId::Color));
     assert!(still.contains(&ActionId::Fit));
     assert!(still.contains(&ActionId::Speed));
+    assert!(!still.contains(&ActionId::Reverse), "a still has no footage to reverse: {still:?}");
     // Mix is not in the clip menu, but it wears the same class refusal the
     // dock's verb row hides it by (`ui::dock_stance::ghost_verb`): nothing to
     // mix for a picture with no sound at all, live everywhere else.
     let mix_ctx = |lane, image| Ctx {
-        clip: Some((clip, lane)),
+        clip: Some((clip.clone(), lane)),
         image,
         playhead: 60,
         timeline: true,
@@ -864,13 +894,13 @@ fn the_clip_menu_dims_what_the_playhead_is_not_on_and_stays_in_the_window() {
     // A silent video (no still, but its source's stream table is empty)
     // refuses Mix and Silence the same way, by `no_sound` rather than `image`.
     let mute_video = Ctx {
-        clip: Some((clip, v1)),
+        clip: Some((clip.clone(), v1)),
         no_sound: true,
         playhead: 60,
         timeline: true,
         ..Ctx::default()
     };
-    assert!(!enable(ActionId::Mix, mute_video).listed());
+    assert!(!enable(ActionId::Mix, mute_video.clone()).listed());
     assert!(!enable(ActionId::Silence, mute_video).listed());
     // ...and the state refusals are on all three, dimmed rather than gone:
     // at 30 the playhead is on this clip's head, where a cut has nothing to
@@ -913,7 +943,7 @@ fn the_clip_menu_dims_what_the_playhead_is_not_on_and_stays_in_the_window() {
                 let refusal = enable(
                     action,
                     Ctx {
-                        clip: Some((clip, lane)),
+                        clip: Some((clip.clone(), lane)),
                         image,
                         playhead,
                         timeline: true,
@@ -930,7 +960,7 @@ fn the_clip_menu_dims_what_the_playhead_is_not_on_and_stays_in_the_window() {
         enable(
             ActionId::Silence,
             Ctx {
-                clip: Some((clip, v1)),
+                clip: Some((clip.clone(), v1)),
                 image: true,
                 playhead: 60,
                 timeline: true,
@@ -968,7 +998,7 @@ fn the_clip_menu_dims_what_the_playhead_is_not_on_and_stays_in_the_window() {
         playable: true,
         ..Ctx::default()
     };
-    assert!(whole(ActionId::Play, live).yes());
+    assert!(whole(ActionId::Play, live.clone()).yes());
     // ...and an open timeline with nothing on its lanes refuses the
     // transport in the oracle rather than in the button, which is what
     // makes the key and the button say the same thing.
@@ -977,7 +1007,7 @@ fn the_clip_menu_dims_what_the_playhead_is_not_on_and_stays_in_the_window() {
             ActionId::Play,
             Ctx {
                 playable: false,
-                ..live
+                ..live.clone()
             }
         ),
         Enable::No("the timeline is empty")
@@ -1008,24 +1038,24 @@ fn the_clip_menu_dims_what_the_playhead_is_not_on_and_stays_in_the_window() {
             "{editor_wide:?} is dead with no file open while its key still fires"
         );
     }
-    assert!(!whole(ActionId::Delete, live).yes());
-    assert!(!whole(ActionId::Paste, live).yes());
+    assert!(!whole(ActionId::Delete, live.clone()).yes());
+    assert!(!whole(ActionId::Paste, live.clone()).yes());
     assert!(
         whole(
             ActionId::Paste,
             Ctx {
                 clipboard: true,
-                ..live
+                ..live.clone()
             }
         )
         .yes()
     );
-    assert!(!whole(ActionId::CancelExport, live).yes());
+    assert!(!whole(ActionId::CancelExport, live.clone()).yes());
     let busy = Ctx {
         exporting: true,
-        ..live
+        ..live.clone()
     };
-    assert!(whole(ActionId::CancelExport, busy).yes());
+    assert!(whole(ActionId::CancelExport, busy.clone()).yes());
     for action in ActionId::ALL {
         // Nothing may touch the edit list while an export is reading it --
         // and the palette does not: it repaints this window and writes one
@@ -1039,13 +1069,24 @@ fn the_clip_menu_dims_what_the_playhead_is_not_on_and_stays_in_the_window() {
         // chord and the spine glyph leave the exporting card on screen.
         let allowed = action == ActionId::CancelExport
             || action == ActionId::Theme
+            || action == ActionId::AccentColour
+            || action == ActionId::ViewZoom
+            || action == ActionId::PlaybackQuality
+            || action == ActionId::GuideStyle
+            || action == ActionId::GuideMask
             || action == ActionId::Fullscreen
             || action == ActionId::SubtitleStyle
             // Moving the ring touches no edit list either -- same kind of
             // thing as Fullscreen right above it.
-            || action == ActionId::FocusPanels;
+            || action == ActionId::FocusPanels
+            // The shortcuts sheet opens a dock tab and touches no edit list.
+            || action == ActionId::ShowKeys
+            || action == ActionId::About
+            // The video output window and its display: a second window onto the picture.
+            || action == ActionId::ToggleOutputWindow
+            || action == ActionId::OutputDisplay;
         assert_eq!(
-            whole(action, busy).yes(),
+            whole(action, busy.clone()).yes(),
             allowed,
             "{action:?} while an export reads the edit list"
         );
@@ -1077,7 +1118,21 @@ fn the_clip_menu_dims_what_the_playhead_is_not_on_and_stays_in_the_window() {
     let keymap = Keymap::defaults();
     for action in MENU_ITEMS {
         assert!(ActionId::ALL.contains(&action), "{action:?} is not listed");
-        assert_ne!(keymap.display(action), "unbound", "{action:?}");
+        // The Effects opener has a menu row and no stroke; the popup prints
+        // no hint for a row without one.
+        if !matches!(
+            action,
+            ActionId::Effects
+                | ActionId::TrackMask
+                | ActionId::Reframe
+                | ActionId::NestClips
+                | ActionId::BreakApart
+                | ActionId::OpenCompound
+                | ActionId::FlattenMulticam
+                | ActionId::ClipLabel
+        ) {
+            assert_ne!(keymap.display(action), "unbound", "{action:?}");
+        }
     }
     // ...and the whole card still fits the 640x360 floor, however many items
     // it grows to: the list is what scrolls where the window is too short
@@ -1107,11 +1162,11 @@ fn the_clip_menu_dims_what_the_playhead_is_not_on_and_stays_in_the_window() {
     // ("more below — scroll the …"): a row nobody knows is under the fold
     // is a row that is not there, and no scroll bar says it.
     let families = crate::ui::theme::PaletteId::ALL.len();
-    assert_eq!(
-        menu_rows_h(families, floor),
-        families as f32 * MENU_ROW_H,
-        "{families} palettes no longer fit 640x360 -- the picker now needs \
-         the 'more below' line and a keyboard cursor that scrolls into view"
+    // With 28px rows (REDESIGN §3.1) the floor shows all but a couple of them and the
+    // list scrolls, as every menu does at that height.
+    assert!(
+        menu_rows_h(families, floor) >= 11. * MENU_ROW_H,
+        "the picker shows fewer than eleven palettes at 640x360"
     );
     // ...and the detail beside each one is short enough to survive the
     // right-hand column at that width instead of being truncated mid-word.
@@ -1137,11 +1192,24 @@ fn the_clip_menu_dims_what_the_playhead_is_not_on_and_stays_in_the_window() {
 fn a_menu_offers_only_what_applies_and_is_drawn_inside_the_window() {
     use keymap::ActionId;
     let clip = Clip {
+        speed_keys: Vec::new(),
+        reversed: false,
+        stabilise: None, deinterlace: Default::default(), mark: Default::default(),
+        angle: Default::default(),
         fade_in: 0,
         fade_out: 0,
         transition_out: 0,
+        transition_kind: Default::default(),
         visualizer: 0,
         viz_paint: 0,
+        gain_db: 0.0,
+        gain_keys: Vec::new(),
+        pan: 0,
+        pitch: 0,
+        transform_keys: Vec::new(),
+        opacity_keys: Vec::new(),
+        color_keys: Vec::new(),
+        effects: Vec::new(),
         start: 30,
         in_frame: 0,
         out_frame: 60,
@@ -1154,7 +1222,7 @@ fn a_menu_offers_only_what_applies_and_is_drawn_inside_the_window() {
         speed: Speed::NORMAL,
     };
     let ctx = |lane, image| Ctx {
-        clip: Some((clip, lane)),
+        clip: Some((clip.clone(), lane)),
         image,
         playhead: 60,
         timeline: true,
@@ -1165,11 +1233,11 @@ fn a_menu_offers_only_what_applies_and_is_drawn_inside_the_window() {
     // oracle hides -- there is no third answer, and no hand-written list.
     for (lane, image) in [(Lane::V1, false), (Lane::A1, false), (Lane::V1, true)] {
         let ctx = ctx(lane, image);
-        let rows = menu_items(ctx);
+        let rows = menu_items(ctx.clone());
         for action in MENU_ITEMS {
             assert_eq!(
                 rows.contains(&action),
-                enable(action, ctx).listed(),
+                enable(action, ctx.clone()).listed(),
                 "{action:?} on {lane:?}, image={image}"
             );
         }
@@ -1228,17 +1296,24 @@ fn a_menu_offers_only_what_applies_and_is_drawn_inside_the_window() {
         "a file that cannot join this timeline is not an Add anybody can ask for"
     );
     assert!(!row_enable(RowItem::Remove, RowCtx { placed: 1, ..live }).yes());
-    // The two removes are one verb with two shapes and exactly one of them is
-    // ever on the plate: a placed source offers "with its clips", an unplaced
-    // one the plain remove. Before this pair existed a placed source had no
-    // reachable way out of the library at all (user 2026-08-21: "can not
-    // remove a media from library").
+    // The two removes are both listed (DESIGN §6.7) and exactly one of them
+    // answers yes: a placed source takes "with its clips", an unplaced one the
+    // plain remove, and the other is refused with its reason rather than
+    // hidden. Before this pair existed a placed source had no reachable way
+    // out of the library at all (user 2026-08-21: "can not remove a media from
+    // library").
     let placed = RowCtx { placed: 2, ..live };
     let items = row_items(placed);
-    assert!(items.contains(&RowItem::RemoveWithClips) && !items.contains(&RowItem::Remove));
+    assert!(items.contains(&RowItem::RemoveWithClips) && items.contains(&RowItem::Remove));
     assert!(row_enable(RowItem::RemoveWithClips, placed).yes());
+    assert!(!row_enable(RowItem::Remove, placed).yes());
     let unplaced = row_items(live);
-    assert!(unplaced.contains(&RowItem::Remove) && !unplaced.contains(&RowItem::RemoveWithClips));
+    assert!(unplaced.contains(&RowItem::Remove) && unplaced.contains(&RowItem::RemoveWithClips));
+    assert!(row_enable(RowItem::Remove, live).yes());
+    assert_eq!(
+        row_enable(RowItem::RemoveWithClips, live).why(),
+        Some("no clip uses it")
+    );
     assert!(
         !row_enable(
             RowItem::RemoveWithClips,
@@ -1296,8 +1371,10 @@ fn a_menu_offers_only_what_applies_and_is_drawn_inside_the_window() {
     }
     // On any window with the room, the whole list is drawn rather than
     // twelve rows of it and a scroll nobody is told about.
-    let items = MENU_ITEMS.len() + 1;
-    let real = size(px(1280.), px(690.));
+    // The compound verbs fold into one "Compound" row and the card openers into one "Adjust"
+    // row, so the top level counts each of those folds once.
+    let items = MENU_ITEMS.iter().filter(|a| !crate::menus::compound_item(**a) && !crate::menus::adjust_item(**a)).count() + 2;
+    let real = size(px(1280.), px(820.));
     assert_eq!(menu_rows_h(items, real), items as f32 * MENU_ROW_H);
     assert!(menu_rows_h(items, size(px(640.), px(360.))) < items as f32 * MENU_ROW_H);
 }
@@ -1317,9 +1394,13 @@ fn a_menu_offers_only_what_applies_and_is_drawn_inside_the_window() {
 ///    that column and §8 forbids the instructional copy that used to sit there.
 #[test]
 fn the_hanging_menus_mount_at_the_room_root_and_their_rows_wear_chords_not_prose() {
-    let stance = src_text("ui/stance.rs");
+    // Whitespace-collapsed, so the call still matches however rustfmt wraps it.
+    let stance = src_text("ui/stance.rs")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     let (centre, root) = stance
-        .split_once(".child(divider(Split::Dock,")
+        .split_once(".child(divider( Split::Dock,")
         .expect("the dock seam splits the centre column from the room root");
     for menu in [
         "children(player.context_card(",
@@ -1337,21 +1418,19 @@ fn the_hanging_menus_mount_at_the_room_root_and_their_rows_wear_chords_not_prose
     }
     let library = src_text("ui/library.rs");
     assert!(
-        library.contains("menu.at.y + px(ROW_CLEAR)"),
-        "the library menu must hang clear of the row it names"
+        library.contains("menu_at_w(at, viewport, pw, h)")
+            && !library.contains("ROW_CLEAR"),
+        "the library menu opens with its corner on the pointer, like every context menu"
     );
-    // Exactly one row wears a chord, and it is the one `ui/stance.rs`'s
-    // `enter` branch actually answers; every other row's column is empty.
+    // Two rows wear a chord: the add, which is the stroke `ui/stance.rs`'s
+    // `enter` branch answers, and preview. Every other row's column is empty.
     for item in ROW_ITEMS {
         let hint = item.hint();
         match item {
             RowItem::Add => {
-                assert_eq!(hint, "↵");
-                assert!(
-                    stance.contains("if key == \"enter\"\n                && this.dock_src_active"),
-                    "the ↵ this menu advertises must still be the stroke that adds"
-                );
+                assert_eq!(hint, "");
             }
+            RowItem::Preview => assert_eq!(hint, "↵"),
             _ => assert!(hint.is_empty(), "{:?} prints prose: {hint:?}", item.label()),
         }
         // §9: no junk drawer. A label that fits the plate whole beside its
@@ -1365,6 +1444,17 @@ fn the_hanging_menus_mount_at_the_room_root_and_their_rows_wear_chords_not_prose
     // The two removes must not read as the same verb now that the column
     // beside them is empty.
     assert_ne!(RowItem::Remove.label(), RowItem::RemoveWithClips.label());
+    // The destructive rows are the tail of the list, under the one rule, and
+    // the rule is the clip menu's seam token -- not a second hairline colour.
+    let first = ROW_ITEMS.iter().position(|i| i.destructive()).unwrap();
+    assert!(ROW_ITEMS[first..].iter().all(|i| i.destructive()));
+    // The rule is the shared popup rule (the seam token lives in `ui/popup.rs`).
+    assert!(library.contains("popup_rule()"));
+    assert!(src_text("ui/popup.rs").contains("bg(rgba(crate::ui::theme::tokens().line))"));
+    assert!(
+        !library.contains("DARK_HAIRLINE"),
+        "the Media menu's rule drifted from the clip menu's"
+    );
 }
 
 /// The other half of the keys menu's guarantee, and the audit this batch was
@@ -1386,12 +1476,21 @@ fn every_action_is_reachable_without_the_keyboard() {
         })
         .collect();
     for action in ActionId::ALL {
+        // Angles 2 to 9 share the one "angle 1–9" row (see `keys_rows`).
+        if action.angle_number().is_some_and(|n| n > 1) {
+            continue;
+        }
         assert_eq!(
             listed.iter().filter(|a| **a == action).count(),
             1,
             "{action:?} is reachable by keyboard only"
         );
     }
+    assert_eq!(
+        listed.iter().filter(|a| a.angle_number().is_some()).count(),
+        1,
+        "the angles are one row on the keys card"
+    );
     // The snap's own door was the rail's `⌗` glyph, and the rail is deleted
     // (DESIGN §5 as amended 2026-09-09, user decision "option C"). Its
     // replacement landed with the ruler's right-click menu ([`BENCH_ITEMS`]),
@@ -1404,11 +1503,11 @@ fn every_action_is_reachable_without_the_keyboard() {
         "no pointer door for the snap"
     );
     // And the card is a door the pointer can open: the panel's own button.
-    assert!(element("keys"), "no way to open the actions card");
+    assert!(element("menubar-search"), "no way to open the command palette");
     // The card-local strokes have the same rule, and each of them is a thing
     // on its card: the graph and its two buttons, the colour bars and their
-    // reset, the speed bar and its presets, and the silence card's rows --
-    // whose steppers are the pointer's only way to a threshold.
+    // reset, the speed bar and its presets, and the silence card's threshold
+    // bar and scope chips -- the bar is the pointer's only way to a threshold.
     for id in [
         "eq-graph",
         "eq-reset",
@@ -1417,10 +1516,16 @@ fn every_action_is_reachable_without_the_keyboard() {
         "color-reset",
         "speed-bar",
         "speed-preset",
-        "silence-row",
-        "silence-step",
+        "speed-mode",
+        "ramp-preset",
+        "ramp-add-key",
+        "ramp-key-remove",
+        "ramp-key-step",
+        "ramp-clear",
+        "silence-threshold",
+        "silence-scope",
         "mix-row",
-        "mix-step",
+        "eq-gain-field",
         "silence-apply",
         "export-confirm",
     ] {
@@ -1459,19 +1564,21 @@ fn every_action_is_reachable_without_the_keyboard() {
 #[test]
 fn every_card_closes_without_the_keyboard() {
     for card in [
-        "export_card",
         "eq_card",
         "color_card",
         "speed_card",
+        "effects_card",
         "mix_card",
         "silence_card",
         "subtitle_style_card",
     ] {
+        // Every clip card is one shared frame: its head carries the back
+        // and close buttons (`this.close_card()`), and its outer element is
+        // `card_outer`, which swallows nothing a control needs.
         let src = fn_body(card);
         assert!(
-            src.contains("this.close_card()"),
-            "{card}'s scrim swallows the press without closing the card: \
-             escape is the only way out of it"
+            src.contains("self.card_outer(") && (src.contains("dark_card_head") || src.contains("section_header_row")),
+            "{card} is not built on the shared card frame"
         );
         assert!(
             src.contains("MouseButton::Left, swallow"),
@@ -1479,6 +1586,11 @@ fn every_card_closes_without_the_keyboard() {
              one of its controls would close the card under itself"
         );
     }
+    let common = src_text("ui/cards/common.rs");
+    // REDESIGN §3.9: the card's back/close buttons are gone; its section head
+    // in the Clip inspector folds it (`this.close_card()`), `esc` still closes it.
+    let _ = common;
+    assert!(src_text("ui/dock_stance.rs").contains("this.close_card()"));
     // ...and every state that makes the window modal is a state that press
     // clears. `exporting()` is not one of them: a running export is a job
     // with a cancel button, not a card with a scrim.
@@ -1591,7 +1703,7 @@ fn group_reaches_the_sound_before_a_video_layer_over_it() {
     let v2 = session.add_lane(LaneKind::Video);
     // A bare layer, through the one-lane door: a *drop* on V2 brings the
     // file's sound down with it and would put a third clip over this span.
-    let whole = session.lane_clips(Lane::V1)[0];
+    let whole = session.lane_clips(Lane::V1)[0].clone();
     assert!(
         session.place_at(v2, 0.0, whole),
         "a layer covering the same frames as the take"
@@ -1639,21 +1751,22 @@ fn group_reaches_the_sound_before_a_video_layer_over_it() {
 /// refused file cannot leave a row behind.
 #[test]
 fn a_refused_import_leaves_no_row_and_an_accepted_one_is_whole() {
-    // A mono timeline: since a mono track up-mixes onto a wider timeline
-    // (`engine::audio::widen`), the refusal left standing is the reverse --
-    // a wider file cannot join a mono timeline, nothing narrows a source.
+    // A mono timeline. Audio no longer refuses on channel count: every
+    // multichannel track is folded to stereo at the decoder's door and a
+    // stereo pair is narrowed onto mono (`engine::audio::widen`), so 5.1 and
+    // stereo sources both join. What is still refused is a file that is not
+    // media at all, here a text file named `.edith`.
     let mut session = PlaybackSession::open(asset("test_ac3.mp4")).expect("open the fixture");
     // Silent like the engine suite: this opens the real device.
     session.set_gain(0.0);
     assert_eq!(session.sources().len(), 1);
     // 640x360 joins now (the project canvas places it), and so does a file
-    // with no sound (it plays silence over its span). What is left is one
-    // output device: a stereo track cannot join a mono timeline.
+    // with no sound (it plays silence over its span).
     let refusal = session
-        .import(&asset("test_av.mp4"))
-        .expect_err("a stereo track must not join a mono timeline")
+        .import(&asset("test_h264.edith"))
+        .expect_err("a text file is not media and must not join")
         .to_string();
-    assert!(refusal.contains("audio"), "refusal must name it: {refusal}");
+    assert!(!refusal.is_empty(), "a refusal must say why");
     assert_eq!(session.sources().len(), 1, "a refusal added a row");
     // An accepted one does add a row, and it reads as the whole file: 3 s
     // at 30 fps, its own length and not one taken off the lanes.
@@ -1694,10 +1807,11 @@ fn adding_a_row_drops_the_whole_source_in_at_the_playhead() {
     // One take, not a video clip with no sound under it: both lanes hold
     // the same clip at the same place, in the same group.
     let at = |lane: &[Clip]| {
-        *lane
+        lane
             .iter()
             .find(|c| c.start == 60)
             .expect("inserted at 2 s")
+            .clone()
     };
     assert_eq!(at(video), at(audio));
     assert_eq!(at(video).source, 1);
@@ -1757,7 +1871,7 @@ fn a_row_dropped_on_the_open_bed_lands_under_the_pointer() {
     // bed: ten seconds in, five seconds past the end of the timeline, and
     // no mark anywhere near enough to pull it back.
     let clips = [session.lane_clips(Lane::V1), session.lane_clips(Lane::A1)];
-    let marks = snap_marks(&clips, None, None, frame_at(session.now(), fps), None);
+    let marks = snap_marks(&clips, None, None, frame_at(session.now(), fps), None, &[]);
     let under = frame_at(scale.time_at(px_along(px(212.), bed)), fps);
     // The drop's own magnet, not the trims' finer one -- `Player::place_frame`
     // ships `drop_snap_frames`, and a test computing with `snap_frames` stops
@@ -1776,7 +1890,7 @@ fn a_row_dropped_on_the_open_bed_lands_under_the_pointer() {
         session
             .lane_clips(lane)
             .last()
-            .copied()
+            .cloned()
             .expect("the dropped clip")
     };
     assert_eq!(
@@ -1874,11 +1988,24 @@ fn removing_a_row_is_refused_while_it_plays_and_takes_the_row_away() {
 #[test]
 fn a_copied_clip_is_renumbered_or_dropped_when_a_row_leaves_the_library() {
     let clip = |source: usize| Clip {
+        speed_keys: Vec::new(),
+        reversed: false,
+        stabilise: None, deinterlace: Default::default(), mark: Default::default(),
+        angle: Default::default(),
         fade_in: 0,
         fade_out: 0,
         transition_out: 0,
+        transition_kind: Default::default(),
         visualizer: 0,
         viz_paint: 0,
+        gain_db: 0.0,
+        gain_keys: Vec::new(),
+        pan: 0,
+        pitch: 0,
+        transform_keys: Vec::new(),
+        opacity_keys: Vec::new(),
+        color_keys: Vec::new(),
+        effects: Vec::new(),
         start: 0,
         in_frame: 0,
         out_frame: 30,
@@ -1938,7 +2065,7 @@ fn a_clip_trimmed_by_its_edge_plays_less_of_its_file() {
 
     let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
     session.set_gain(0.0);
-    let whole = session.lane_clips(Lane::V1)[0];
+    let whole = session.lane_clips(Lane::V1)[0].clone();
     let full = session.timeline_duration();
     assert_eq!(
         session.trim_room(Lane::V1, 0, Edge::End),
@@ -1972,7 +2099,7 @@ fn a_clip_trimmed_by_its_edge_plays_less_of_its_file() {
     // The head takes the in-point with it, so what plays at the new start
     // is source frame 10 rather than source frame 0.
     assert!(session.trim_clip(Lane::V1, 0, Edge::Start, 10));
-    let head = session.lane_clips(Lane::V1)[0];
+    let head = session.lane_clips(Lane::V1)[0].clone();
     assert_eq!((head.start, head.in_frame), (10, 10));
     assert_eq!(session.lane_clips(Lane::A1)[0].in_frame, 10, "sound too");
     assert_eq!(
@@ -1996,7 +2123,7 @@ fn trim_to_playhead_moves_the_selected_clips_edge_and_undoes_in_one_step() {
 
     let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
     session.set_gain(0.0);
-    let whole = session.lane_clips(Lane::V1)[0];
+    let whole = session.lane_clips(Lane::V1)[0].clone();
     let fps = session.meta().frame_rate;
 
     // Playhead mid-clip, a second in on a five-second timeline.
@@ -2233,11 +2360,24 @@ fn a_history_step_still_takes_its_settings_and_its_pick_back_up() {
 #[test]
 fn trim_to_playhead_needs_a_subject_cut_with_the_playhead_on_it() {
     let clip = Clip {
+        speed_keys: Vec::new(),
+        reversed: false,
+        stabilise: None, deinterlace: Default::default(), mark: Default::default(),
+        angle: Default::default(),
         fade_in: 0,
         fade_out: 0,
         transition_out: 0,
+        transition_kind: Default::default(),
         visualizer: 0,
         viz_paint: 0,
+        gain_db: 0.0,
+        gain_keys: Vec::new(),
+        pan: 0,
+        pitch: 0,
+        transform_keys: Vec::new(),
+        opacity_keys: Vec::new(),
+        color_keys: Vec::new(),
+        effects: Vec::new(),
         start: 100,
         in_frame: 0,
         out_frame: 60,
@@ -2257,26 +2397,26 @@ fn trim_to_playhead_needs_a_subject_cut_with_the_playhead_on_it() {
                 ..Ctx::default()
             }
         ),
-        Enable::No("no subject cut"),
+        Enable::No("no clip is selected"),
         "nothing marked"
     );
     let off = Ctx {
-        clip: Some((clip, Lane::V1)),
+        clip: Some((clip.clone(), Lane::V1)),
         playhead: 5,
         timeline: true,
         ..Ctx::default()
     };
     assert_eq!(
         enable(ActionId::TrimOutToPlayhead, off),
-        Enable::No("the playhead is off this cut")
+        Enable::No("the playhead is off this clip")
     );
     let on = Ctx {
-        clip: Some((clip, Lane::V1)),
+        clip: Some((clip.clone(), Lane::V1)),
         playhead: clip.start,
         timeline: true,
         ..Ctx::default()
     };
-    assert_eq!(enable(ActionId::TrimInToPlayhead, on), Enable::Yes);
+    assert_eq!(enable(ActionId::TrimInToPlayhead, on.clone()), Enable::Yes);
     assert_eq!(enable(ActionId::TrimOutToPlayhead, on), Enable::Yes);
 }
 
@@ -2437,8 +2577,8 @@ fn a_selection_drag_moves_every_pick_by_the_same_delta() {
             .place_stream_at(10.0, &second, 0, None)
             .expect("av2 is on this timeline")
     );
-    let clip0 = session.lane_clips(Lane::V1)[0];
-    let clip1 = session.lane_clips(Lane::V1)[1];
+    let clip0 = session.lane_clips(Lane::V1)[0].clone();
+    let clip1 = session.lane_clips(Lane::V1)[1].clone();
     assert_eq!((clip0.start, clip1.start), (0, 300));
 
     // clipC on a second video row, well past both of the above.
@@ -2448,7 +2588,7 @@ fn a_selection_drag_moves_every_pick_by_the_same_delta() {
             .place_stream_at(20.0, &path, 0, Some(v2))
             .expect("test_av.mp4 is on this timeline")
     );
-    let clip_c = session.lane_clips(v2)[0];
+    let clip_c = session.lane_clips(v2)[0].clone();
     assert_eq!(clip_c.start, 600);
 
     let picks = [(Lane::V1, 0), (Lane::V1, 1), (v2, 0)];
@@ -2505,8 +2645,8 @@ fn a_selection_drag_refuses_as_one_set_when_any_pick_cannot_land() {
             .place_stream_at(10.0, &second, 0, None)
             .expect("av2 is on this timeline")
     );
-    let clip0 = session.lane_clips(Lane::V1)[0];
-    let clip1 = session.lane_clips(Lane::V1)[1];
+    let clip0 = session.lane_clips(Lane::V1)[0].clone();
+    let clip1 = session.lane_clips(Lane::V1)[1].clone();
 
     let v2 = session.add_lane(LaneKind::Video);
     assert!(
@@ -2514,7 +2654,7 @@ fn a_selection_drag_refuses_as_one_set_when_any_pick_cannot_land() {
             .place_stream_at(0.0, &path, 0, Some(v2))
             .expect("test_av.mp4 is on this timeline")
     );
-    let clip_c = session.lane_clips(v2)[0];
+    let clip_c = session.lane_clips(v2)[0].clone();
     // A clip clip1 is not picked, blocking the road on V2 the drag is about
     // to try: clip1 dragged onto V2 lands its head inside this one.
     assert!(
@@ -2522,7 +2662,7 @@ fn a_selection_drag_refuses_as_one_set_when_any_pick_cannot_land() {
             .place_stream_at(10.0, &second, 0, Some(v2))
             .expect("av2 is on this timeline")
     );
-    let blocker = session.lane_clips(v2)[1];
+    let blocker = session.lane_clips(v2)[1].clone();
     assert_eq!(blocker.start, 300);
 
     let picks = [(Lane::V1, 0), (Lane::V1, 1), (v2, 0)];
@@ -2546,11 +2686,11 @@ fn a_single_pick_copy_paste_round_trips_unchanged() {
     session.set_gain(0.0);
     // `open` seeds V1 with the whole fixture as its own clip -- what a plain
     // click would copy.
-    let copied = session.lane_clips(Lane::V1)[0];
+    let copied = session.lane_clips(Lane::V1)[0].clone();
 
     let at = session.timeline_duration();
-    assert!(session.paste_at(at, copied), "a free spot always takes it");
-    let pasted = session.lane_clips(Lane::V1)[1];
+    assert!(session.paste_at(at, copied.clone()), "a free spot always takes it");
+    let pasted = session.lane_clips(Lane::V1)[1].clone();
     assert_eq!(
         (pasted.source, pasted.in_frame, pasted.out_frame),
         (copied.source, copied.in_frame, copied.out_frame),
@@ -2581,8 +2721,8 @@ fn a_three_pick_copy_paste_preserves_gaps_and_lane_assignment() {
             .place_stream_at(10.0, &second, 0, None)
             .expect("av2 is on this timeline")
     );
-    let clip0 = session.lane_clips(Lane::V1)[0];
-    let clip1 = session.lane_clips(Lane::V1)[1];
+    let clip0 = session.lane_clips(Lane::V1)[0].clone();
+    let clip1 = session.lane_clips(Lane::V1)[1].clone();
 
     let v2 = session.add_lane(LaneKind::Video);
     assert!(
@@ -2590,20 +2730,20 @@ fn a_three_pick_copy_paste_preserves_gaps_and_lane_assignment() {
             .place_stream_at(20.0, &path, 0, Some(v2))
             .expect("test_av.mp4 is on this timeline")
     );
-    let clip_c = session.lane_clips(v2)[0];
+    let clip_c = session.lane_clips(v2)[0].clone();
 
     // Copied in click order, out of the lanes each was clicked in -- exactly
     // what `Player::copy_selected` builds.
-    let items = [(Lane::V1, clip0), (Lane::V1, clip1), (v2, clip_c)];
+    let items = [(Lane::V1, clip0.clone()), (Lane::V1, clip1.clone()), (v2, clip_c.clone())];
     let at = session.timeline_duration();
     assert!(
         session.paste_set_at(at, &items),
         "a free spot takes the set"
     );
 
-    let new0 = session.lane_clips(Lane::V1)[2];
-    let new1 = session.lane_clips(Lane::V1)[3];
-    let new_c = session.lane_clips(v2)[1];
+    let new0 = session.lane_clips(Lane::V1)[2].clone();
+    let new1 = session.lane_clips(Lane::V1)[3].clone();
+    let new_c = session.lane_clips(v2)[1].clone();
     // The gaps between picks survive the trip untouched.
     assert_eq!(new1.start - new0.start, clip1.start - clip0.start);
     assert_eq!(new_c.start - new0.start, clip_c.start - clip0.start);
@@ -2642,8 +2782,8 @@ fn a_colliding_set_paste_refuses_whole() {
             .place_stream_at(10.0, &second, 0, None)
             .expect("av2 is on this timeline")
     );
-    let clip0 = session.lane_clips(Lane::V1)[0];
-    let clip1 = session.lane_clips(Lane::V1)[1];
+    let clip0 = session.lane_clips(Lane::V1)[0].clone();
+    let clip1 = session.lane_clips(Lane::V1)[1].clone();
 
     let v2 = session.add_lane(LaneKind::Video);
     assert!(
@@ -2651,9 +2791,9 @@ fn a_colliding_set_paste_refuses_whole() {
             .place_stream_at(20.0, &path, 0, Some(v2))
             .expect("test_av.mp4 is on this timeline")
     );
-    let clip_c = session.lane_clips(v2)[0];
+    let clip_c = session.lane_clips(v2)[0].clone();
 
-    let items = [(Lane::V1, clip0), (Lane::V1, clip1), (v2, clip_c)];
+    let items = [(Lane::V1, clip0.clone()), (Lane::V1, clip1.clone()), (v2, clip_c.clone())];
     // A blocker sat right where the V1 half of the set would land: pasting
     // at the timeline's own start walks every item straight back onto the
     // lanes it was copied off of, colliding with everything already there.
@@ -2685,7 +2825,7 @@ fn a_lone_clip_drag_is_unchanged_by_the_selection_path() {
     // The other kind of lane is refused exactly as before.
     assert!(!session.move_clip_to(v2, 0, Lane::A1, 0));
     // A drop back where it was picked up is a click, still refused.
-    let clip = session.lane_clips(v2)[0];
+    let clip = session.lane_clips(v2)[0].clone();
     assert!(!session.move_clip_to(v2, 0, v2, clip.start));
 }
 
@@ -2752,15 +2892,15 @@ fn a_source_is_only_ever_asked_for_its_peaks_once() {
     let sources = [
         Source {
             path: a.clone(),
-            audio_stream: 0,
+            audio_stream: 0, ..Default::default()
         },
         Source {
             path: a.clone(),
-            audio_stream: 1,
+            audio_stream: 1, ..Default::default()
         },
         Source {
             path: b.clone(),
-            audio_stream: 0,
+            audio_stream: 0, ..Default::default()
         },
     ];
     let keys = |s: &[Source]| {
@@ -2819,7 +2959,7 @@ fn a_source_is_only_ever_asked_for_its_peaks_once() {
 fn a_project_that_makes_no_proxies_by_itself_starts_none_until_it_is_cut_on_them() {
     let sources = [Source {
         path: asset("test_av.mp4"),
-        audio_stream: 0,
+        audio_stream: 0, ..Default::default()
     }];
     let none: HashMap<PathBuf, ()> = HashMap::new();
     let one = vec![asset("test_av.mp4")];
@@ -2991,10 +3131,10 @@ fn escape_closes_a_card_before_it_can_ever_reach_deselect() {
     // so that guard has nothing left to name here.
     let stance_rs = src_text("ui/stance.rs");
     let dispatch = stance_rs
-        .find("if let Some(action) = this.keymap.lookup(key, ctrl) {")
+        .find("if let Some(action) = this.keymap.lookup(key, ctrl, shift, alt) {")
         .expect("the keymap fallthrough that fires Deselect");
     for (guard, label) in [
-        ("if this.dock_filter_edit {", "the dock filter"),
+        ("this.text_field_key(event, window, cx)", "the open text fields (one dispatch point)"),
         (
             "if this.param_card_key(key, event.keystroke.modifiers.shift, cx) {",
             "a param card",
@@ -3024,7 +3164,7 @@ fn escape_closes_a_card_before_it_can_ever_reach_deselect() {
 }
 
 /// A refused split is not an edit, so it may not drop the clip in hand: the
-/// refused stroke is worded ("NOTHING TO SPLIT — the playhead is already on a
+/// refused stroke is worded ("Nothing to split — the playhead is already on a
 /// cut") and the pick is still what the next `x`, `delete` or clip-menu row acts
 /// on. The clear rides the door's own answer, the way [`Player::regroup`]'s
 /// always has -- a split that happened is the other way round: the seam it
@@ -3073,14 +3213,15 @@ fn a_refused_split_keeps_the_clip_in_hand() {
 #[test]
 fn escape_with_nothing_open_empties_the_selection() {
     let actions_rs = src_text("player/actions.rs");
+    let view_rs = src_text("player/view.rs");
     assert!(
-        actions_rs.contains("ActionId::Deselect => {")
-            && actions_rs.contains("self.selected = Selection::new();"),
-        "the Deselect arm no longer clears self.selected"
+        actions_rs.contains("ActionId::Deselect => self.clear_picks(cx),")
+            && view_rs.contains("self.selected = Selection::new();"),
+        "the Deselect arm no longer clears the selection through clear_picks"
     );
     let k = keymap::Keymap::defaults();
     assert_eq!(
-        k.lookup("escape", false),
+        k.lookup("escape", false, false, false),
         Some(ActionId::Deselect),
         "bare escape must still route to Deselect for that arm to ever run"
     );
@@ -3169,4 +3310,664 @@ fn every_verb_the_spine_carried_is_a_right_click_row() {
             );
         }
     }
+}
+
+/// The first import into an empty timeline is placed on it, and that placement
+/// is one undo step: the library line that stands behind it is not. What
+/// `take_import` does for a file that lands on an empty timeline, minus the
+/// window (DESIGN §7).
+#[test]
+fn a_first_import_placed_on_an_empty_timeline_is_one_undo_step() {
+    let mut session =
+        PlaybackSession::open_library(asset("test_av.mp4")).expect("open the fixture");
+    session.set_gain(0.0);
+    assert!(
+        session.is_empty(),
+        "the library holds the file, the lanes do not"
+    );
+    let path = session.sources()[0].path.clone();
+    assert!(
+        session
+            .place_stream_at(0.0, &path, 0, None)
+            .expect("the file is on this timeline")
+    );
+    assert!(!session.is_empty());
+    assert_eq!(session.timeline_duration(), 5.0);
+    assert!(session.undo(), "the placement is an undo step");
+    assert!(session.is_empty(), "undo takes the placement back");
+    assert!(!session.undo(), "the import itself is not an undo step");
+}
+
+/// DESIGN §7's gap door, below the window: a picked hole is what Delete
+/// closes, one undo step gives it back, and an undo that takes the hole away
+/// leaves a pick that no longer names one.
+#[test]
+fn a_picked_gap_closes_in_one_undo_step_and_a_stale_pick_is_dropped() {
+    let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+    session.set_gain(0.0);
+    let path = session.sources()[0].path.clone();
+    let c0 = session.lane_clips(Lane::V1)[0].clone();
+    assert!(
+        session
+            .place_stream_at(20.0, &path, 0, None)
+            .expect("test_av.mp4 is on this timeline")
+    );
+    let c1 = session.lane_clips(Lane::V1)[1].clone();
+    let (start, frames) = (c0.end(), c1.start - c0.end());
+    assert!(
+        frames > 0,
+        "the second placement leaves a hole behind the first"
+    );
+    let pick = GapPick {
+        lane: Lane::V1,
+        start,
+        frames,
+    };
+    assert_eq!(live_gap(&session, pick), Some(pick));
+
+    // Delete's door: the same close a right-click gives, and the ripple moves
+    // the placement after the hole.
+    let scope = session
+        .gap_take_scope(Lane::V1, start, frames)
+        .expect("a scope");
+    session
+        .cut_regions(&[(start, frames)], &scope)
+        .expect("the hole closes");
+    assert_eq!(live_gap(&session, pick), None, "a closed hole is no hole");
+    assert!(session.lane_clips(Lane::V1)[1].start < c1.start);
+    assert!(session.undo(), "the close is one undo step");
+    assert_eq!(session.lane_clips(Lane::V1)[1].start, c1.start);
+    assert_eq!(live_gap(&session, pick), Some(pick));
+
+    // An undo that takes the placement away takes the hole with it.
+    assert!(session.undo(), "the placement is undoable");
+    assert_eq!(session.lane_clips(Lane::V1).len(), 1);
+    assert_eq!(live_gap(&session, pick), None);
+}
+
+/// Delete over a picked gap is live with nothing marked; the clip-only rows
+/// beside it stay refused.
+#[test]
+fn delete_is_enabled_over_a_picked_gap() {
+    let gap = Ctx {
+        gap: true,
+        timeline: true,
+        ..Ctx::default()
+    };
+    assert_eq!(enable(ActionId::Delete, gap.clone()), Enable::Yes);
+    let bare = Ctx {
+        timeline: true,
+        ..Ctx::default()
+    };
+    assert!(matches!(enable(ActionId::Delete, bare), Enable::No(_)));
+    assert!(matches!(enable(ActionId::Copy, gap), Enable::No(_)));
+}
+
+/// The ledger's gap readout: both ends as timecodes and the length in seconds.
+#[test]
+fn the_gap_readout_names_both_ends_and_the_length() {
+    assert_eq!(
+        gap_readout(100, 62, 25.0),
+        "Gap · 2.5 s · starts at 0:04"
+    );
+}
+
+/// The ledger's clip readout (DESIGN §6.9): the source's stem, the clip's
+/// first and last frame as timecodes and its length in seconds.
+#[test]
+fn the_clip_readout_names_the_source_both_ends_and_the_length() {
+    assert_eq!(
+        clip_readout("city_dusk", 0, 285, 30.0),
+        "city_dusk · 9.5 s · starts at 0:00"
+    );
+}
+
+/// The status bar's frame rate: whole rates lose their decimals, fractional
+/// ones keep two.
+#[test]
+fn the_status_bar_writes_a_frame_rate_without_trailing_zeros() {
+    assert_eq!(fps_label(30.0), "30");
+    assert_eq!(fps_label(29.97), "29.97");
+    assert_eq!(fps_label(24.0), "24");
+}
+
+/// DESIGN §7: a locked lane refuses the edits to its items, and the oracle says
+/// why in the words the toast uses. Selection, playback and the editor's own
+/// switches are not edits and stay live.
+#[test]
+fn a_locked_lane_refuses_its_edits_with_the_lock_reason() {
+    use keymap::ActionId;
+    let locked = Ctx {
+        timeline: true,
+        locked: true,
+        playable: true,
+        ..Ctx::default()
+    };
+    for edit in [
+        ActionId::Cut,
+        ActionId::Delete,
+        ActionId::Lift,
+        ActionId::Paste,
+        ActionId::Crossfade,
+        ActionId::TrimIn,
+        ActionId::Mix,
+    ] {
+        assert_eq!(
+            enable(edit, locked.clone()),
+            Enable::No("The track is locked"),
+            "{edit:?} changes a locked lane's item",
+        );
+    }
+    assert_eq!(enable(ActionId::Play, locked.clone()), Enable::Yes);
+    assert_eq!(enable(ActionId::ToggleSnap, locked.clone()), Enable::Yes);
+    // Unlocked, the same question is the one it always was: with nothing marked,
+    // Delete says there is nothing to delete, not that a lock is on.
+    let open = Ctx {
+        locked: false,
+        ..locked
+    };
+    assert_eq!(
+        enable(ActionId::Delete, open),
+        Enable::No("nothing selected")
+    );
+}
+
+/// An insert onto a locked lane is refused with the lock's own toast before it
+/// places anything. The auto-pick is the same question: with no lane named the
+/// insert writes `V1` and `A1` (or `A1` alone for a song), and the lock is asked
+/// about each of those. Needs a window to run, so the pick and the order of the
+/// door are pinned here from the source.
+#[test]
+fn an_insert_onto_a_locked_lane_is_refused_with_the_lock_reason() {
+    let picture = Path::new("/media/clip.mp4");
+    let song = Path::new("/media/song.mp3");
+    let still = Path::new("/media/still.png");
+    assert_eq!(
+        crate::Player::insert_lanes(picture, None),
+        vec![Lane::V1, Lane::A1],
+        "an unnamed picture is the grouped take on V1 and A1"
+    );
+    assert_eq!(crate::Player::insert_lanes(song, None), vec![Lane::A1]);
+    assert_eq!(crate::Player::insert_lanes(still, None), vec![Lane::V1]);
+    let v2 = Lane::new(LaneKind::Video, 1);
+    let a2 = Lane::new(LaneKind::Audio, 1);
+    assert_eq!(
+        crate::Player::insert_lanes(picture, Some(v2)),
+        vec![v2, a2],
+        "a picture named onto V2 takes its sound on A2"
+    );
+    assert_eq!(crate::Player::insert_lanes(song, Some(a2)), vec![a2]);
+
+    let body = fn_body("place_source");
+    let door = body
+        .find("lane_locked_refusal(")
+        .expect("insert_source asks the lock");
+    let place = body
+        .find("session.place_stream_at(")
+        .expect("insert_source places the stream");
+    assert!(
+        body.contains("Self::insert_lanes(path, onto)") && door < place,
+        "insert_source places the stream before it asks whether the lane is locked"
+    );
+    assert!(
+        fn_body("lane_locked_refusal").contains("is locked"),
+        "the refusal must say the lane is locked"
+    );
+}
+
+/// The lock's refusals are the Player's, and they need a window to run, so the
+/// doors are pinned by their source: each edit entry point asks the one lock
+/// helper before it touches the timeline, and the toast offers the way out.
+#[test]
+fn every_edit_door_asks_the_lock_before_it_touches_the_timeline() {
+    for func in [
+        "move_clip_now",
+        "move_sub",
+        "place_sub",
+        "lift_sub",
+        "start_trim",
+        "start_pro",
+        "cut",
+        "delete_selected",
+        "lift_selected",
+        "paste",
+        "place_source",
+    ] {
+        assert!(
+            fn_body(func).contains("lane_locked_refusal(")
+                || fn_body(func).contains("marked_locked_lane()"),
+            "{func} edits a lane without asking whether it is locked"
+        );
+    }
+    for func in ["select", "pick"] {
+        assert!(
+            fn_body(func).contains("lane_locked_refusal(target.0)"),
+            "{func} selects an item on a locked lane"
+        );
+    }
+    let stance = src_text("ui/stance.rs");
+    assert!(
+        stance.contains("ToastAction::Unlock(_) => \"Unlock\""),
+        "the locked toast has no Unlock button"
+    );
+    assert!(
+        src_text("player/actions.rs").contains("ToastAction::Unlock(lane) =>"),
+        "the Unlock button does nothing"
+    );
+}
+
+/// The inline cue editor ends on a press anywhere outside its plate, as Enter
+/// does: the root hears the press, and the plate stops its own presses from
+/// reaching it. Pinned on source, since a window is not available here.
+#[test]
+fn a_press_off_the_cue_plate_commits_the_edit_and_a_press_on_it_does_not() {
+    let root = src_text("ui/stance.rs");
+    assert!(
+        root.contains("cx.listener(Player::cue_edit_press_outside)"),
+        "the root does not commit an open cue edit on a press"
+    );
+    assert!(
+        src_text("player/timeline_edit.rs")
+            .contains("if self.cue_edit.is_some() {\n            self.commit_cue_edit(cx);"),
+        "a press outside the plate does not commit the open edit"
+    );
+    let plate = src_text("ui/bench_stance/sub.rs");
+    let start = plate
+        .find("fn cue_edit_plate(")
+        .expect("the cue edit plate");
+    assert!(
+        plate[start..].contains("cx.stop_propagation()"),
+        "the cue edit plate lets its own presses reach the root"
+    );
+}
+
+// ---- three-point edits from the library (F9 insert, F10 overwrite) ----
+
+fn ask<'a>(lanes: &'a [(Lane, bool)]) -> crate::SourceEditAsk<'a> {
+    crate::SourceEditAsk {
+        fps: 30.0,
+        lanes,
+        playhead: 60,
+        range: None,
+        marks: (None, None),
+        source: 1,
+        total: 150,
+        picture: true,
+        sound: true,
+        still: false,
+        video_patch: None,
+        audio_patch: None,
+    }
+}
+
+/// The plan reads the marks the way an editor does: the source's own in..out
+/// when marked, the whole item when not, at the playhead.
+#[test]
+fn the_plan_is_the_marked_range_at_the_playhead() {
+    let lanes = [(Lane::V1, false), (Lane::A1, false)];
+    let (at, items) = crate::plan_source_edit(&ask(&lanes)).expect("plans");
+    assert_eq!(at, 60);
+    let shape: Vec<_> = items.iter().map(|(l, c)| (*l, c.source, c.in_frame, c.out_frame)).collect();
+    assert_eq!(shape, vec![(Lane::V1, 1, 0, 150), (Lane::A1, 1, 0, 150)], "no marks: the whole item");
+    let marked = crate::SourceEditAsk { marks: (Some(1.0), Some(2.5)), ..ask(&lanes) };
+    let (_, items) = crate::plan_source_edit(&marked).expect("plans");
+    assert!(items.iter().all(|(_, c)| (c.in_frame, c.out_frame) == (30, 75)));
+    // An out mark past the file is held to its end; an in mark alone runs to the end.
+    let tail = crate::SourceEditAsk { marks: (Some(4.0), None), ..ask(&lanes) };
+    let (_, items) = crate::plan_source_edit(&tail).expect("plans");
+    assert!(items.iter().all(|(_, c)| (c.in_frame, c.out_frame) == (120, 150)));
+    let empty = crate::SourceEditAsk { marks: (Some(2.0), Some(2.0)), ..ask(&lanes) };
+    assert!(crate::plan_source_edit(&empty).is_err());
+    // The source patch sends each half to its own lane, when that lane is there.
+    let (v2, a2) = (Lane::new(LaneKind::Video, 1), Lane::new(LaneKind::Audio, 1));
+    let lanes = [(Lane::V1, false), (Lane::A1, false), (v2, false), (a2, false)];
+    let patched = crate::SourceEditAsk { video_patch: Some(v2), audio_patch: Some(a2), ..ask(&lanes) };
+    let (_, items) = crate::plan_source_edit(&patched).expect("plans");
+    let lanes_hit: Vec<_> = items.iter().map(|(l, _)| *l).collect();
+    assert_eq!(lanes_hit, vec![v2, a2]);
+}
+
+/// Classic three-point: the source's in plus the timeline's in and out. The
+/// timeline's in mark is where it lands, its length is how long; a source out
+/// mark wins the length when both are set.
+#[test]
+fn the_timeline_range_sets_where_and_how_long_when_the_source_has_no_out() {
+    let lanes = [(Lane::V1, false), (Lane::A1, false)];
+    let three = crate::SourceEditAsk { range: Some((90, 120)), marks: (Some(1.0), None), ..ask(&lanes) };
+    let (at, items) = crate::plan_source_edit(&three).expect("plans");
+    assert_eq!(at, 90);
+    assert!(items.iter().all(|(_, c)| (c.in_frame, c.out_frame) == (30, 60)));
+    let both = crate::SourceEditAsk { range: Some((90, 120)), marks: (Some(1.0), Some(3.0)), ..ask(&lanes) };
+    let (at, items) = crate::plan_source_edit(&both).expect("plans");
+    assert_eq!(at, 90);
+    assert!(items.iter().all(|(_, c)| (c.in_frame, c.out_frame) == (30, 90)));
+}
+
+/// The first unlocked lane of each kind takes its half; a sound-only item and a
+/// still take their one lane; every lane locked refuses by name.
+#[test]
+fn the_plan_picks_the_first_unlocked_lanes() {
+    let v2 = Lane::new(LaneKind::Video, 1);
+    let a2 = Lane::new(LaneKind::Audio, 1);
+    let lanes = [(Lane::V1, true), (Lane::A1, false), (v2, false), (a2, false)];
+    let (_, items) = crate::plan_source_edit(&ask(&lanes)).expect("plans");
+    assert_eq!(items.iter().map(|(l, _)| *l).collect::<Vec<_>>(), vec![v2, Lane::A1]);
+    let song = crate::SourceEditAsk { picture: false, ..ask(&lanes) };
+    let (_, items) = crate::plan_source_edit(&song).expect("plans");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].0, Lane::A1);
+    let still = crate::SourceEditAsk { picture: true, sound: false, still: true, total: 1, ..ask(&lanes) };
+    let (_, items) = crate::plan_source_edit(&still).expect("plans");
+    assert_eq!((items[0].0, items[0].1.out_frame), (v2, 150), "a still shows five seconds by default");
+    let locked = [(Lane::V1, true), (Lane::A1, true)];
+    assert!(crate::plan_source_edit(&ask(&locked)).unwrap_err().contains("locked"));
+}
+
+/// The whole chain minus the keys: plan the marked range, then the engine edit.
+/// An insert in the middle of the first take cuts and ripples it; an overwrite
+/// replaces and moves nothing; each is one undo step.
+#[test]
+fn insert_and_overwrite_run_the_plan_through_the_engine_and_undo_in_one_step() {
+    let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+    session.set_gain(0.0);
+    session.import(&asset("test_av2.mp4")).expect("av2 matches");
+    let lanes: Vec<(Lane, bool)> = [Lane::V1, Lane::A1].into_iter().map(|l| (l, false)).collect();
+    let before = (session.lane_clips(Lane::V1).to_vec(), session.lane_clips(Lane::A1).to_vec());
+    let marked = crate::SourceEditAsk {
+        playhead: 60,
+        marks: (Some(1.0), Some(2.0)),
+        total: session.file_frames(&session.sources()[1].path.clone()),
+        ..ask(&lanes)
+    };
+    let (at, items) = crate::plan_source_edit(&marked).expect("plans");
+    session
+        .edit_from_source_at(engine::SourceEdit::Insert, f64::from(at) / 30.0, &items)
+        .expect("inserts");
+    let spans = |lane| {
+        session.lane_clips(lane).iter().map(|c| (c.start, c.end(), c.source)).collect::<Vec<_>>()
+    };
+    assert_eq!(spans(Lane::V1), vec![(0, 60, 0), (60, 90, 1), (90, 180, 0)]);
+    assert_eq!(spans(Lane::A1), spans(Lane::V1), "the sound went in with the picture");
+    assert!(session.undo());
+    assert_eq!((session.lane_clips(Lane::V1).to_vec(), session.lane_clips(Lane::A1).to_vec()), before);
+    session
+        .edit_from_source_at(engine::SourceEdit::Overwrite, f64::from(at) / 30.0, &items)
+        .expect("overwrites");
+    let spans = |lane| {
+        session.lane_clips(lane).iter().map(|c| (c.start, c.end(), c.source)).collect::<Vec<_>>()
+    };
+    assert_eq!(spans(Lane::V1), vec![(0, 60, 0), (60, 90, 1), (90, 150, 0)]);
+    assert!(session.undo());
+    // A locked lane refuses with its name and costs no undo step.
+    assert!(session.set_lane_locked(Lane::A1, true));
+    let err = session
+        .edit_from_source_at(engine::SourceEdit::Insert, 2.0, &items)
+        .expect_err("A1 is locked");
+    assert!(err.to_string().contains("A1 is locked"), "{err}");
+}
+
+/// F9 and F10 are free (the comma and the period already walk the cuts), `I`
+/// and `O` mark the previewed item while one is up, and the palette and the
+/// keys card list both actions by name.
+#[test]
+fn the_source_edits_have_keys_marks_and_a_menu() {
+    let keys = keymap::Keymap::defaults();
+    assert_eq!(keys.lookup("f9", false, false, false), Some(ActionId::InsertSource));
+    assert_eq!(keys.lookup("f10", false, false, false), Some(ActionId::OverwriteSource));
+    assert_eq!(keys.lookup(".", false, false, false), Some(ActionId::WalkCutNext));
+    assert_eq!(keys.lookup(",", false, false, false), Some(ActionId::WalkCutPrev));
+    assert_eq!(ActionId::InsertSource.label(), "Insert source at playhead");
+    assert_eq!(ActionId::OverwriteSource.label(), "Overwrite source at playhead");
+    let act = source_from("pub(crate) fn act(");
+    for arm in [
+        "ActionId::SetIn if self.preview_session.is_some() => self.mark_source(true, cx)",
+        "ActionId::SetOut if self.preview_session.is_some() => self.mark_source(false, cx)",
+        "ActionId::ClearRange if self.preview_session.is_some() => self.clear_source_marks(cx)",
+        "ActionId::InsertSource => self.source_edit(engine::SourceEdit::Insert, cx)",
+        "ActionId::OverwriteSource => self.source_edit(engine::SourceEdit::Overwrite, cx)",
+    ] {
+        assert!(act.contains(arm), "act() lacks `{arm}`");
+    }
+    assert!(
+        ui_source().contains("Act(ActionId::InsertSource)")
+            && ui_source().contains("Act(ActionId::OverwriteSource)"),
+        "the Edit menu carries both"
+    );
+    let rows = keys_rows();
+    for a in [ActionId::InsertSource, ActionId::OverwriteSource] {
+        assert!(rows.iter().any(|r| matches!(r, KeyRow::Act(x) if *x == a)), "{a:?} is on the keys card");
+    }
+    assert!(fn_body("source_edit_at").contains("edit_from_source_at("));
+}
+
+/// The comment markers' doors: every one of the four actions has a stroke that is not a
+/// taken one (bare `m` is the mute and stays it), a row on the ruler's right-click menu
+/// and one in the Timeline menu, and the oracle answers them like the rest of the
+/// timeline's actions -- live with a timeline, refused without.
+#[test]
+fn the_marker_actions_have_free_keys_menu_rows_and_an_oracle_answer() {
+    use keymap::ActionId;
+    let keymap = keymap::Keymap::defaults();
+    assert_eq!(keymap.lookup("m", false, false, false), Some(ActionId::ToggleMute));
+    assert_eq!(keymap.lookup("m", false, false, true), Some(ActionId::AddMarker));
+    assert_eq!(keymap.lookup("m", false, true, false), Some(ActionId::NextMarker));
+    assert_eq!(keymap.lookup("m", true, true, false), Some(ActionId::PrevMarker));
+    assert_eq!(keymap.lookup("8", false, false, true), Some(ActionId::Markers));
+    let mut chords: Vec<String> = keymap.entries().iter().map(|b| b.chord.pretty()).collect();
+    let all = chords.len();
+    chords.sort();
+    chords.dedup();
+    assert_eq!(chords.len(), all, "a default chord is bound twice");
+    let timeline = Ctx { timeline: true, playable: true, ..Ctx::default() };
+    assert!(BENCH_ITEMS.contains(&ActionId::MarkerHere), "the ruler menu drops a marker at the frame it names");
+    for action in [ActionId::NextMarker, ActionId::PrevMarker, ActionId::Markers] {
+        assert!(BENCH_ITEMS.contains(&action), "{action:?} has no ruler menu row");
+        assert!(
+            crate::ui::menubar::Title::Timeline
+                .entries()
+                .contains(&crate::ui::menubar::Entry::Act(action)),
+            "{action:?} has no Timeline menu row"
+        );
+        assert_eq!(enable(action, timeline.clone()), Enable::Yes, "{action:?}");
+        assert!(
+            matches!(enable(action, Ctx::default()), Enable::No(_)),
+            "{action:?} needs a timeline"
+        );
+    }
+}
+
+/// Roll, slip and slide through the doors the shift-drags and the keys end at
+/// ([`Player::pro_apply`] calls exactly these): each is one undo step, the
+/// timeline keeps its length, and a gesture that moves nothing takes no step.
+#[test]
+fn roll_slip_and_slide_reach_the_engine_as_one_undoable_edit_each() {
+    let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+    session.set_gain(0.0);
+    assert!(session.cut_at(1.0) && session.cut_at(3.0));
+    let full = session.timeline_duration();
+    let spans = |s: &PlaybackSession, lane: Lane| {
+        s.lane_clips(lane)
+            .iter()
+            .map(|c| (c.start, c.end(), c.in_frame))
+            .collect::<Vec<_>>()
+    };
+    let before = spans(&session, Lane::V1);
+    let depth = session.undo_depth();
+
+    // Roll: the cut after clip 0, one detent later; the take rolls with it.
+    assert_eq!(session.roll_clip(Lane::V1, 0, 31), Some(31));
+    assert_eq!(spans(&session, Lane::V1)[..2], [(0, 31, 0), (31, 90, 31)]);
+    assert_eq!(spans(&session, Lane::A1)[..2], [(0, 31, 0), (31, 90, 31)]);
+    assert_eq!(session.undo_depth(), depth + 1);
+    assert_eq!(session.timeline_duration(), full);
+    // Pulled past the neighbour it is held a frame short of it.
+    let (_, hi) = session.roll_room(Lane::V1, 0).expect("a cut");
+    assert_eq!(session.roll_clip(Lane::V1, 0, 9_999), Some(hi));
+    assert!(session.undo() && session.undo());
+    assert_eq!(spans(&session, Lane::V1), before);
+
+    // Slip: the window moves, the slot does not.
+    let by = session.slip_source_delta(Lane::V1, 1, 5).expect("a video clip");
+    assert_eq!(by, 5);
+    assert_eq!(session.slip_clip(Lane::V1, 1, by), Some(5));
+    assert_eq!(spans(&session, Lane::V1)[1], (30, 90, 35));
+    assert_eq!(session.slip_clip(Lane::V1, 1, 0), Some(0), "nothing moved");
+    assert_eq!(session.undo_depth(), depth + 1, "and no step was taken");
+    assert!(session.undo());
+
+    // Slide: the clip moves, its neighbours give and take the frames.
+    assert_eq!(session.slide_clip(Lane::V1, 1, 40), Some(40));
+    assert_eq!(
+        spans(&session, Lane::V1),
+        [(0, 40, 0), (40, 100, 30), (100, 150, 100)]
+    );
+    assert_eq!(session.timeline_duration(), full);
+    assert_eq!(session.slide_clip(Lane::V1, 0, 5), None, "no clip before it");
+    assert!(session.undo());
+    assert_eq!(spans(&session, Lane::V1), before);
+}
+
+/// The keys and the shift-drags only land inside the engine's room: the
+/// drag's arithmetic is a clamp, never a wrap or a negative frame.
+#[test]
+fn a_pro_trim_target_is_held_inside_the_rooms_the_engine_answered() {
+    assert_eq!(crate::timeline_math::pro_target(30, 5, 1, 89), 35);
+    assert_eq!(crate::timeline_math::pro_target(30, 500, 1, 89), 89);
+    assert_eq!(crate::timeline_math::pro_target(30, -500, 1, 89), 1);
+    assert_eq!(crate::timeline_math::pro_target(0, -3, 0, 10), 0);
+}
+
+/// The oracle's answers for the six keys: a clip is needed, a still has no
+/// more footage to slip, and a locked lane refuses all of them.
+#[test]
+fn the_pro_trim_actions_need_a_clip_refuse_stills_and_obey_locks() {
+    use keymap::ActionId::*;
+    let all = [RollBack, RollForward, SlipBack, SlipForward, SlideBack, SlideForward];
+    let bare = Ctx {
+        timeline: true,
+        ..Ctx::default()
+    };
+    for action in all {
+        assert_eq!(enable(action, bare.clone()), Enable::No("no clip is selected"), "{action:?}");
+    }
+    let session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+    let clip = session.lane_clips(Lane::V1)[0].clone();
+    let on = Ctx {
+        clip: Some((clip, Lane::V1)),
+        ..bare.clone()
+    };
+    for action in all {
+        assert_eq!(enable(action, on.clone()), Enable::Yes, "{action:?}");
+        assert_eq!(
+            enable(action, Ctx { locked: true, ..on.clone() }),
+            Enable::No("The track is locked"),
+            "{action:?}"
+        );
+    }
+    let still = Ctx {
+        image: true,
+        ..on
+    };
+    assert_eq!(enable(SlipBack, still.clone()), Enable::Hidden("this clip is a still"));
+    assert_eq!(enable(SlideBack, still), Enable::Yes);
+}
+
+/// The default chords reach the six, and the shift-drags are wired where the
+/// pointer lands: the body and the edge strips route a shift press to
+/// `start_pro`, the gpui move-drag the body also starts is told to stand
+/// down, and the root follows and commits the gesture. Source pins, since a
+/// window is not available here.
+#[test]
+fn the_pro_trims_have_chords_and_shift_drags() {
+    use keymap::ActionId::*;
+    let keys = keymap::Keymap::defaults();
+    for (key, action) in [
+        ("[", RollBack),
+        ("]", RollForward),
+        (",", SlipBack),
+        (".", SlipForward),
+        ("left", SlideBack),
+        ("right", SlideForward),
+    ] {
+        assert_eq!(keys.lookup(key, false, false, true), Some(action), "alt+{key}");
+    }
+    let clip = src_text("ui/bench_stance/clip.rs");
+    assert!(clip.contains("event.modifiers.shift"), "the shift press is not read");
+    assert!(clip.contains("ProKind::Roll") && clip.contains("ProKind::Slide"));
+    assert!(fn_body("move_clip_now").contains("pro_drag.is_some()"));
+    let edit = src_text("player/timeline_edit.rs");
+    assert!(edit.contains("self.pro_to(event.position.x, cx)"));
+    assert!(edit.contains("self.commit_pro(cx)"));
+}
+
+/// The J/K/L shuttle: L and J start at 1x and double to 4x on a repeat, the
+/// other key turns round at 1x, and a stopped transport starts at 1x.
+#[test]
+fn the_shuttle_steps_one_two_four_and_turns_round_at_one() {
+    use crate::player::transport::shuttle_rate;
+    assert_eq!(shuttle_rate(true, false, 1.0), 1.0, "L from rest");
+    assert_eq!(shuttle_rate(false, false, 1.0), -1.0, "J from rest");
+    assert_eq!(shuttle_rate(true, true, 1.0), 2.0);
+    assert_eq!(shuttle_rate(true, true, 2.0), 4.0);
+    assert_eq!(shuttle_rate(true, true, 4.0), 4.0, "4x is the top");
+    assert_eq!(shuttle_rate(false, true, -1.0), -2.0);
+    assert_eq!(shuttle_rate(false, true, -2.0), -4.0);
+    assert_eq!(shuttle_rate(false, true, -4.0), -4.0);
+    assert_eq!(shuttle_rate(false, true, 2.0), -1.0, "J while forward turns round at 1x");
+    assert_eq!(shuttle_rate(true, true, -4.0), 1.0, "L while backward turns round at 1x");
+    assert_eq!(shuttle_rate(true, false, 2.0), 1.0, "a paused shuttle starts over");
+}
+
+/// Backward a picture is due once the clock has come down to its frame.
+#[test]
+fn a_backward_picture_is_due_when_the_clock_comes_down_to_it() {
+    use crate::player::transport::frame_due;
+    assert!(frame_due(10, 10.5, false) && !frame_due(11, 10.5, false));
+    assert!(frame_due(10, 10.5, true), "the frame under the clock is shown");
+    assert!(frame_due(11, 10.5, true), "...and one above it is not held back");
+    assert!(!frame_due(9, 10.5, true), "one below is still ahead of the clock");
+}
+
+/// J is a live action wherever L is.
+#[test]
+fn j_is_enabled_wherever_l_is() {
+    use keymap::ActionId;
+    let live = Ctx {
+        timeline: true,
+        playable: true,
+        ..Ctx::default()
+    };
+    assert!(enable(ActionId::ShuttleBack, live.clone()).yes());
+    assert_eq!(
+        enable(
+            ActionId::ShuttleBack,
+            Ctx {
+                playable: false,
+                ..live.clone()
+            }
+        ),
+        enable(
+            ActionId::ShuttleForward,
+            Ctx {
+                playable: false,
+                ..live
+            }
+        ),
+    );
+}
+
+#[test]
+fn sequence_actions_enable_only_where_they_can_work() {
+    let lone = Ctx { sequences: 1, timeline: true, ..Ctx::default() };
+    assert!(matches!(enable(ActionId::NewSequence, lone.clone()), Enable::Yes));
+    assert!(matches!(enable(ActionId::DeleteSequence, lone.clone()), Enable::No(_)));
+    assert!(matches!(enable(ActionId::CloseCompound, lone), Enable::No(_)));
+    let two = Ctx { sequences: 2, timeline: true, ..Ctx::default() };
+    assert!(matches!(enable(ActionId::DeleteSequence, two.clone()), Enable::Yes));
+    let used = Ctx { sequence_used: true, ..two.clone() };
+    assert!(matches!(enable(ActionId::DeleteSequence, used), Enable::No(_)));
+    let child = Ctx { parent: true, ..two };
+    assert!(matches!(enable(ActionId::CloseCompound, child), Enable::Yes));
+    assert!(matches!(enable(ActionId::NestClips, Ctx::default()), Enable::No(_)));
+    assert!(matches!(enable(ActionId::BreakApart, Ctx::default()), Enable::No(_)));
 }

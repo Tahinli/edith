@@ -44,9 +44,9 @@ type Shared = std::sync::RwLockReadGuard<'static, ()>;
 fn pin_software() -> Shared {
     let borrowed = SEAT.read().unwrap_or_else(|poisoned| poisoned.into_inner());
     static PIN: Once = Once::new();
-    PIN.call_once(|| unsafe {
-        std::env::set_var("VE_SW", "1");
-        std::env::set_var("VE_SW_ENC", "1");
+    PIN.call_once(|| {
+        engine::envcfg::set("VE_SW", "1");
+        engine::envcfg::set("VE_SW_ENC", "1");
     });
     borrowed
 }
@@ -292,6 +292,68 @@ fn a_turn_that_is_not_a_quarter_turn_is_refused_by_name() {
             "{file}: the refusal names the angle it cannot make: {said}"
         );
     }
+}
+
+/// The number a refusal states, as the sentence spells it: the text between
+/// "matrix of " and the degree sign.
+fn stated_degrees(said: &str) -> String {
+    let start = said.find("matrix of ").expect("the refusal states an angle") + "matrix of ".len();
+    let end = start + said[start..].find('°').expect("the angle is followed by a degree sign");
+    said[start..end].to_string()
+}
+
+/// The `rotation` side data ffprobe reports for the file's video track: the
+/// counter-clockwise angle, in ffprobe's own sign.
+fn ffprobe_rotation_degrees(path: &Path) -> f64 {
+    let out = std::process::Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "side_data=rotation",
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(path)
+        .output()
+        .expect("ffprobe runs");
+    assert!(out.status.success(), "ffprobe reads {}", path.display());
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .expect("ffprobe states a rotation for a turned file")
+        .parse()
+        .expect("ffprobe's rotation is a number")
+}
+
+/// The refused angle is stated in the same convention for both containers, and
+/// that convention is ffprobe's: a 45-degree matrix in an mp4 and the same turn
+/// as an mkv roll both say `45.0`, the counter-clockwise angle ffprobe reports
+/// for each (`-atan2(b, a)` on the mp4 side, the roll itself on the mkv side).
+#[test]
+fn a_refused_angle_states_ffprobes_counter_clockwise_sign_in_both_containers() {
+    let mut stated = Vec::new();
+    for file in ["test_rotation45.mp4", "test_rotation45.mkv"] {
+        let error = match engine::demux::Demuxer::open(&asset(file)) {
+            Ok(_) => panic!("45 degrees is not a quarter turn, and opening {file} must not succeed"),
+            Err(error) => error,
+        };
+        let text = stated_degrees(&error.to_string());
+        let ffprobe = ffprobe_rotation_degrees(&asset(file));
+        assert_eq!(
+            text,
+            format!("{ffprobe:.1}"),
+            "{file}: the angle it states is ffprobe's rotation, sign and all"
+        );
+        stated.push(text);
+    }
+    assert_eq!(
+        stated[0], stated[1],
+        "the mp4 and mkv twins state the same angle for the same turn"
+    );
 }
 
 /// A rotated file whose *coded* height and *displayed* height sit on opposite

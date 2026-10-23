@@ -60,6 +60,7 @@ fn main() {
     let path = PathBuf::from(args.next().unwrap_or_else(|| usage()));
     match metric.as_str() {
         "open" => open_bench(&path),
+        "stabilise" => stabilise_bench(&path),
         "seek" => seek_bench(&path, arg_f64(args.next(), "seconds")),
         "seekstorm" => seekstorm_bench(&path, arg_seed(args.next())),
         "playloop" => playloop_bench(&path, arg_f64(args.next(), "seconds"), arg_seed(args.next())),
@@ -86,10 +87,22 @@ fn usage() -> ! {
          bench seekstorm <file> [seed]\n       \
          bench playloop <file> <secs> [seed]\n       \
          bench cutloop <file> [regions=20] [keep_s=0.5] [cut_s=0.3]\n       \
-         bench scrub <file>\n       bench waveform <file>\n       \
+         bench scrub <file>\n       bench waveform <file>\n       bench stabilise <file>\n       \
          bench export <file> <h264sw|h264hw|av1|hevc|hevchw> <out_dir>"
     );
     std::process::exit(2)
+}
+
+/// The shake analysis of the whole file, as an export of a stabilised clip with
+/// no cached analysis runs it: frames a second, decode included.
+fn stabilise_bench(path: &Path) {
+    let frames = engine::demux::Demuxer::open(path).expect("opens").0.frame_count;
+    let (progress, cancel) = (Default::default(), Default::default());
+    let t = Instant::now();
+    let track = engine::stabilise::analyse(path, 0, frames, &progress, &cancel).expect("analysed");
+    let secs = t.elapsed().as_secs_f64();
+    let (w, h) = (track.w, track.h);
+    println!("stabilise analysis: {frames} frames of {w}x{h} in {secs:.2} s = {:.1} fps", f64::from(frames) / secs);
 }
 
 fn arg_f64(arg: Option<String>, what: &str) -> f64 {
@@ -860,11 +873,23 @@ fn export_bench(path: &Path, seat: &str, out_dir: &Path) {
         .min(meta.frame_count.max(1));
     let in_frame = (meta.frame_count / 10).min(meta.frame_count.saturating_sub(span));
     let clip = Clip {
+        speed_keys: Vec::new(),
+        reversed: false,
+        stabilise: None, deinterlace: Default::default(), mark: Default::default(),
+        angle: Default::default(),
         fade_in: 0,
         fade_out: 0,
         transition_out: 0,
+        transition_kind: Default::default(),
         visualizer: 0,
         viz_paint: 0,
+        gain_db: 0.0,
+        gain_keys: Vec::new(),
+        pan: 0,
+        transform_keys: Vec::new(),
+        opacity_keys: Vec::new(),
+        color_keys: Vec::new(),
+        effects: Vec::new(),
         start: 0,
         in_frame,
         out_frame: in_frame + span,
@@ -875,12 +900,13 @@ fn export_bench(path: &Path, seat: &str, out_dir: &Path) {
         fit: engine::scale::FitPolicy::default(),
         speed: Speed::NORMAL,
         transform: None,
+        pitch: 0,
     };
     // The sound, where it was asked for, is the same clip on an audio lane:
     // the very window the picture covers, so the two passes measure one export.
     let mut lanes = vec![(LaneKind::Video, vec![clip.clone()])];
     if with_audio {
-        lanes.push((LaneKind::Audio, vec![clip]));
+        lanes.push((LaneKind::Audio, vec![clip.clone()]));
     }
     let stream = env_f64("BENCH_EXPORT_ASTREAM", 0.0) as usize;
     let project = match Project::from_parts(

@@ -3,18 +3,22 @@ name = "engine-hw"
 version.workspace = true
 edition.workspace = true
 
-# cdylib only: this is the one artifact allowed to link libva/gbm/drm. The app
-# dlopens it and keeps working when it is missing.
+# The hardware child. This package is the one allowed to link libva/drm, and
+# it is never linked into the editor: `hw-child` is a binary the editor spawns
+# next to its own executable, and the editor keeps working without it.
 [lib]
 name = "engine_hw"
-crate-type = ["cdylib"]
+# No runnable doc examples; skip the rustdoc test pass.
+doctest = false
+
+[[bin]]
+name = "hw-child"
+path = "src/bin/hw-child.rs"
 
 [dependencies]
 engine = { path = "../engine" }
-cros-codecs = { version = "0.0.6", features = ["vaapi"] }
-# Same version cros-codecs already pulls in; we allocate output frames ourselves.
-gbm = { version = "0.15", default-features = false, features = ["drm-support"] }
-# The software VP8 seat, this project's own (`ec-vp8`, RFC 6386): linked in
-# as ordinary Rust, the one codec with no runtime dlopen behind it -- the
-# `libloading` the old libvpx FFI needed is gone with the FFI.
+# The decode seat: ec-hw drives the VA-API decoders, ec-va the display under it.
+ec-hw = { path = "../../../edith_codecs/crates/ec-hw" }
+ec-va = { path = "../../../edith_codecs/crates/ec-va" }
+# The software VP8 seat, this project's own (`ec-vp8`, RFC 6386).
 ec-vp8 = { path = "../../../edith_codecs/crates/ec-vp8" }

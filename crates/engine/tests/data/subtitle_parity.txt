@@ -1,0 +1,43 @@
+test_subs.srt: 3 cues
+  500000 1500000 "first line"
+  2000000 3250000 "second line\nwith a break"
+  4000000 4750000 "third line"
+test_subs.ass: 3 cues
+  500000 1500000 "first line"
+  2000000 3250000 "second line\nwith a break"
+  4000000 4750000 "third line"
+inline.vtt: 2 cues
+  1000000 2500000 "Hello there"
+  3000000 4000000 "second\nline"
+inline.ass: 2 cues
+  1000000 2000000 "top slant\nnext"
+  3000000 4000000 "plain bold"
+inline.srt: 1 cues
+  1000000 2000000 "tilted and red\nsecond"
+test_subs.mkv track 2 S_TEXT/UTF8: 3 cues
+  500000 1500000 "first line"
+  2000000 3250000 "second line\nwith a break"
+  4000000 4750000 "third line"
+test_subs.mkv track 3 S_TEXT/ASS: 3 cues
+  500000 1500000 "first line"
+  2000000 3250000 "second line\nwith a break"
+  4000000 4750000 "third line"
+test_subs.mks track 1 S_TEXT/UTF8: 3 cues
+  500000 1500000 "first line"
+  2000000 3250000 "second line\nwith a break"
+  4000000 4750000 "third line"
+test_subs.mks track 2 S_TEXT/ASS: 3 cues
+  500000 1500000 "first line"
+  2000000 3250000 "second line\nwith a break"
+  4000000 4750000 "third line"
+test_subs_bcp47.mkv track 2 S_TEXT/UTF8: 3 cues
+  500000 1500000 "first line"
+  2000000 3250000 "second line\nwith a break"
+  4000000 4750000 "third line"
+test_subs_bcp47.mkv track 3 S_TEXT/ASS: 3 cues
+  500000 1500000 "first line"
+  2000000 3250000 "second line\nwith a break"
+  4000000 4750000 "third line"
+pgs.mkv track 1 S_HDMV/PGS: 1 cues
+  500000 2000000 ""
+  image 8x4 set acf32c6083e1900f canvas fnv 3a4cc8070e143b65 lit 4

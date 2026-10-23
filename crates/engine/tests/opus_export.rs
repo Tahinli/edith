@@ -60,9 +60,9 @@ fn out_path(name: &str) -> Scratch {
 
 fn pin_software() {
     static PIN: Once = Once::new();
-    PIN.call_once(|| unsafe {
-        std::env::set_var("VE_SW", "1");
-        std::env::set_var("VE_SW_ENC", "1");
+    PIN.call_once(|| {
+        engine::envcfg::set("VE_SW", "1");
+        engine::envcfg::set("VE_SW_ENC", "1");
     });
 }
 
@@ -82,11 +82,24 @@ fn wait(handle: &ExportHandle, limit: Duration) -> engine::Result<()> {
 /// `sound_in` seconds into that file: an edit, so nothing here can be a copy.
 fn project(video: &Path, sound: &Path, sound_in: u32) -> Project {
     let clip = |source, in_frame, out_frame| Clip {
+        speed_keys: Vec::new(),
+        reversed: false,
+        stabilise: None, deinterlace: Default::default(), mark: Default::default(),
+        angle: Default::default(),
         fade_in: 0,
         fade_out: 0,
         transition_out: 0,
+        transition_kind: Default::default(),
         visualizer: 0,
         viz_paint: 0,
+        gain_db: 0.0,
+        gain_keys: Vec::new(),
+        pan: 0,
+        pitch: 0,
+        transform_keys: Vec::new(),
+        opacity_keys: Vec::new(),
+        color_keys: Vec::new(),
+        effects: Vec::new(),
         start: 0,
         in_frame,
         out_frame,
@@ -442,7 +455,7 @@ fn ffmpeg_decode(path: &Path) -> Option<Vec<f32>> {
     );
     Some(
         out.stdout
-            .chunks_exact(4)
+            .as_chunks::<4>().0.iter()
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect(),
     )
@@ -468,11 +481,24 @@ fn a_copied_picture_names_the_sound_it_was_written_with() {
     let (meta, _) = engine::demux::Demuxer::open(&video).expect("probe the picture");
     let frames = meta.frame_count;
     let clip = |source, out_frame| Clip {
+        speed_keys: Vec::new(),
+        reversed: false,
+        stabilise: None, deinterlace: Default::default(), mark: Default::default(),
+        angle: Default::default(),
         fade_in: 0,
         fade_out: 0,
         transition_out: 0,
+        transition_kind: Default::default(),
         visualizer: 0,
         viz_paint: 0,
+        gain_db: 0.0,
+        gain_keys: Vec::new(),
+        pan: 0,
+        pitch: 0,
+        transform_keys: Vec::new(),
+        opacity_keys: Vec::new(),
+        color_keys: Vec::new(),
+        effects: Vec::new(),
         start: 0,
         in_frame: 0,
         out_frame,

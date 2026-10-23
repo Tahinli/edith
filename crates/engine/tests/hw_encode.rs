@@ -13,6 +13,9 @@
 //! session plumbing cannot cancel out a plugin bug; the independent witness for
 //! the stream's well-formedness is ffmpeg, in the export suite.
 
+#[path = "support/hwchild.rs"]
+mod hwchild;
+
 use std::time::{Duration, Instant};
 
 use engine::hw::{HwEncoder, HwPicture, HwSession};
@@ -164,6 +167,7 @@ fn mean_abs_diff(a: &[u8], b: &[u8]) -> f64 {
 #[test]
 #[ignore]
 fn round_trips_sixty_frames() {
+    hwchild::require();
     let (width, height) = (1280u32, 720u32);
     let (stream, units) =
         encode(width, height, 60).expect("no hardware encode plugin/driver available");
@@ -206,6 +210,7 @@ fn round_trips_sixty_frames() {
 #[test]
 #[ignore]
 fn round_trips_unaligned_dimensions() {
+    hwchild::require();
     let (width, height) = (322u32, 242u32);
     let Some((stream, units)) = encode(width, height, 10) else {
         println!("driver refused {width}x{height}, software encode would take over -- skipping");
@@ -238,6 +243,7 @@ fn round_trips_unaligned_dimensions() {
 #[test]
 #[ignore = "needs libengine_hw.so and a VA-API driver with H.264 decode and encode"]
 fn a_decoded_buffer_is_encoded_without_ever_being_read_back() {
+    hwchild::require();
     const FRAMES: usize = 24;
     let asset =
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets/test_baseline.mp4");
@@ -314,17 +320,16 @@ fn a_decoded_buffer_is_encoded_without_ever_being_read_back() {
 #[test]
 #[ignore = "needs libengine_hw.so and a VA-API driver with an H.264 encode entrypoint"]
 fn isolating_the_encoder_costs_little_at_1080p() {
+    hwchild::require();
     const FRAMES: u32 = 60;
     let (width, height) = (1920u32, 1080u32);
     let mut spent = Vec::new();
     for inprocess in [true, false] {
-        // SAFETY-of-a-sort: the ignored run is `--test-threads=1`, which is
-        // what this file's own header already requires of its env pins.
-        unsafe {
-            match inprocess {
-                true => std::env::set_var("VE_HW_INPROCESS", "1"),
-                false => std::env::remove_var("VE_HW_INPROCESS"),
-            }
+        // The ignored run is `--test-threads=1`, which is what this file's own
+        // header already requires of its env pins.
+        match inprocess {
+            true => engine::envcfg::set("VE_HW_INPROCESS", "1"),
+            false => engine::envcfg::unset("VE_HW_INPROCESS"),
         }
         let started = Instant::now();
         let Some((_, units)) = encode(width, height, FRAMES) else {
@@ -357,6 +362,7 @@ fn isolating_the_encoder_costs_little_at_1080p() {
 #[test]
 #[ignore]
 fn decode_and_encode_load_independently() {
+    hwchild::require();
     let asset =
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets/test_baseline.mp4");
     assert!(
@@ -369,11 +375,14 @@ fn decode_and_encode_load_independently() {
     assert!(HwEncoder::open(640, 480, FPS, 1, BITRATE).is_some());
 }
 
+/// Per slice: `(is_idr, frame_num, pic_order_cnt_lsb)`, read by [`slice_counters`].
+type SliceCounters = Vec<(bool, u32, Option<u32>)>;
+
 /// Walks the Annex B stream and reads, per slice, `(is_idr, frame_num,
 /// pic_order_cnt_lsb)`, plus the SPS `level_idc`. Main profile, POC type 0 and
 /// frame_mbs_only -- the SPS the vendored encoder writes -- is all this reads;
 /// the test fails loudly on anything else rather than guessing.
-fn slice_counters(stream: &[u8]) -> (u8, Vec<(bool, u32, u32)>) {
+fn slice_counters(stream: &[u8]) -> (u8, u32, SliceCounters) {
     struct Bits<'a>(&'a [u8], usize);
     impl Bits<'_> {
         fn bit(&mut self) -> u32 {
@@ -431,8 +440,14 @@ fn slice_counters(stream: &[u8]) -> (u8, Vec<(bool, u32, u32)>) {
                 level = b.bits(8) as u8;
                 b.ue();
                 log2_fn = b.ue() + 4;
-                assert_eq!(b.ue(), 0, "pic_order_cnt_type 0 expected");
-                log2_poc = b.ue() + 4;
+                // Type 0 carries `pic_order_cnt_lsb` in every slice; type 2 derives
+                // the order from `frame_num` (legal without B-frames) and carries
+                // no lsb at all, which is what ec-hw writes.
+                match b.ue() {
+                    0 => log2_poc = b.ue() + 4,
+                    2 => log2_poc = 0,
+                    other => panic!("pic_order_cnt_type {other} is not one this encoder writes"),
+                }
             }
             1 | 5 => {
                 assert!(log2_fn > 0, "slice before any SPS");
@@ -443,12 +458,13 @@ fn slice_counters(stream: &[u8]) -> (u8, Vec<(bool, u32, u32)>) {
                 if kind == 5 {
                     b.ue();
                 }
-                out.push((kind == 5, frame_num, b.bits(log2_poc)));
+                let poc = (log2_poc > 0).then(|| b.bits(log2_poc));
+                out.push((kind == 5, frame_num, poc));
             }
             _ => {}
         }
     }
-    (level, out)
+    (level, 1 << log2_fn, out)
 }
 
 /// The driver on this box writes `frame_num = 0` and `pic_order_cnt_lsb = 0`
@@ -462,6 +478,7 @@ fn slice_counters(stream: &[u8]) -> (u8, Vec<(bool, u32, u32)>) {
 #[test]
 #[ignore = "needs libengine_hw.so and a VA-API driver with an H.264 encode entrypoint"]
 fn slice_headers_carry_frame_num_and_poc() {
+    hwchild::require();
     let (width, height) = (1920u32, 1080u32);
     let count = 100; // a 2 s GOP at 30 fps is 60: two IDRs, frame_num wraps at 32
     let (stream, units) =
@@ -471,7 +488,7 @@ fn slice_headers_carry_frame_num_and_poc() {
         std::fs::write(&path, &stream).expect("dump");
         println!("stream written to {path}");
     }
-    let (level, slices) = slice_counters(&stream);
+    let (level, max_frame_num, slices) = slice_counters(&stream);
     assert_eq!(level, 40, "1920x1080 at 30 fps is level 4.0");
     assert_eq!(slices.len() as u32, count, "one slice per picture");
     let idrs: Vec<usize> = slices
@@ -486,8 +503,12 @@ fn slice_headers_carry_frame_num_and_poc() {
         if idr {
             since_idr = 0;
         }
-        assert_eq!(frame_num, since_idr % 32, "slice {i} frame_num");
-        assert_eq!(poc, (since_idr * 2) % 64, "slice {i} pic_order_cnt_lsb");
+        // The modulus is the SPS's own: the encoder picks it, and it need not be 32.
+        assert_eq!(frame_num, since_idr % max_frame_num, "slice {i} frame_num");
+        // Type 2 has no lsb to check: its order is the frame_num's, checked above.
+        if let Some(poc) = poc {
+            assert_eq!(poc, (since_idr * 2) % 64, "slice {i} pic_order_cnt_lsb");
+        }
         since_idr += 1;
     }
     let distinct: std::collections::BTreeSet<u32> = slices.iter().map(|s| s.1).collect();

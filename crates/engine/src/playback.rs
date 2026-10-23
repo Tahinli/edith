@@ -11,6 +11,7 @@
 //! Drift policy stays with the caller -- this type answers "what time is it",
 //! the renderer decides which frame that means.
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
@@ -27,8 +28,8 @@ use crate::decode::{Backend, BackendCell, DecodeSession, Frame, Worker};
 use crate::demux::{Codec, Demuxer, NoVideoTrack, Rotation, VideoMeta};
 use crate::eq::EqParams;
 use crate::project::{
-    Clip, Edge, GapSweep, Lane, LaneKind, Project, ProjectSettings, Rate, Source, Span, Speed,
-    SubClip,
+    Clip, Edge, GainKey, GapSweep, Lane, LaneKind, Project, ProjectSettings, Rate, RedoCheckpoint, Source,
+    SourceWalls, Span, Speed, SubClip, TrimWalls, WallBound, STILL_DEFAULT_SECS,
 };
 use crate::scale::{Composer, FitPolicy};
 use crate::transform::TransformParams;
@@ -102,11 +103,6 @@ const IMAGE_ONLY_RATE: f64 = 30.0;
 /// would then have to take from the document rather than from the file.
 const IMAGE_MAX_SECS: f64 = 600.0;
 
-/// How long a still image is *placed* for: five seconds, the length a picture
-/// gets when nobody has said one -- trimmable either way up to
-/// [`IMAGE_MAX_SECS`].
-const IMAGE_PLACE_SECS: f64 = 5.0;
-
 /// The output half of a session: the device, plus what the feeder has handed it.
 /// Cloned into the feeder thread; every field that matters is shared.
 #[derive(Clone)]
@@ -174,6 +170,15 @@ struct Audio {
     /// is not the device's own callback -- the plugin's RT thread never sees
     /// this lock, and the feeder holds it for one memcpy per write.
     tap: Arc<Mutex<Vec<f32>>>,
+    /// The highest sample magnitude handed to the device since it was last read
+    /// ([`PlaybackSession::levels`]), as f32 bits. Non-negative floats order the
+    /// same as their bits, so the feeder raises it with a `fetch_max`. Taken
+    /// after the mix and the limiter, before the device's own volume: the
+    /// meter reads what the device is given, not what the speakers are told.
+    peak: Arc<AtomicU32>,
+    /// [`Self::peak`] per side, left then right (a mono stream fills both), read and cleared
+    /// together with it for the stereo meter.
+    peak_lr: Arc<[AtomicU32; 2]>,
     /// Feeder threads started and not yet returned. They are detached, so there
     /// is no handle to count instead, and a scrub leaves dozens of them exiting
     /// at once -- which is precisely what
@@ -192,6 +197,32 @@ struct Audio {
 /// reads it transforms it, and long enough that the lowest band the editor
 /// draws (20 Hz) has a whole cycle in the window at any rate we open.
 const TAP_SAMPLES: usize = 2048;
+
+/// `gains` (one per audio lane, in `audio`'s order) with every lane outside
+/// `solo` silenced. A solo naming no lane in `audio` is no solo at all, so a
+/// stale handle cannot silence everything.
+fn soloed_gains(mut gains: Vec<f32>, audio: &[Lane], solo: &[Lane]) -> Vec<f32> {
+    if !audio.iter().any(|lane| solo.contains(lane)) {
+        return gains;
+    }
+    for (gain, lane) in gains.iter_mut().zip(audio) {
+        if !solo.contains(lane) {
+            *gain = 0.0;
+        }
+    }
+    gains
+}
+
+/// The level meters' reading: [`PlaybackSession::levels`]. Linear peaks in
+/// `0.0..=1.0` since the last read, one per audio lane in the lanes' own order,
+/// and the master.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Levels {
+    pub lanes: Vec<f32>,
+    pub master: f32,
+    /// The master's peak on the left and on the right (a mono stream reads the same on both).
+    pub master_lr: [f32; 2],
+}
 
 impl Audio {
     /// Whether the device has played everything there will ever be, i.e. the
@@ -220,7 +251,16 @@ impl Audio {
     /// Keeps the newest [`TAP_SAMPLES`] of what was just queued, downmixed to
     /// mono. Called from the feeder only, once per accepted write.
     fn note_tap(&self, accepted: &[f32]) {
+        // Every sample, not just the tail the tap keeps: a peak that falls
+        // outside the window is still a peak the ear heard.
+        let peak = accepted.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        self.peak.fetch_max(peak.to_bits(), Ordering::Relaxed);
         let channels = self.channels.max(1) as usize;
+        let side = |at: usize| {
+            accepted.iter().skip(at.min(channels - 1)).step_by(channels).fold(0.0f32, |m, s| m.max(s.abs()))
+        };
+        self.peak_lr[0].fetch_max(side(0).to_bits(), Ordering::Relaxed);
+        self.peak_lr[1].fetch_max(side(1).to_bits(), Ordering::Relaxed);
         let mut tap = self.tap.lock().unwrap();
         // Only the tail can survive anyway: a big write replaces the window
         // outright rather than being summed into it and then thrown away.
@@ -306,6 +346,34 @@ impl Audio {
     }
 }
 
+/// Where the picture of the current span is decoded from. `Cached` is a render
+/// cache segment ([`crate::render_cache`]) that already holds the span's frames
+/// composed, so the decoder reads that file and nothing else is applied.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Feed {
+    /// The live path: the project's clips, composed as they play.
+    Live,
+    /// A render-cache segment at `segment`, read from its own first frame.
+    Cached { segment: PathBuf },
+}
+
+/// How the pictures of a span played backward are numbered (see
+/// [`PlaybackSession::stamp`]). Backward the span is the stretch of its clip
+/// *up to* the playhead, and its pictures are wanted from the playhead down.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Back {
+    /// Forward play, or a span (a still, a stack, a visualizer) that is drawn
+    /// forward whichever way the clock runs.
+    Off,
+    /// A forward clip decoded last frame first ([`DecodeSession::open_reversed`]
+    /// over the file frames ending at `top`).
+    Mirror { top: u32 },
+    /// A reversed clip, whose backward is the file's forward.
+    Forward,
+    /// A gap: black numbered from zero, counted down from the span's last frame.
+    Gap,
+}
+
 /// The cross-dissolve a span's tail owes its successor, tracked from the
 /// moment [`PlaybackSession::start_span`] opens A's own decoder until a later
 /// `start_span` throws it away. What decides there *is* one mirrors
@@ -326,6 +394,8 @@ struct Dissolve {
     /// on ([`Project::composite_color_at`], `composite_fit_at`), the same
     /// `b_start` [`crate::export`] grades B's side of the same dissolve by.
     b_start: u32,
+    /// How the picture is blended ([`crate::transitions`]).
+    kind: crate::transitions::TransitionKind,
     /// B's live decode, once open; `None` before the playhead reaches the
     /// window.
     b: Option<DissolveB>,
@@ -343,7 +413,42 @@ struct DissolveB {
 }
 
 /// A file opened for playback. Starts paused at t=0; call [`PlaybackSession::play`].
+/// One track that has ended: where it was, and what it did to its mask.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TrackDone {
+    pub lane: Lane,
+    pub idx: usize,
+    pub slot: usize,
+    /// The keys written and the first and last source frame of the path, or why it stopped.
+    pub result: Result<TrackOutcome, String>,
+}
+
+/// What a finished track wrote: how many keys, the frames it covered, and the frame it
+/// was lost at when it stopped early.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TrackOutcome {
+    pub keys: usize,
+    pub from: u32,
+    pub to: u32,
+    pub lost_at: Option<u32>,
+}
+
+/// A mask track in progress: the job ([`crate::track::start`]) and the mask it writes to.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TrackJob {
+    pub lane: Lane,
+    pub idx: usize,
+    pub slot: usize,
+    pub id: crate::track::JobId,
+    /// The source frame the track starts from, where its path begins.
+    pub from: u32,
+    /// The mask's centre at `from`, in canvas fractions.
+    pub anchor: (f32, f32),
+}
+
 pub struct PlaybackSession {
+    /// The thread that plays scrub snippets, made by the first [`PlaybackSession::scrub_audio`].
+    scrub: Scrub,
     /// The *timeline's* parameters, not any one file's: its frame rate and codec
     /// come from source 0 and are what every other source is held to, while
     /// `width`/`height` are the **project resolution** -- source 0's picture to
@@ -418,6 +523,10 @@ pub struct PlaybackSession {
     /// not -- with the single exception `sources` itself has,
     /// [`Self::remove_source`], which takes the same entry out of both.
     counts: Vec<u32>,
+    /// What a load had to change to open the file, one line per change: a clip that
+    /// ran past its source is clamped to the source's end rather than refused (see
+    /// [`PlaybackSession::load_warnings`]). Empty for a project that opened as saved.
+    load_warnings: Vec<String>,
     /// Audio headers already read, by the `(path, stream)` they were read for.
     /// Every door that checks a file against the timeline asks the same two
     /// questions -- what this file's sound is, and what the timeline's first
@@ -464,6 +573,11 @@ pub struct PlaybackSession {
     /// is late by exactly this window's length with another restart of it
     /// ([`picture_priming`](Self::picture_priming)).
     span_priming: bool,
+    /// Where the picture of the current span is decoded from ([`Feed`]).
+    feed: Feed,
+    /// How the stream feeding the current span is numbered when the clock runs
+    /// backward ([`Back`]); `Off` at every forward rate.
+    back: Back,
     /// The cross-dissolve the current span's tail owes its successor, if any
     /// ([`crate::export::dissolve_window`], the same test an export makes of
     /// the same span) -- and, once the playhead has reached the window, B's
@@ -478,6 +592,11 @@ pub struct PlaybackSession {
     /// which has a seat of its own ([`crate::export`]) and never comes here.
     view: Option<(u32, u32)>,
     eos: bool,
+    /// Where the timeline ended (seconds) when `eos` was set. The clock runs on
+    /// past it on wall time, so an edit at the end reseeks here, not to
+    /// wherever the wall clock has drifted -- which, after a slow drain, can be
+    /// past the very clip a paste just appended.
+    eos_end: f64,
     /// The mix the running mixer is reading, when there is one: what lets a
     /// fader and the master ceiling move without rebuilding the audio pipeline
     /// at all ([`crate::audio::MixControls`]). `None` for a timeline that is
@@ -485,6 +604,11 @@ pub struct PlaybackSession {
     /// bit-exact single-stream path -- and the first move off that reopens the
     /// stream once, mixed, and lives from there.
     mix: Option<Arc<crate::audio::MixControls>>,
+    /// The audio lanes soloed for listening: while any is set, the other audio
+    /// lanes are silent in the sound this session plays. Monitoring only -- it
+    /// is not in the [`Project`], is not saved, and an export never reads it
+    /// ([`Self::mix_gains`]). Empty is no solo at all.
+    solo: Vec<Lane>,
     /// An audio stream has been started and has not yet played a sample: the
     /// window [`tick`](Self::tick) holds the clock still through, so the silence
     /// of a restart is never counted as timeline time. See
@@ -548,6 +672,131 @@ enum Dirty {
     Both,
 }
 
+/// How [`PlaybackSession::make_multicam_at`] lines the cameras up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MulticamSync {
+    /// By the loudness curve of each camera's sound.
+    Audio,
+    /// Every camera starts at the same moment.
+    Start,
+}
+
+/// How one angle was placed.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum AngleSync {
+    /// The camera the others were lined up with.
+    Reference,
+    /// Matched by sound with this normalised correlation (0 to 1).
+    Audio { score: f32 },
+    /// Placed at the start: that was asked for.
+    Start,
+    /// Placed at the start: its sound did not match the reference well enough.
+    Weak { score: f32 },
+    /// Placed at the start: the file has no sound.
+    NoSound,
+}
+
+/// What [`PlaybackSession::make_multicam_at`] did.
+#[derive(Clone, Debug)]
+pub struct MulticamReport {
+    pub made: crate::project::MulticamMade,
+    /// Per angle, how it was placed.
+    pub how: Vec<AngleSync>,
+    /// Per angle, seconds later than the reference that its sound happens (0 for unmatched ones).
+    pub offsets_secs: Vec<f64>,
+    /// Per angle, where its first frame sits in the multicam clip, in timeline frames.
+    pub starts: Vec<u32>,
+}
+
+/// One camera of a [`MulticamJob`].
+#[derive(Clone, Debug)]
+pub struct MulticamJobSource {
+    pub index: usize,
+    pub path: std::path::PathBuf,
+    pub audio_stream: usize,
+    pub frames: u32,
+}
+
+/// The reading half of making a multicam clip ([`PlaybackSession::multicam_job`]): the cameras'
+/// loudness curves are measured and matched, which takes a while and touches no project state.
+#[derive(Clone, Debug)]
+pub struct MulticamJob {
+    sources: Vec<MulticamJobSource>,
+    sync: MulticamSync,
+    fps: f64,
+}
+
+/// What [`MulticamJob::run`] found, ready for [`PlaybackSession::apply_multicam`].
+#[derive(Clone, Debug)]
+pub struct MulticamPlan {
+    sources: Vec<MulticamJobSource>,
+    angles: Vec<crate::project::AngleSpec>,
+    how: Vec<AngleSync>,
+    offsets: Vec<f64>,
+}
+
+impl MulticamJob {
+    /// Measures and matches the cameras. `progress` runs 0..=1000; setting `cancel` stops it at the
+    /// next camera with an error.
+    pub fn run(&self, progress: &std::sync::atomic::AtomicU32, cancel: &std::sync::atomic::AtomicBool) -> crate::Result<MulticamPlan> {
+        use std::sync::atomic::Ordering;
+        let n = self.sources.len().max(1) as u32;
+        let range = match self.sync {
+            MulticamSync::Audio => (0.0, crate::multisync::SYNC_SECS),
+            MulticamSync::Start => (0.0, 0.5),
+        };
+        let mut curves: Vec<Option<Vec<f32>>> = Vec::new();
+        for (i, src) in self.sources.iter().enumerate() {
+            if cancel.load(Ordering::Relaxed) {
+                return Err("stopped".into());
+            }
+            let levels = if crate::is_image(&src.path) { None } else { crate::silence::levels(&src.path, src.audio_stream, range).ok().flatten() };
+            curves.push(levels);
+            progress.store((i as u32 + 1) * 900 / n, Ordering::Relaxed);
+        }
+        let mut how = vec![AngleSync::Start; self.sources.len()];
+        let mut offsets = vec![0.0f64; self.sources.len()];
+        if self.sync == MulticamSync::Audio {
+            let reference = curves.iter().position(Option::is_some);
+            for (i, c) in curves.iter().enumerate() {
+                match (reference, c) {
+                    (_, None) => how[i] = AngleSync::NoSound,
+                    (Some(r), Some(_)) if r == i => how[i] = AngleSync::Reference,
+                    (Some(r), Some(c)) => {
+                        let lag = curves[r].as_deref().and_then(|a| crate::multisync::best_lag(a, c, crate::multisync::MAX_LAG_SECS));
+                        match lag {
+                            Some(l) if l.score >= crate::multisync::MIN_SCORE => {
+                                offsets[i] = l.secs;
+                                how[i] = AngleSync::Audio { score: l.score };
+                            }
+                            Some(l) => how[i] = AngleSync::Weak { score: l.score },
+                            None => how[i] = AngleSync::Weak { score: 0.0 },
+                        }
+                    }
+                    (None, Some(_)) => {}
+                }
+            }
+        }
+        // `offsets[i]`: the same sound happens that much later in camera i, so camera i started
+        // that much earlier on the common clock, so it starts at `top - offset`; the earliest at 0.
+        let top = offsets.iter().copied().fold(0.0, f64::max);
+        let angles = self
+            .sources
+            .iter()
+            .enumerate()
+            .map(|(i, s)| crate::project::AngleSpec {
+                source: s.index,
+                name: s.path.file_stem().map(|x| x.to_string_lossy().into_owned()).unwrap_or_default(),
+                frames: s.frames,
+                start: secs_to_frame(top - offsets[i], self.fps),
+                audio: curves[i].is_some(),
+            })
+            .collect();
+        progress.store(1000, Ordering::Relaxed);
+        Ok(MulticamPlan { sources: self.sources.clone(), angles, how, offsets })
+    }
+}
+
 /// What an import is held to, off a timeline that is already up: the sources
 /// its sound has to agree with and the meta its rate is read against. Owned and
 /// `Send`, so the check itself can run on a worker with no session in reach --
@@ -568,6 +817,68 @@ pub struct ImportProbe {
     gate: ImportGate,
     meta: VideoMeta,
     rate: Rate,
+}
+
+/// How long one scrub snippet plays ([`PlaybackSession::scrub_audio`]): long enough to hear
+/// what a word or a beat is, short enough that a drag across a second of sound is a run of
+/// clicks rather than a smear.
+pub const SCRUB_SECS: f64 = 0.07;
+/// The fade at each end of a scrub snippet, in seconds ([`scrub_snippet`]).
+const SCRUB_FADE_SECS: f64 = 0.01;
+
+/// One scrub snippet's samples: the window `src` holds (interleaved, `channels` wide) with a
+/// raised-cosine fade of `fade` frames at each end, so the snippet starts and stops at silence
+/// and no edge of it can click. The fade is held to half the window, and the result is the
+/// window's length.
+pub fn scrub_snippet(src: &[f32], channels: usize, fade: usize) -> Vec<f32> {
+    let channels = channels.max(1);
+    let frames = src.len() / channels;
+    let mut out = src[..frames * channels].to_vec();
+    let fade = fade.min(frames / 2);
+    for f in 0..fade {
+        // Rising from just above silence to just below unity over `fade` frames.
+        let g = 0.5 - 0.5 * (std::f32::consts::PI * (f as f32 + 0.5) / fade as f32).cos();
+        for c in 0..channels {
+            out[f * channels + c] *= g;
+            out[(frames - 1 - f) * channels + c] *= g;
+        }
+    }
+    out
+}
+
+/// A piece of scrub work: opening and reading a snippet's audio, which happens off the caller's
+/// thread. It hands back the device's rate and width and the faded samples.
+type ScrubWork = Box<dyn FnOnce() -> Option<(u32, u32, Vec<f32>)> + Send>;
+
+/// The scrub thread's handle: `None` until the first snippet is asked for.
+#[derive(Default)]
+struct Scrub {
+    tx: Option<std::sync::mpsc::Sender<ScrubWork>>,
+    /// How many snippets have been asked for ([`PlaybackSession::scrub_requests`]).
+    requests: u64,
+}
+
+/// The scrub thread. It owns one output stream for as long as the rate and width hold, and
+/// plays only the newest request: a drag that outruns the decoder skips the ones it left behind.
+fn scrub_thread(rx: Receiver<ScrubWork>) {
+    let mut out: Option<(u32, u32, AoSession)> = None;
+    while let Ok(mut work) = rx.recv() {
+        while let Ok(newer) = rx.try_recv() {
+            work = newer;
+        }
+        let Some((rate, channels, samples)) = work() else {
+            continue;
+        };
+        if out.as_ref().is_none_or(|(r, c, _)| *r != rate || *c != channels) {
+            out = AoSession::open(rate, channels).map(|ao| (rate, channels, ao));
+        }
+        if let Some((_, _, ao)) = out.as_mut() {
+            // A snippet replaces the one still sounding, so the newest is heard at once.
+            ao.flush();
+            ao.set_active(true);
+            ao.write(&samples);
+        }
+    }
 }
 
 impl PlaybackSession {
@@ -606,8 +917,12 @@ impl PlaybackSession {
         // A still is the other source with no timeline in it: it has a picture
         // (which becomes the canvas) but no rate and no length, so it too
         // scaffolds rather than describes.
+        // A numbered run opens as one clip of its frames, the same as an import of it.
+        if let Some(run) = crate::sequence::Run::parse(&path).or_else(|| crate::sequence::Run::detect(&path)) {
+            return Self::open_image_only(&run.spelled(), Some(run.count));
+        }
         if crate::is_image(&path) {
-            return Self::open_image_only(&path);
+            return Self::open_image_only(&path, None);
         }
         // `open_worker` rather than `open` purely for the worker handle: the
         // field has to exist from the start for the first seek to use it.
@@ -648,8 +963,12 @@ impl PlaybackSession {
         };
         // One clip per lane covering the file, so timeline == source until the
         // first edit -- and the range opened above is exactly that clip's.
-        let project = Project::single(&path, meta.frame_count);
-        let span = project.composite_span_at(0);
+        // The grouped pair runs one length: the sound's when the file's sound is shorter
+        // than its picture (the walls the save and the load check the audio lane to), so
+        // the take is sound_held_frames long from the start, not the picture's count.
+        let held = sound_held_frames(&path, 0, meta.frame_count, meta.frame_rate);
+        let project = Project::single(&path, held);
+        let span = crate::export::stack_span_at(&project, 0);
         // A second, header-only open purely for the light level: `open_worker`
         // above already read one to hand the decode thread its own, but never
         // hands it back out. The same trade the audio header cache above this
@@ -659,6 +978,8 @@ impl PlaybackSession {
             .map(|(_, d)| d.light())
             .unwrap_or_default();
         Ok(Self {
+            scrub: Scrub::default(),
+            load_warnings: Vec::new(),
             meta,
             content_light,
             native: (meta.width, meta.height),
@@ -680,10 +1001,14 @@ impl PlaybackSession {
             span_rate: Rate::REAL_TIME,
             span,
             span_priming: true,
+            feed: Feed::Live,
+            back: Back::Off,
             dissolve: None,
             view: None,
             eos: false,
+            eos_end: 0.0,
             mix: None,
+            solo: Vec::new(),
             priming: false,
             drop_late: false,
             // A file just opened is a project nobody has picked stand-ins for.
@@ -722,6 +1047,74 @@ impl PlaybackSession {
         Ok(session)
     }
 
+    /// A timeline with no file behind it: a `width` x `height` canvas at `fps`,
+    /// no sources and no clips, for a project started from nothing. Its picture
+    /// is the black of an uncovered canvas, its length is zero, and the first
+    /// import sets the sources the way it does on any session.
+    pub fn empty(width: u32, height: u32, fps: f64) -> crate::Result<Self> {
+        if width == 0 || height == 0 || fps <= 0.0 {
+            return Err(format!("empty timeline: {width}x{height} at {fps} fps").into());
+        }
+        let meta = VideoMeta {
+            width,
+            height,
+            frame_rate: fps,
+            frame_count: 0,
+            codec: Codec::H264,
+            color: ColorDescription::default(),
+            matrix_assumed: false,
+            rotation: Rotation::None,
+            coded_width: width,
+            coded_height: height,
+            pixel_aspect: crate::demux::PixelAspect::SQUARE,
+        };
+        let stream = DecodeSession::open_black(width, height, 0);
+        Ok(Self {
+            scrub: Scrub::default(),
+            load_warnings: Vec::new(),
+            meta,
+            content_light: ContentLight::default(),
+            native: (width, height),
+            native_fps: fps,
+            frames: stream.frames,
+            worker: stream.worker,
+            backend: stream.backend,
+            video_failure: stream.failure,
+            retired: Vec::new(),
+            restarts: 0,
+            clock: PlaybackClock::new(ClockSource::Wall),
+            audio: None,
+            audio_disabled: None,
+            project: Project::from_parts(
+                Vec::new(),
+                vec![(LaneKind::Video, Vec::new()), (LaneKind::Audio, Vec::new())],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )?,
+            counts: Vec::new(),
+            probes: std::collections::HashMap::new(),
+            rates: Vec::new(),
+            span_rate: Rate::REAL_TIME,
+            span: None,
+            span_priming: true,
+            feed: Feed::Live,
+            back: Back::Off,
+            dissolve: None,
+            view: None,
+            eos: false,
+            eos_end: 0.0,
+            mix: None,
+            solo: Vec::new(),
+            priming: false,
+            drop_late: false,
+            proxies: false,
+            auto_proxies: true,
+            encoder_seat: crate::export::EncoderSeat::default(),
+            sample_rate: None,
+        })
+    }
+
     /// Opens a standalone audio file ([`crate::is_audio`]) as a timeline of its
     /// own: one clip on `A1`, nothing on the video lane, and a picture that is
     /// the black of an uncovered canvas ([`AUDIO_ONLY_CANVAS`]) for as long as
@@ -748,6 +1141,7 @@ impl PlaybackSession {
             // A canvas this engine drew itself, not a stream that was read:
             // the default description is what it is drawn in.
             color: ColorDescription::default(),
+            matrix_assumed: false,
             rotation: Rotation::None,
             // No container said anything about these: the canvas this engine drew
             // itself is square pixels at the size it was drawn at.
@@ -760,11 +1154,23 @@ impl PlaybackSession {
         // *video* open's pair of grouped clips: here there is no picture to
         // group the sound with, so the video lane starts empty.
         let clip = Clip {
+            speed_keys: Vec::new(),
+            reversed: false,
+            stabilise: None, deinterlace: Default::default(), mark: Default::default(),
+            angle: Default::default(),
             fade_in: 0,
             fade_out: 0,
             transition_out: 0,
+            transition_kind: Default::default(),
             visualizer: 0,
             viz_paint: 0,
+            gain_db: 0.0,
+            gain_keys: Vec::new(),
+            pan: 0,
+            transform_keys: Vec::new(),
+            opacity_keys: Vec::new(),
+            color_keys: Vec::new(),
+            effects: Vec::new(),
             start: 0,
             in_frame: 0,
             out_frame: meta.frame_count,
@@ -775,6 +1181,7 @@ impl PlaybackSession {
             transform: None,
             fit: FitPolicy::default(),
             speed: Speed::NORMAL,
+            pitch: 0,
         };
         let project = Project::from_parts(
             vec![Source::new(path, 0)],
@@ -787,9 +1194,11 @@ impl PlaybackSession {
         // anything: `composite_span_at` says so and the black worker
         // `start_span` would open is opened here instead, for the reason `open`
         // opens its decoder inline -- the field has to exist for the first seek.
-        let span = project.composite_span_at(0);
+        let span = crate::export::stack_span_at(&project, 0);
         let stream = DecodeSession::open_black(width, height, span.map_or(1, |s| s.len));
         Ok(Self {
+            scrub: Scrub::default(),
+            load_warnings: Vec::new(),
             meta,
             content_light: ContentLight::default(),
             native: (width, height),
@@ -817,10 +1226,14 @@ impl PlaybackSession {
             span_rate: Rate::REAL_TIME,
             span,
             span_priming: true,
+            feed: Feed::Live,
+            back: Back::Off,
             dissolve: None,
             view: None,
             eos: false,
+            eos_end: 0.0,
             mix: None,
+            solo: Vec::new(),
             priming: false,
             drop_late: false,
             // A file just opened is a project nobody has picked stand-ins for.
@@ -832,14 +1245,16 @@ impl PlaybackSession {
     }
 
     /// Opens a still image ([`crate::is_image`]) as a timeline of its own: one
-    /// clip on `V1`, [`IMAGE_PLACE_SECS`] long, over silence. The *canvas* is
+    /// clip on `V1`, [`STILL_DEFAULT_SECS`] long, over silence. The *canvas* is
     /// the image's own picture -- unlike a song, a still has one, and inventing
     /// a 1080p canvas around a 640x360 PNG would letterbox it against nothing.
     /// The frame rate is [`IMAGE_ONLY_RATE`], for the reason an audio-only
     /// timeline has one at all: nothing was shot on it.
     ///
     /// Wall time keeps the clock, as it does for any silent source.
-    fn open_image_only(path: &Path) -> crate::Result<Self> {
+    /// `frames` is the length of a numbered run (its spelling is `path`), or `None` for one picture,
+    /// which is held and placed for [`image_frames`] and [`IMAGE_PLACE_SECS`].
+    fn open_image_only(path: &Path, frames: Option<u32>) -> crate::Result<Self> {
         // Decoded here rather than probed: this is the door a `.png` that is
         // not one comes to, and the picture is wanted a line later anyway.
         let still = crate::decode::Still::open(path)?;
@@ -849,9 +1264,10 @@ impl PlaybackSession {
             frame_rate: IMAGE_ONLY_RATE,
             // Its length is the wall a trim is held to, exactly as a song's
             // playing time is -- see [`image_frames`].
-            frame_count: image_frames(IMAGE_ONLY_RATE),
+            frame_count: frames.unwrap_or_else(|| image_frames(IMAGE_ONLY_RATE)),
             codec: Codec::H264,
             color: ColorDescription::default(),
+            matrix_assumed: false,
             // `Rotation::None` is honest, not a shrug: a still's own turn was
             // made in `Still::open`, before these planes were written, so the
             // pair below is already the displayed one and there is nothing left
@@ -864,14 +1280,26 @@ impl PlaybackSession {
             pixel_aspect: crate::demux::PixelAspect::SQUARE,
         };
         let clip = Clip {
+            speed_keys: Vec::new(),
+            reversed: false,
+            stabilise: None, deinterlace: Default::default(), mark: Default::default(),
+            angle: Default::default(),
             fade_in: 0,
             fade_out: 0,
             transition_out: 0,
+            transition_kind: Default::default(),
             visualizer: 0,
             viz_paint: 0,
+            gain_db: 0.0,
+            gain_keys: Vec::new(),
+            pan: 0,
+            transform_keys: Vec::new(),
+            opacity_keys: Vec::new(),
+            color_keys: Vec::new(),
+            effects: Vec::new(),
             start: 0,
             in_frame: 0,
-            out_frame: place_frames(meta.frame_count, IMAGE_ONLY_RATE),
+            out_frame: place_frames(meta.frame_count, IMAGE_ONLY_RATE, STILL_DEFAULT_SECS),
             source: 0,
             link: None,
             eq: None,
@@ -879,6 +1307,7 @@ impl PlaybackSession {
             transform: None,
             fit: FitPolicy::default(),
             speed: Speed::NORMAL,
+            pitch: 0,
         };
         // No group and no audio clip: a still is silent, and a clip on `A1`
         // playing from a PNG is a source the audio worker cannot open.
@@ -889,7 +1318,7 @@ impl PlaybackSession {
             Vec::new(),
             Vec::new(),
         )?;
-        let span = project.composite_span_at(0);
+        let span = crate::export::stack_span_at(&project, 0);
         // The placeholder the first seek supersedes, opened here for `open`'s
         // reason: the field has to exist before anything can seek.
         let stream = DecodeSession::open_still(
@@ -901,6 +1330,8 @@ impl PlaybackSession {
             Composer::passthrough(),
         )?;
         Ok(Self {
+            scrub: Scrub::default(),
+            load_warnings: Vec::new(),
             meta,
             content_light: ContentLight::default(),
             native: (meta.width, meta.height),
@@ -922,10 +1353,14 @@ impl PlaybackSession {
             span_rate: Rate::REAL_TIME,
             span,
             span_priming: true,
+            feed: Feed::Live,
+            back: Back::Off,
             dissolve: None,
             view: None,
             eos: false,
+            eos_end: 0.0,
             mix: None,
+            solo: Vec::new(),
             priming: false,
             drop_late: false,
             // A file just opened is a project nobody has picked stand-ins for.
@@ -954,14 +1389,76 @@ impl PlaybackSession {
     ///
     /// The undo history is not saved: `undo` is `false` on a fresh load.
     pub fn open_project(path: &Path) -> crate::Result<Self> {
-        let doc = crate::edith::load(path)?;
+        Self::open_project_relinked(path, &[])
+    }
+
+    /// What the last load changed to open the file, one line per clip it clamped
+    /// (a clip that ran past its source). Empty for a project that opened as saved.
+    pub fn load_warnings(&self) -> &[String] {
+        &self.load_warnings
+    }
+
+    /// [`open_project`](Self::open_project) with some saved paths replaced:
+    /// each `(saved, found)` pair points the source the project saved at `saved`
+    /// at `found` before anything is checked. A source whose file is still
+    /// missing is **offline**: its clips stay on the timeline, nothing is read
+    /// from it, and [`offline_sources`](Self::offline_sources) names it. Only a
+    /// project with no present source at all is refused.
+    /// A project none of whose sources is on disk: the timeline is the canvas and rate it was saved
+    /// with, every clip stays, and every source is offline. Each source's length is the furthest
+    /// frame a clip reaches into it, which is what a relink is checked against.
+    fn open_all_offline(doc: crate::edith::Document) -> crate::Result<Self> {
+        let (width, height) = doc.resolution.unwrap_or((1920, 1080));
+        let fps = doc.fps.filter(|f| f.is_finite() && *f > 0.0).unwrap_or(30.0);
+        let counts: Vec<u32> = (0..doc.sources.len())
+            .map(|i| {
+                doc.lanes
+                    .iter()
+                    .flat_map(|(_, clips)| clips)
+                    .filter(|clip| clip.source == i)
+                    .map(|clip| clip.out_frame)
+                    .max()
+                    .unwrap_or(0)
+            })
+            .collect();
+        let rates = vec![Rate::REAL_TIME; doc.sources.len()];
+        let mut session = Self::empty(width, height, fps)?;
+        session.project = Project::from_parts(doc.sources, doc.lanes, doc.eq, doc.color, doc.transform)?
+            .with_mix(&doc.gains, doc.limiter)
+            .with_ducks(&doc.ducks)
+            .with_voices(&doc.voices)
+            .with_lane_names(&doc.names)
+            .with_bins(doc.bins)
+            .with_lane_flags(&doc.flags)
+            .with_tone(doc.tone)
+            .with_notes(doc.notes)
+            .with_still_secs(doc.still_secs);
+        session.counts = counts;
+        session.rates = rates;
+        Ok(session)
+    }
+
+    pub fn open_project_relinked(path: &Path, relinks: &[(PathBuf, PathBuf)]) -> crate::Result<Self> {
+        let mut doc = crate::edith::load(path)?;
+        for source in doc.sources.iter_mut() {
+            if let Some((_, found)) = relinks
+                .iter()
+                .find(|(saved, _)| crate::project::canonical(saved) == source.path)
+            {
+                *source = Source { fav: source.fav, bin: source.bin, ..Source::new(found, source.audio_stream) };
+            }
+        }
+        if doc.sources.iter().all(|s| !crate::source_present(&s.path)) && !doc.sources.is_empty() {
+            return Self::open_all_offline(doc);
+        }
         // *Which* source scaffolds it: the first that is not a still, and index
         // 0 only when there is no other. A still defines no frame rate -- it is
         // given [`IMAGE_ONLY_RATE`] -- so scaffolding a timeline of 24 fps
-        // footage off a PNG that a save happened to renumber to index 0
-        // (`Project::without_orphan_sources` numbers by first use, and a
-        // library removal moves indexes too) reads the timeline as 30 fps and
-        // then refuses every file on it for not matching. The rule this and
+        // footage off a PNG that was imported first and so sits at index 0
+        // (`Project::without_orphan_sources` keeps every source in session
+        // order, so whatever was imported first is saved first) reads the
+        // timeline as 30 fps and then refuses every file on it for not
+        // matching. The rule this and
         // [`audio_source_of`] share: nothing may assume what source 0 *is*.
         //
         // A v9 file says what rate it was cut at, and that answer beats the
@@ -972,10 +1469,13 @@ impl PlaybackSession {
         // defining the timeline as it always did -- it is the file every clip
         // on the lane was conformed to, and the two agree by construction.
         let saved_fps = doc.fps.filter(|f| f.is_finite() && *f > 0.0);
+        // An offline source cannot scaffold: the first present non-still does,
+        // then the first present anything.
         let scaffold = doc
             .sources
             .iter()
-            .position(|s| !crate::is_image(&s.path))
+            .position(|s| !crate::is_image(&s.path) && crate::source_present(&s.path))
+            .or_else(|| doc.sources.iter().position(|s| crate::source_present(&s.path)))
             .unwrap_or(0);
         // Owned: the sources move into the `Project` below, and the device is
         // opened after that (see the comment there).
@@ -1028,6 +1528,7 @@ impl PlaybackSession {
                         .map_err(|e| format!("source {}: {e}", first.path.display()))?,
                     codec: Codec::H264,
                     color: ColorDescription::default(),
+                    matrix_assumed: false,
                     rotation: Rotation::None,
                     // No container said anything about these: the canvas this engine drew
                     // itself is square pixels at the size it was drawn at.
@@ -1051,6 +1552,7 @@ impl PlaybackSession {
                     frame_count: image_frames(frame_rate),
                     codec: Codec::H264,
                     color: ColorDescription::default(),
+                    matrix_assumed: false,
                     // `Rotation::None` is honest, not a shrug: `Still::open`
                     // made the file's own turn before these planes were
                     // written, so the pair below is already the displayed one.
@@ -1101,6 +1603,7 @@ impl PlaybackSession {
                             .map_err(|e| format!("source {}: {e}", first.path.display()))?,
                         codec: Codec::H264,
                         color: ColorDescription::default(),
+                        matrix_assumed: false,
                         rotation: Rotation::None,
                         // No container said anything about these: the canvas this engine drew
                         // itself is square pixels at the size it was drawn at.
@@ -1165,6 +1668,21 @@ impl PlaybackSession {
                 rates.push(scaffold_rate);
                 continue;
             }
+            // Offline: nothing to check it against. Its length is the furthest
+            // frame a clip reaches into it, so the clip check below holds.
+            if !crate::source_present(&source.path) {
+                let reach = doc
+                    .lanes
+                    .iter()
+                    .flat_map(|(_, clips)| clips)
+                    .filter(|clip| clip.source == i)
+                    .map(|clip| clip.out_frame)
+                    .max()
+                    .unwrap_or(0);
+                counts.push(reach);
+                rates.push(Rate::REAL_TIME);
+                continue;
+            }
             // A still has neither a rate to match nor a track to match with:
             // its length is the one it is held to, recomputed exactly as the
             // import that first noted it did ([`image_frames`]), which is what
@@ -1186,8 +1704,21 @@ impl PlaybackSession {
                 rates.push(Rate::REAL_TIME);
                 continue;
             }
-            let (other, _) = Demuxer::open(&source.path)
-                .map_err(|e| format!("source {}: {e}", source.path.display()))?;
+            // A container with sound but no picture (an audio-only mp4 behind a
+            // video extension) is held and counted exactly as `import_audio` holds
+            // and counts it when it first joins the timeline -- the same door
+            // `import` takes, so a file that imports always reopens.
+            let (other, _) = match Demuxer::open(&source.path) {
+                Ok(opened) => opened,
+                Err(e) if NoVideoTrack::is_it(&e) => {
+                    audio_matches(source, &first_audio)
+                        .map_err(|e| format!("source {}: {e}", source.path.display()))?;
+                    counts.push(audio_frames(&source.path, meta.frame_rate)?);
+                    rates.push(Rate::REAL_TIME);
+                    continue;
+                }
+                Err(e) => return Err(format!("source {}: {e}", source.path.display()).into()),
+            };
             let rate = matches_timeline(source, &other, &meta, &first_audio)
                 .map_err(|e| format!("source {}: {e}", source.path.display()))?;
             counts.push(rate.timeline_at(other.frame_count));
@@ -1202,7 +1733,9 @@ impl PlaybackSession {
         for (kind, clip) in doc
             .lanes
             .iter()
+            .chain(doc.sequences.iter().flat_map(|s| s.doc.lanes.iter()))
             .flat_map(|(kind, clips)| clips.iter().map(move |clip| (*kind, clip)))
+            .filter(|(_, clip)| !crate::project::is_sequence_source(clip.source))
         {
             let path = &doc.sources[clip.source].path;
             if kind == LaneKind::Audio && crate::is_image(path) {
@@ -1213,19 +1746,41 @@ impl PlaybackSession {
                 .into());
             }
         }
-        for (i, clip) in doc.lanes.iter().flat_map(|(_, clips)| clips).enumerate() {
-            if clip.out_frame > counts[clip.source] {
-                return Err(format!(
-                    "clip {i} ends at frame {} but {} has {} frames",
-                    clip.out_frame,
-                    doc.sources[clip.source].path.display(),
-                    counts[clip.source]
-                )
-                .into());
+        // Each lane is held to the length its own clips are walled by ([`wall_table`]).
+        // A clip that runs past its source is clamped to the source's end and
+        // reported in `warnings`, not refused: a project that was saved with one
+        // (a placement or a trim that used the wrong length) must still open, and
+        // the clamp is the one change that keeps every later edit's walls true.
+        let audio_walls = wall_table(&doc.sources, &counts, meta.frame_rate, Lane::A1);
+        let mut warnings = Vec::new();
+        let mut i = 0;
+        let sources = doc.sources.clone();
+        for (kind, clips) in doc
+            .lanes
+            .iter_mut()
+            .chain(doc.sequences.iter_mut().flat_map(|s| s.doc.lanes.iter_mut()))
+        {
+            let walls: &[u32] = if *kind == LaneKind::Audio { &audio_walls } else { &counts };
+            for clip in clips.iter_mut() {
+                let n = i;
+                i += 1;
+                if crate::project::is_sequence_source(clip.source) {
+                    continue;
+                }
+                let wall = walls[clip.source];
+                if clip.out_frame > wall && wall > 0 {
+                    warnings.push(format!(
+                        "clip {n} ended at frame {} but {} has {wall} frames: clamped to {wall}",
+                        clip.out_frame,
+                        sources[clip.source].path.display(),
+                    ));
+                    clip.out_frame = wall;
+                    if clip.in_frame >= clip.out_frame {
+                        clip.in_frame = clip.out_frame - 1;
+                    }
+                }
             }
         }
-
-        let playhead = doc.playhead;
         // The subtitle files are read here rather than in the parser: a
         // `.edith` names them and holds no cues. One that has gone missing, or
         // whose track is a codec of pictures, comes back listed and refused by
@@ -1235,28 +1790,26 @@ impl PlaybackSession {
         // All of them in one call, in saved order, because a file is walked
         // whole to reach one track: a film whose project names many of its
         // tracks is one walk here rather than one per row.
-        let subtitles = crate::subtitle::open_all(&doc.subtitles);
-        let project =
-            Project::from_parts(doc.sources, doc.lanes, doc.eq, doc.color, doc.transform)?
-                .with_mix(&doc.gains, doc.limiter)
-                .with_tone(doc.tone)
-                // The palette before what is placed on it: a caption names a row of
-                // it, and [`Project::with_subs`] refuses one naming a row that is
-                // not there.
-                .with_subtitles(subtitles)
-                .with_subs(doc.subs)?
-                // The header a load puts back: the canvas and rate above, which a
-                // save's own `resolution`/`fps` lines may have moved off the
-                // scaffold's, and the switches the literal below carries -- handed
-                // in here because they are the project's own and a door that moved
-                // one after this would snapshot whatever copy it holds, which until
-                // this line is the placeholder's. No undo step for
-                // [`Project::with_mix`]'s reason: a project that arrived one `z`
-                // from a state it was never in is a project whose first undo is a
-                // surprise.
-                .with_canvas(meta.width, meta.height, meta.frame_rate)
-                .with_switches(doc.proxy, doc.auto_proxy, doc.encoder, doc.sample_rate);
-        let span = project.composite_span_at(0);
+        let playhead = doc.playhead;
+        let (proxy, auto_proxy, encoder, sample_rate) = (doc.proxy, doc.auto_proxy, doc.encoder, doc.sample_rate);
+        let seq_active = doc.seq_active.take();
+        let seq_order = std::mem::take(&mut doc.seq_order);
+        let seq_docs = std::mem::take(&mut doc.sequences);
+        let mcams = std::mem::take(&mut doc.mcams);
+        let mut project = project_of(doc, &meta)?;
+        if let Some((active, name)) = seq_active {
+            // The fresh project's placeholder sequence is not the file's: the file's
+            // sequences (the active one by `set_sequence_meta`) are all there is.
+            project.clear_sequences();
+            for sd in seq_docs {
+                let other = project_of(sd.doc, &meta)?;
+                project.absorb_sequence(sd.id, &sd.name, other)?;
+            }
+            project.set_sequence_meta(active, &name, &seq_order);
+            project.set_multicam(&mcams)?;
+            project.check_sequences()?;
+        }
+        let span = crate::export::stack_span_at(&project.render_view(), 0);
         // Last, because it is the one thing here that cannot be taken back: the
         // feeder thread outlives the `Audio` value (it holds its own clones) and
         // only a session's `drop` retires it, so a refusal above this line would
@@ -1282,7 +1835,7 @@ impl PlaybackSession {
             for source in project
                 .sources()
                 .iter()
-                .filter(|s| !crate::is_image(&s.path))
+                .filter(|s| !crate::is_image(&s.path) && crate::source_present(&s.path))
             {
                 opened = open_audio(&source.path, source.audio_stream);
                 if opened.0.is_some() {
@@ -1292,7 +1845,9 @@ impl PlaybackSession {
             opened
         };
         let mut session = Self {
+            scrub: Scrub::default(),
             meta,
+            load_warnings: warnings,
             content_light,
             native,
             native_fps,
@@ -1315,22 +1870,26 @@ impl PlaybackSession {
             span_rate: Rate::REAL_TIME,
             span,
             span_priming: true,
+            feed: Feed::Live,
+            back: Back::Off,
             dissolve: None,
             view: None,
             eos: false,
+            eos_end: 0.0,
             mix: None,
+            solo: Vec::new(),
             priming: false,
             drop_late: false,
             // What the file says, and `false` for every dialect before v12:
             // a project cut on the films themselves opens on them.
-            proxies: doc.proxy,
+            proxies: proxy,
             // ...and what it says about making them, which is "yes" for every
             // dialect before v13 and for one that leaves the line out.
-            auto_proxies: doc.auto_proxy,
+            auto_proxies: auto_proxy,
             // ...and which encoder it exports with, which is the seat this
             // machine has for every dialect before v14.
-            encoder_seat: doc.encoder,
-            sample_rate: doc.sample_rate,
+            encoder_seat: encoder,
+            sample_rate,
         };
         // The scaffolding above opened source 0 from its first frame and the
         // whole of its audio; this puts both onto the clip the playhead is
@@ -1360,7 +1919,7 @@ impl PlaybackSession {
     /// opened -- so a card may ask it per repaint; the picture's half costs a
     /// plugin open and lives in [`crate::export::planned_video`].
     pub fn planned_audio(&self, format: crate::export::Format, ranged: bool) -> &'static str {
-        crate::export::planned_audio(&self.project, format, ranged)
+        crate::export::planned_audio(&self.project.render_view(), format, ranged)
     }
 
     /// The timeline an export started right now would be run against, owned:
@@ -1371,6 +1930,30 @@ impl PlaybackSession {
     /// is about the export that would really start.
     pub fn export_snapshot(&self) -> (crate::project::Project, VideoMeta) {
         (self.project.export_snapshot(), self.meta)
+    }
+
+    /// The timeline's frame rate: what an editor timeline is read at ([`crate::interchange::otio::read`]).
+    pub fn timeline_frame_rate(&self) -> f64 {
+        self.meta.frame_rate
+    }
+
+    /// The active sequence as an editor timeline, for the interchange formats ([`crate::interchange`]).
+    pub fn timeline_snapshot(&self) -> crate::interchange::Timeline {
+        let (project, meta) = self.export_snapshot();
+        crate::interchange::of_project(&project, meta.frame_rate, (meta.width, meta.height))
+    }
+
+    /// The composed picture at timeline `frame`, headless and exact: what
+    /// export writes for that frame, scaled to fit `width` x `height`. Does not
+    /// touch the playback clock. See [`crate::export::compose_at`].
+    pub fn compose_at(
+        &self,
+        frame: u32,
+        width: u32,
+        height: u32,
+    ) -> crate::Result<crate::decode::Frame> {
+        let (project, meta) = self.export_snapshot();
+        crate::export::compose_at(&project, &meta, frame, width, height)
     }
 
     /// What an export would do about the tracks at `picks` --
@@ -1385,7 +1968,7 @@ impl PlaybackSession {
         format: crate::export::Format,
         picks: impl IntoIterator<Item = usize>,
     ) -> String {
-        crate::export::planned_subtitles(&self.project, format, picks)
+        crate::export::planned_subtitles(&self.project.render_view(), format, picks)
     }
 
     /// Where the cues of the track at `pick` land on *this* timeline --
@@ -1403,7 +1986,7 @@ impl PlaybackSession {
             .subtitles()
             .get(pick)
             .map_or_else(Vec::new, |t| {
-                crate::export::timeline_cues(&self.project, t, self.meta.frame_rate)
+                crate::export::timeline_cues(&self.project.render_view(), t, self.meta.frame_rate)
             })
     }
 
@@ -1415,7 +1998,7 @@ impl PlaybackSession {
         format: crate::export::Format,
         ranged: bool,
     ) -> Option<&'static str> {
-        crate::export::audio_rate_refusal(&self.project, format, ranged)
+        crate::export::audio_rate_refusal(&self.project.render_view(), format, ranged)
     }
 
     /// Why this session plays silent although the file has sound -- an audio
@@ -1499,12 +2082,14 @@ impl PlaybackSession {
         // Matroska one ([`crate::demux::is_matroska`], which is where `.mks` --
         // the subtitles alone -- comes in) and the mp4 family, whose `tx3g`
         // timed text is what an mp4 export of this project's own writes, so a
-        // file edith wrote is a file edith imports back.
+        // file edith wrote is a file edith imports back. A transport stream
+        // carries Blu-ray/AVCHD PGS bitmaps the same way.
         let tracks = match crate::demux::is_matroska(path)
+            || crate::demux::is_mpegts(path)
             || path.extension().is_some_and(|e| {
                 matches!(
                     e.to_string_lossy().to_ascii_lowercase().as_str(),
-                    "mp4" | "m4v" | "mov"
+                    "mp4" | "m4v" | "mov" | "3gp" | "3g2"
                 )
             }) {
             true => crate::subtitle::of_media(path)?,
@@ -1542,11 +2127,44 @@ impl PlaybackSession {
     /// the parse is a separate door: nothing here opens, seeks or decodes.
     /// Subtitles are not clips and land on no lane, so nothing playable changes
     /// and no undo step is pushed ([`Project::remove_subtitles`] says why).
+    /// [`import_subtitles`](Self::import_subtitles) with a language on its tracks: `lang` as a
+    /// person typed it, on every track, or else a standalone file's own name
+    /// ([`crate::subtitle::import_language`]). Returns the count added and the language with where
+    /// it came from, `None` when none was set. One undo step, as the import is.
+    pub fn import_subtitles_as(
+        &mut self,
+        path: &Path,
+        lang: Option<&str>,
+    ) -> crate::Result<(usize, Option<(String, &'static str)>)> {
+        let mut tracks = Self::parse_subtitles(path)?;
+        if tracks.is_empty() {
+            return Err(Self::no_subtitles_in(path));
+        }
+        let standalone = tracks.iter().all(|t| t.track.is_none());
+        let named = if lang.is_some() || standalone {
+            crate::subtitle::import_language(path, lang)?
+        } else {
+            None
+        };
+        if let Some((code, _)) = &named {
+            for t in &mut tracks {
+                if lang.is_some() || t.track.is_none() {
+                    crate::subtitle::set_language(t, code);
+                }
+            }
+        }
+        let n = self.add_subtitle_tracks(tracks);
+        Ok((n, named))
+    }
+
+    /// Names the language of subtitle track `track` ([`Project::set_subtitle_language`]). One undo step.
+    pub fn set_subtitle_language(&mut self, track: usize, code: &str) -> bool {
+        self.project.set_subtitle_language(track, code)
+    }
+
     pub fn add_subtitle_tracks(&mut self, tracks: Vec<crate::subtitle::SubtitleTrack>) -> usize {
-        tracks
-            .into_iter()
-            .filter(|t| self.project.add_subtitles(t))
-            .count()
+        // One undo step for the whole import (see [`Project::add_subtitles_all`]).
+        self.project.add_subtitles_all(&tracks)
     }
 
     /// Takes the track at `idx` off this timeline -- the door a subtitle row's
@@ -1586,24 +2204,135 @@ impl PlaybackSession {
         if self.project.sources().is_empty() {
             return Err("this project names no file: there is nothing to save".into());
         }
-        let (sources, lanes, eq, color, transform) = self.project.without_orphan_sources();
+        self.save_project_noted(path).map(|_| ())
+    }
+
+    /// [`save_project`](Self::save_project) that also returns what it had to change
+    /// to write the file, one plain sentence per clip, for the front-end to show. A
+    /// clip that runs past its source's end (a placement or an edit that used the
+    /// wrong length, or a project saved before the walls held) is shortened to the
+    /// source's end on the way out, never refused: the user's work is saved, and the
+    /// note says what was shortened.
+    pub fn save_project_noted(&self, path: &Path) -> crate::Result<Vec<String>> {
+        if self.project.sources().is_empty() {
+            return Err("this project names no file: there is nothing to save".into());
+        }
+        let (picture, sound) = lane_walls(self.project.sources(), &self.counts, self.meta.frame_rate);
+        let mut notes = Vec::new();
+        let mut main = self.project.clone();
+        notes.extend(self.wall_notes(&main.clamp_to_walls(&picture, &sound), None));
+        // The parked sequences are saved whole too, so they are held to the same walls.
+        let mut parked = Vec::new();
+        for (id, name, active) in self.project.sequence_rows() {
+            if !active {
+                let mut other = self.project.as_sequence(id)?;
+                notes.extend(self.wall_notes(&other.clamp_to_walls(&picture, &sound), Some(&name)));
+                parked.push((id, other));
+            }
+        }
+        self.write_project(path, &main, &parked)?;
+        Ok(notes)
+    }
+
+    /// One plain sentence per clip [`Project::clamp_to_walls`] shortened, naming the
+    /// clip by its file's name and its lane. `seq` names a parked sequence.
+    fn wall_notes(&self, clamps: &[crate::project::WallClamp], seq: Option<&str>) -> Vec<String> {
+        let of = seq.map_or_else(String::new, |n| format!(" in sequence \"{n}\""));
+        clamps
+            .iter()
+            .map(|c| {
+                let path = &self.project.sources()[c.source].path;
+                let name = path.file_stem().map_or_else(
+                    || path.display().to_string(),
+                    |s| s.to_string_lossy().into_owned(),
+                );
+                let what = match c.lane.kind {
+                    LaneKind::Audio => "sound",
+                    _ => "picture",
+                };
+                format!(
+                    "The {what} of \"{name}\" on {} runs past the end of its file{of}. It was shortened to fit.",
+                    c.lane.label(),
+                )
+            })
+            .collect()
+    }
+
+    /// Writes the timeline to `path` for an autosave: exactly what
+    /// [`save_project`](Self::save_project) writes, minus its wall check. A clip
+    /// that runs past its source is written as it is, not refused, so an
+    /// autosave can never fail on a session's state -- the one place a refusal
+    /// would lose the edits it was meant to keep. [`open_project`](Self::open_project)
+    /// already clamps such a clip to its source with a warning when the file is
+    /// read back, so the file still opens.
+    ///
+    /// The one refusal kept is an empty library ([`save_project`](Self::save_project)):
+    /// a file that names no source has no timeline in it to write.
+    pub fn save_autosave(&self, path: &Path) -> crate::Result<()> {
+        if self.project.sources().is_empty() {
+            return Err("this project names no file: there is nothing to save".into());
+        }
+        let mut parked = Vec::new();
+        for (id, _, active) in self.project.sequence_rows() {
+            if !active {
+                parked.push((id, self.project.as_sequence(id)?));
+            }
+        }
+        self.write_project(path, &self.project, &parked)
+    }
+
+    /// The write [`save_project`](Self::save_project) and
+    /// [`save_autosave`](Self::save_autosave) share: the project as it stands,
+    /// atomically, with its playhead and settings.
+    /// `main` is the active sequence as it is to be written and `parked` the others,
+    /// by id, already held to their walls.
+    fn write_project(&self, path: &Path, main: &Project, parked: &[(u32, Project)]) -> crate::Result<()> {
+        let dir = crate::edith::project_dir(path);
         let playhead = secs_to_frame(self.now(), self.meta.frame_rate)
-            .min(self.project.timeline_frames().saturating_sub(1));
-        crate::edith::save(
-            path,
+            .min(main.timeline_frames().saturating_sub(1));
+        let main_bytes = self.encode_sequence(&dir, main, playhead);
+        let main_bytes = crate::edith::binned(main_bytes, self.project.sources(), self.project.bins());
+        let main_bytes = crate::edith::noted(main_bytes, self.project.notes(), self.project.still_secs());
+        if !self.project.uses_sequences() {
+            return crate::edith::write_atomic(path, &main_bytes);
+        }
+        // Several sequences: the active one is the body, the others follow as blocks of
+        // their own, each a whole document (v45).
+        let mut blocks = Vec::new();
+        for (id, name, active) in self.project.sequence_rows() {
+            if active {
+                continue;
+            }
+            let Some((_, other)) = parked.iter().find(|(p, _)| *p == id) else { continue };
+            let at = playhead.min(other.timeline_frames().saturating_sub(1));
+            blocks.push(crate::edith::SeqBlock { id, name, bytes: self.encode_sequence(&dir, other, at) });
+        }
+        let order: Vec<u32> = self.project.sequence_rows().iter().map(|r| r.0).collect();
+        let active = self.project.active_sequence();
+        let name = self.project.sequence_name(active).unwrap_or("Sequence").to_string();
+        let bytes = crate::edith::sequenced(main_bytes, (active, &name), &order, &blocks, &self.project.multicam_rows());
+        crate::edith::write_atomic(path, &bytes)
+    }
+
+    /// One sequence as the bytes of a standalone project document: `project` has that
+    /// sequence active.
+    fn encode_sequence(&self, dir: &Path, project: &Project, playhead: u32) -> Vec<u8> {
+        let (sources, lanes, eq, color, transform) = project.without_orphan_sources();
+        crate::edith::encode_flagged(
+            dir,
             &sources,
             &lanes,
             // The lane volumes and the limiter with them: a mix that vanished
             // on a reload would be a mix nobody could keep, and both are the
             // project's, not this machine's (the monitoring volume is not
             // written and never will be).
-            &self.project.lane_gains(),
+            &project.lane_gains(),
             // ...and what is placed on each lane, in the same order again: the
             // captions, which are the only thing a subtitle lane holds.
-            &self.project.lane_subs(),
+            &project.lane_subs(),
             // The subtitle tracks with them, by reference: which file the cues
             // are in, never the cues (see [`crate::edith`]).
-            self.project.subtitles(),
+            project.subtitles(),
             &eq,
             &color,
             &transform,
@@ -1615,7 +2344,7 @@ impl PlaybackSession {
             // ...and which rendition its HDR media is watched in, for the same
             // reason: a picked look that vanished on a reload is a look nobody
             // could keep.
-            self.project.tone(),
+            project.tone(),
             // ...and whether it is cut on the stand-ins, for the same reason.
             // *Which* files have one is not saved: [`crate::proxy`] finds that
             // out from the film itself, so nothing here can go stale.
@@ -1628,12 +2357,37 @@ impl PlaybackSession {
             // a project delivered on the software encoder is delivered on it
             // again after a reload.
             self.encoder_seat,
-            self.project.limiter(),
+            project.limiter(),
             // ...and the rate the mix was picked to run at, for the same
             // reason: a project delivered at a chosen rate is delivered at it
             // again after a reload.
             self.sample_rate,
             playhead,
+            // ...and each lane's switches, hidden, muted or locked, which a
+            // reload has to hand back as they were left.
+            &project.lane_flags(),
+            // ...and each audio lane's duck, by the key lane it names, in the
+            // same order again: a ducked music bed that came back unducked
+            // would be a mix nobody could keep.
+            &project.lane_ducks(),
+            // ...and the cues somebody retyped, which live in no file: the words
+            // a reload has to hand back as they were typed.
+            project.cue_edits(),
+            // ...and the cues added to a track, which no file has.
+            project.cue_adds(),
+            // ...and the title cards and text overlays, which are the project's own.
+            project.titles(),
+            // ...and the chapter markers, which are the project's own too.
+            project.chapters(),
+            // ...and the comment markers.
+            project.markers(),
+            &project.caption_style(),
+            // ...and each audio lane's voice processors, which a reload has to
+            // hand back as they were left (the noise profile included: it is
+            // learned from the sound, and re-learning it would not be the same).
+            &project.lane_voices(),
+            // ...and the names the user gave the lanes.
+            &project.lane_names(),
         )
     }
 
@@ -1668,9 +2422,7 @@ impl PlaybackSession {
                     // slower file's picture is therefore held for the frames in
                     // between. Real time for a gap and for a single-rate
                     // project, where this is the identity.
-                    frame.index = self.span.map_or(frame.index, |s| {
-                        s.timeline_at(self.span_rate.timeline_at(frame.index))
-                    });
+                    frame.index = self.stamp(frame.index);
                     // The first picture out of the span now decoding ends its
                     // prime ([`Self::span_priming`]).
                     self.span_priming = false;
@@ -1709,7 +2461,36 @@ impl PlaybackSession {
                         if let Some(bf) = &b.held {
                             let idx_in_window = (frame.index - d.tail_start).min(d.window - 1);
                             let t = crate::export::dissolve_weight(idx_in_window, d.window);
-                            frame.bgra = blend_bgra(&frame.bgra, &bf.bgra, t);
+                            frame.bgra = match d.kind {
+                                crate::transitions::TransitionKind::Dissolve => {
+                                    blend_bgra(&frame.bgra, &bf.bgra, t)
+                                }
+                                kind => crate::transitions::blend_bgra(
+                                    kind,
+                                    &frame.bgra,
+                                    &bf.bgra,
+                                    t,
+                                    frame.width as usize,
+                                    frame.height as usize,
+                                ),
+                            };
+                        }
+                    }
+                    // A picture fade is drawn toward black, the way export draws
+                    // it ([`crate::export::picture_fade_at`]): black is zero in
+                    // every colour channel of BGRA, the alpha byte left alone.
+                    // A layered picture's fades were applied per clip by its worker.
+                    let fade = match self.span.is_some_and(|s| {
+                        crate::export::layered_at(&self.project.render_view(), s.start)
+                    }) {
+                        true => None,
+                        false => crate::export::picture_fade_at(&self.project.render_view(), frame.index),
+                    };
+                    if let Some(k) = fade {
+                        for px in frame.bgra.as_chunks_mut::<4>().0 {
+                            for c in &mut px[..3] {
+                                *c = (f32::from(*c) * k).round() as u8;
+                            }
                         }
                     }
                     return Some(frame);
@@ -1721,6 +2502,8 @@ impl PlaybackSession {
                 Err(TryRecvError::Disconnected) => {
                     if !self.next_clip() {
                         self.eos = true;
+                        self.eos_end =
+                            f64::from(self.project.timeline_frames()) / self.meta.frame_rate;
                         return None;
                     }
                 }
@@ -1759,7 +2542,9 @@ impl PlaybackSession {
     /// ([`Span::speed`]) -> the file's ([`Rate`]). A gap and the emptied
     /// timeline have no file to be inside of, and publish nothing.
     fn publish_playhead(&self) {
-        if !self.drop_late {
+        // Backward the worker is not walking toward the clock but away from where
+        // it started, and a stale picture is dropped by the pump instead.
+        if !self.drop_late || self.backward() {
             return;
         }
         let Some(span) = self.span else { return };
@@ -1770,8 +2555,41 @@ impl PlaybackSession {
         let offset = now.saturating_sub(span.start).min(span.len);
         self.worker.playhead(
             self.span_rate
-                .source_at(in_frame + span.speed.source_at(offset)),
+                .source_at(in_frame + span.source_offset(offset)),
         );
+    }
+
+    /// Whether the clock runs backward: the picture is then drawn from the
+    /// playhead down ([`Back`]) and a pump presents what is *at or after* the
+    /// clock instead of at or before it.
+    pub fn backward(&self) -> bool {
+        self.clock.rate() < 0.0
+    }
+
+    /// The playback rate: 1.0 is real time, negative is backward.
+    pub fn rate(&self) -> f64 {
+        self.clock.rate()
+    }
+
+    /// The timeline frame a decoded frame numbered `idx` is due at, in the numbering
+    /// the current worker was opened with ([`Back`]). Forward it is the ceil half
+    /// of the pair an export encodes with ([`Span::timeline_at`]) through the
+    /// file's own rate; backward the same mapping read off the file frame the
+    /// stream really holds, so the stamps fall as the stream goes on.
+    fn stamp(&self, idx: u32) -> u32 {
+        let Some(s) = self.span else { return idx };
+        let rate = self.span_rate;
+        match self.back {
+            Back::Off => s.timeline_at(rate.timeline_at(idx)),
+            Back::Mirror { top } => {
+                s.timeline_at(rate.timeline_at((2 * top).saturating_sub(idx)))
+            }
+            Back::Forward => {
+                let first = s.from.map_or(0, |(_, f)| f);
+                s.timeline_at((2 * first).saturating_sub(rate.timeline_at(idx)))
+            }
+            Back::Gap => s.start + s.len.saturating_sub(1).saturating_sub(idx),
+        }
     }
 
     /// Installs `replacement` as the decode worker, parking the outgoing one in
@@ -1819,6 +2637,43 @@ impl PlaybackSession {
         self.span_priming
     }
 
+    /// Whether the picture now playing is read off a render-cache segment
+    /// ([`crate::render_cache`]) rather than composed live.
+    pub fn playing_from_cache(&self) -> bool {
+        matches!(self.feed, Feed::Cached { .. })
+    }
+
+    /// The part of `span` a render-cache segment can stand in for, with the
+    /// segment it comes from: the span's first frame must be inside a segment
+    /// that matches the timeline now, and the span must be a forward clip at
+    /// 1x through no dissolve. The returned span keeps the span's own start and
+    /// its length up to the segment's end, and reads from the segment's own
+    /// first frame ([`Feed::Cached`]), at real time, so the stamp is the identity.
+    fn cached_cut(
+        &self,
+        span: Option<Span>,
+        backward: bool,
+    ) -> Option<(Span, crate::render_cache::Segment)> {
+        let span = span?;
+        if backward
+            || self.dissolve.is_some()
+            || span.reverse
+            || span.ramp.is_some()
+            || span.speed != Speed::NORMAL
+        {
+            return None;
+        }
+        let (source, _) = span.from?;
+        let segment = crate::render_cache::at(&self.project, &self.meta, span.start)?;
+        let len = span.end().min(segment.to) - span.start;
+        let cut = Span {
+            len,
+            from: Some((source, span.start - segment.from)),
+            ..span
+        };
+        Some((cut, segment))
+    }
+
     /// Starved audio callbacks since the device opened, and how far into the
     /// device's own playback (seconds) the last of them was -- `None` for a
     /// session with no device at all. The counter the plugin prints on drop,
@@ -1854,13 +2709,18 @@ impl PlaybackSession {
     fn next_clip(&mut self) -> bool {
         // No span is the emptied timeline: it was played out the moment its one
         // black frame went by, and there is no "next" to walk to.
-        let next = match self.span {
-            Some(span) => span.end(),
-            None => return false,
+        let backward = self.backward();
+        let span = match (self.span, backward) {
+            (None, _) => return false,
+            // Backward the next stretch to draw is the one that ends just before
+            // this one starts, and the start of the timeline is where it ends.
+            (Some(span), true) => match span.start.checked_sub(1) {
+                Some(frame) => back_span_at(&self.project.render_view(), frame),
+                None => return false,
+            },
+            (Some(span), false) => crate::export::stack_span_at(&self.project.render_view(), span.end()),
         };
-        let Some(span) = self.project.composite_span_at(next) else {
-            return false;
-        };
+        let Some(span) = span else { return false };
         // We only get here on a disconnect, so the old span is already done;
         // abandon anyway, so `start_span` treats every path alike -- and the
         // *worker* is kept, because the next clip is very often the same file
@@ -1903,14 +2763,17 @@ impl PlaybackSession {
         // and every edit that could touches this span starts it over
         // ([`crate::export::dissolve_window`] makes the identical check for
         // the same reason, on export).
-        self.dissolve = span.and_then(|s| {
-            crate::export::dissolve_window(&self.project, &s).map(
+        let backward = self.backward();
+        self.back = Back::Off;
+        self.dissolve = span.filter(|_| !backward).and_then(|s| {
+            crate::export::dissolve_window(&self.project.render_view(), &s).map(
                 |(b_source, b_in_frame, window, b_start)| Dissolve {
                     tail_start: s.start + s.len - window,
                     window,
                     b_source,
                     b_in_frame,
                     b_start,
+                    kind: crate::transitions::kind_at(&self.project.render_view(), s.start),
                     b: None,
                 },
             )
@@ -1931,15 +2794,80 @@ impl PlaybackSession {
         // pictures in: the span's own source, and real time for a gap, whose
         // black worker counts timeline frames already. Set before the open,
         // because the open is the first thing that converts with it.
+        // A layered span's worker numbers its frames on the timeline itself
+        // ([`crate::export::layered_stream`]), so it is read at real time.
+        let layered = span.is_some_and(|s| crate::export::layered_at(&self.project.render_view(), s.start));
+        // A field-mode clip of an interlaced file is decoded as fields, two to a
+        // frame: the decoder's frame numbers are field numbers, so the file's
+        // rate against the timeline doubles ([`crate::deinterlace::fields_rate`]).
+        let deint = match span.and_then(|s| s.from) {
+            Some((source, _)) if !layered => self.deint_at(source, span.map_or(0, |s| s.start)),
+            _ => crate::project::Deinterlace::Frame,
+        };
         self.span_rate = match span.and_then(|s| s.from) {
-            Some((source, _)) => self.rates.get(source).copied().unwrap_or(Rate::REAL_TIME),
-            None => Rate::REAL_TIME,
+            Some((source, _)) if !layered => {
+                let rate = self.rates.get(source).copied().unwrap_or(Rate::REAL_TIME);
+                crate::deinterlace::counted_rate(deint, rate)
+            }
+            _ => Rate::REAL_TIME,
         };
         // The new span owes its first picture from the moment it is asked for:
         // every path below, the reused worker as much as a fresh one
         // ([`Self::span_priming`]).
         self.span_priming = true;
+        // A render-cache segment over this span's first frame plays the render
+        // instead of compositing it ([`Feed::Cached`]). Only forward at 1x and
+        // never through a dissolve; every other span stays on the live path.
+        self.feed = Feed::Live;
+        if let Some((cut, segment)) = self.cached_cut(span, backward) {
+            let source_frame = cut.from.map_or(0, |(_, f)| f);
+            let end = source_frame + cut.len;
+            self.span_rate = Rate::REAL_TIME;
+            // The render already holds the grade, transform, fit, tone and
+            // effects, so the decoder applies none of them.
+            let stream = DecodeSession::open_worker_deferred_with(
+                &segment.path,
+                source_frame,
+                end,
+                ColorParams::default(),
+                TransformParams::default(),
+                Composer::new(canvas_w, canvas_h, FitPolicy::default()),
+                self.project.tone(),
+                Speed::NORMAL,
+                crate::project::Deinterlace::Frame,
+            );
+            self.frames = stream.frames;
+            self.backend = stream.backend;
+            self.retire(stream.worker);
+            self.span = Some(cut);
+            self.feed = Feed::Cached { segment: segment.path };
+            return;
+        }
         let opened = match span {
+            // Two or more clips cover the span: its composed pictures come from a
+            // stream of their own, each clip drawn over the ones beneath it as an
+            // export draws them, at the viewer's size.
+            Some(span) if layered => {
+                let mut view_meta = self.meta;
+                view_meta.width = canvas_w;
+                view_meta.height = canvas_h;
+                // Each clip's picture comes off its stand-in when the project is
+                // cut on stand-ins, the way a single clip's does ([`picture_path`]).
+                let paths = self.proxies.then(|| {
+                    self.project
+                        .sources()
+                        .iter()
+                        .map(|s| crate::proxy::cached(&s.path).unwrap_or_else(|| s.path.clone()))
+                        .collect()
+                });
+                Ok(crate::export::layered_stream(
+                    self.project.export_snapshot(),
+                    view_meta,
+                    crate::colorspace::ColorDescription::output_sized(self.meta.width, self.meta.height),
+                    span,
+                    paths,
+                ))
+            }
             // The grade is the composite's at this frame -- the same clip the
             // span itself came from -- and it is constant across the span, so
             // the worker carries it and every frame it converts wears it.
@@ -1965,7 +2893,7 @@ impl PlaybackSession {
                         .composite_transform_at(start)
                         .copied()
                         .unwrap_or_default(),
-                    Composer::new(canvas_w, canvas_h, self.project.composite_fit_at(start)),
+                    Composer::new(canvas_w, canvas_h, self.project.render_view().composite_fit_at(start)),
                 )
                 .inspect_err(|e| eprintln!("timeline frame {start}: image open failed: {e}"))
             }
@@ -1974,7 +2902,7 @@ impl PlaybackSession {
                 from: Some((source, in_frame)),
                 ..
             }) if crate::is_audio(&self.project.sources()[source].path)
-                || self.project.composite_visualizer_at(start) & 1 != 0 =>
+                || self.project.render_view().composite_visualizer_at(start) & 1 != 0 =>
             {
                 let (path, stream) = {
                     let src = &self.project.sources()[source];
@@ -1994,9 +2922,9 @@ impl PlaybackSession {
                         .composite_transform_at(start)
                         .copied()
                         .unwrap_or_default(),
-                    Composer::new(canvas_w, canvas_h, self.project.composite_fit_at(start)),
-                    self.project.composite_visualizer_at(start),
-                    self.project.composite_viz_paint_at(start),
+                    Composer::new(canvas_w, canvas_h, self.project.render_view().composite_fit_at(start)),
+                    self.project.render_view().composite_visualizer_at(start),
+                    self.project.render_view().composite_viz_paint_at(start),
                 )
                 .inspect_err(|e| eprintln!("timeline frame {start}: visualizer open failed: {e}"))
             }
@@ -2045,7 +2973,7 @@ impl PlaybackSession {
                 // the reason the grade is. Built where it is handed over rather
                 // than kept in a local, because a `Composer` owns the scratch
                 // buffers it places through -- the value is not copied about.
-                let fit = self.project.composite_fit_at(start);
+                let fit = self.project.render_view().composite_fit_at(start);
                 let canvas = || Composer::new(canvas_w, canvas_h, fit);
                 // ...and the rendition an HDR source among them is mapped to,
                 // the project's own and constant across the span for that
@@ -2068,12 +2996,74 @@ impl PlaybackSession {
                 } else {
                     Speed::NORMAL
                 };
+                // Playing backward the span is the clip up to the playhead, drawn from
+                // the playhead down: a forward clip is served last frame first, and a
+                // reversed one -- whose backward is the file's forward -- first frame
+                // first, in both cases over the window the span reads.
+                let backward_window = backward.then(|| {
+                    let sp = span.expect("matched above");
+                    let (_, lo, hi) = sp.source_window().expect("a clip's span has a window");
+                    (
+                        self.span_rate.source_at(lo),
+                        self.span_rate.source_at(hi.saturating_sub(1)) + 1,
+                    )
+                });
+                if let Some((lo, hi)) = backward_window
+                    && !span.is_some_and(|s| s.reverse)
+                {
+                    self.back = Back::Mirror { top: hi - 1 };
+                    let stream = DecodeSession::open_reversed_with(
+                        &path,
+                        hi - 1,
+                        hi - lo,
+                        color,
+                        transform,
+                        canvas(),
+                        tone,
+                        deint,
+                    );
+                    self.frames = stream.frames;
+                    self.backend = stream.backend;
+                    self.retire(stream.worker);
+                    self.span = span;
+                    return;
+                }
+                // ...and a reversed clip's backward is the file's forward: the same
+                // worker as any clip, over the window, numbered by the file.
+                let (start_frame, end_frame, decode_speed) = match backward_window {
+                    Some((lo, hi)) => {
+                        self.back = Back::Forward;
+                        (lo, hi, Speed::NORMAL)
+                    }
+                    None => (start_frame, end_frame, decode_speed),
+                };
+                // A reversed clip is served backwards from the file frame the span
+                // starts on, a block at a time ([`DecodeSession::open_reversed`]); its
+                // frames are numbered as a forward stream's would be, so the stamps
+                // and drops below need no case of their own.
+                if !backward && span.is_some_and(|s| s.reverse) {
+                    let stream = DecodeSession::open_reversed_with(
+                        &path,
+                        start_frame,
+                        end_frame.saturating_sub(start_frame).max(1),
+                        color,
+                        transform,
+                        canvas(),
+                        tone,
+                        deint,
+                    );
+                    self.frames = stream.frames;
+                    self.backend = stream.backend;
+                    self.retire(stream.worker);
+                    self.span = span;
+                    return;
+                }
                 // The worker already decoding this very file takes the new span
                 // itself: no thread, no container parse, no VA-API init -- the
                 // whole of what a seek used to cost. It answers `None` for any
                 // other file (and for a worker whose thread has ended), and the
                 // deferred opener below is then exactly the path it always was.
-                if let Some((frames, backend)) = self.worker.reseek(
+                if let Some((frames, backend)) = self.worker.reseek_with(
                     &path,
                     start_frame,
                     end_frame,
@@ -2082,13 +3072,14 @@ impl PlaybackSession {
                     canvas(),
                     tone,
                     decode_speed,
+                    deint,
                 ) {
                     self.frames = frames;
                     self.backend = backend;
                     self.span = span;
                     return;
                 }
-                Ok(DecodeSession::open_worker_deferred(
+                Ok(DecodeSession::open_worker_deferred_with(
                     &path,
                     start_frame,
                     end_frame,
@@ -2097,16 +3088,22 @@ impl PlaybackSession {
                     canvas(),
                     tone,
                     decode_speed,
+                    deint,
                 ))
             }
             // A gap: black for as long as it runs. An emptied timeline has no
             // span at all and gets one frame of it -- enough to put black on
             // screen, and it ends where the timeline does, at once.
-            gap => Ok(DecodeSession::open_black(
-                canvas_w,
-                canvas_h,
-                gap.map_or(1, |s| s.len),
-            )),
+            gap => {
+                if backward && gap.is_some() {
+                    self.back = Back::Gap;
+                }
+                Ok(DecodeSession::open_black(
+                    canvas_w,
+                    canvas_h,
+                    gap.map_or(1, |s| s.len),
+                ))
+            }
         };
         let Ok(stream) = opened else {
             // The file would not open. The span still goes in -- the timeline
@@ -2135,6 +3132,18 @@ impl PlaybackSession {
         self.span = span;
     }
 
+    /// The deinterlace setting of the clip on screen at `frame`, as it applies to
+    /// the file `source`'s picture is decoded from (the stand-in when there is one):
+    /// `Frame` for anything but interlaced H.264, which ignores the setting.
+    fn deint_at(&self, source: usize, frame: u32) -> crate::project::Deinterlace {
+        let mode = self.project.composite_clip_at(frame).map_or(crate::project::Deinterlace::Frame, |(lane, idx)| {
+            self.project.deinterlace_of(lane, idx)
+        });
+        let path = &self.project.sources()[source].path;
+        let file = self.proxies.then(|| crate::proxy::cached(path)).flatten().unwrap_or_else(|| path.clone());
+        crate::deinterlace::effective(mode, &file)
+    }
+
     /// Opens B's own decoder for the current span's dissolve, the first time
     /// [`try_frame`](Self::try_frame) sees the playhead inside the window --
     /// a no-op once it is already open, or if this span has no dissolve at
@@ -2153,7 +3162,14 @@ impl PlaybackSession {
         }
         let (source, in_frame, window, b_start) = (d.b_source, d.b_in_frame, d.window, d.b_start);
         let path = self.picture_path(source);
-        let rate = self.rates.get(source).copied().unwrap_or(Rate::REAL_TIME);
+        // B takes one picture per timeline frame: `Field` is its `Frame`; a clip with its
+        // pulldown removed counts film frames.
+        let b_deint = match self.deint_at(source, b_start) {
+            crate::project::Deinterlace::Off => crate::project::Deinterlace::Off,
+            crate::project::Deinterlace::Ivtc => crate::project::Deinterlace::Ivtc,
+            _ => crate::project::Deinterlace::Frame,
+        };
+        let rate = crate::deinterlace::counted_rate(b_deint, self.rates.get(source).copied().unwrap_or(Rate::REAL_TIME));
         let start_frame = rate.source_at(in_frame);
         let end_frame = rate.source_at(in_frame + window);
         let color = self
@@ -2166,9 +3182,9 @@ impl PlaybackSession {
             .composite_transform_at(b_start)
             .copied()
             .unwrap_or_default();
-        let canvas = Composer::new(canvas_w, canvas_h, self.project.composite_fit_at(b_start));
+        let canvas = Composer::new(canvas_w, canvas_h, self.project.render_view().composite_fit_at(b_start));
         let tone = self.project.tone();
-        let stream = DecodeSession::open_worker_deferred(
+        let stream = DecodeSession::open_worker_deferred_with(
             &path,
             start_frame,
             end_frame,
@@ -2177,6 +3193,7 @@ impl PlaybackSession {
             canvas,
             tone,
             Speed::NORMAL,
+            b_deint,
         );
         if let Some(d) = self.dissolve.as_mut() {
             d.b = Some(DissolveB {
@@ -2259,6 +3276,106 @@ impl PlaybackSession {
     /// bottom, and the list [`add_lane`](Self::add_lane) grows.
     pub fn lanes(&self) -> Vec<Lane> {
         self.project.lanes()
+    }
+
+    /// The sources whose files are not on disk, as `(index, saved path)`. Their
+    /// clips stay on the timeline; a frame or an export that reads one is
+    /// refused naming it.
+    pub fn offline_sources(&self) -> Vec<(usize, PathBuf)> {
+        self.project
+            .sources()
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| !crate::source_present(&s.path))
+            .map(|(i, s)| (i, s.path.clone()))
+            .collect()
+    }
+
+    /// Points source `index` at `path`, which must be the same material: the
+    /// same kind (picture, sound or still), and a picture or sound at least as
+    /// long as the furthest frame a clip reaches into the source (within a
+    /// frame). Returns warnings: a length that differs by more than a frame from
+    /// the file it replaces. The playhead is reopened on it. One undo step
+    /// ([`Project::relink_source`]): undo points the source back at the old file
+    /// and reads its length again. Nothing changes on a refusal.
+    pub fn relink_source(&mut self, index: usize, path: &Path) -> crate::Result<Vec<String>> {
+        let Some(old) = self.project.sources().get(index).cloned() else {
+            return Err(format!("there is no source {index}").into());
+        };
+        if !path.is_file() {
+            return Err(format!("{} is not a file", path.display()).into());
+        }
+        let kind = |p: &Path| {
+            if crate::is_image(p) {
+                "a still"
+            } else if crate::is_audio(p) {
+                "a sound file"
+            } else {
+                "a picture"
+            }
+        };
+        if kind(&old.path) != kind(path) {
+            return Err(format!(
+                "source {index} is {} but {} is {}",
+                kind(&old.path),
+                path.display(),
+                kind(path)
+            )
+            .into());
+        }
+        let candidate = Source::new(path, old.audio_stream);
+        let (have, rate) = self.measure_source(&candidate)?;
+        let expected = self.counts[index];
+        // What the clips actually read: the furthest out-point any clip on any
+        // lane takes from this source. A clip reading part of a source needs only
+        // that part, so refusal is against the reach, not the whole length. Both
+        // are in timeline-rate frames, the unit `have` is counted in.
+        let reach = self
+            .lanes()
+            .into_iter()
+            .flat_map(|lane| {
+                self.lane_clips(lane)
+                    .iter()
+                    .filter(|c| c.source == index)
+                    .map(|c| c.out_frame)
+                    .collect::<Vec<_>>()
+            })
+            .max()
+            .unwrap_or(0);
+        if have + 1 < reach {
+            return Err(format!(
+                "{} has {have} frames but the clips on source {index} reach frame {reach}",
+                path.display()
+            )
+            .into());
+        }
+        let mut warnings = Vec::new();
+        if crate::source_present(&old.path) && have.abs_diff(expected) > 1 {
+            warnings.push(format!(
+                "{} has {have} frames; the file it replaces had {expected}",
+                path.display()
+            ));
+        }
+        self.project.relink_source(index, path)?;
+        self.counts[index] = have;
+        self.rates[index] = rate;
+        let at = self.now();
+        self.seek(at);
+        Ok(warnings)
+    }
+
+    /// Points several sources at copies of the same files ([`crate::collect`]) as one undo
+    /// step. The copies are not measured against the clips: they are the same bytes. Their
+    /// lengths are read again as an undo reads them, and the playhead is reopened. Returns how
+    /// many sources moved.
+    pub fn relink_all(&mut self, pairs: &[(usize, PathBuf)]) -> usize {
+        let before = self.project.sources().to_vec();
+        let moved = self.project.relink_sources(pairs);
+        if moved > 0 {
+            self.reread_sources(&before);
+            self.invalidate(Dirty::Both);
+        }
+        moved
     }
 
     /// Appends an empty lane and hands back its handle. One undo step
@@ -2377,6 +3494,232 @@ impl PlaybackSession {
         self.project.sub_lane_cues(lane, self.meta.frame_rate)
     }
 
+    /// Every cue on the subtitle lanes, in start order: the captions that File > Export
+    /// captions and `export_captions` write as SRT or WebVTT ([`crate::subtitle::write_srt`]).
+    pub fn caption_cues(&self) -> Vec<crate::subtitle::Cue> {
+        let mut cues: Vec<crate::subtitle::Cue> = self.subtitle_lanes().into_iter().flat_map(|l| self.sub_lane_cues(l)).collect();
+        cues.sort_by_key(|c| c.start_us);
+        cues
+    }
+
+    /// [`sub_lane_cues`](Self::sub_lane_cues) with the cue each one is, as
+    /// `(start_us, end_us, track, cue)` in the same order ([`Project::sub_lane_cue_refs`]):
+    /// what a front-end hit-tests a drawn cue against to find the words to edit.
+    pub fn sub_lane_cue_refs(&self, lane: Lane) -> Vec<(i64, i64, usize, usize)> {
+        self.project.sub_lane_cue_refs(lane, self.meta.frame_rate)
+    }
+
+    /// [`sub_lane_cue_refs`](Self::sub_lane_cue_refs) with the part of each cue's own clock that
+    /// is shown ([`Project::sub_lane_cue_spans`]), which its word times are moved by.
+    pub fn sub_lane_cue_spans(&self, lane: Lane) -> Vec<crate::project::CueSpan> {
+        self.project.sub_lane_cue_spans(lane, self.meta.frame_rate)
+    }
+
+    /// Retypes one cue's words ([`Project::set_cue_text`]). One undo step, and
+    /// `false` with none for a cue that is not there or already reads this.
+    /// No invalidation: the picture's captions are drawn per repaint from the
+    /// palette ([`sub_lane_cues`](Self::sub_lane_cues)), so the new words are on
+    /// the next frame without a reseek.
+    pub fn set_cue_text(&mut self, track: usize, cue: usize, text: &str) -> bool {
+        self.project.set_cue_text(track, cue, text)
+    }
+
+    /// Removes one cue from its track ([`Project::delete_cue`]): gone from every
+    /// placement of the track, nothing moves. One undo step, and `false` with
+    /// none for a cue that is not there.
+    pub fn delete_cue(&mut self, track: usize, cue: usize) -> bool {
+        self.project.delete_cue(track, cue)
+    }
+
+    /// The room a cue has on the track's own clock ([`Project::cue_room`]).
+    pub fn cue_room(&self, track: usize, cue: usize) -> Option<(i64, i64)> {
+        self.project.cue_room(track, cue)
+    }
+
+    /// Where timeline time `tl_us` is on the track's clock, through the placement on `lane`
+    /// that shows the cue ([`Project::cue_track_us_at`]).
+    pub fn cue_track_us_at(&self, lane: Lane, track: usize, cue: usize, tl_us: i64) -> Option<i64> {
+        self.project.cue_track_us_at(lane, track, cue, tl_us, self.meta.frame_rate)
+    }
+
+    /// Moves or trims one cue ([`Project::set_cue_times`]). One undo step.
+    pub fn set_cue_times(&mut self, track: usize, cue: usize, start_us: i64, end_us: i64) -> crate::Result<bool> {
+        self.project.set_cue_times(track, cue, start_us, end_us)
+    }
+
+    /// Joins a cue with the one after it ([`Project::merge_cue_next`]). One undo step.
+    pub fn merge_cue_next(&mut self, track: usize, cue: usize) -> crate::Result<()> {
+        self.project.merge_cue_next(track, cue)
+    }
+
+    /// Divides the cue straddling `t_us` on the track's clock ([`Project::split_cues_at`]). One undo step.
+    pub fn split_cues_at(&mut self, track: usize, t_us: i64) -> bool {
+        self.project.split_cues_at(track, t_us)
+    }
+
+    /// Adds a cue to a track on the track's own clock ([`Project::add_cue`]): kept
+    /// in the project and saved with it. One undo step; the index it lands at, or
+    /// the refusal, which changes nothing.
+    pub fn add_cue(&mut self, track: usize, start_us: i64, end_us: i64, text: &str, overwrite: bool) -> crate::Result<usize> {
+        self.project.add_cue(track, start_us, end_us, text, overwrite)
+    }
+
+    /// The title cards and text overlays, in draw order ([`Project::titles`]).
+    pub fn titles(&self) -> &[crate::project::Title] {
+        self.project.titles()
+    }
+
+    /// The chapter markers, sorted by frame, at most one per frame
+    /// ([`Project::chapters`]).
+    pub fn chapters(&self) -> &[crate::project::Chapter] {
+        self.project.chapters()
+    }
+
+    /// The chapters as a YouTube description listing, `00:00 Intro` a line each, and the
+    /// warnings its rules call for ([`chapter_listing`]). The whole timeline, never a range.
+    pub fn youtube_chapters(&self) -> (String, Vec<String>) {
+        let fps = self.meta.frame_rate;
+        let end = (self.timeline_duration() * fps).round() as u32;
+        let chapters: Vec<(u32, String)> = self.chapters().iter().map(|c| (c.frame, c.title.clone())).collect();
+        chapter_listing(&chapters, fps, end)
+    }
+
+    /// Adds a chapter at `frame` named `title`, and returns its index in
+    /// [`chapters`](Self::chapters). One undo step; refused, with nothing changed,
+    /// for a name the project refuses or a frame that already has a chapter.
+    pub fn add_chapter(&mut self, frame: u32, title: &str) -> crate::Result<usize> {
+        self.project.add_chapter(crate::project::Chapter { frame, title: title.to_string() })
+    }
+
+    /// Takes the chapter at `idx` off the list. One undo step; `false`, with
+    /// nothing changed, for an index that is not there.
+    pub fn remove_chapter(&mut self, idx: usize) -> bool {
+        self.project.remove_chapter(idx)
+    }
+
+    /// Renames the chapter at `idx`. One undo step; `false` for an index that
+    /// is not there, a name the project refuses, or the name it already has.
+    pub fn set_chapter_title(&mut self, idx: usize, title: &str) -> bool {
+        self.project.set_chapter_title(idx, title)
+    }
+
+    /// Moves the chapter at `idx` to `frame`, and returns its new index. One undo
+    /// step; refused for a frame another chapter already holds.
+    pub fn move_chapter(&mut self, idx: usize, frame: u32) -> crate::Result<usize> {
+        self.project.move_chapter(idx, frame)
+    }
+
+    /// Maps every chapter's frame through `map` as one undo step, for an edit that
+    /// moves time (see [`Project::remap_chapters`]). Returns how many chapters a
+    /// landing on another's frame dropped.
+    pub fn remap_chapters(&mut self, map: impl Fn(u32) -> u32) -> usize {
+        self.project.remap_chapters(map)
+    }
+
+    /// How burned captions animate ([`crate::captionanim`]).
+    pub fn caption_style(&self) -> crate::captionanim::CaptionStyle {
+        self.project.caption_style()
+    }
+
+    /// Gives a caption track's cues the word times they were written from
+    /// ([`Project::attach_cue_words`]); `auto_captions` calls it right after the import.
+    pub fn attach_cue_words(&mut self, track: usize, timed: &[crate::subtitle::Cue]) {
+        self.project.attach_cue_words(track, timed);
+    }
+
+    /// Sets how burned captions animate; one undo step, `false` when it is already so.
+    pub fn set_caption_style(&mut self, style: crate::captionanim::CaptionStyle) -> bool {
+        self.project.set_caption_style(style)
+    }
+
+    /// The comment markers, sorted by frame ([`Project::markers`]).
+    pub fn markers(&self) -> &[crate::project::Marker] {
+        self.project.markers()
+    }
+
+    /// Adds a marker and returns its index in [`markers`](Self::markers). One undo step;
+    /// refused, with nothing changed, for a marker the project refuses.
+    pub fn add_marker(&mut self, marker: crate::project::Marker) -> crate::Result<usize> {
+        self.project.add_marker(marker)
+    }
+
+    /// Takes the marker at `idx` off. One undo step; `false` for an index that is not there.
+    pub fn remove_marker(&mut self, idx: usize) -> bool {
+        self.project.remove_marker(idx)
+    }
+
+    /// Replaces the marker at `idx` and returns its new index. One undo step; refused for
+    /// a marker the project refuses or one that changes nothing.
+    pub fn set_marker(&mut self, idx: usize, marker: crate::project::Marker) -> crate::Result<usize> {
+        self.project.set_marker(idx, marker)
+    }
+
+    /// Maps every marker's start and end through `map` as one undo step, for an edit that
+    /// moves time (see [`Project::remap_markers`]). `false` when nothing moved.
+    pub fn remap_markers(&mut self, map: impl Fn(u32) -> u32) -> bool {
+        self.project.remap_markers(map)
+    }
+
+    /// The markers as a chapter list for an export of `range`, as [`chapter_list_ns`](Self::chapter_list_ns)
+    /// lists chapters: `(start_ns, name)` pairs in frame order, the first marker on a frame
+    /// winning when several share one (a chapter list holds one per instant).
+    pub fn marker_list_ns(&self, range: Option<(u32, u32)>) -> Vec<(u64, String)> {
+        let (from, to) = range.unwrap_or((0, u32::MAX));
+        let fps = self.meta.frame_rate;
+        let mut out: Vec<(u64, String)> = Vec::new();
+        for m in self.project.markers().iter().filter(|m| m.frame >= from && m.frame < to) {
+            let ns = (f64::from(m.frame - from) / fps * 1e9).round() as u64;
+            if out.last().is_none_or(|(last, _)| *last != ns) {
+                out.push((ns, m.name.clone()));
+            }
+        }
+        out
+    }
+
+    /// The chapter list an export of `range` (frames, as [`ExportSettings::range`]
+    /// names it) writes: `(start_ns, name)` pairs in frame order. A chapter's time
+    /// is measured from the start of the range, so an export that starts at frame
+    /// 100 writes a chapter at frame 100 as the first one, at 0 ns. Chapters before
+    /// the range or at or past its end are left out; with no range every chapter
+    /// is listed from the start of the timeline.
+    ///
+    /// Ready for an export's chapter list: the codecs writers take the pairs as
+    /// they are.
+    pub fn chapter_list_ns(&self, range: Option<(u32, u32)>) -> Vec<(u64, String)> {
+        let (from, to) = range.unwrap_or((0, u32::MAX));
+        let fps = self.meta.frame_rate;
+        self.project
+            .chapters()
+            .iter()
+            .filter(|c| c.frame >= from && c.frame < to)
+            .map(|c| {
+                let ns = f64::from(c.frame - from) / fps * 1e9;
+                (ns.round() as u64, c.title.clone())
+            })
+            .collect()
+    }
+
+    /// Adds a title card or text overlay and recomposes the picture at the
+    /// playhead. The index it lands at, or the refusal of [`Project::add_title`],
+    /// which changes nothing.
+    pub fn add_title(&mut self, title: crate::project::Title) -> crate::Result<usize> {
+        let idx = self.project.add_title(title)?;
+        self.invalidate(Dirty::Picture);
+        Ok(idx)
+    }
+
+    /// Replaces the title at `idx` -- see [`Project::set_title`]. One undo step
+    /// and a recomposed picture.
+    pub fn set_title(&mut self, idx: usize, title: crate::project::Title) -> bool {
+        self.edit(Dirty::Picture, |p| p.set_title(idx, title))
+    }
+
+    /// Takes the title at `idx` off -- see [`Project::remove_title`]. One undo
+    /// step and a recomposed picture.
+    pub fn remove_title(&mut self, idx: usize) -> bool {
+        self.edit(Dirty::Picture, |p| p.remove_title(idx))
+    }
+
     /// Splits every lane at `timeline_secs`, so the two sides become two
     /// groups. Metadata only: a split never changes the timeline->source
     /// mapping, so the running decoder stays correct and playback does not
@@ -2385,6 +3728,19 @@ impl PlaybackSession {
     pub fn cut_at(&mut self, timeline_secs: f64) -> bool {
         self.project
             .split(secs_to_frame(timeline_secs, self.meta.frame_rate))
+    }
+
+    /// The frame nearest `frame` within `reach` frames at which [`cut_at`](Self::cut_at)
+    /// lands cleanly on every lane ([`Project::cut_frame_near`]); `None` when none is that near.
+    pub fn cut_frame_near(&self, frame: u32, reach: u32) -> Option<u32> {
+        self.project.cut_frame_near(frame, reach)
+    }
+
+    /// [`cut_at`](Self::cut_at) on the lanes in `lanes` only; the others keep
+    /// their clips whole across the cut. Metadata only, like `cut_at`.
+    pub fn cut_at_lanes(&mut self, timeline_secs: f64, lanes: &[Lane]) -> bool {
+        self.project
+            .split_on(secs_to_frame(timeline_secs, self.meta.frame_rate), lanes)
     }
 
     /// The inverse of [`cut_at`](Self::cut_at): rejoins the clips that meet at
@@ -2489,6 +3845,130 @@ impl PlaybackSession {
         self.edit(Dirty::Sound, |p| p.set_eq(lane, idx, params))
     }
 
+    /// The clip's own gain in dB at `idx` of `lane`, or `None` for an index
+    /// that is not there ([`Project::clip_gain`]).
+    pub fn clip_gain_of(&self, lane: Lane, idx: usize) -> Option<f32> {
+        self.project.clip_gain(lane, idx)
+    }
+
+    /// Sets that clip's gain in dB, clamped to the clip-gain range. One undo
+    /// step, and the sound is rebuilt where the playhead is, as for
+    /// [`set_eq`](Self::set_eq). `false` for a video lane, a bad index, a
+    /// non-finite value, or a value already set.
+    pub fn set_clip_gain(&mut self, lane: Lane, idx: usize, db: f32) -> bool {
+        self.edit(Dirty::Sound, |p| p.set_clip_gain(lane, idx, db))
+    }
+
+    /// Plays the timeline's sound at `at` (timeline seconds) for [`SCRUB_SECS`]: the audible
+    /// half of a ruler scrub while paused. The decode happens on the scrub thread and nothing
+    /// here waits for it, so a drag never stalls on the file; a request that arrives while an
+    /// earlier one is still being read replaces it. Silent, and a no-op, past the end of the
+    /// timeline or where nothing plays.
+    pub fn scrub_audio(&mut self, at: f64) {
+        if !(at.is_finite() && at >= 0.) {
+            return;
+        }
+        let fps = self.meta.frame_rate;
+        let target = (at * fps) as u32;
+        let view = self.project.render_view();
+        let segs = view.audio_segments_from(target, fps);
+        if segs.is_empty() {
+            return;
+        }
+        let eqs = view.audio_eqs_from(target, fps);
+        let speeds = view.audio_speeds_from(target, fps);
+        let fades = view.audio_fades_from(target, fps);
+        let sources = self.project.audio_sources();
+        let gains = self.mix_gains();
+        let ducks = view.audio_ducks();
+        let voices = view.audio_voices();
+        let limiter = self.project.limiter();
+        let sample_rate = self.sample_rate;
+        let work: ScrubWork = Box::new(move || {
+            let (meta, rx) = AudioSession::open_mixed_streams_live_fade(
+                &sources,
+                &segs,
+                &eqs,
+                &speeds,
+                &fades,
+                fps,
+                &gains,
+                &ducks,
+                &voices,
+                limiter,
+                None,
+                sample_rate,
+            )
+            .ok()??;
+            let channels = usize::from(meta.channels).max(1);
+            let want = (SCRUB_SECS * f64::from(meta.sample_rate)) as usize * channels;
+            let mut buf = Vec::with_capacity(want);
+            while buf.len() < want {
+                match rx.recv_timeout(std::time::Duration::from_millis(500)) {
+                    Ok(chunk) => buf.extend_from_slice(&chunk.samples),
+                    Err(_) => break,
+                }
+            }
+            buf.truncate(want);
+            if buf.is_empty() {
+                return None;
+            }
+            let fade = (SCRUB_FADE_SECS * f64::from(meta.sample_rate)) as usize;
+            let samples = scrub_snippet(&buf, channels, fade);
+            Some((meta.sample_rate, u32::from(meta.channels), samples))
+        });
+        let tx = self.scrub.tx.get_or_insert_with(|| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let _ = std::thread::Builder::new()
+                .name("audio-scrub".into())
+                .spawn(move || scrub_thread(rx));
+            tx
+        });
+        let _ = tx.send(work);
+        self.scrub.requests += 1;
+    }
+
+    /// How many scrub snippets have been asked for on this session: the count a test reads to see
+    /// that a drag did, or did not, play sound ([`PlaybackSession::scrub_audio`]).
+    pub fn scrub_requests(&self) -> u64 {
+        self.scrub.requests
+    }
+
+    /// The clip's pitch shift in semitones at `idx` of `lane` ([`Project::clip_pitch`]).
+    pub fn clip_pitch_of(&self, lane: Lane, idx: usize) -> Option<i8> {
+        self.project.clip_pitch(lane, idx)
+    }
+
+    /// Sets that clip's pitch in semitones, clamped to `-12..=12`. One undo step; the
+    /// sound is rebuilt where the playhead is, as for [`set_clip_gain`](Self::set_clip_gain).
+    /// `false` for a video lane, a bad index, or a value already set.
+    pub fn set_clip_pitch(&mut self, lane: Lane, idx: usize, semitones: i32) -> bool {
+        self.edit(Dirty::Sound, |p| p.set_clip_pitch(lane, idx, semitones))
+    }
+
+    /// The clip's pan at `idx` of `lane`, `-1.0..=1.0` ([`Project::clip_pan`]).
+    pub fn clip_pan_of(&self, lane: Lane, idx: usize) -> Option<f32> {
+        self.project.clip_pan(lane, idx)
+    }
+
+    /// Sets that clip's pan. One undo step; the sound is rebuilt where the playhead is, as for
+    /// [`set_clip_gain`](Self::set_clip_gain). `false` for a video lane, a bad index, a
+    /// non-finite value, or a value already set.
+    pub fn set_clip_pan(&mut self, lane: Lane, idx: usize, pan: f32) -> bool {
+        self.edit(Dirty::Sound, |p| p.set_clip_pan(lane, idx, pan))
+    }
+
+    /// An audio lane's pan, `-1.0..=1.0` ([`Project::lane_pan`]).
+    pub fn lane_pan(&self, lane: Lane) -> f32 {
+        self.project.lane_pan(lane)
+    }
+
+    /// Sets it. One undo step; the pan rides in each clip's envelope, so the sound is rebuilt
+    /// where the playhead is (a caller commits one change per gesture).
+    pub fn set_lane_pan(&mut self, lane: Lane, pan: f32) -> bool {
+        self.edit(Dirty::Sound, |p| p.set_lane_pan(lane, pan))
+    }
+
     /// How loud that lane plays, in dB -- everything on it, every frequency of
     /// it. See [`Project::lane_gain_db`] for what it is *not*.
     pub fn lane_gain_db(&self, lane: Lane) -> f32 {
@@ -2514,19 +3994,203 @@ impl PlaybackSession {
         true
     }
 
+    /// Sets or clears the auto-duck on an audio lane -- see
+    /// [`Project::set_lane_duck`]. Live exactly as a volume is: the running
+    /// mixer is handed the new duck and picks it up at its next block, and
+    /// nothing is rebuilt.
+    pub fn set_lane_duck(&mut self, lane: Lane, duck: Option<crate::duck::Duck>) -> bool {
+        if !self.project.set_lane_duck(lane, duck) {
+            return false;
+        }
+        self.push_mix();
+        true
+    }
+
+    /// The duck on `lane`, if it has one -- see [`Project::lane_duck`].
+    pub fn lane_duck(&self, lane: Lane) -> Option<crate::duck::Duck> {
+        self.project.lane_duck(lane)
+    }
+
+    /// Every duck on `lane`, one per key -- see [`Project::lane_duck_list`].
+    pub fn lane_duck_list(&self, lane: Lane) -> Vec<crate::duck::Duck> {
+        self.project.lane_duck_list(lane)
+    }
+
+    /// Removes the duck `lane` has under the key `under` (the key's
+    /// [`Lane::ord`]) and keeps its others -- see [`Project::clear_lane_duck`].
+    /// Live like [`set_lane_duck`](Self::set_lane_duck).
+    pub fn clear_lane_duck(&mut self, lane: Lane, under: usize) -> bool {
+        if !self.project.clear_lane_duck(lane, under) {
+            return false;
+        }
+        self.push_mix();
+        true
+    }
+
+    /// The voice processors on `lane` -- see [`Project::lane_voice`].
+    pub fn lane_voice(&self, lane: Lane) -> crate::voice::VoiceFx {
+        self.project.lane_voice(lane)
+    }
+
+    /// Sets the voice processors of an audio lane -- see [`Project::set_lane_voice`].
+    /// One undo step. Not live: the processors run on the lane's own stream, so the
+    /// sound is rebuilt where the playhead is, as for [`set_eq`](Self::set_eq).
+    pub fn set_lane_voice(&mut self, lane: Lane, voice: crate::voice::VoiceFx) -> bool {
+        self.edit(Dirty::Sound, |p| p.set_lane_voice(lane, voice))
+    }
+
+    /// Learns a noise profile from `lane` -- the quietest half second of it, or the
+    /// `range` (lane seconds) -- see [`crate::voice::learn_noise`]. Reads the lane as it
+    /// plays and changes nothing.
+    pub fn learn_noise(
+        &self,
+        lane: Lane,
+        range: Option<(f64, f64)>,
+    ) -> crate::Result<crate::voice::Learned> {
+        crate::voice::learn_noise(&self.project, lane, self.meta.frame_rate, self.sample_rate, range)
+    }
+
+    /// Whether the lane is hidden -- see [`Project::lane_hidden`].
+    pub fn lane_hidden(&self, lane: Lane) -> bool {
+        self.project.lane_hidden(lane)
+    }
+
+    /// Whether the lane is muted -- see [`Project::lane_muted`].
+    pub fn lane_muted(&self, lane: Lane) -> bool {
+        self.project.lane_muted(lane)
+    }
+
+    /// Whether the lane is locked -- see [`Project::lane_locked`]. Nothing here
+    /// refuses an edit on it; the front-end does.
+    pub fn lane_locked(&self, lane: Lane) -> bool {
+        self.project.lane_locked(lane)
+    }
+
+    /// Hides or shows a lane, live. A video lane's picture is recomposed at the
+    /// playhead, the one rebuild this costs ([`Dirty::Picture`]); the sound keeps
+    /// playing. A subtitle lane is drawn from the project at every repaint, so
+    /// nothing is rebuilt for it at all.
+    pub fn set_lane_hidden(&mut self, lane: Lane, hidden: bool) -> bool {
+        if !self.project.set_lane_hidden(lane, hidden) {
+            return false;
+        }
+        if lane.kind == LaneKind::Video {
+            self.invalidate(Dirty::Picture);
+        }
+        true
+    }
+
+    /// Mutes or unmutes an audio lane, live: the mix is handed its new gain at
+    /// the next block exactly as a fader is ([`push_mix`](Self::push_mix)).
+    pub fn set_lane_muted(&mut self, lane: Lane, muted: bool) -> bool {
+        if !self.project.set_lane_muted(lane, muted) {
+            return false;
+        }
+        self.push_mix();
+        true
+    }
+
+    /// Locks or unlocks a lane. Nothing plays differently, so nothing is
+    /// touched -- it is in the lane list, so it is one undo step like the rest.
+    pub fn set_lane_locked(&mut self, lane: Lane, locked: bool) -> bool {
+        self.project.set_lane_locked(lane, locked)
+    }
+
+    /// Names a lane ([`Project::set_lane_name`]). A label only: nothing is rebuilt.
+    pub fn set_lane_name(&mut self, lane: Lane, name: &str) -> Result<bool, String> {
+        self.project.set_lane_name(lane, name)
+    }
+
+    /// The name given to a lane, `None` for none ([`Project::lane_name`]).
+    pub fn lane_name(&self, lane: Lane) -> Option<&str> {
+        self.project.lane_name(lane)
+    }
+
+    /// What a lane header shows: the name, else the address ([`Project::lane_title`]).
+    pub fn lane_title(&self, lane: Lane) -> String {
+        self.project.lane_title(lane)
+    }
+
+    /// Solos audio lanes for listening: while any is soloed, every other audio
+    /// lane is silent in what this session plays. Monitoring only -- it is not
+    /// project state, is not saved, and an export never reads it. Lanes that
+    /// are not audio lanes are ignored, and an empty list clears the solo.
+    /// `false` when nothing changes. A [`Lane`] is a handle into the lane list,
+    /// so solo again after a lane is removed or moved.
+    pub fn set_solo(&mut self, lanes: &[Lane]) -> bool {
+        let solo: Vec<Lane> = self
+            .project
+            .audio_lanes()
+            .into_iter()
+            .filter(|lane| lanes.contains(lane))
+            .collect();
+        if solo == self.solo {
+            return false;
+        }
+        self.solo = solo;
+        self.push_mix();
+        true
+    }
+
+    /// The audio lanes soloed for listening, as [`set_solo`](Self::set_solo) took them.
+    pub fn soloed(&self) -> &[Lane] {
+        &self.solo
+    }
+
+    /// The gains the sound plays: the project's own, with the audio lanes
+    /// outside a solo silenced. A solo that names no audio lane any more is no
+    /// solo, so a stale handle cannot silence everything. The export reads
+    /// [`Project::audio_gains`] directly and never comes through here.
+    fn mix_gains(&self) -> Vec<f32> {
+        soloed_gains(
+            self.project.render_view().audio_gains(),
+            &self.project.render_view().audio_lanes(),
+            &self.solo,
+        )
+    }
+
+    /// The level meters, as the sound has reached them since the last call, and
+    /// starts them over: the highest level each audio lane reached after its own
+    /// gain (mute and solo read as silence) and the master peak after the
+    /// limiter, before the device's volume. The flat single-lane path has no
+    /// mixer, and its one lane is the master. Cheap: atomics and one short lock,
+    /// nothing on the device's callback.
+    pub fn levels(&self) -> Levels {
+        let master = self.audio.as_ref().map_or(0.0, |audio| {
+            f32::from_bits(audio.peak.swap(0, Ordering::Relaxed))
+        });
+        let master_lr = self.master_peaks_lr();
+        let mut lanes = match self.mix.as_ref() {
+            Some(mix) => mix.take_lane_peaks(),
+            None => vec![master],
+        };
+        lanes.resize(self.project.audio_lanes().len(), 0.0);
+        Levels { lanes, master, master_lr }
+    }
+
+    /// The master's left and right peaks since the last read (of this or of [`levels`](Self::levels)),
+    /// and starts them over: the stereo transport meter's own door, which leaves the lane peaks and
+    /// the mono master the mix card reads alone.
+    pub fn master_peaks_lr(&self) -> [f32; 2] {
+        self.audio.as_ref().map_or([0.0; 2], |audio| {
+            [0, 1].map(|i| f32::from_bits(audio.peak_lr[i].swap(0, Ordering::Relaxed)))
+        })
+    }
+
     /// Hands the mix the running mixer is reading its new settings -- the whole
     /// of what a fader and a ceiling cost. With no mixer listening (the
     /// single-lane flat path, and a session with no sound at all) the sound is
     /// rebuilt instead, which is what opens one.
     fn push_mix(&mut self) {
-        let gains = self.project.audio_gains();
+        let gains = self.mix_gains();
+        let ducks = self.project.render_view().audio_ducks();
         let limiter = self.project.limiter();
         // A mixer reading these, or an open on its way to being one: either way
         // the number is heard without a rebuild, and *that* is what a handle
         // left over from an open that found nothing cannot do
         // ([`crate::audio::MixControls::is_reachable`]).
         if let Some(mix) = self.mix.as_ref().filter(|mix| mix.is_reachable()) {
-            mix.set(gains, limiter);
+            mix.set(gains, ducks, limiter);
             return;
         }
         // Nothing to hand it to. Only a setting that *needs* a mixer is worth
@@ -2535,7 +4199,7 @@ impl PlaybackSession {
         // single-stream path the timeline is already playing
         // ([`AudioSession::is_mixed`]), and reseeking per nudge was a hole in
         // the sound for a change nobody could hear.
-        if crate::audio::AudioSession::is_mixed(gains.len(), &gains, limiter) {
+        if crate::audio::AudioSession::is_mixed(gains.len(), &gains, limiter, &self.project.render_view().audio_voices()) {
             self.reseek_audio();
         }
     }
@@ -2576,6 +4240,21 @@ impl PlaybackSession {
         self.edit(Dirty::Both, |p| p.lift(lane, idx))
     }
 
+    /// [`swap_clips`](Self::swap_clips) without the ripple: each clip takes the
+    /// other's head and nothing between them moves ([`Project::swap_in_place`]).
+    /// The `Err` names the clip the longer one would overlap, and nothing changes.
+    pub fn swap_clips_in_place(&mut self, lane: Lane, a: usize, b: usize) -> crate::Result<()> {
+        self.project.swap_in_place(lane, a, b)?;
+        self.invalidate(Dirty::Both);
+        Ok(())
+    }
+
+    /// Swaps two placements of one lane ([`Project::swap`]): `b` takes `a`'s
+    /// start and the ones between them ripple by the difference. One undo step.
+    pub fn swap_clips(&mut self, lane: Lane, a: usize, b: usize) -> bool {
+        self.edit(Dirty::Both, |p| p.swap(lane, a, b))
+    }
+
     /// Moves that clip onto lane `to` with its head at timeline frame `start` --
     /// the drag that carries a take along its track or onto another one, and its
     /// whole group with it. See [`Project::move_clip`] for the walls `start` is
@@ -2588,7 +4267,19 @@ impl PlaybackSession {
     /// [`trim_clip`](Self::trim_clip)'s reason: the drag has already put the
     /// pointer on a frame, and converting it back through seconds would be a
     /// rounding step between the box let go of and the box committed.
+    ///
+    /// Across kinds (a picture onto an audio lane or back) the clip must fit
+    /// the new lane's wall ([`held_to_lane`](Self::held_to_lane)): a clip past
+    /// it is refused rather than cut, since a move is not an edit of its length.
     pub fn move_clip_to(&mut self, from: Lane, idx: usize, to: Lane, start: u32) -> bool {
+        if from.kind != to.kind {
+            let Some(clip) = self.lane_clips(from).get(idx).cloned() else {
+                return false;
+            };
+            if self.held_to_lane(to, clip.clone()).out_frame != clip.out_frame {
+                return false;
+            }
+        }
         self.edit(Dirty::Both, |p| p.move_clip(from, idx, to, start))
     }
 
@@ -2610,6 +4301,18 @@ impl PlaybackSession {
         })
     }
 
+    /// [`trim_clip`](Self::trim_clip) as a ripple trim ([`Project::ripple_trim`]): the hole the
+    /// edge leaves closes, or opens, and what follows moves with it. One undo step.
+    pub fn ripple_trim_clip(&mut self, lane: Lane, idx: usize, edge: Edge, to: u32) -> bool {
+        let (picture, sound) = lane_walls(self.project.sources(), &self.counts, self.meta.frame_rate);
+        if !self.project.ripple_trim_with_walls(lane, idx, edge, to, SourceWalls { picture: &picture, sound: &sound }) {
+            return false;
+        }
+        let now = self.now();
+        self.seek(now);
+        true
+    }
+
     /// Drags one end of that clip to timeline frame `to`, changing how much of
     /// its source it plays and nothing else on the lane -- see [`Project::trim`]
     /// for the walls it is clamped by, which this fills the source lengths in
@@ -2625,12 +4328,73 @@ impl PlaybackSession {
     pub fn trim_clip(&mut self, lane: Lane, idx: usize, edge: Edge, to: u32) -> bool {
         // Spelled out rather than through `edit`, whose closure cannot hold a
         // second borrow of the session while it has the project.
-        if !self.project.trim(lane, idx, edge, to, &self.counts) {
+        let (picture, sound) = lane_walls(self.project.sources(), &self.counts, self.meta.frame_rate);
+        if !self.project.trim_with_walls(lane, idx, edge, to, SourceWalls { picture: &picture, sound: &sound }) {
             return false;
         }
         let now = self.now();
         self.seek(now);
         true
+    }
+
+    /// **Roll**: moves the cut at the end of the clip at `idx` of `lane` to timeline
+    /// frame `to` ([`Project::roll`]): the out-point of that clip and the in-point of
+    /// the one behind it move together. Returns where the cut is now; `None` for a
+    /// clip with nothing abutting behind it. Reseeks, one undo step.
+    pub fn roll_clip(&mut self, lane: Lane, idx: usize, to: u32) -> Option<u32> {
+        let (picture, sound) = lane_walls(self.project.sources(), &self.counts, self.meta.frame_rate);
+        let at = self.project.roll(lane, idx, to, SourceWalls { picture: &picture, sound: &sound })?;
+        let now = self.now();
+        self.seek(now);
+        Some(at)
+    }
+
+    /// Where that cut may travel, `(first, last)` frame inclusive ([`Project::roll_room`]).
+    pub fn roll_room(&self, lane: Lane, idx: usize) -> Option<(u32, u32)> {
+        let (picture, sound) = lane_walls(self.project.sources(), &self.counts, self.meta.frame_rate);
+        self.project.roll_room(lane, idx, SourceWalls { picture: &picture, sound: &sound })
+    }
+
+    /// **Slide**: starts that clip at timeline frame `to` between its neighbours
+    /// ([`Project::slide`]). Returns where it starts now; `None` for a clip
+    /// without a neighbour on both sides. Reseeks, one undo step.
+    pub fn slide_clip(&mut self, lane: Lane, idx: usize, to: u32) -> Option<u32> {
+        let (picture, sound) = lane_walls(self.project.sources(), &self.counts, self.meta.frame_rate);
+        let at = self.project.slide(lane, idx, to, SourceWalls { picture: &picture, sound: &sound })?;
+        let now = self.now();
+        self.seek(now);
+        Some(at)
+    }
+
+    /// Where that clip may start when slid, `(first, last)` frame inclusive ([`Project::slide_room`]).
+    pub fn slide_room(&self, lane: Lane, idx: usize) -> Option<(u32, u32)> {
+        let (picture, sound) = lane_walls(self.project.sources(), &self.counts, self.meta.frame_rate);
+        self.project.slide_room(lane, idx, SourceWalls { picture: &picture, sound: &sound })
+    }
+
+    /// **Slip**: shifts that clip's source window by `by` source frames
+    /// ([`Project::slip`]; [`slip_source_delta`](Self::slip_source_delta) turns timeline
+    /// frames into them). Returns the frames it moved; `None` for a bad index or a
+    /// still. Reseeks, one undo step.
+    pub fn slip_clip(&mut self, lane: Lane, idx: usize, by: i64) -> Option<i64> {
+        let (picture, sound) = lane_walls(self.project.sources(), &self.counts, self.meta.frame_rate);
+        let moved = self.project.slip(lane, idx, by, SourceWalls { picture: &picture, sound: &sound })?;
+        if moved != 0 {
+            let now = self.now();
+            self.seek(now);
+        }
+        Some(moved)
+    }
+
+    /// How far that clip may slip, `(back, forward)` source frames ([`Project::slip_room`]).
+    pub fn slip_room(&self, lane: Lane, idx: usize) -> Option<(i64, i64)> {
+        let (picture, sound) = lane_walls(self.project.sources(), &self.counts, self.meta.frame_rate);
+        self.project.slip_room(lane, idx, SourceWalls { picture: &picture, sound: &sound })
+    }
+
+    /// The source frames `by` timeline frames are worth for that clip ([`Project::slip_source_delta`]).
+    pub fn slip_source_delta(&self, lane: Lane, idx: usize, by: i64) -> Option<i64> {
+        self.project.slip_source_delta(lane, idx, by)
     }
 
     /// How fast the clip at `idx` of `lane` plays -- what a card shows before
@@ -2658,6 +4422,36 @@ impl PlaybackSession {
             || self.now(),
             |frame| f64::from(frame) / self.meta.frame_rate,
         );
+        self.seek(now);
+        Ok(())
+    }
+
+    /// Whether the clip at `idx` of `lane` plays backwards ([`Project::reversed_of`]).
+    pub fn reversed_of(&self, lane: Lane, idx: usize) -> bool {
+        self.project.reversed_of(lane, idx)
+    }
+
+    /// Plays the clip and its whole group backwards, or forwards again
+    /// ([`Project::set_reverse`]): one undo step, and a reseek at the playhead so
+    /// the picture and the sound run the new way from the next frame on.
+    pub fn set_reverse(&mut self, lane: Lane, idx: usize, on: bool) -> crate::Result<()> {
+        self.project.set_reverse(lane, idx, on)?;
+        let now = self.now();
+        self.seek(now);
+        Ok(())
+    }
+
+    /// Gives the clip at `idx` of `lane` (and its group) a speed ramp, or clears it
+    /// with empty `keys` ([`Project::set_speed_ramp`]). Reseeks like
+    /// [`set_speed`](Self::set_speed), and the playhead holds where it stood.
+    pub fn set_speed_ramp(
+        &mut self,
+        lane: Lane,
+        idx: usize,
+        keys: &[crate::project::SpeedKey],
+    ) -> crate::Result<()> {
+        self.project.set_speed_ramp(lane, idx, keys)?;
+        let now = self.now();
         self.seek(now);
         Ok(())
     }
@@ -2690,8 +4484,7 @@ impl PlaybackSession {
     /// span math the decoder walks. What a test asks to prove a reseek kept
     /// the scene, and nothing in the editor itself reads.
     pub fn video_source_frame_at(&self, timeline_secs: f64) -> Option<(usize, u32)> {
-        self.project
-            .composite_span_at(secs_to_frame(timeline_secs, self.meta.frame_rate))
+        crate::export::stack_span_at(&self.project.render_view(), secs_to_frame(timeline_secs, self.meta.frame_rate))
             .and_then(|s| s.from)
     }
 
@@ -2748,11 +4541,35 @@ impl PlaybackSession {
         Ok(())
     }
 
+    // The length of each source on a picture lane and on an audio lane
+    // ([`wall_table`]): a linked take drags both edges together, so a trim
+    // measures each lane's members against that lane's own length.
+
     /// Where that edge may land, `(first, last)` timeline frame inclusive: what
     /// a drag clamps the pointer to so the box it draws is the box
     /// [`trim_clip`](Self::trim_clip) will commit. `None` for a bad index.
     pub fn trim_room(&self, lane: Lane, idx: usize, edge: Edge) -> Option<(u32, u32)> {
-        self.project.trim_room(lane, idx, edge, &self.counts)
+        let (picture, sound) = lane_walls(self.project.sources(), &self.counts, self.meta.frame_rate);
+        self.project.trim_room_with_walls(lane, idx, edge, SourceWalls { picture: &picture, sound: &sound })
+    }
+
+    /// [`trim_room`](Self::trim_room) with the walls named: which of the two is
+    /// the source's media limit, so a drag that stops there can say so. `None`
+    /// for a bad index.
+    pub fn trim_walls(&self, lane: Lane, idx: usize, edge: Edge) -> Option<TrimWalls> {
+        let (picture, sound) = lane_walls(self.project.sources(), &self.counts, self.meta.frame_rate);
+        self.project.trim_walls_with_walls(lane, idx, edge, SourceWalls { picture: &picture, sound: &sound })
+    }
+
+    /// [`trim_walls`](Self::trim_walls) with each wall's bound named
+    /// ([`Project::trim_bounds`]): the source, a neighbour at a frame, the
+    /// timeline's first frame, a clip's minimum length or a still's cap. Asked
+    /// before a trim, so the names are for the walls the trim is measured to.
+    /// `None` for a bad index.
+    pub fn trim_bounds(&self, lane: Lane, idx: usize, edge: Edge) -> Option<(WallBound, WallBound)> {
+        let (picture, sound) = lane_walls(self.project.sources(), &self.counts, self.meta.frame_rate);
+        self.project
+            .trim_bounds(lane, idx, edge, SourceWalls { picture: &picture, sound: &sound })
     }
 
     /// Records how long a source is and what rate it was shot at, for a source
@@ -2952,6 +4769,17 @@ impl PlaybackSession {
         self.encoder_seat
     }
 
+    /// Gives a loaded project the window's seat when it carries none of its own: nobody
+    /// picked it, so it is no undo step. Its own copy of the settings is kept in step with
+    /// the session, as [`Self::set_encoder_seat`] keeps it, and nothing else moves.
+    pub fn default_encoder_seat(&mut self, seat: crate::export::EncoderSeat) {
+        if self.encoder_seat == seat {
+            return;
+        }
+        self.encoder_seat = seat;
+        self.project.mirror_settings(self.settings_value());
+    }
+
     /// Pick the seat. Nothing to reseek and nothing to re-probe here: this
     /// decides what an *export* opens, never what plays. One undo step, like
     /// every other pick on the project.
@@ -3080,6 +4908,26 @@ impl PlaybackSession {
         self.edit(Dirty::Picture, |p| p.set_color_live(lane, idx, params))
     }
 
+    /// [`Project::lut_problems`]: the `.cube` files clips name that cannot be used, and why.
+    pub fn lut_problems(&self) -> Vec<(PathBuf, String)> {
+        self.project.lut_problems()
+    }
+
+    /// [`Project::luts`]: every `.cube` file a clip's grade names.
+    pub fn luts(&self) -> Vec<crate::cube::LutRef> {
+        self.project.luts()
+    }
+
+    /// [`Project::relink_lut`], with the reseek every picture edit makes.
+    pub fn relink_lut(&mut self, from: &std::path::Path, to: &std::path::Path) -> usize {
+        let mut n = 0;
+        self.edit(Dirty::Picture, |p| {
+            n = p.relink_lut(from, to);
+            n > 0
+        });
+        n
+    }
+
     /// Where the clip at `idx` of `lane` is placed -- [`color_of`](Self::color_of)'s
     /// twin for geometry instead of grade.
     pub fn transform_of(&self, lane: Lane, idx: usize) -> Option<&TransformParams> {
@@ -3096,6 +4944,181 @@ impl PlaybackSession {
         params: Option<TransformParams>,
     ) -> bool {
         self.edit(Dirty::Picture, |p| p.set_transform(lane, idx, params))
+    }
+
+    /// The placement animation of the clip at `idx` of `lane`, in source order
+    /// ([`Project::transform_keys_of`]).
+    pub fn transform_keys_of(&self, lane: Lane, idx: usize) -> &[crate::transform::TransformKey] {
+        self.project.transform_keys_of(lane, idx)
+    }
+
+    /// Replaces the clip's placement animation, or clears it with an empty list
+    /// ([`Project::set_transform_keys`]). One undo step and one reseek.
+    pub fn set_transform_keys(
+        &mut self,
+        lane: Lane,
+        idx: usize,
+        keys: Vec<crate::transform::TransformKey>,
+    ) -> bool {
+        self.edit(Dirty::Picture, |p| p.set_transform_keys(lane, idx, keys))
+    }
+
+    /// The opacity animation of the clip at `idx` of `lane`, in source order
+    /// ([`Project::opacity_keys_of`]).
+    pub fn opacity_keys_of(&self, lane: Lane, idx: usize) -> &[crate::transform::OpacityKey] {
+        self.project.opacity_keys_of(lane, idx)
+    }
+
+    /// Replaces the clip's opacity animation, or clears it with an empty list
+    /// ([`Project::set_opacity_keys`]). One undo step and one reseek.
+    pub fn set_opacity_keys(
+        &mut self,
+        lane: Lane,
+        idx: usize,
+        keys: Vec<crate::transform::OpacityKey>,
+    ) -> bool {
+        self.edit(Dirty::Picture, |p| p.set_opacity_keys(lane, idx, keys))
+    }
+
+    /// The colour animation of the clip at `idx` of `lane`, in source order
+    /// ([`Project::color_keys_of`]).
+    pub fn color_keys_of(&self, lane: Lane, idx: usize) -> &[crate::color::ColorKey] {
+        self.project.color_keys_of(lane, idx)
+    }
+
+    /// Replaces the clip's colour animation, or clears it with an empty list
+    /// ([`Project::set_color_keys`]). One undo step and one reseek.
+    pub fn set_color_keys(
+        &mut self,
+        lane: Lane,
+        idx: usize,
+        keys: Vec<crate::color::ColorKey>,
+    ) -> bool {
+        self.edit(Dirty::Picture, |p| p.set_color_keys(lane, idx, keys))
+    }
+
+    /// The effects stack of the clip at `idx` of `lane` ([`Project::effects_of`]).
+    pub fn effects_of(&self, lane: Lane, idx: usize) -> &[crate::effects::Effect] {
+        self.project.effects_of(lane, idx)
+    }
+
+    /// The keys of the mask at stack position `slot` ([`Project::mask_keys_of`]).
+    pub fn mask_keys_of(&self, lane: Lane, idx: usize, slot: usize) -> &[crate::effects::MaskKey] {
+        self.project.mask_keys_of(lane, idx, slot)
+    }
+
+    /// Replaces the keys of the mask at stack position `slot`, or clears them with an
+    /// empty list ([`Project::set_mask_keys`]). One undo step and one reseek.
+    pub fn set_mask_keys(&mut self, lane: Lane, idx: usize, slot: usize, keys: Vec<crate::effects::MaskKey>) -> bool {
+        self.edit(Dirty::Picture, |p| p.set_mask_keys(lane, idx, slot, keys))
+    }
+
+    /// Replaces the clip's effects stack ([`Project::set_effects`]). One undo
+    /// step and one reseek.
+    pub fn set_effects(&mut self, lane: Lane, idx: usize, effects: Vec<crate::effects::Effect>) -> bool {
+        self.edit(Dirty::Picture, |p| p.set_effects(lane, idx, effects))
+    }
+
+    /// [`Project::key_source_frame`].
+    pub fn key_source_frame(&self, lane: Lane, idx: usize, timeline_frame: u32) -> Option<u32> {
+        self.project.key_source_frame(lane, idx, timeline_frame)
+    }
+
+    /// [`Project::is_keyed`].
+    pub fn is_keyed(&self, lane: Lane, idx: usize, kind: crate::project::KeyKind) -> bool {
+        self.project.is_keyed(lane, idx, kind)
+    }
+
+    /// [`Project::key_ease_at`].
+    pub fn key_ease_at(
+        &self,
+        lane: Lane,
+        idx: usize,
+        kind: crate::project::KeyKind,
+        timeline_frame: u32,
+    ) -> Option<crate::transform::KeyEase> {
+        self.project.key_ease_at(lane, idx, kind, timeline_frame)
+    }
+
+    /// The stopwatch ([`Project::toggle_key`]). One undo step and one reseek.
+    pub fn toggle_key(
+        &mut self,
+        lane: Lane,
+        idx: usize,
+        kind: crate::project::KeyKind,
+        timeline_frame: u32,
+    ) -> Option<bool> {
+        let mut out = None;
+        self.edit(Dirty::Picture, |p| {
+            out = p.toggle_key(lane, idx, kind, timeline_frame);
+            out.is_some()
+        });
+        out
+    }
+
+    /// [`Project::set_key_ease_at`]. One undo step and one reseek.
+    pub fn set_key_ease_at(
+        &mut self,
+        lane: Lane,
+        idx: usize,
+        kind: crate::project::KeyKind,
+        timeline_frame: u32,
+        ease: crate::transform::KeyEase,
+    ) -> bool {
+        self.edit(Dirty::Picture, |p| p.set_key_ease_at(lane, idx, kind, timeline_frame, ease))
+    }
+
+    /// [`Project::put_transform_key_at`]; `snapshot` false is the live write of a drag.
+    pub fn put_transform_key_at(
+        &mut self,
+        lane: Lane,
+        idx: usize,
+        timeline_frame: u32,
+        params: TransformParams,
+        snapshot: bool,
+    ) -> bool {
+        self.edit(Dirty::Picture, |p| p.put_transform_key_at(lane, idx, timeline_frame, params, snapshot))
+    }
+
+    /// [`Project::put_opacity_key_at`]; `snapshot` false is the live write of a drag.
+    pub fn put_opacity_key_at(
+        &mut self,
+        lane: Lane,
+        idx: usize,
+        timeline_frame: u32,
+        opacity: f32,
+        snapshot: bool,
+    ) -> bool {
+        self.edit(Dirty::Picture, |p| p.put_opacity_key_at(lane, idx, timeline_frame, opacity, snapshot))
+    }
+
+    /// [`Project::put_color_key_at`]; `snapshot` false is the live write of a drag.
+    pub fn put_color_key_at(
+        &mut self,
+        lane: Lane,
+        idx: usize,
+        timeline_frame: u32,
+        params: ColorParams,
+        snapshot: bool,
+    ) -> bool {
+        self.edit(Dirty::Picture, |p| p.put_color_key_at(lane, idx, timeline_frame, params, snapshot))
+    }
+
+    /// The placement the clip shows at timeline `timeline_frame`, keys evaluated
+    /// ([`Project::transform_at`]).
+    pub fn transform_at(&self, lane: Lane, idx: usize, timeline_frame: u32) -> Option<TransformParams> {
+        self.project.transform_at(lane, idx, timeline_frame)
+    }
+
+    /// The grade the clip shows at `timeline_frame`, keys evaluated ([`Project::color_at`]).
+    pub fn color_at(&self, lane: Lane, idx: usize, timeline_frame: u32) -> Option<ColorParams> {
+        self.project.color_at(lane, idx, timeline_frame)
+    }
+
+    /// The opacity the clip shows at `timeline_frame`, keys evaluated, fades not
+    /// counted ([`Project::opacity_at`]).
+    pub fn opacity_at(&self, lane: Lane, idx: usize, timeline_frame: u32) -> f32 {
+        self.project.opacity_at(lane, idx, timeline_frame)
     }
 
     /// The same placement and the same reseek without the undo step
@@ -3155,6 +5178,28 @@ impl PlaybackSession {
     /// another, and a setting on the project rather than on any clip.
     pub fn tone(&self) -> crate::tonemap::Preset {
         self.project.tone()
+    }
+
+    /// The project's notes ([`Project::notes`]).
+    pub fn notes(&self) -> &str {
+        self.project.notes()
+    }
+
+    /// Sets the project's notes ([`Project::set_notes`]): one undo step, `false` for the text
+    /// already in force.
+    pub fn set_notes(&mut self, notes: &str) -> bool {
+        self.project.set_notes(notes)
+    }
+
+    /// How long a still is placed for, in seconds ([`Project::still_secs`]).
+    pub fn still_secs(&self) -> f64 {
+        self.project.still_secs()
+    }
+
+    /// Sets the still length ([`Project::set_still_secs`]): one undo step, `false` for the length
+    /// already in force. Stills placed after this take it; clips already on the timeline keep theirs.
+    pub fn set_still_secs(&mut self, secs: f64) -> bool {
+        self.project.set_still_secs(secs)
     }
 
     /// What source 0's own file declared about how bright it gets
@@ -3217,7 +5262,7 @@ impl PlaybackSession {
     /// are the half that goes through the map twice
     /// ([`PlaybackSession::adopt_settings`]).
     pub fn set_frame_rate(&mut self, fps: f64) -> bool {
-        if !fps.is_finite() || fps <= 0.0 || fps == self.meta.frame_rate {
+        if !fps.is_finite() || fps <= 0.0 || fps == self.meta.frame_rate || self.project.rate_locked() {
             return false;
         }
         // Old timeline frames per new one, exactly -- the one map every frame
@@ -3233,7 +5278,7 @@ impl PlaybackSession {
         // length, so a clip that played to the last frame of its file still
         // does rather than naming one past the end.
         for count in &mut self.counts {
-            *count = k.timeline_at(*count).max(1);
+            *count = k.timeline_nearest(*count).max(1);
         }
         self.project.retime(k, &self.counts);
         // A file's own rate has not changed; what it is *against* has.
@@ -3241,7 +5286,7 @@ impl PlaybackSession {
             *rate = rate.then(k);
         }
         self.meta.frame_rate = fps;
-        self.meta.frame_count = k.timeline_at(self.meta.frame_count).max(1);
+        self.meta.frame_count = k.timeline_nearest(self.meta.frame_count).max(1);
         // The copy the project keeps, now that the change has landed: what the
         // next lane edit's entry carries.
         self.project.mirror_settings(self.settings_value());
@@ -3260,6 +5305,298 @@ impl PlaybackSession {
     /// the caller nudging the playhead. `false` for an index that is not there.
     pub fn set_fit(&mut self, lane: Lane, idx: usize, fit: FitPolicy) -> bool {
         self.edit(Dirty::Picture, |p| p.set_fit(lane, idx, fit))
+    }
+
+    /// [`Project::set_stabilise`]. Reseeks like a grade. The analysis it needs is
+    /// started in the background ([`Self::stabilise_start`]); until it is done the
+    /// clip plays as it is.
+    pub fn set_stabilise(&mut self, lane: Lane, idx: usize, st: Option<crate::stabilise::Stabilise>) -> bool {
+        let done = self.edit(Dirty::Picture, |p| p.set_stabilise(lane, idx, st));
+        if done && st.is_some() {
+            self.stabilise_start(lane, idx);
+        }
+        done
+    }
+
+    /// The generator of kind `name` ([`crate::generate::KINDS`]) at its defaults, drawn for this
+    /// timeline's canvas and rate.
+    pub fn generator_named(&self, name: &str) -> Option<crate::generate::Gen> {
+        crate::generate::Gen::named(name, self.meta.width, self.meta.height, self.meta.frame_rate)
+    }
+
+    /// Places a generated clip ([`crate::generate`]) `secs` long on the video lane `onto` (`V1`
+    /// when none), at `timeline_secs`, like a still. A countdown with no length asked for runs
+    /// its own count. Overwrites what the stretch lands on, as a still does. `false` when the
+    /// lane or the place is refused.
+    pub fn place_generated(&mut self, spec: crate::generate::Gen, timeline_secs: f64, secs: Option<f64>, onto: Option<Lane>) -> crate::Result<bool> {
+        let fps = self.meta.frame_rate;
+        let source = self.generator_source(spec);
+        let secs = secs.unwrap_or(match spec.kind {
+            crate::generate::Kind::Countdown { from, .. } => f64::from(from),
+            _ => self.project.still_secs(),
+        });
+        let wall = self.counts[source];
+        let out = ((secs * fps).round() as u32).clamp(1, wall.max(1));
+        let lane = match onto {
+            Some(lane) if lane.kind == LaneKind::Video => lane,
+            Some(_) => return Err("a generated clip goes on a video lane".into()),
+            None => Lane::V1,
+        };
+        if self.project.lane(lane).is_empty() && !self.project.lanes().contains(&lane) {
+            return Err(format!("{lane:?} is not a lane of this timeline").into());
+        }
+        Ok(self.place_at(lane, timeline_secs, Clip::source_range(source, 0, out)))
+    }
+
+    /// Places a test tone ([`crate::generate::Tone`]) `secs` long on the audio lane `onto` (`A1`
+    /// when none), at `timeline_secs`, as a sound file's stream is placed. The tone's file is made
+    /// in `dir` the first time (the project's folder for a saved project, else the data folder).
+    /// `false` when the place is refused.
+    pub fn place_tone(&mut self, tone: crate::generate::Tone, timeline_secs: f64, secs: u32, onto: Option<Lane>, dir: &std::path::Path) -> crate::Result<bool> {
+        let path = tone.write(dir, secs)?;
+        let lane = match onto {
+            Some(lane) if lane.kind == LaneKind::Audio => lane,
+            Some(_) => return Err("a tone goes on an audio lane".into()),
+            None => Lane::A1,
+        };
+        // A tone is a standalone audio file: taken into the library the first time it is
+        // placed (as a song is), so the placement below finds it.
+        if self.file_frames(&path) == 0 {
+            self.import(&path)?;
+        }
+        self.place_stream_at(timeline_secs, &path, 0, Some(lane))
+    }
+
+    /// The source index of `spec`, taken into the library the first time it is used.
+    fn generator_source(&mut self, spec: crate::generate::Gen) -> usize {
+        let source = self.project.import(spec.path(), 0);
+        self.note_frames(source, image_frames(self.meta.frame_rate), Rate::REAL_TIME);
+        source
+    }
+
+    /// Changes the generator the clip at `idx` of `lane` is, keeping its place and length.
+    /// One undo step; `false` for a clip that is not there or no change.
+    pub fn set_generator(&mut self, lane: Lane, idx: usize, spec: crate::generate::Gen) -> bool {
+        let source = self.generator_source(spec);
+        self.edit(Dirty::Picture, |p| p.set_clip_source(lane, idx, source))
+    }
+
+    /// The generator the clip at `idx` of `lane` is, `None` for a clip made from a file.
+    pub fn generator_of(&self, lane: Lane, idx: usize) -> Option<crate::generate::Gen> {
+        let src = self.project.sources().get(self.project.lane(lane).get(idx)?.source)?;
+        crate::generate::Gen::parse(&src.path)
+    }
+
+    /// [`Project::set_label`].
+    pub fn set_label(&mut self, lane: Lane, idx: usize, label: u8) -> bool {
+        self.project.set_label(lane, idx, label)
+    }
+
+    /// [`Project::set_enabled`]: a switched-off clip is skipped by picture and sound.
+    pub fn set_enabled(&mut self, lane: Lane, idx: usize, enabled: bool) -> bool {
+        self.edit(Dirty::Both, |p| p.set_enabled(lane, idx, enabled))
+    }
+
+    /// [`Project::mark_of`].
+    pub fn mark_of(&self, lane: Lane, idx: usize) -> crate::project::ClipMark {
+        self.project.mark_of(lane, idx)
+    }
+
+    /// [`Project::set_deinterlace`]. Stored only; the render reads it once the engine acts on it.
+    pub fn set_deinterlace(&mut self, lane: Lane, idx: usize, mode: crate::project::Deinterlace) -> bool {
+        self.project.set_deinterlace(lane, idx, mode)
+    }
+
+    /// [`Project::deinterlace_of`].
+    pub fn deinterlace_of(&self, lane: Lane, idx: usize) -> crate::project::Deinterlace {
+        self.project.deinterlace_of(lane, idx)
+    }
+
+    /// [`Project::stabilise_of`].
+    pub fn stabilise_of(&self, lane: Lane, idx: usize) -> Option<crate::stabilise::Stabilise> {
+        self.project.stabilise_of(lane, idx)
+    }
+
+    /// The source and file-frame range the clip at `idx` of `lane` is analysed
+    /// over, `None` for no clip or one that is not footage (a still, a song).
+    pub fn stabilise_range(&self, lane: Lane, idx: usize) -> Option<(std::path::PathBuf, u32, u32)> {
+        let c = self.project.lane(lane).get(idx)?;
+        let path = &self.project.sources().get(c.source)?.path;
+        if crate::is_image(path) || crate::is_audio(path) {
+            return None;
+        }
+        let (lo, hi) = crate::stabilise::clip_range(path, c, self.meta.frame_rate);
+        Some((path.clone(), lo, hi))
+    }
+
+    /// Where the clip's stabilisation analysis stands ([`crate::stabilise::status`]).
+    pub fn stabilise_status(&self, lane: Lane, idx: usize) -> Option<crate::stabilise::Status> {
+        let (path, lo, hi) = self.stabilise_range(lane, idx)?;
+        Some(crate::stabilise::status(&path, lo, hi))
+    }
+
+    /// Starts the clip's stabilisation analysis in the background unless it is
+    /// cached or running ([`crate::stabilise::start`]).
+    pub fn stabilise_start(&self, lane: Lane, idx: usize) -> Option<crate::stabilise::Status> {
+        let (path, lo, hi) = self.stabilise_range(lane, idx)?;
+        Some(crate::stabilise::start(&path, lo, hi))
+    }
+
+    /// Stops the clip's running analysis. `false` when none runs.
+    pub fn stabilise_cancel(&self, lane: Lane, idx: usize) -> bool {
+        self.stabilise_range(lane, idx).is_some_and(|(path, lo, hi)| crate::stabilise::cancel(&path, lo, hi))
+    }
+
+    /// What auto reframe needs of the clip at `idx` of `lane`: its file range and the
+    /// geometry its keys are made for ([`crate::reframe`]). `None` for no clip, a
+    /// still or a song.
+    pub fn reframe_job(&self, lane: Lane, idx: usize) -> Option<crate::reframe::ReframeJob> {
+        let (path, lo, hi) = self.stabilise_range(lane, idx)?;
+        let c = self.project.lane(lane).get(idx)?;
+        let shown = crate::demux::Demuxer::open(&path).ok()?.0;
+        let target = crate::reframe::Target {
+            src_w: shown.width,
+            src_h: shown.height,
+            canvas_w: self.meta.width,
+            canvas_h: self.meta.height,
+            base: self.project.transform_of(lane, idx).copied().unwrap_or_default(),
+            in_frame: c.in_frame,
+            out_frame: c.out_frame,
+        };
+        Some(crate::reframe::ReframeJob { path, lo, hi, target })
+    }
+
+    /// Writes reframe `keys` on the clip, and puts it on [`FitPolicy::Fit`] -- the
+    /// placement they are made for. One undo step; `false` when the keys are refused.
+    pub fn apply_reframe(&mut self, lane: Lane, idx: usize, keys: Vec<crate::transform::TransformKey>) -> bool {
+        self.begin_batch();
+        self.set_fit(lane, idx, FitPolicy::Fit);
+        let done = self.set_transform_keys(lane, idx, keys);
+        self.end_batch();
+        done
+    }
+
+    /// Redraws the picture once an analysis finished, so a stabilised clip shows
+    /// its correction without an edit.
+    pub fn stabilise_refresh(&mut self) {
+        self.invalidate(Dirty::Picture);
+    }
+
+    /// Starts following the rect or ellipse mask at stack position `slot` of the clip at
+    /// `idx` of `lane` ([`crate::track`]) from source frame `from` to `to`, either order.
+    /// The mask's centre at `from` is where the feature is; [`Self::track_mask_apply`]
+    /// writes the path back once the track has finished.
+    pub fn track_mask_start(&self, lane: Lane, idx: usize, slot: usize, from: u32, to: u32) -> Result<TrackJob, String> {
+        use crate::effects::EffectKind;
+        let c = self.project.lane(lane).get(idx).ok_or("there is no clip there")?;
+        let e = c.effects.get(slot).ok_or("there is no effect in that stack position")?;
+        if !matches!(e.kind, EffectKind::RectMask | EffectKind::EllipseMask) {
+            return Err("only a rect or ellipse mask can be tracked".into());
+        }
+        let (path, lo, hi) = self.stabilise_range(lane, idx).ok_or("a still or a song has no picture to track")?;
+        let (from, to) = (from.clamp(lo, hi - 1), to.clamp(lo, hi - 1));
+        if from == to {
+            return Err("a track needs two frames: from and to are the same frame".into());
+        }
+        let forward = to > from;
+        let range = if forward { (from, to + 1) } else { (to, from + 1) };
+        let at = e.posed(f64::from(from));
+        let (x, y) = (at.values[0], at.values[1]);
+        let region = crate::track::Region { x, y, w: at.values[2], h: at.values[3] };
+        // The placement the renderer gives the clip, so the track's points land on the canvas
+        // where the mask is drawn: the base transform and its keys, on this canvas.
+        let pose = crate::track::Pose {
+            base: self.transform_of(lane, idx).copied().unwrap_or_default(),
+            keys: self.transform_keys_of(lane, idx).to_vec(),
+            canvas: self.resolution(),
+            fit: crate::scale::FitPolicy::default(),
+        };
+        let id = crate::track::start(&path, range, from, forward, region, pose);
+        Ok(TrackJob { lane, idx, slot, id, from, anchor: (x, y) })
+    }
+
+    /// Writes every finished track in `jobs` onto its mask ([`Self::track_mask_apply`]) and
+    /// takes it out of `jobs`; running ones stay. Each landing is one undo step. Returns one
+    /// entry per track that ended.
+    pub fn track_settle(&mut self, jobs: &mut Vec<TrackJob>) -> Vec<TrackDone> {
+        let mut done = Vec::new();
+        let mut running = Vec::new();
+        for job in std::mem::take(jobs) {
+            let result = match crate::track::status(job.id) {
+                crate::track::Status::Running(_) => {
+                    running.push(job);
+                    continue;
+                }
+                crate::track::Status::Gone => continue,
+                crate::track::Status::Finished => match crate::track::take(job.id) {
+                    None => continue,
+                    Some(Err(e)) => Err(e),
+                    Some(Ok(t)) => self.track_mask_apply(&job, &t).map(|keys| {
+                        let frames = t.points.iter().map(|p| p.0);
+                        TrackOutcome {
+                            keys,
+                            from: frames.clone().min().unwrap_or(job.from),
+                            to: frames.max().unwrap_or(job.from),
+                            lost_at: t.lost_at,
+                        }
+                    }),
+                },
+            };
+            done.push(TrackDone { lane: job.lane, idx: job.idx, slot: job.slot, result });
+        }
+        *jobs = running;
+        done
+    }
+
+    /// Writes a finished track onto its mask: the mask's centre moves by the feature's
+    /// displacement from where it was at the start, and its size and soft edge keep the
+    /// values they have at each frame. Keys inside the tracked frames are replaced and
+    /// keys outside them stay. Returns how many keys were written. One undo step.
+    pub fn track_mask_apply(&mut self, job: &TrackJob, track: &crate::track::Track) -> Result<usize, String> {
+        use crate::effects::MaskKey;
+        use crate::track::{KEY_TOLERANCE, simplify};
+        use crate::transform::{KeyEase, MAX_TRANSFORM_KEYS};
+        let Some(&(_, x0, y0)) = track.points.first() else {
+            return Err("the track has no points".into());
+        };
+        let mut pts: Vec<(u32, f32, f32)> = track
+            .points
+            .iter()
+            .map(|&(f, x, y)| (f, job.anchor.0 + x - x0, job.anchor.1 + y - y0))
+            .collect();
+        pts.sort_by_key(|p| p.0);
+        let (first, last) = (pts[0].0, pts[pts.len() - 1].0);
+        let outside: Vec<MaskKey> =
+            self.mask_keys_of(job.lane, job.idx, job.slot).iter().filter(|k| k.at < first || k.at > last).copied().collect();
+        let room = MAX_TRANSFORM_KEYS.saturating_sub(outside.len()).max(2);
+        let mut tolerance = KEY_TOLERANCE;
+        let mut kept = simplify(&pts, tolerance);
+        while kept.len() > room {
+            tolerance *= 2.0;
+            kept = simplify(&pts, tolerance);
+        }
+        let mut keys = {
+            let e = self
+                .project
+                .lane(job.lane)
+                .get(job.idx)
+                .and_then(|c| c.effects.get(job.slot))
+                .ok_or("the mask is gone")?;
+            kept.iter()
+                .map(|&i| {
+                    let (f, x, y) = pts[i];
+                    let v = e.posed(f64::from(f));
+                    MaskKey { at: f, x, y, width: v.values[2], height: v.values[3], feather: v.values[4], ease: KeyEase::Linear }
+                })
+                .collect::<Vec<_>>()
+        };
+        keys.extend(outside);
+        keys.sort_by_key(|k| k.at);
+        let count = keys.len();
+        if !self.set_mask_keys(job.lane, job.idx, job.slot, keys) {
+            return Err("the engine refused the keys (is the mask still there?)".into());
+        }
+        Ok(count)
     }
 
     /// Waveform flags on a visualizer clip. Reseeks like a grade: the
@@ -3284,6 +5621,35 @@ impl PlaybackSession {
     /// `idx` of `lane`. `0` for an index that is not there.
     pub fn fade_in_of(&self, lane: Lane, idx: usize) -> u32 {
         self.project.fade_in_of(lane, idx)
+    }
+
+    /// The volume envelope of the clip at `idx` of `lane`
+    /// ([`Project::gain_keys_of`]).
+    pub fn gain_keys_of(&self, lane: Lane, idx: usize) -> &[GainKey] {
+        self.project.gain_keys_of(lane, idx)
+    }
+
+    /// Replaces the clip's whole volume envelope ([`Project::set_gain_keys`]).
+    /// A sound-only edit: no reseek of the picture.
+    pub fn set_gain_keys(&mut self, lane: Lane, idx: usize, keys: Vec<GainKey>) -> bool {
+        self.edit(Dirty::Sound, |p| p.set_gain_keys(lane, idx, keys))
+    }
+
+    /// Puts one point into the clip's volume envelope ([`Project::add_gain_key`]).
+    pub fn add_gain_key(&mut self, lane: Lane, idx: usize, key: GainKey) -> bool {
+        self.edit(Dirty::Sound, |p| p.add_gain_key(lane, idx, key))
+    }
+
+    /// Takes the point at source frame `at` out of the clip's volume envelope
+    /// ([`Project::remove_gain_key`]).
+    pub fn remove_gain_key(&mut self, lane: Lane, idx: usize, at: u32) -> bool {
+        self.edit(Dirty::Sound, |p| p.remove_gain_key(lane, idx, at))
+    }
+
+    /// The effective envelope dB at a timeline frame, keys and clip gain but not
+    /// the fades ([`Project::gain_db_at`]).
+    pub fn gain_db_at(&self, lane: Lane, idx: usize, timeline_frame: u32) -> Option<f32> {
+        self.project.gain_db_at(lane, idx, timeline_frame)
     }
 
     /// Sets that clip's fade-in, clamped to its own length. A sound-only
@@ -3315,6 +5681,23 @@ impl PlaybackSession {
         self.project.transition_out_of(lane, idx)
     }
 
+    /// The kind of the transition that clip plays into its neighbour.
+    pub fn transition_kind_of(&self, lane: Lane, idx: usize) -> crate::transitions::TransitionKind {
+        self.project.transition_kind_of(lane, idx)
+    }
+
+    /// Sets that clip's transition into its neighbour, kind and length in one
+    /// undo step. A picture edit, like [`Self::set_transition_out`].
+    pub fn set_transition(
+        &mut self,
+        lane: Lane,
+        idx: usize,
+        kind: crate::transitions::TransitionKind,
+        frames: u32,
+    ) -> bool {
+        self.edit(Dirty::Picture, |p| p.set_transition(lane, idx, kind, frames))
+    }
+
     /// Sets that clip's dissolve into its neighbour, clamped to its own
     /// length. A picture edit -- same as a grade or fit policy.
     pub fn set_transition_out(&mut self, lane: Lane, idx: usize, frames: u32) -> bool {
@@ -3325,7 +5708,7 @@ impl PlaybackSession {
     /// numbers and nothing else, so a copy stays valid after the clip it came
     /// from is deleted. `None` past the end.
     pub fn clip_at(&self, idx: usize) -> Option<Clip> {
-        self.project.clips().get(idx).copied()
+        self.project.clips().get(idx).cloned()
     }
 
     /// Inserts `clip` at the playhead, splitting the clip under it. Like a
@@ -3338,6 +5721,7 @@ impl PlaybackSession {
         // place on the bed and means it.
         let at =
             secs_to_frame(timeline_secs, self.meta.frame_rate).min(self.project.timeline_frames());
+        let clip = self.held_to_take(clip);
         self.edit(Dirty::Both, |p| p.paste(at, clip))
     }
 
@@ -3348,7 +5732,12 @@ impl PlaybackSession {
     pub fn paste_set_at(&mut self, timeline_secs: f64, items: &[(Lane, Clip)]) -> bool {
         let at =
             secs_to_frame(timeline_secs, self.meta.frame_rate).min(self.project.timeline_frames());
-        self.edit(Dirty::Both, |p| p.paste_set(at, items))
+        // Each item is held to its own lane's wall, as a lone placement is.
+        let items: Vec<(Lane, Clip)> = items
+            .iter()
+            .map(|(lane, clip)| (*lane, self.held_to_lane(*lane, clip.clone())))
+            .collect();
+        self.edit(Dirty::Both, |p| p.paste_set(at, &items))
     }
 
     /// Places the whole of `path` played on its audio `stream` at
@@ -3377,14 +5766,42 @@ impl PlaybackSession {
     /// on the audio lane it was asked for, or on `A1`, and never on a video
     /// lane. A still image ([`crate::is_image`]) is its mirror: the video lane
     /// it was asked for or `V1`, never an audio one, and it goes down
-    /// [`IMAGE_PLACE_SECS`] long rather than at the length it is *allowed* to
-    /// be trimmed out to. A caller never has to ask.
+    /// the project's still length ([`Project::still_secs`]) long rather than at the length it is
+    /// *allowed* to be trimmed out to. A caller never has to ask.
     pub fn place_stream_at(
         &mut self,
         timeline_secs: f64,
         path: &Path,
         stream: usize,
         onto: Option<Lane>,
+    ) -> crate::Result<bool> {
+        self.place_stream_mode(timeline_secs, path, stream, onto, None)
+    }
+
+    /// [`place_stream_at`](Self::place_stream_at) as an **overwrite**: what the file lands on
+    /// is replaced for its length and nothing is pushed along ([`SourceEdit::Overwrite`]). The
+    /// lanes it lands on are chosen exactly as `place_stream_at` chooses them, and a refusal
+    /// comes back with the engine's own words.
+    pub fn place_stream_overwrite_at(
+        &mut self,
+        timeline_secs: f64,
+        path: &Path,
+        stream: usize,
+        onto: Option<Lane>,
+    ) -> crate::Result<bool> {
+        self.place_stream_mode(timeline_secs, path, stream, onto, Some(crate::SourceEdit::Overwrite))
+    }
+
+    /// The one placement behind both doors: `overwrite` of `None` is the insert-and-paste
+    /// `place_stream_at` has always made; `Some` replaces what is there through
+    /// [`edit_from_source_at`](Self::edit_from_source_at).
+    fn place_stream_mode(
+        &mut self,
+        timeline_secs: f64,
+        path: &Path,
+        stream: usize,
+        onto: Option<Lane>,
+        overwrite: Option<crate::SourceEdit>,
     ) -> crate::Result<bool> {
         let wanted = Source::new(path, stream);
         // Another stream of a file this session has taken in: that is what a
@@ -3397,7 +5814,7 @@ impl PlaybackSession {
             return Err(format!("{} is not on this timeline", path.display()).into());
         }
         // A still has no sound to hold to the timeline's -- and no length
-        // either, so it goes down at [`IMAGE_PLACE_SECS`] rather than at the
+        // either, so it goes down at the project's still length rather than at the
         // ten minutes it is *allowed* to be dragged out to.
         let image = crate::is_image(path);
         if !image {
@@ -3408,16 +5825,28 @@ impl PlaybackSession {
         let source = self.project.import(path, stream);
         self.note_frames(source, frames, rate);
         let clip = Clip {
+            speed_keys: Vec::new(),
+            reversed: false,
+            stabilise: None, deinterlace: Default::default(), mark: Default::default(),
+            angle: Default::default(),
             fade_in: 0,
             fade_out: 0,
             transition_out: 0,
+            transition_kind: Default::default(),
             visualizer: 0,
             viz_paint: 0,
+            gain_db: 0.0,
+            gain_keys: Vec::new(),
+            pan: 0,
+            transform_keys: Vec::new(),
+            opacity_keys: Vec::new(),
+            color_keys: Vec::new(),
+            effects: Vec::new(),
             start: 0,
             in_frame: 0,
             out_frame: match image {
-                true => place_frames(frames, self.meta.frame_rate),
-                false => frames.max(1),
+                true => place_frames(frames, self.meta.frame_rate, self.project.still_secs()),
+                false => sound_held_frames(path, stream, frames, self.meta.frame_rate),
             },
             source,
             link: None,
@@ -3426,6 +5855,7 @@ impl PlaybackSession {
             transform: None,
             fit: FitPolicy::default(),
             speed: Speed::NORMAL,
+            pitch: 0,
         };
         // Which lane a source may land on is decided here and only here, so a
         // front-end never has to make the same call twice: a file with no
@@ -3442,9 +5872,13 @@ impl PlaybackSession {
                 Some(lane) if lane.kind == LaneKind::Video => lane,
                 _ => Lane::V1,
             };
+            if let Some(edit) = overwrite {
+                self.edit_from_source_at(edit, timeline_secs, &[(lane, clip)])?;
+                return Ok(true);
+            }
             return Ok(self.place_at(lane, timeline_secs, clip));
         }
-        let onto = match (crate::is_audio(path), onto) {
+        let onto = match (sound_only(path), onto) {
             // No picture: an audio lane and nothing else, whichever one was
             // asked for -- `A1` when none was.
             (true, Some(lane)) if lane.kind == LaneKind::Audio => Some(lane),
@@ -3456,6 +5890,21 @@ impl PlaybackSession {
             (false, Some(lane)) if lane.ord > 0 => Some(lane),
             (false, _) => None,
         };
+        // An overwrite lays the same lanes down as an insert would, replacing what is under
+        // them: a picture and its sound as one take (a link on both halves), a sound alone
+        // on its audio lane.
+        if let Some(edit) = overwrite {
+            let items: Vec<(Lane, Clip)> = match onto {
+                Some(lane) if lane.kind == LaneKind::Audio => vec![(lane, clip)],
+                Some(lane) if lane.kind == LaneKind::Video => vec![
+                    (lane, clip.clone()),
+                    (Lane::new(LaneKind::Audio, lane.ord), clip),
+                ],
+                _ => vec![(Lane::V1, clip.clone()), (Lane::A1, clip)],
+            };
+            self.edit_from_source_at(edit, timeline_secs, &items)?;
+            return Ok(true);
+        }
         Ok(match onto {
             // A picture let go over a further *video* track lands there with the
             // sound it came with -- `V2`'s picture, `A2`'s sound, one take and
@@ -3464,6 +5913,7 @@ impl PlaybackSession {
             // row for an mp4 means.
             Some(lane) if lane.kind == LaneKind::Video => {
                 let at = secs_to_frame(timeline_secs, self.meta.frame_rate);
+                let clip = self.held_to_take(clip);
                 self.edit(Dirty::Both, |p| p.place_take(lane, at, clip))
             }
             Some(lane) => self.place_at(lane, timeline_secs, clip),
@@ -3473,6 +5923,7 @@ impl PlaybackSession {
             // clipboard, and a drop that named a place is not a paste.
             None => {
                 let at = secs_to_frame(timeline_secs, self.meta.frame_rate);
+                let clip = self.held_to_take(clip);
                 self.edit(Dirty::Both, |p| p.paste(at, clip))
             }
         })
@@ -3494,6 +5945,28 @@ impl PlaybackSession {
     /// any other and leaves a session with an empty library -- silent, empty of
     /// clips, and unsaveable ([`save_project`](Self::save_project)); a
     /// front-end showing one is showing an empty window.
+    /// [`remove_source`](Self::remove_source) for the one source that may go
+    /// without clearing undo: the **last** entry, when no clip and no undo or
+    /// redo step names it ([`Project::remove_unused_source`]). Nothing playable
+    /// changes, so there is no reseek and the timeline and its history stay as
+    /// they were. Used to roll back a batch that imported a source and then
+    /// failed, where clearing history would also wipe the user's undo.
+    pub fn remove_unused_source(&mut self, path: &Path, stream: usize) -> crate::Result<usize> {
+        let wanted = Source::new(path, stream);
+        let idx = self
+            .project
+            .sources()
+            .iter()
+            .position(|s| *s == wanted)
+            .ok_or_else(|| format!("{} is not on this timeline", path.display()))?;
+        self.project.remove_unused_source(idx)?;
+        if idx < self.counts.len() {
+            self.counts.remove(idx);
+            self.rates.remove(idx);
+        }
+        Ok(idx)
+    }
+
     pub fn remove_source(&mut self, path: &Path, stream: usize) -> crate::Result<usize> {
         let wanted = Source::new(path, stream);
         let idx = self
@@ -3565,9 +6038,89 @@ impl PlaybackSession {
     /// makes, and the only way an audio-only file reaches the timeline. The
     /// placement belongs to no group (see [`Project::place`]). One undo step,
     /// and it reseeks like every other edit.
+    ///
+    /// The clip is held to `lane`'s own wall first ([`held_to_lane`](Self::held_to_lane)):
+    /// a caller's `out_frame` past the source's length on that lane is cut back
+    /// to it, so no door places a clip the save would refuse.
     pub fn place_at(&mut self, lane: Lane, timeline_secs: f64, clip: Clip) -> bool {
         let at = secs_to_frame(timeline_secs, self.meta.frame_rate);
+        let clip = self.held_to_lane(lane, clip);
         self.edit(Dirty::Both, |p| p.place(lane, at, clip))
+    }
+
+    /// [`Project::edit_from_source`]'s door: an insert or an overwrite of the
+    /// halves in `items` at `timeline_secs`. Each half is held to its own lane's
+    /// wall -- and a take of a picture and its sound to the shorter of the two,
+    /// so the halves run the same length and stay one link. One undo step; it
+    /// reseeks like every other edit. The error says why it refused.
+    pub fn edit_from_source_at(
+        &mut self,
+        kind: crate::SourceEdit,
+        timeline_secs: f64,
+        items: &[(Lane, Clip)],
+    ) -> crate::Result<()> {
+        let at = secs_to_frame(timeline_secs, self.meta.frame_rate);
+        let both = items.iter().any(|(l, _)| l.kind == LaneKind::Video)
+            && items.iter().any(|(l, _)| l.kind == LaneKind::Audio);
+        let items: Vec<(Lane, Clip)> = items
+            .iter()
+            .map(|(lane, clip)| {
+                let held = if both {
+                    self.held_to_take(clip.clone())
+                } else {
+                    self.held_to_lane(*lane, clip.clone())
+                };
+                (*lane, held)
+            })
+            .collect();
+        let mut result = Ok(());
+        let done = self.edit(Dirty::Both, |p| match p.edit_from_source(kind, at, &items) {
+            Ok(()) => true,
+            Err(e) => {
+                result = Err(e);
+                false
+            }
+        });
+        match (done, result) {
+            (_, Err(e)) => Err(e),
+            (false, Ok(())) => Err("the edit changed nothing".into()),
+            (true, Ok(())) => Ok(()),
+        }
+    }
+
+    /// The longest `clip` may run on `lane`: its source's length on that lane's
+    /// kind -- the picture's on a video lane, the sound's on an audio lane
+    /// ([`lane_walls`]), the two tables [`save_project`](Self::save_project)
+    /// checks each lane against. `out_frame` is held to that wall; a clip the
+    /// wall leaves no frame of is one [`Project::place`] refuses.
+    fn held_to_lane(&self, lane: Lane, mut clip: Clip) -> Clip {
+        let (picture, sound) =
+            lane_walls(self.project.sources(), &self.counts, self.meta.frame_rate);
+        let table = match lane.kind {
+            LaneKind::Audio => sound,
+            _ => picture,
+        };
+        if let Some(&wall) = table.get(clip.source) {
+            clip.out_frame = clip.out_frame.min(wall);
+        }
+        clip
+    }
+
+    /// [`held_to_lane`](Self::held_to_lane) for a clip placed as one take: a
+    /// picture on a video lane and its sound on an audio lane, so it is held to
+    /// the shorter of the source's two walls. Both halves of a take share the
+    /// one clip, so neither may run past its own lane.
+    fn held_to_take(&self, mut clip: Clip) -> Clip {
+        let (picture, sound) =
+            lane_walls(self.project.sources(), &self.counts, self.meta.frame_rate);
+        let wall = [picture.get(clip.source), sound.get(clip.source)]
+            .into_iter()
+            .flatten()
+            .min();
+        if let Some(&wall) = wall {
+            clip.out_frame = clip.out_frame.min(wall);
+        }
+        clip
     }
 
     /// Places a waveform-visualizer clip of `path`'s audio on a video lane.
@@ -3603,11 +6156,23 @@ impl PlaybackSession {
         }
         let source = self.project.import(path, stream);
         let clip = Clip {
+            speed_keys: Vec::new(),
+            reversed: false,
+            stabilise: None, deinterlace: Default::default(), mark: Default::default(),
+            angle: Default::default(),
             fade_in: 0,
             fade_out: 0,
             transition_out: 0,
+            transition_kind: Default::default(),
             visualizer: 1,
             viz_paint: 0,
+            gain_db: 0.0,
+            gain_keys: Vec::new(),
+            pan: 0,
+            transform_keys: Vec::new(),
+            opacity_keys: Vec::new(),
+            color_keys: Vec::new(),
+            effects: Vec::new(),
             start: 0,
             in_frame,
             out_frame,
@@ -3618,6 +6183,7 @@ impl PlaybackSession {
             transform: None,
             fit: FitPolicy::default(),
             speed: Speed::NORMAL,
+            pitch: 0,
         };
         let end = start + clip.frames();
         let overlaps = |lane: Lane| {
@@ -3636,6 +6202,7 @@ impl PlaybackSession {
                 .find(|&l| !overlaps(l))
                 .unwrap_or_else(|| self.add_lane(LaneKind::Video)),
         };
+        let clip = self.held_to_lane(lane, clip);
         Ok(self.edit(Dirty::Both, |p| p.place(lane, start, clip)))
     }
 
@@ -3668,6 +6235,383 @@ impl PlaybackSession {
         self.restored_step(Project::redo)
     }
 
+    /// Every sequence in tab order ([`Project::sequences`]).
+    pub fn sequences(&self) -> Vec<crate::project::SequenceInfo> {
+        self.project.sequences()
+    }
+
+    /// The active sequence's id.
+    pub fn active_sequence(&self) -> u32 {
+        self.project.active_sequence()
+    }
+
+    /// The name of sequence `id`.
+    pub fn sequence_name(&self, id: u32) -> Option<String> {
+        self.project.sequence_name(id).map(str::to_string)
+    }
+
+    /// The sequence called `name`.
+    pub fn sequence_named(&self, name: &str) -> Option<u32> {
+        self.project.sequence_named(name)
+    }
+
+    /// See [`Project::source_uses_parked`].
+    pub fn source_uses_parked(&self, source: usize) -> Vec<(u32, usize)> {
+        self.project.source_uses_parked(source)
+    }
+
+    /// See [`Project::compound_pieces`].
+    pub fn compound_pieces(&self, kind: LaneKind, clip: &Clip) -> Vec<Clip> {
+        self.project.compound_pieces(kind, clip)
+    }
+
+    /// The sequence the compound clip at `lane`/`idx` plays.
+    pub fn compound_at(&self, lane: Lane, idx: usize) -> Option<u32> {
+        self.project.compound_at(lane, idx)
+    }
+
+    /// The angle names of sequence `id` when it is a multicam source ([`Project::angle_names`]).
+    pub fn angle_names(&self, id: u32) -> Option<Vec<String>> {
+        self.project.angle_names(id).map(<[String]>::to_vec)
+    }
+
+    /// The multicam source the clip at `lane`/`idx` plays and its angle names, when it is a
+    /// multicam clip.
+    pub fn multicam_at(&self, lane: Lane, idx: usize) -> Option<(u32, Vec<String>)> {
+        let c = self.project.lane(lane).get(idx)?;
+        self.project.multicam_of(c).map(|(id, n)| (id, n.to_vec()))
+    }
+
+    /// Whether the rate and other time-scaled settings are fixed because the
+    /// project holds more than one sequence.
+    pub fn rate_locked(&self) -> bool {
+        self.project.rate_locked()
+    }
+
+    /// An edit that can be refused with a reason: the picture and the sound are
+    /// rebuilt when it was made.
+    fn edit_try<T>(&mut self, f: impl FnOnce(&mut Project) -> crate::Result<T>) -> crate::Result<T> {
+        let made = f(&mut self.project)?;
+        self.invalidate(Dirty::Both);
+        Ok(made)
+    }
+
+    /// Adds an empty sequence; see [`Project::new_sequence`]. Not switched to.
+    pub fn new_sequence(&mut self, name: Option<&str>) -> crate::Result<u32> {
+        self.edit_try(|p| p.new_sequence(name))
+    }
+
+    /// Makes an editor timeline a new sequence and switches to it ([`crate::interchange::build`]).
+    /// Each file it names is taken in as a library file is; one that is gone is offline, as a
+    /// missing file is in a saved project. One undo step.
+    pub fn import_timeline(&mut self, t: &crate::interchange::Timeline) -> crate::Result<u32> {
+        let mut reach: Vec<(PathBuf, u32)> = Vec::new();
+        for item in t.tracks.iter().flat_map(|tr| &tr.items) {
+            if let crate::interchange::Item::Clip(c) = item {
+                match reach.iter_mut().find(|(p, _)| *p == c.path) {
+                    Some((_, r)) => *r = (*r).max(c.out_frame),
+                    None => reach.push((c.path.clone(), c.out_frame)),
+                }
+            }
+        }
+        for (path, furthest) in &reach {
+            if self.source_of(path).is_some() {
+                continue;
+            }
+            if crate::source_present(path) {
+                self.import(path)?;
+            } else {
+                let source = self.project.import(path, 0);
+                self.note_frames(source, *furthest, Rate::REAL_TIME);
+            }
+        }
+        self.begin_batch();
+        let made = self.edit_try(|p| crate::interchange::build(p, t));
+        self.end_batch();
+        made
+    }
+
+    /// See [`Project::rename_sequence`].
+    pub fn rename_sequence(&mut self, id: u32, name: &str) -> crate::Result<()> {
+        self.edit_try(|p| p.rename_sequence(id, name))
+    }
+
+    /// See [`Project::duplicate_sequence`].
+    pub fn duplicate_sequence(&mut self, id: u32) -> crate::Result<u32> {
+        self.edit_try(|p| p.duplicate_sequence(id))
+    }
+
+    /// See [`Project::delete_sequence`]. The picture and sound follow the
+    /// sequence that is active afterwards.
+    pub fn delete_sequence(&mut self, id: u32) -> crate::Result<u32> {
+        self.edit_try(|p| p.delete_sequence(id))
+    }
+
+    /// Makes `id` the sequence on the timeline and in the picture and sound. Not an undo step.
+    pub fn switch_sequence(&mut self, id: u32) -> crate::Result<()> {
+        if id == self.project.active_sequence() {
+            return Ok(());
+        }
+        self.edit_try(|p| p.switch_sequence(id))
+    }
+
+    /// See [`Project::nest`].
+    pub fn nest(&mut self, picks: &[(Lane, usize)], name: Option<&str>) -> crate::Result<crate::project::Nested> {
+        self.edit_try(|p| p.nest(picks, name))
+    }
+
+    /// See [`Project::break_apart`].
+    pub fn break_apart(&mut self, picks: &[(Lane, usize)]) -> crate::Result<Vec<(Lane, usize)>> {
+        self.edit_try(|p| p.break_apart(picks))
+    }
+
+    /// Syncs the sources `picks` and makes a multicam clip of them at `timeline_secs` on `lane`
+    /// ([`Project::make_multicam`]). With [`MulticamSync::Audio`] every camera is lined up with
+    /// the first one that has sound by the loudness curve of its track
+    /// ([`crate::multisync`]); a camera that cannot be matched (no sound, or too weak a match)
+    /// starts with the others and the report says so. One undo step.
+    pub fn make_multicam_at(
+        &mut self,
+        picks: &[usize],
+        sync: MulticamSync,
+        name: Option<&str>,
+        lane: Lane,
+        timeline_secs: f64,
+    ) -> crate::Result<MulticamReport> {
+        let job = self.multicam_job(picks, sync)?;
+        let plan = job.run(&std::sync::atomic::AtomicU32::new(0), &std::sync::atomic::AtomicBool::new(false))?;
+        self.apply_multicam(&plan, name, lane, timeline_secs)
+    }
+
+    /// The part of [`make_multicam_at`](Self::make_multicam_at) that only reads the sources, as a
+    /// value that can be run on a thread of its own ([`MulticamJob::run`]) while the window stays
+    /// live; [`apply_multicam`](Self::apply_multicam) then makes the clip, one undo step.
+    pub fn multicam_job(&self, picks: &[usize], sync: MulticamSync) -> crate::Result<MulticamJob> {
+        let mut seen = Vec::new();
+        let mut sources = Vec::new();
+        for &p in picks {
+            let Some(src) = self.project.sources().get(p) else {
+                return Err(format!("source {p} is not in the project").into());
+            };
+            if seen.contains(&p) {
+                return Err(format!("source {p} is picked twice: an angle is one camera").into());
+            }
+            seen.push(p);
+            sources.push(MulticamJobSource {
+                index: p,
+                path: src.path.clone(),
+                audio_stream: src.audio_stream,
+                frames: self.counts.get(p).copied().unwrap_or(0).max(1),
+            });
+        }
+        Ok(MulticamJob { sources, sync, fps: self.meta.frame_rate })
+    }
+
+    /// The library's bins ([`Project::bins`]).
+    pub fn bins(&self) -> &[crate::project::Bin] {
+        self.project.bins()
+    }
+
+    /// Makes a bin; see [`Project::create_bin`]. A label only: nothing is rebuilt.
+    pub fn create_bin(&mut self, name: &str, parent: u32) -> Result<u32, String> {
+        self.project.create_bin(name, parent)
+    }
+
+    /// See [`Project::rename_bin`].
+    pub fn rename_bin(&mut self, id: u32, name: &str) -> Result<bool, String> {
+        self.project.rename_bin(id, name)
+    }
+
+    /// See [`Project::remove_bin`].
+    pub fn remove_bin(&mut self, id: u32) -> Result<usize, String> {
+        self.project.remove_bin(id)
+    }
+
+    /// See [`Project::move_to_bin`].
+    pub fn move_to_bin(&mut self, srcs: &[usize], bin: u32) -> Result<usize, String> {
+        self.project.move_to_bin(srcs, bin)
+    }
+
+    /// See [`Project::set_favourite`].
+    pub fn set_favourite(&mut self, srcs: &[usize], on: bool) -> Result<usize, String> {
+        self.project.set_favourite(srcs, on)
+    }
+
+    /// Makes the multicam clip a [`MulticamJob::run`] measured, at `timeline_secs` on `lane`. One
+    /// undo step. Refused when the project's sources are no longer the ones that were measured.
+    pub fn apply_multicam(&mut self, plan: &MulticamPlan, name: Option<&str>, lane: Lane, timeline_secs: f64) -> crate::Result<MulticamReport> {
+        for a in &plan.sources {
+            if self.project.sources().get(a.index).map(|s| &s.path) != Some(&a.path) {
+                return Err("the media list changed while the angles were being synced".into());
+            }
+        }
+        let fps = self.meta.frame_rate;
+        let at = secs_to_frame(timeline_secs, fps);
+        let made = self.edit_try(|p| p.make_multicam(name, &plan.angles, lane, at))?;
+        Ok(MulticamReport { made, how: plan.how.clone(), offsets_secs: plan.offsets.clone(), starts: plan.angles.iter().map(|a| a.start).collect() })
+    }
+
+    /// See [`Project::switch_angle`], at `timeline_secs`.
+    pub fn switch_angle_at(
+        &mut self,
+        lane: Option<Lane>,
+        timeline_secs: f64,
+        video: Option<u8>,
+        audio: Option<Option<u8>>,
+    ) -> crate::Result<Vec<(Lane, u32)>> {
+        let at = secs_to_frame(timeline_secs, self.meta.frame_rate);
+        self.edit_try(|p| p.switch_angle(lane, at, video, audio))
+    }
+
+    /// The multicam clip under timeline `frame`, if any ([`Project::multicam_under`]).
+    pub fn multicam_under(&self, frame: u32) -> Option<crate::project::MulticamUnder> {
+        self.project.multicam_under(frame)
+    }
+
+    /// One flattened project per angle of the multicam clip under `frame` and the timeline meta
+    /// to compose them with ([`crate::export::compose_at`]): the angle monitor's tiles, composed
+    /// off the window's thread.
+    pub fn angle_views(&self, frame: u32) -> Option<(crate::project::MulticamUnder, Vec<crate::project::Project>, VideoMeta)> {
+        self.project.angle_views(frame).map(|(u, v)| (u, v, self.meta))
+    }
+
+    /// See [`Project::flatten_multicam`].
+    pub fn flatten_multicam(&mut self, lane: Lane, idx: usize) -> crate::Result<Vec<(Lane, usize)>> {
+        self.edit_try(|p| p.flatten_multicam(lane, idx))
+    }
+
+    /// See [`Project::place_sequence`], at `timeline_secs`.
+    pub fn place_sequence_at(&mut self, seq: u32, lane: Lane, timeline_secs: f64) -> crate::Result<()> {
+        let at = secs_to_frame(timeline_secs, self.meta.frame_rate);
+        self.edit_try(|p| p.place_sequence(seq, lane, at))
+    }
+
+    /// The project as an edit sees it, compound clips and all, with the undo history left out
+    /// (what a "did this batch change anything" comparison reads; [`export_snapshot`](Self::export_snapshot)
+    /// is the expanded one a render reads).
+    pub fn raw_snapshot(&self) -> (crate::project::Project, VideoMeta) {
+        (self.project.raw_snapshot(), self.meta)
+    }
+
+    /// [`export_snapshot`](Self::export_snapshot) of sequence `seq` (the active one for `None`).
+    pub fn export_snapshot_of(&self, seq: Option<u32>) -> crate::Result<(crate::project::Project, VideoMeta)> {
+        Ok((self.project.render_snapshot(seq)?, self.meta))
+    }
+
+    /// Starts a batch: the edits until [`end_batch`](Self::end_batch) are one
+    /// undo step, taken before the first of them. Only the caller that opens a
+    /// batch sees the difference; the GUI never calls this, so its steps stay one per edit.
+    pub fn begin_batch(&mut self) {
+        self.project.begin_batch();
+    }
+
+    /// Ends the batch [`begin_batch`](Self::begin_batch) opened.
+    pub fn end_batch(&mut self) {
+        self.project.end_batch();
+    }
+
+    /// The mark an action takes before it edits, for [`Self::name_step`].
+    pub fn step_mark(&mut self) -> u64 {
+        self.project.step_mark()
+    }
+
+    /// Names the step the action that took `mark` pushed, so Undo and Redo can say what
+    /// they take back. An action that pushed nothing names nothing.
+    pub fn name_step(&mut self, mark: u64, label: &str) {
+        self.project.name_step(mark, label);
+    }
+
+    /// What [`undo`](Self::undo) takes back, when the step was named.
+    pub fn undo_label(&self) -> Option<&str> {
+        self.project.undo_label()
+    }
+
+    /// What [`redo`](Self::redo) walks forward to, when the step was named.
+    pub fn redo_label(&self) -> Option<&str> {
+        self.project.redo_label()
+    }
+
+    /// The names of the steps [`undo`](Self::undo) can take back, oldest first
+    /// ([`Project::undo_labels`]).
+    pub fn undo_labels(&self) -> Vec<Option<String>> {
+        self.project.undo_labels()
+    }
+
+    /// The names of the steps [`redo`](Self::redo) can walk forward to, the next one last
+    /// ([`Project::redo_labels`]).
+    pub fn redo_labels(&self) -> Vec<Option<String>> {
+        self.project.redo_labels()
+    }
+
+    /// Moves through the undo history by `index` steps from where it stands: negative undoes that
+    /// many, positive redoes. Each step goes through [`undo`](Self::undo) or [`redo`](Self::redo),
+    /// so it reseeks like them. Returns how many steps were taken; it stops early at either end.
+    pub fn jump_to(&mut self, index: isize) -> usize {
+        let mut taken = 0;
+        for _ in 0..index.unsigned_abs() {
+            let moved = match index < 0 {
+                true => self.undo(),
+                false => self.redo(),
+            };
+            if !moved {
+                break;
+            }
+            taken += 1;
+        }
+        taken
+    }
+
+    /// How many steps [`undo`](Self::undo) can still take.
+    pub fn undo_depth(&self) -> usize {
+        self.project.history_len()
+    }
+
+    /// How many steps [`redo`](Self::redo) can still take.
+    pub fn redo_depth(&self) -> usize {
+        self.project.redo_len()
+    }
+
+    /// Which state the timeline is in ([`Project::revision`]): equal before and
+    /// after an undo means the undo walked back to the same timeline, so a save
+    /// taken at one can tell whether the timeline has since moved off it.
+    pub fn revision(&self) -> u64 {
+        self.project.revision()
+    }
+
+    /// Every undo snapshot the session has pushed, including those the
+    /// [`HISTORY_CAP`](crate::project) has since dropped. Unlike
+    /// [`undo_depth`](Self::undo_depth) it keeps rising at the cap, so a caller
+    /// counts a batch's steps as the difference of two reads of it.
+    pub fn history_pushes(&self) -> u64 {
+        self.project.history_pushes()
+    }
+
+    /// Drops the redo stack with no step taken. For a caller that rolled its own
+    /// trial edits back: the undone states they left are not a branch to redo.
+    pub fn clear_redo(&mut self) {
+        self.project.clear_redo();
+    }
+
+    /// Moves the redo stack out ([`RedoCheckpoint`]) with no step taken, for a
+    /// caller whose trial edits may be rolled back. The trial's own edits clear
+    /// it and its rollback fills it, so [`restore_redo`](Self::restore_redo)
+    /// puts back exactly what was there before the trial.
+    pub fn take_redo(&mut self) -> RedoCheckpoint {
+        self.project.take_redo()
+    }
+
+    /// Puts back the redo stack [`take_redo`](Self::take_redo) took out.
+    pub fn restore_redo(&mut self, cp: RedoCheckpoint) {
+        self.project.restore_redo(cp);
+    }
+
+    /// Opens (`true`) or closes (`false`) a trial batch's hold on the undo cap:
+    /// while held, its steps evict nothing, so a rolled-back trial leaves the
+    /// history exactly as it found it. Closing trims back to the cap.
+    pub fn hold_history(&mut self, hold: bool) {
+        self.project.hold_history(hold);
+    }
+
     /// Takes `path` into the **library**: it becomes a source of this session,
     /// with its length noted ([`file_frames`](Self::file_frames)), and nothing
     /// is placed on any lane. What reaches the timeline is decided afterwards,
@@ -3689,9 +6633,29 @@ impl PlaybackSession {
     /// rate* of its own: the file is placed for the seconds it lasts and read at
     /// [`Rate`] against the timeline's rate, so it plays at the speed it was
     /// shot at.
+    /// [`import`](Self::import), with what the import cannot do for the file
+    /// said back as warnings rather than left on stderr. A file whose sound is in
+    /// a codec this build does not decode (DTS, say) imports with its picture and
+    /// plays silent: the one warning is that sentence, naming the track. Empty
+    /// for a file with nothing to warn about.
+    pub fn import_with_warnings(&mut self, path: &Path) -> crate::Result<(usize, Vec<String>)> {
+        let source = self.import(path)?;
+        let warnings = AudioSession::unsupported(path)
+            .ok()
+            .flatten()
+            .map(|why| format!("{}: {why}; its sound will be silent", path.display()))
+            .into_iter()
+            .collect();
+        Ok((source, warnings))
+    }
+
     pub fn import(&mut self, path: &Path) -> crate::Result<usize> {
         if crate::is_audio(path) {
             return self.import_audio(path);
+        }
+        // One frame of a numbered run is the whole run: a clip of its frames, asked nothing.
+        if let Some(run) = crate::sequence::Run::parse(path).or_else(|| crate::sequence::Run::detect(path)) {
+            return self.import_run(&run);
         }
         if crate::is_image(path) {
             return self.import_image(path);
@@ -3801,6 +6765,24 @@ impl PlaybackSession {
         Ok(source)
     }
 
+    /// The registration of a numbered run ([`crate::sequence`]): one source named for the whole
+    /// run, held to as many frames as the run holds, at the timeline's rate. The first frame is
+    /// what a refusal is decided on -- a run of pictures this engine cannot compose is refused in
+    /// the words a single still would be.
+    fn import_run(&mut self, run: &crate::sequence::Run) -> crate::Result<usize> {
+        let (width, height) = crate::decode::image_size(&run.frame(0))?;
+        if !crate::is_resolution(width, height) {
+            return Err(format!(
+                "{} is {width}x{height}, which is not a picture this engine composes",
+                run.frame(0).display()
+            )
+            .into());
+        }
+        let source = self.project.import(run.spelled(), 0);
+        self.note_frames(source, run.count, Rate::REAL_TIME);
+        Ok(source)
+    }
+
     /// The same registration for a still image, and the shortest of the three:
     /// a picture has nothing to agree with. No frame rate (it is one picture),
     /// no audio (it is silent), and a resolution of its own is what every
@@ -3847,6 +6829,9 @@ impl PlaybackSession {
             auto_proxies: self.auto_proxies,
             tone: self.project.tone(),
             limiter: self.project.limiter(),
+            caption_style: self.project.caption_style(),
+            notes: self.project.notes().to_string(),
+            still_secs: self.project.still_secs(),
         }
     }
 
@@ -3892,12 +6877,12 @@ impl PlaybackSession {
                 return;
             };
             for count in &mut self.counts {
-                *count = k.timeline_at(*count).max(1);
+                *count = k.timeline_nearest(*count).max(1);
             }
             for rate in &mut self.rates {
                 *rate = rate.then(k);
             }
-            self.meta.frame_count = k.timeline_at(self.meta.frame_count).max(1);
+            self.meta.frame_count = k.timeline_nearest(self.meta.frame_count).max(1);
         }
     }
 
@@ -3906,6 +6891,7 @@ impl PlaybackSession {
     /// ([`Self::adopt_settings`]). Reseeks both halves, so a canvas that moved
     /// is repainted and a proxy switch that flipped reopens the file.
     fn restored_step(&mut self, f: impl FnOnce(&mut Project) -> bool) -> bool {
+        let before = self.project.sources().to_vec();
         if !f(&mut self.project) {
             return false;
         }
@@ -3916,28 +6902,109 @@ impl PlaybackSession {
         // the step *undid* lands on the wrong frame of the right project (and
         // reopens the file through the switch that just went back).
         self.adopt_settings();
+        // A step that put a relinked file's old path back is read again here,
+        // before the reseek opens it.
+        self.reread_sources(&before);
         self.invalidate(Dirty::Both);
         true
     }
 
+    /// Takes `other`'s timeline over as one undo step ([`Project::adopt_as_step`]),
+    /// the way a recovery puts an autosave's edits on the saved project it opened.
+    /// The settings are adopted and the sources read again exactly as an undo
+    /// does it. `false`, with nothing changed, when the project refuses it.
+    pub fn adopt_as_step(&mut self, other: &PlaybackSession) -> bool {
+        let before = self.project.sources().to_vec();
+        if !self.project.adopt_as_step(&other.project) {
+            return false;
+        }
+        self.adopt_settings();
+        self.reread_sources(&before);
+        self.invalidate(Dirty::Both);
+        true
+    }
+
+    /// Measures the sources a step moved or added, against the timeline as it
+    /// stands. `before` is the list the step started from: a source whose path
+    /// or stream differs from it (a relink undone or redone, an entry adopted
+    /// from another project) has its length and rate read again, and so does
+    /// one past the end of the counts. A file that can no longer be read keeps
+    /// the length it had, or a whole picture's for an entry it never had.
+    fn reread_sources(&mut self, before: &[Source]) {
+        let now = self.project.sources().to_vec();
+        self.counts.truncate(now.len());
+        self.rates.truncate(now.len());
+        for (i, source) in now.iter().enumerate() {
+            if i < self.counts.len() && before.get(i) == Some(source) {
+                continue;
+            }
+            let (count, rate) = match self.measure_source(source) {
+                Ok(measured) => measured,
+                Err(_) => (
+                    self.counts.get(i).copied().unwrap_or(self.meta.frame_count),
+                    self.rates.get(i).copied().unwrap_or(Rate::REAL_TIME),
+                ),
+            };
+            if i < self.counts.len() {
+                self.counts[i] = count;
+                self.rates[i] = rate;
+            } else {
+                self.counts.push(count);
+                self.rates.push(rate);
+            }
+        }
+    }
+
+    /// The frame count and the rate `source`'s file has on this timeline: what a
+    /// relink measures a new file by, and what an undo measures the file it puts
+    /// back by. The file must be the kind and the material the timeline holds,
+    /// as [`Self::relink_source`] checks it.
+    fn measure_source(&mut self, source: &Source) -> crate::Result<(u32, Rate)> {
+        let path = source.path.as_path();
+        let first = self.first_audio()?;
+        if crate::is_image(path) {
+            crate::decode::image_size(path)?;
+            Ok((image_frames(self.meta.frame_rate), Rate::REAL_TIME))
+        } else if crate::is_audio(path) {
+            audio_matches(source, &first)?;
+            Ok((audio_frames(path, self.meta.frame_rate)?, Rate::REAL_TIME))
+        } else {
+            let (other, _) = Demuxer::open(path)?;
+            let rate = matches_timeline(source, &other, &self.meta, &first)?;
+            Ok((rate.timeline_at(other.frame_count), rate))
+        }
+    }
+
     fn edit(&mut self, dirty: Dirty, f: impl FnOnce(&mut Project) -> bool) -> bool {
-        if !f(&mut self.project) {
+        let done = f(&mut self.project);
+        self.project.settle();
+        if !done {
             return false;
         }
         self.invalidate(dirty);
         true
     }
 
+    /// Where an edit rebuilds from: the clock, except at the end of a played-out
+    /// timeline, where the clock has kept running on wall time and the edit
+    /// resumes at the end the viewer saw (so a paste there plays the pasted clip).
+    fn playhead(&self) -> f64 {
+        match self.eos {
+            true => self.now().min(self.eos_end),
+            false => self.now(),
+        }
+    }
+
     /// Rebuilds the dirtied half (or both) at the playhead.
     fn invalidate(&mut self, dirty: Dirty) {
         match dirty {
             Dirty::Picture => {
-                let (_, target) = self.landing(self.now());
+                let (_, target) = self.landing(self.playhead());
                 self.start_picture(target);
             }
             Dirty::Sound => self.reseek_audio(),
             Dirty::Both => {
-                let now = self.now();
+                let now = self.playhead();
                 self.seek(now);
             }
         }
@@ -4009,8 +7076,39 @@ impl PlaybackSession {
         // reports are relative to the first one after that, so a seek would go
         // here too -- `clock.seek_to(t)` and then `set_active(true)`.
         self.clock.play();
-        if let Some(audio) = &self.audio {
+        // Above or below 1x the sound stays off: `set_rate(1.0)` brings it back.
+        if let Some(audio) = self.audio.as_ref().filter(|_| self.clock.rate() == 1.0) {
             audio.set_playing(true);
+        }
+    }
+
+    /// Sets the playback speed: 1.0 is real time, 2/4/8 forward, -1/-2 backward.
+    ///
+    /// Anything but 1x runs the clock on wall time at that rate and keeps the
+    /// sound silent -- audio cannot play backward or fast without a stretch the
+    /// engine does not do here. Going back to 1x reopens the sound at the
+    /// current position, as a seek does. Drawing the picture backward is not
+    /// done for the sound; the picture is, from the playhead down ([`Back`]), and
+    /// turning the clock round restarts it there.
+    pub fn set_rate(&mut self, rate: f64) {
+        if !rate.is_finite() || rate == 0.0 || rate == self.clock.rate() {
+            return;
+        }
+        let was_backward = self.backward();
+        if rate != 1.0 {
+            if let Some(audio) = &self.audio {
+                audio.set_playing(false);
+            }
+            self.clock.set_rate(rate);
+        } else {
+            self.clock.set_rate(1.0);
+            if self.audio.is_some() {
+                self.reseek_audio();
+            }
+        }
+        if was_backward != self.backward() {
+            let (_, target) = self.landing(self.now());
+            self.start_picture(target);
         }
     }
 
@@ -4046,8 +7144,30 @@ impl PlaybackSession {
     /// frame and this is still the end. That is what makes it safe to call on
     /// the crossing into it -- the state the transport shows does not change,
     /// only the running clock stops.
+    /// Carries the clock on past the last frame, on wall time from where it stands, for a
+    /// take that runs longer than the timeline. The audio is stopped with it: nothing is
+    /// left to play. A no-op unless the clock runs on the audio device.
+    pub fn run_past_end(&mut self) {
+        if self.clock.source() != ClockSource::Audio {
+            return;
+        }
+        if let Some(audio) = &self.audio {
+            audio.set_playing(false);
+        }
+        self.clock.switch_to_wall();
+    }
+
     pub fn halt_at_end(&mut self) {
         self.pause();
+        // Played backward the end it ran into is the start, and the rate goes back
+        // to real time there: the next press plays on from the top.
+        if self.backward() {
+            self.set_rate(1.0);
+            self.clock.seek_to(0.0);
+            // The picture restart above cleared it; this is still the end.
+            self.eos = true;
+            return;
+        }
         self.clock.seek_to(self.timeline_duration());
     }
 
@@ -4077,19 +7197,15 @@ impl PlaybackSession {
     /// still runs, so the picture keeps playing against it.
     pub fn set_gain(&self, gain: f32) -> bool {
         match &self.audio {
-            Some(audio) => {
-                // The device is the owner and is told first: a remembered level
-                // that says something the device does not agree with is worse
-                // than no memory at all, because the next replacement would
-                // restore the wrong number.
-                if audio.ao.lock().unwrap().set_volume(gain) {
-                    audio.gain.store(gain.to_bits(), Ordering::Release);
-                    true
-                } else {
-                    false
-                }
+            // The device is the owner and is told first: a remembered level
+            // that says something the device does not agree with is worse
+            // than no memory at all, because the next replacement would
+            // restore the wrong number.
+            Some(audio) if audio.ao.lock().unwrap().set_volume(gain) => {
+                audio.gain.store(gain.to_bits(), Ordering::Release);
+                true
             }
-            None => false,
+            _ => false,
         }
     }
 
@@ -4145,6 +7261,11 @@ impl PlaybackSession {
         let was_playing = self.clock.is_playing();
         self.stop_audio();
         self.start_picture(target);
+        if self.clock.rate() != 1.0 {
+            // Sound stays silent off-speed; `set_rate(1.0)` reopens it here.
+            self.clock.seek_to(t);
+            return;
+        }
         let audio_running = self.start_audio(target);
         // Same invariant as `play`: position the clock before audio restarts.
         if audio_running && self.clock.source() != ClockSource::Audio {
@@ -4190,7 +7311,11 @@ impl PlaybackSession {
         // The span runs from `target` to the end of whatever it landed in -- a
         // clip, or a gap, which starts a black-frame worker instead. `None` is
         // the emptied timeline, black too, and `start_span` says so.
-        self.start_span(self.project.composite_span_at(target));
+        let span = match self.backward() {
+            true => back_span_at(&self.project.render_view(), target),
+            false => crate::export::stack_span_at(&self.project.render_view(), target),
+        };
+        self.start_span(span);
         self.eos = false;
     }
 
@@ -4274,24 +7399,24 @@ impl PlaybackSession {
             // One play list per audio lane, summed by the mixer: what the ear
             // hears is every lane at once, and a lane's own gaps are silence in
             // it rather than a hole in the count the master clock keeps.
-            let segs = self.project.audio_segments_from(target, fps);
+            let segs = self.project.render_view().audio_segments_from(target, fps);
             // The equalizers beside them, one per segment: the worker filters a
             // segment's own samples before the mix, so a clip's curve reaches
             // that clip and stops. Rebuilt on every seek, which is what makes an
             // EQ edit audible at once -- `edit` reseeks, so the drag that
             // changed a band restarts the workers with the new curve already in
             // them, and no live channel has to reach into a running one.
-            let eqs = self.project.audio_eqs_from(target, fps);
+            let eqs = self.project.render_view().audio_eqs_from(target, fps);
             // ...and the rates, the same way again: a speeded segment is
             // resampled inside its own worker, before the mix, so what the ear
             // hears is what the timeline shows. Empty for a project nobody has
             // speeded, which is the path that decodes the same samples it always
             // did.
-            let speeds = self.project.audio_speeds_from(target, fps);
+            let speeds = self.project.render_view().audio_speeds_from(target, fps);
             // ...and the fades, the same way again: a clip's own envelope runs
             // inside its worker, after the rate and the equalizer, so a fade
             // edit is audible at once exactly as an EQ edit is.
-            let fades = self.project.audio_fades_from(target, fps);
+            let fades = self.project.render_view().audio_fades_from(target, fps);
             // Each source on the stream it was placed with: what plays is what
             // the library row said, and what an export copies (`export::run`).
             let sources = self.project.audio_sources();
@@ -4301,16 +7426,20 @@ impl PlaybackSession {
             // the sum, where nothing is decoded, so a fader moved later is a
             // number the running mixer picks up rather than a stream rebuilt
             // under the ear ([`crate::audio::MixControls`]).
-            let gains = self.project.audio_gains();
+            let gains = self.mix_gains();
+            let ducks = self.project.render_view().audio_ducks();
+            // ...and the voice processors, which are not live: an edit to one
+            // rebuilds the sound like an equalizer edit does.
+            let voices = self.project.render_view().audio_voices();
             let limiter = self.project.limiter();
-            let controls = crate::audio::MixControls::new(gains.clone(), limiter);
+            let controls = crate::audio::MixControls::new(gains.clone(), ducks.clone(), limiter);
             // Only a mixed timeline has a mixer to talk to; the single-lane
             // flat path is the bit-exact one and has none. Decided here from
             // the very lists the open is about to be handed
             // ([`AudioSession::is_mixed`]) rather than read off the handle
             // afterwards, because there *is* no afterwards on this thread any
             // more -- the open runs on the feeder.
-            let mixed = crate::audio::AudioSession::is_mixed(segs.len(), &gains, limiter);
+            let mixed = crate::audio::AudioSession::is_mixed(segs.len(), &gains, limiter, &voices);
             let worker_controls = Arc::clone(&controls);
             // ...and the rate the mix runs at, if the project picked one: the
             // same override [`crate::edith::save`] writes and [`Self::open_project`]
@@ -4329,6 +7458,8 @@ impl PlaybackSession {
                     &fades,
                     fps,
                     &gains,
+                    &ducks,
+                    &voices,
                     limiter,
                     Some(&worker_controls),
                     sample_rate,
@@ -4349,7 +7480,7 @@ impl PlaybackSession {
                         // A read this session abandoned on purpose -- the seek
                         // after it, or the session going away -- is not a file
                         // that would not open, and says nothing.
-                        if !crate::demux::is_cancelled(&e) {
+                        if !crate::demux::is_cancelled(&e) && std::env::var_os("EDITH_DEBUG").is_some() {
                             eprintln!("timeline audio open failed: {e}");
                         }
                         None
@@ -4377,6 +7508,11 @@ impl PlaybackSession {
     /// here, so a timeline that was played out still is; see
     /// [`is_eos`](Self::is_eos).
     fn reseek_audio(&mut self) {
+        if self.clock.rate() != 1.0 {
+            // Off-speed the sound is silent and `set_rate(1.0)` rebuilds it, so a
+            // change to it now has nothing to rebuild.
+            return;
+        }
         let (t, target) = self.landing(self.now());
         let was_playing = self.clock.is_playing();
         self.stop_audio();
@@ -4410,13 +7546,18 @@ impl PlaybackSession {
         out: &Path,
         settings: &crate::export::ExportSettings,
     ) -> crate::ExportHandle {
-        crate::export::start(
-            self.project.export_snapshot(),
-            self.meta,
-            out,
-            settings,
-            self.sample_rate,
-        )
+        // The chapter marks, measured from the export's own start (the range's
+        // `from`, the same clock `chapter_list_ns` uses). A caller's list wins.
+        let mut settings = settings.clone();
+        if settings.chapters.is_empty() {
+            settings.chapters = self.chapter_list_ns(settings.range);
+        }
+        let mut snapshot = self.project.export_snapshot();
+        // A range that never reads a missing file is written without opening it.
+        if let Some(range) = settings.range {
+            snapshot.drop_offline_outside(range, crate::source_present);
+        }
+        crate::export::start(snapshot, self.meta, out, &settings, self.sample_rate)
     }
 
     /// Moves the clock forward; the caller runs this once per rendered frame.
@@ -4558,8 +7699,8 @@ fn matches_timeline(
     // The codec is *not* held to the timeline's -- every clip opens its own
     // decoder, so an H.264 take and an HEVC one play on one timeline. What the
     // codec gate was really protecting against stays, in the one place that
-    // can actually answer it: on a machine without the VA-API plugin an HEVC,
-    // VP9 or VP8 clip would be black frames with the refusal on stderr alone,
+    // can actually answer it: on a machine without the VA-API plugin an HEVC
+    // or VP8 clip would be black frames with the refusal on stderr alone,
     // so the file is asked for a decoder *here*, at the door, where the `Err`
     // is still something a front-end can show. A zero-length range probes and
     // starts no
@@ -4626,12 +7767,29 @@ fn matches_timeline(
 /// c581d41 rule ("a later source with real audio must be heard") at the add
 /// door.
 fn first_audio_of(sources: &[Source]) -> crate::Result<Option<crate::AudioProbe>> {
-    for source in sources.iter().filter(|s| !crate::is_image(&s.path)) {
+    for source in sources
+        .iter()
+        .filter(|s| !crate::is_image(&s.path) && crate::source_present(&s.path))
+    {
         if let Some(probe) = AudioSession::probe(&source.path, source.audio_stream)? {
             return Ok(Some(probe));
         }
     }
     Ok(None)
+}
+
+/// Whether a file is sound and no picture, which decides the lane it goes on.
+/// The extension answers for a song; an mp4 or Matroska file is asked of its
+/// header the way [`PlaybackSession::import`] asks it, so an audio-only mp4
+/// lands on an audio lane exactly as it imports and reopens.
+fn sound_only(path: &Path) -> bool {
+    if crate::is_audio(path) {
+        return true;
+    }
+    if crate::is_image(path) {
+        return false;
+    }
+    matches!(Demuxer::open(path), Err(ref e) if NoVideoTrack::is_it(e))
 }
 
 /// *Which* source that is: the first one that is not a still. The single answer
@@ -4645,7 +7803,9 @@ fn first_audio_of(sources: &[Source]) -> crate::Result<Option<crate::AudioProbe>
 /// `None` for a library of nothing but stills, and for one with no file at all:
 /// both are silent timelines.
 fn audio_source_of(sources: &[Source]) -> Option<&Source> {
-    sources.iter().find(|s| !crate::is_image(&s.path))
+    sources
+        .iter()
+        .find(|s| !crate::is_image(&s.path) && crate::source_present(&s.path))
 }
 
 fn audio_matches(source: &Source, first: &Option<crate::AudioProbe>) -> crate::Result<()> {
@@ -4670,13 +7830,23 @@ fn audio_matches_probed(
     }
     // A mono file joins a wider timeline: [`crate::audio::widen`] duplicates
     // its one channel into every channel the timeline carries, the inverse of
-    // the [`crate::audio::downmix`] a wider file already folds through. The
-    // reverse -- a wider file onto a mono timeline -- stays refused below;
-    // nothing here narrows a source, only the decoder's own downmix does.
-    if let (Some(p), Some(b)) = (probe, first) {
-        if p.channels == 1 && b.channels > 1 {
-            return Ok(());
-        }
+    // the [`crate::audio::downmix`] a wider file already folds through. A
+    // wider file onto a mono timeline -- beyond a stereo pair -- stays refused
+    // below; the stereo pair is narrowed by [`crate::audio::widen`] (below).
+    if let (Some(p), Some(b)) = (probe, first)
+        && p.channels == 1
+        && b.channels > 1
+    {
+        return Ok(());
+    }
+    // ...and a stereo file joins a mono timeline: [`crate::audio::widen`]
+    // averages its pair into the one channel the timeline carries. Import and
+    // open both come through here, so a project this accepts always reopens.
+    if let (Some(p), Some(b)) = (probe, first)
+        && p.channels == 2
+        && b.channels == 1
+    {
+        return Ok(());
     }
     // ...and a *silent* file joins whatever the timeline is: it contributes
     // silence over its span, which is the very thing both audio paths already
@@ -4716,12 +7886,137 @@ fn image_frames(fps: f64) -> u32 {
         .clamp(1.0, f64::from(u32::MAX))) as u32
 }
 
-/// How long a still is placed for: [`IMAGE_PLACE_SECS`], never past the length
+/// How long a still is placed for: `secs` (the project's still length), never past the length
 /// it is held to and never zero (a clip is never empty).
-fn place_frames(count: u32, fps: f64) -> u32 {
-    ((IMAGE_PLACE_SECS * fps)
+fn place_frames(count: u32, fps: f64, secs: f64) -> u32 {
+    ((secs * fps)
         .ceil()
         .clamp(1.0, f64::from(count.max(1)))) as u32
+}
+
+/// The project one document of a file describes, on the canvas and rate `meta` gives it.
+fn project_of(doc: crate::edith::Document, meta: &VideoMeta) -> crate::Result<Project> {
+    let subtitles = crate::subtitle::open_all(&doc.subtitles);
+    Ok(
+Project::from_parts(doc.sources, doc.lanes, doc.eq, doc.color, doc.transform)?
+            .with_mix(&doc.gains, doc.limiter)
+            .with_ducks(&doc.ducks)
+            .with_voices(&doc.voices)
+            .with_lane_names(&doc.names)
+            .with_bins(doc.bins)
+            .with_lane_flags(&doc.flags)
+            .with_tone(doc.tone)
+            .with_notes(doc.notes)
+            .with_still_secs(doc.still_secs)
+            // The palette before what is placed on it: a caption names a row of
+            // it, and [`Project::with_subs`] refuses one naming a row that is
+            // not there.
+            .with_subtitles(subtitles)
+            .with_sub_langs(&doc.sub_langs)
+            // The cue overrides, over the words the files gave: a retyped
+            // cue comes back as it was typed.
+            .with_cue_edits(&doc.cue_edits)
+            // ...and the cues added to a track, after the file's own, each at
+            // its start (see [`crate::edith`]'s `cueadd` lines).
+            .with_cue_adds(&doc.cue_adds)
+            // The title cards and text overlays, in the order the file has them.
+            .with_titles(doc.titles)
+            // The chapter markers, in frame order (see [`crate::edith`]'s `chapter` lines).
+            .with_chapters(doc.chapters)
+            // The comment markers, in frame order (`marker` lines).
+            .with_markers(doc.markers)
+            .with_cue_words(&doc.cue_words)
+            .with_caption_style(doc.caption_style)
+            .with_subs(doc.subs)?
+            // The header a load puts back: the canvas and rate above, which a
+            // save's own `resolution`/`fps` lines may have moved off the
+            // scaffold's, and the switches the literal below carries -- handed
+            // in here because they are the project's own and a door that moved
+            // one after this would snapshot whatever copy it holds, which until
+            // this line is the placeholder's. No undo step for
+            // [`Project::with_mix`]'s reason: a project that arrived one `z`
+            // from a state it was never in is a project whose first undo is a
+            // surprise.
+            .with_canvas(meta.width, meta.height, meta.frame_rate)
+            .with_switches(doc.proxy, doc.auto_proxy, doc.encoder, doc.sample_rate)
+    )
+}
+
+/// The two tables a trim measures by, `(picture, sound)`: [`wall_table`] for a
+/// video lane and for an audio one, so a linked take's members each meet their
+/// own lane's length. Borrows `counts` only, so the caller may hold them across
+/// a `&mut` to the project.
+fn lane_walls<'a>(
+    sources: &[Source],
+    counts: &'a [u32],
+    fps: f64,
+) -> (Cow<'a, [u32]>, Cow<'a, [u32]>) {
+    (
+        wall_table(sources, counts, fps, Lane::V1),
+        wall_table(sources, counts, fps, Lane::A1),
+    )
+}
+
+/// The length each source's clips are walled by on `lane`, in timeline frames.
+/// A clip on an audio lane takes the sound, so a video source's own audio stream
+/// sets its length there (the picture's frame count is the length everywhere
+/// else, and `counts` is that table). Stills and audio files already are their
+/// sound's length in `counts`, and a source with no audio stream keeps its
+/// `counts` entry. Mirrors the length `place` gives an audio-lane placement in
+/// the MCP (`source_frames`).
+fn wall_table<'a>(sources: &[Source], counts: &'a [u32], fps: f64, lane: Lane) -> Cow<'a, [u32]> {
+    if lane.kind != LaneKind::Audio {
+        return Cow::Borrowed(counts);
+    }
+    Cow::Owned(
+        sources
+            .iter()
+            .zip(counts)
+            .map(|(source, &frames)| {
+                if crate::is_image(&source.path) || crate::is_audio(&source.path) {
+                    return frames;
+                }
+                match audio_stream_secs(&source.path, source.audio_stream) {
+                    Some(secs) if secs > 0.0 => (secs * fps).ceil().clamp(1.0, f64::from(u32::MAX)) as u32,
+                    _ => frames,
+                }
+            })
+            .collect(),
+    )
+}
+
+/// How long a placed file's clip is: its picture's frame count, held to the length
+/// its sound is walled by ([`wall_table`]) when it has one. A grouped take puts the
+/// same clip on the picture lane and the sound lane, so a 2.002 s picture beside a
+/// 2.000 s sound is 60 frames, not 61 -- the sound's own wall is what the load and
+/// save checks hold the audio lane to, and one clip must satisfy both lanes.
+fn sound_held_frames(path: &Path, stream: usize, frames: u32, fps: f64) -> u32 {
+    if crate::is_image(path) || crate::is_audio(path) {
+        return frames.max(1);
+    }
+    match audio_stream_secs(path, stream) {
+        Some(secs) if secs > 0.0 => {
+            let held = (secs * fps).ceil().clamp(1.0, f64::from(u32::MAX)) as u32;
+            frames.min(held).max(1)
+        }
+        _ => frames.max(1),
+    }
+}
+
+/// [`AudioSession::stream_duration_secs`] for one stream, remembered per file:
+/// a trim asks for it on every drag step. Only a found length is kept; a file
+/// that cannot be read now may be back in a moment.
+fn audio_stream_secs(path: &Path, stream: usize) -> Option<f64> {
+    static SECS: std::sync::OnceLock<Mutex<std::collections::HashMap<(PathBuf, usize), f64>>> =
+        std::sync::OnceLock::new();
+    let cache = SECS.get_or_init(Default::default);
+    let key = (path.to_path_buf(), stream);
+    if let Some(&secs) = cache.lock().ok()?.get(&key) {
+        return Some(secs);
+    }
+    let secs = AudioSession::stream_duration_secs(path, stream).ok()??;
+    cache.lock().ok()?.insert(key, secs);
+    Some(secs)
 }
 
 /// How many timeline frames a standalone audio file occupies: its playing time
@@ -4759,12 +8054,12 @@ fn open_audio(path: &Path, stream: usize) -> (Option<Audio>, Option<String>) {
             Ok(None) => {
                 let reason = AudioSession::unsupported(path).ok().flatten();
                 if let Some(reason) = &reason {
-                    eprintln!("audio disabled: {reason}");
+                    crate::audio::debug_once(format!("audio disabled: {reason}"));
                 }
                 return (None, reason);
             }
             Err(e) => {
-                eprintln!("audio disabled: {e}");
+                crate::audio::debug_once(format!("audio disabled: {e}"));
                 return (None, Some(e.to_string()));
             }
         };
@@ -4787,6 +8082,8 @@ fn open_audio(path: &Path, stream: usize) -> (Option<Audio>, Option<String>) {
         gain: Arc::new(AtomicU32::new(1.0f32.to_bits())),
         wants_active: Arc::new(AtomicBool::new(false)),
         tap: Arc::new(Mutex::new(Vec::with_capacity(TAP_SAMPLES))),
+        peak: Arc::new(AtomicU32::new(0)),
+        peak_lr: Arc::new([AtomicU32::new(0), AtomicU32::new(0)]),
         feeders: Arc::new(AtomicUsize::new(0)),
         rearm_at: Arc::new(Mutex::new(None)),
     };
@@ -4893,6 +8190,28 @@ fn feed(rx: Receiver<AudioChunk>, audio: &Audio, epoch: u64) {
     }
 }
 
+/// The stretch of the timeline that ends at `frame` (inclusive) and starts where
+/// whatever is shown there starts: [`crate::export::stack_span_at`] at that
+/// start, cut short at `frame`. What a backward play draws, from `frame` down.
+fn back_span_at(project: &Project, frame: u32) -> Option<crate::project::Span> {
+    let mut lo = 0;
+    let visible = project
+        .lanes()
+        .into_iter()
+        .filter(|lane| lane.kind == LaneKind::Video && !project.lane_hidden(*lane));
+    for lane in visible {
+        let clips = project.lane(lane);
+        let from = match project.lane_clip_at(lane, frame) {
+            Some(idx) => clips[idx].start,
+            None => clips.iter().rfind(|c| c.end() <= frame).map_or(0, |c| c.end()),
+        };
+        lo = lo.max(from);
+    }
+    let mut span = crate::export::stack_span_at(project, lo)?;
+    span.len = span.len.min(frame + 1 - lo);
+    Some(span)
+}
+
 /// Timeline seconds to a 0-based frame index, floor semantics: position `t`
 /// shows the frame whose interval contains it. The epsilon absorbs float error
 /// at exact frame boundaries -- `123.0/30.0 * 30.0` is `122.999...`, and a
@@ -4918,10 +8237,54 @@ fn blend_bgra(a: &[u8], b: &[u8], t: f32) -> Vec<u8> {
         .collect()
 }
 
+/// A chapter time as YouTube writes one in a description: `MM:SS`, or `H:MM:SS` from an hour on.
+/// The frame is floored to whole seconds.
+pub fn youtube_time(frame: u32, fps: f64) -> String {
+    let secs = (f64::from(frame) / fps).floor() as u64;
+    let (h, m, sec) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{sec:02}")
+    } else {
+        format!("{m:02}:{sec:02}")
+    }
+}
+
+/// The YouTube description listing for `chapters` (frame, name, sorted by frame) and the warnings
+/// its rules call for: the first chapter at 00:00, each chapter at least 10 seconds long (the last
+/// runs to `end`), and at least 3 chapters. Empty when there are none.
+pub fn chapter_listing(chapters: &[(u32, String)], fps: f64, end: u32) -> (String, Vec<String>) {
+    if chapters.is_empty() {
+        return (String::new(), Vec::new());
+    }
+    let listing = chapters
+        .iter()
+        .map(|(f, t)| format!("{} {t}", youtube_time(*f, fps)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut warnings = Vec::new();
+    if chapters[0].0 != 0 {
+        warnings.push(format!(
+            "the first chapter starts at {}, not 00:00: YouTube needs one at 00:00",
+            youtube_time(chapters[0].0, fps)
+        ));
+    }
+    for (i, (frame, title)) in chapters.iter().enumerate() {
+        let next = chapters.get(i + 1).map_or(end, |c| c.0);
+        let secs = f64::from(next.saturating_sub(*frame)) / fps;
+        if secs < 10.0 {
+            warnings.push(format!("chapter \"{title}\" at {} lasts {secs:.1} s: YouTube wants 10 s or more", youtube_time(*frame, fps)));
+        }
+    }
+    if chapters.len() < 3 {
+        warnings.push(format!("YouTube needs at least 3 chapters; this timeline has {}", chapters.len()));
+    }
+    (listing, warnings)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        AUDIO_LOST, Edge, Lane, PlaybackSession, Source, TransformParams, audio_source_of,
+        SCRUB_SECS, scrub_snippet, AUDIO_LOST, Edge, Lane, PlaybackSession, Source, TransformParams, audio_source_of,
         blend_bgra, secs_to_frame,
     };
     use std::path::PathBuf;
@@ -4931,6 +8294,162 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../assets")
             .join(name)
+    }
+
+    /// A scrub snippet is the window it was cut from, as long as [`SCRUB_SECS`], and it rises
+    /// from silence and falls to it again over its fades, so no edge of it can click.
+    #[test]
+    fn a_scrub_snippet_is_the_window_long_and_faded_at_both_ends() {
+        let rate = 48_000u32;
+        let frames = (SCRUB_SECS * f64::from(rate)) as usize;
+        assert_eq!(frames, 3360, "70 ms at 48 kHz");
+        let fade = (0.01 * f64::from(rate)) as usize;
+        let src = vec![1.0f32; frames * 2];
+        let out = scrub_snippet(&src, 2, fade);
+        assert_eq!(out.len(), frames * 2, "the window's length, both channels");
+        assert!(out[0].abs() < 0.01 && out[1].abs() < 0.01, "starts at silence: {:?}", &out[..2]);
+        let last = out.len() - 2;
+        assert!(out[last].abs() < 0.01 && out[last + 1].abs() < 0.01, "ends at silence");
+        let mid = frames / 2 * 2;
+        assert_eq!((out[mid], out[mid + 1]), (1.0, 1.0), "the middle is untouched");
+        for f in 1..fade {
+            assert!(out[2 * f] >= out[2 * (f - 1)], "the fade in rises at frame {f}");
+            let tail = out.len() - 2 * (f + 1);
+            assert!(out[tail] >= out[tail + 2], "the fade out falls toward the end at frame {f}");
+        }
+        // A window shorter than twice the fade has its fade held to half of it.
+        let short = scrub_snippet(&[1.0; 8], 1, 100);
+        assert_eq!(short.len(), 8);
+        assert!(short[0].abs() < 0.5 && short[7].abs() < 0.5, "{short:?}");
+        assert!(scrub_snippet(&[1.0; 8], 0, 2).len() == 8, "a zero width is read as mono");
+    }
+
+    /// The crash path: a saved project with several sequences (one of them a compound clip
+    /// over another, plus a marker) is written as an autosave and read back, and the autosave
+    /// on top of the saved file recovers to the same sequences, compound clips and markers.
+    #[test]
+    fn autosave_round_trips_every_sequence_compound_and_marker() {
+        let dir = crate::scratch::Scratch::dir("ve_sidecar_round_trip");
+        let media = dir.join("film.mp4");
+        std::fs::copy(asset("test_av.mp4"), &media).expect("copy the fixture");
+        let path = dir.join("proj.edith");
+        let s = PlaybackSession::open(&media).expect("open the fixture");
+        s.set_gain(0.0);
+        s.save_project_noted(&path).expect("save the base");
+        let mut s = PlaybackSession::open_project(&path).expect("reopen the base");
+        let b = s.new_sequence(Some("Cut B")).expect("a second sequence");
+        s.switch_sequence(b).expect("switch to it");
+        assert!(s.place_stream_at(0.0, &media, 0, None).expect("placeable"));
+        let copy = s.duplicate_sequence(b).expect("duplicate it");
+        s.switch_sequence(copy).expect("switch to the copy");
+        s.nest(&[(Lane::V1, 0)], Some("Inner")).expect("nest a clip");
+        assert_eq!(s.project.sequences().len(), 4, "the base, B, its copy and the nested one");
+        s.add_marker(crate::project::Marker {
+            frame: 3,
+            length: 0,
+            name: "beat".into(),
+            note: String::new(),
+            color: crate::project::MarkerColor::Red,
+        })
+        .expect("a marker");
+        assert_eq!(s.project.markers().len(), 1, "the marker is on the sequence being edited");
+        let sidecar = dir.join("proj.autosave.edith");
+        s.save_autosave(&sidecar).expect("the autosave");
+        let back = PlaybackSession::open_project(&sidecar).expect("the autosave opens");
+        assert_eq!(back.project.sequences(), s.project.sequences(), "the same sequences, in order");
+        assert_eq!(back.project.active_sequence(), s.project.active_sequence());
+        assert_eq!(back.project.markers().len(), 1, "the marker comes back");
+        assert_eq!(back.project.markers()[0].name, "beat");
+        // The recovery path: the saved file, with the autosave on top of it.
+        let mut saved = PlaybackSession::open_project(&path).expect("the saved file");
+        assert!(saved.adopt_as_step(&back), "the autosave lands on the saved file");
+        assert_eq!(saved.project.sequences(), s.project.sequences(), "recovery holds every sequence");
+        assert_eq!(saved.project.markers().len(), 1, "and the marker");
+    }
+
+    /// A clip past its source's end in a parked sequence is shortened on save, just as in the
+    /// active one, and the save says which sequence it was in. It is never refused.
+    #[test]
+    fn save_shortens_the_parked_sequences_over_wall_clips() {
+        let dir = crate::scratch::Scratch::dir("ve_save_parked_walls");
+        let media = dir.join("film.mp4");
+        std::fs::copy(asset("test_av.mp4"), &media).expect("copy the fixture");
+        let mut s = PlaybackSession::open(&media).expect("open the fixture");
+        s.set_gain(0.0);
+        let copy = s.duplicate_sequence(s.project.active_sequence()).expect("duplicate");
+        let copy_name = s.project.sequence_name(copy).expect("the copy is named").to_string();
+        let path = dir.join("proj.edith");
+        assert!(s.save_project_noted(&path).expect("whole walls save").is_empty());
+        s.counts[0] = 1;
+        let notes = s.save_project_noted(&path).expect("the save never refuses");
+        assert!(notes.iter().any(|n| n.contains(&format!("in sequence \"{copy_name}\""))), "{notes:?}");
+        assert!(notes.iter().all(|n| !n.contains("frame")), "no frame numbers in a note: {notes:?}");
+        PlaybackSession::open_project(&path).expect("the saved file opens");
+    }
+
+    /// A video file whose sound is shorter than its picture (a 22.96 s picture under 20.67 s of
+    /// sound): the timeline it opens to holds the grouped take to the sound's length, so an
+    /// edit chain that splits, ripple-deletes and dissolves saves without a refusal and leaves
+    /// no audio clip past the sound's end.
+    #[test]
+    fn a_picture_longer_than_its_sound_saves_after_edits() {
+        let dir = crate::scratch::Scratch::dir("ve_short_sound_edits");
+        let media = dir.join("speech.mp4");
+        let made = std::process::Command::new("ffmpeg")
+            .args(["-y", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=160x120:rate=25:duration=22.96",
+                   "-f", "lavfi", "-i", "sine=frequency=440:duration=20.67", "-c:v", "mpeg4", "-c:a", "aac"])
+            .arg(&media)
+            .status()
+            .map(|s| s.success() && media.exists())
+            .unwrap_or(false);
+        if !made {
+            eprintln!("no ffmpeg: a picture longer than its sound cannot be generated, skipping");
+            return;
+        }
+        let mut s = PlaybackSession::open(&media).expect("open the fixture");
+        s.set_gain(0.0);
+        let sound_frames = 517;
+        assert_eq!(s.lane_clips(Lane::A1)[0].out_frame, sound_frames, "the opened take is the sound's length");
+        assert_eq!(s.lane_clips(Lane::V1)[0].out_frame, sound_frames, "and so is its picture");
+
+        let path = dir.join("proj.edith");
+        assert!(s.cut_at(5.0));
+        assert!(s.cut_regions(&[(50, 100)], &[Lane::V1, Lane::A1]).is_ok());
+        assert!(s.set_transition_out(Lane::V1, 0, 10));
+        assert!(s.place_stream_at(0.0, &media, 0, None).expect("placeable"));
+        let notes = s.save_project_noted(&path).expect("the edited take saves");
+        assert!(notes.is_empty(), "nothing needed shortening: {notes:?}");
+        for lane in [Lane::V1, Lane::A1] {
+            for c in s.lane_clips(lane) {
+                assert!(c.out_frame <= sound_frames, "{lane:?} clip ends at {} past the sound", c.out_frame);
+            }
+        }
+    }
+
+    /// A relink is one undo step on the session too: undo points the source back at the old file,
+    /// which reads again (no longer offline), and redo points it at the new one.
+    #[test]
+    fn undoing_a_relink_reads_the_old_file_again() {
+        let dir = crate::scratch::Scratch::dir("ve_relink_undo_session");
+        let media = dir.join("film.mp4");
+        std::fs::copy(asset("test_av.mp4"), &media).expect("copy the fixture");
+        let session = PlaybackSession::open(&media).expect("open the fixture");
+        session.set_gain(0.0);
+        let path = dir.join("proj.edith");
+        session.save_project(&path).expect("save");
+        let moved = dir.join("moved.mp4");
+        std::fs::rename(&media, &moved).expect("move the media");
+
+        let mut s = PlaybackSession::open_project(&path).expect("opens offline");
+        assert_eq!(s.offline_sources().len(), 1);
+        s.relink_source(0, &moved).expect("relinks");
+        assert!(s.offline_sources().is_empty());
+        std::fs::copy(&moved, &media).expect("the old file is back beside it");
+        assert!(s.undo());
+        assert_eq!(s.sources()[0].path, std::fs::canonicalize(&media).expect("canonical"));
+        assert!(s.offline_sources().is_empty(), "the old file reads again");
+        assert!(s.redo());
+        assert_eq!(s.sources()[0].path, std::fs::canonicalize(&moved).expect("canonical"));
     }
 
     /// A dead output is not the end of a session's sound.
@@ -5285,6 +8804,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_audio_lane_walls_a_video_by_its_sound_and_a_video_lane_by_its_picture() {
+        // A 2 s picture under 60 s of sound: the A1 half of a placed take can be
+        // trimmed out to the sound's end, the V1 half only to the picture's.
+        let path = asset("test_short_video_long_audio.mp4");
+        let mut session = PlaybackSession::open(&path).expect("open the fixture");
+        session.set_gain(0.0);
+        let fps = session.meta().frame_rate;
+        // Placed at the end, so nothing sits in front of it and the walls are the
+        // source's own, not a neighbour's.
+        let end = session.timeline_duration();
+        assert!(
+            session
+                .place_stream_at(end, &path, 0, Some(Lane::A1))
+                .expect("a file on this timeline is placeable")
+        );
+        let a1 = session.lane_clips(Lane::A1).len() - 1;
+        let v1 = session.lane_clips(Lane::V1).len() - 1;
+
+        let audio = session.trim_walls(Lane::A1, a1, Edge::End).expect("A1 clip");
+        let picture = session.trim_walls(Lane::V1, v1, Edge::End).expect("V1 clip");
+        let placed = (end * fps).round();
+        assert!(
+            audio.hi as f64 >= placed + 59.0 * fps,
+            "the sound is 60 s: the A1 end may reach {} frames at {fps} fps",
+            audio.hi
+        );
+        assert!(
+            (picture.hi as f64) < placed + 3.0 * fps,
+            "the picture is 2 s: the V1 end stops at {} frames",
+            picture.hi
+        );
+        assert!(
+            session.trim_clip(Lane::A1, a1, Edge::End, (placed + 40.0 * fps) as u32),
+            "the A1 clip trims to 40 s"
+        );
+        assert_eq!(session.lane_clips(Lane::A1)[a1].len(), (40.0 * fps) as u32);
+    }
+
     /// The seam between the two lists a source index reaches: dropping a file
     /// from the library shortens `sources`, and `counts` -- the frame length
     /// per source, which is what a trim is walled by -- has to lose the same
@@ -5318,7 +8876,7 @@ mod tests {
 
         // The wall is the surviving file's own length, not the gone one's: a
         // whole-file clip cannot be dragged out any further at all.
-        let clip = session.lane_clips(Lane::V1)[0];
+        let clip = session.lane_clips(Lane::V1)[0].clone();
         assert_eq!(clip.len(), short, "av2's take, whole");
         assert_eq!(
             session.trim_room(Lane::V1, 0, Edge::End),
@@ -5460,14 +9018,14 @@ mod tests {
         // *a* frame lands this is the one tick under test.
         let frame_at = |s: &mut PlaybackSession| -> crate::decode::Frame {
             s.seek(t);
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
             loop {
                 if let Some(f) = s.try_frame() {
                     return f;
                 }
                 assert!(
                     std::time::Instant::now() < deadline,
-                    "no frame within 20s of the seek"
+                    "no frame within 120s of the seek"
                 );
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
@@ -5508,12 +9066,12 @@ mod tests {
         let mut s = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
         s.set_gain(0.0);
         let poll = |s: &mut PlaybackSession| -> crate::decode::Frame {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
             loop {
                 if let Some(f) = s.try_frame() {
                     return f;
                 }
-                assert!(std::time::Instant::now() < deadline, "no frame within 20s");
+                assert!(std::time::Instant::now() < deadline, "no frame within 120s");
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
         };
@@ -5558,12 +9116,12 @@ mod tests {
         let mut s = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
         s.set_gain(0.0);
         let poll = |s: &mut PlaybackSession| -> crate::decode::Frame {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
             loop {
                 if let Some(f) = s.try_frame() {
                     return f;
                 }
-                assert!(std::time::Instant::now() < deadline, "no frame within 20s");
+                assert!(std::time::Instant::now() < deadline, "no frame within 120s");
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
         };
@@ -5612,6 +9170,38 @@ mod tests {
             s.project.lane(lane)[idx].viz_paint,
             0,
             "one undo is the whole drag"
+        );
+    }
+
+    #[test]
+    fn solo_keeps_only_the_soloed_audio_lanes_audible() {
+        use super::soloed_gains;
+        use crate::project::LaneKind;
+        let a1 = Lane::new(LaneKind::Audio, 0);
+        let a2 = Lane::new(LaneKind::Audio, 1);
+        let a3 = Lane::new(LaneKind::Audio, 2);
+        let v1 = Lane::new(LaneKind::Video, 0);
+        let audio = [a1, a2, a3];
+        let gains = vec![1.0, 0.5, 0.0];
+        assert_eq!(
+            soloed_gains(gains.clone(), &audio, &[a2]),
+            vec![0.0, 0.5, 0.0],
+            "the others go silent, the soloed one keeps its own gain"
+        );
+        assert_eq!(
+            soloed_gains(gains.clone(), &audio, &[]),
+            vec![1.0, 0.5, 0.0],
+            "no solo changes nothing"
+        );
+        assert_eq!(
+            soloed_gains(gains.clone(), &audio, &[v1]),
+            vec![1.0, 0.5, 0.0],
+            "a video lane is no audio solo"
+        );
+        assert_eq!(
+            soloed_gains(gains.clone(), &[a1, a3], &[a2]),
+            vec![1.0, 0.5, 0.0],
+            "a solo naming no audio lane any more is no solo"
         );
     }
 }

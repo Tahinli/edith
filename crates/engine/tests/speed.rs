@@ -106,11 +106,11 @@ fn out_path(name: &str, ext: &str) -> Scratch {
 #[test]
 fn a_clip_at_2x_takes_half_the_timeline_and_the_same_source() {
     let (mut project, _) = sync_project();
-    let before = project.clips()[0];
+    let before = project.clips()[0].clone();
     project
         .set_speed(Lane::V1, 0, Speed::from_permille(2000))
         .expect("nothing is in the way of a clip that got shorter");
-    let after = project.clips()[0];
+    let after = project.clips()[0].clone();
     assert_eq!(
         (after.in_frame, after.out_frame),
         (before.in_frame, before.out_frame),
@@ -210,9 +210,9 @@ fn speed_survives_a_split_and_a_paste() {
     assert_eq!(halves[0].out_frame, halves[1].in_frame, "in source frames");
     assert_eq!(halves[1].end(), whole, "the lane is unchanged in length");
 
-    let copied = halves[0];
-    assert!(project.paste(whole, copied), "paste it at the end");
-    let pasted = *project.clips().last().expect("something was pasted");
+    let copied = halves[0].clone();
+    assert!(project.paste(whole, copied.clone()), "paste it at the end");
+    let pasted = project.clips().last().expect("something was pasted").clone();
     assert_eq!(pasted.speed, copied.speed, "a copy carries the rate");
     assert_eq!(
         pasted.frames(),
@@ -283,11 +283,13 @@ fn a_wav_export_of_a_2x_timeline_matches_the_preview() {
         None,
     );
     wait(&handle, Duration::from_secs(120)).expect("wav export");
-    let mut reader = hound::WavReader::open(&out).expect("read the export back");
+    let mut reader = ec_riff::WavReader::open(&out).expect("read the export back");
     let spec = reader.spec();
     let samples: Vec<f32> = reader
-        .samples::<i16>()
-        .map(|s| f32::from(s.expect("a sample")) / f32::from(i16::MAX))
+        .read_all_i32()
+        .expect("the samples")
+        .into_iter()
+        .map(|s| s as f32 / f32::from(i16::MAX))
         .collect();
     let written = samples.len() / usize::from(spec.channels);
     let expected = (f64::from(frames) / FPS * f64::from(RATE)).round() as usize;
@@ -472,10 +474,12 @@ fn a_wav_export_of_a_2x_clip_keeps_the_beeps_pitch() {
         None,
     );
     wait(&handle, Duration::from_secs(120)).expect("wav export");
-    let mut reader = hound::WavReader::open(&out).expect("read the export back");
+    let mut reader = ec_riff::WavReader::open(&out).expect("read the export back");
     let samples: Vec<f32> = reader
-        .samples::<i16>()
-        .map(|s| f32::from(s.expect("a sample")) / f32::from(i16::MAX))
+        .read_all_i32()
+        .expect("the samples")
+        .into_iter()
+        .map(|s| s as f32 / f32::from(i16::MAX))
         .collect();
     let at = beep_at(&samples);
     let hz = beep_hz(&samples, at);
@@ -497,7 +501,7 @@ fn a_wav_export_of_a_2x_clip_keeps_the_beeps_pitch() {
 /// encode, so this needs no plugin.
 #[test]
 fn an_mp4_export_honours_a_speeded_picture_across_a_rate_change() {
-    unsafe { std::env::set_var("VE_SW", "1") };
+    engine::envcfg::set("VE_SW", "1");
     let (mut project, meta) = sync_project();
     // Only the picture: detach it from its sound first, or the rate would land
     // on the copied lane and be refused.
@@ -512,7 +516,7 @@ fn an_mp4_export_honours_a_speeded_picture_across_a_rate_change() {
     let fast = project.lane(Lane::V1)[0].frames();
     assert_eq!(fast, 45, "90 source frames at 2x is 45 on the timeline");
     // ...and the same take again behind it, at real time.
-    let whole = project.lane(Lane::V1)[0];
+    let whole = project.lane(Lane::V1)[0].clone();
     assert!(
         project.place(
             Lane::V1,

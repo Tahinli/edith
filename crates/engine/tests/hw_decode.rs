@@ -12,6 +12,9 @@
 //! hardware side goes through [`HwSession`] directly and can never silently be
 //! a fallback.
 
+#[path = "support/hwchild.rs"]
+mod hwchild;
+
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -74,6 +77,7 @@ fn decode_all_hw(name: &str) -> (usize, Vec<u8>) {
 #[test]
 #[ignore = "needs libengine_hw.so and a VA-API driver"]
 fn rejects_unopenable_files() {
+    hwchild::require();
     assert!(HwSession::open(Path::new("/definitely/not/here.mp4")).is_none());
     assert!(
         HwSession::open(Path::new("/etc/hostname")).is_none(),
@@ -90,6 +94,7 @@ fn rejects_unopenable_files() {
 #[test]
 #[ignore = "needs libengine_hw.so and a VA-API driver"]
 fn hardware_decodes_4k_wavefront_slices() {
+    hwchild::require();
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/test_hevc_4k_wpp.mkv");
     let mut hw = open_hw(&path);
     let mut count = 0usize;
@@ -107,6 +112,7 @@ fn hardware_decodes_4k_wavefront_slices() {
 #[test]
 #[ignore = "needs libengine_hw.so and a VA-API driver"]
 fn an_undecodable_hevc_stream_is_refused_by_name() {
+    hwchild::require();
     let good = std::fs::read(
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/test_hevc_4k_wpp.mkv"),
     )
@@ -135,6 +141,7 @@ fn an_undecodable_hevc_stream_is_refused_by_name() {
 #[test]
 #[ignore = "needs libengine_hw.so and a VA-API driver"]
 fn hardware_decodes_baseline() {
+    hwchild::require();
     let (count, _) = decode_all_hw("test_baseline.mp4");
     assert_eq!(count, 150);
 }
@@ -142,6 +149,7 @@ fn hardware_decodes_baseline() {
 #[test]
 #[ignore = "needs libengine_hw.so and a VA-API driver"]
 fn hardware_decodes_high_profile() {
+    hwchild::require();
     // B-frames: the plugin emits display order (DPB bumping happens inside
     // cros-codecs), so a clean run to EOF is the check we can make headlessly.
     let (count, _) = decode_all_hw("test_high.mp4");
@@ -153,11 +161,11 @@ fn hardware_decodes_high_profile() {
 #[test]
 #[ignore = "needs libengine_hw.so and a VA-API driver"]
 fn seek_matches_linear() {
+    hwchild::require();
     const TARGET: u32 = 60;
     let path = asset("test_baseline.mp4");
 
-    // Software side first, pinned like the test above. SAFETY: --test-threads=1.
-    unsafe { std::env::set_var("VE_SW", "1") };
+    engine::envcfg::set("VE_SW", "1");
     let (_, rx) = DecodeSession::open(&path).expect("software open");
     let linear = rx
         .into_iter()
@@ -202,13 +210,8 @@ fn seek_matches_linear() {
 #[test]
 #[ignore = "needs libengine_hw.so and a VA-API driver"]
 fn seek_matches_linear_every_container() {
-    // Sanitize at entry: sibling tests leak `VE_SW=1` by design and run before
-    // this one alphabetically, and a leaked pin makes the plugin-only HEVC
-    // fixtures refuse at open. The hardware path for these, including AV1's
-    // fixture: the point is the seek against the same seat a linear decode ran
-    // on, which the tests below pin for the software seat. SAFETY:
-    // --test-threads=1, which the documented invocation keeps.
-    unsafe { std::env::remove_var("VE_SW") };
+    hwchild::require();
+    engine::envcfg::unset("VE_SW");
     for name in [
         "test_baseline.mp4",
         "test_high.mp4",
@@ -272,17 +275,16 @@ fn range_indices(path: &Path, start: u32, end: u32) -> Vec<u32> {
 #[test]
 #[ignore = "needs libengine_hw.so and a VA-API driver"]
 fn range_stops_at_end() {
+    hwchild::require();
     const START: u32 = 30;
     const END: u32 = 60;
     let path = asset("test_baseline.mp4");
     let want: Vec<u32> = (START..END).collect();
 
-    // Another test in this binary may already have pinned VE_SW; clear it so
-    // the hardware half really is hardware. SAFETY: --test-threads=1.
-    unsafe { std::env::remove_var("VE_SW") };
+    engine::envcfg::unset("VE_SW");
     assert_eq!(range_indices(&path, START, END), want, "hardware range");
 
-    unsafe { std::env::set_var("VE_SW", "1") };
+    engine::envcfg::set("VE_SW", "1");
     assert_eq!(range_indices(&path, START, END), want, "software range");
 
     // Degenerate ranges close cleanly instead of decoding to EOF.
@@ -303,15 +305,14 @@ fn range_stops_at_end() {
 #[test]
 #[ignore = "needs libengine_hw.so, a VA-API driver and the film"]
 fn the_hdr_film_renders_tone_mapped() {
+    hwchild::require();
     // Two minutes in: past the studio logos, inside lit footage.
     const TARGET: u32 = 3000;
     let Some(path) = engine::real_library::film("hevc_4k_hdr") else {
         return;
     };
     let path = path.as_path();
-    // SAFETY: --test-threads=1. There is no software HEVC decoder, so a pinned
-    // VE_SW from another test in this binary would refuse the file outright.
-    unsafe { std::env::remove_var("VE_SW") };
+    engine::envcfg::unset("VE_SW");
 
     // The old picture, by hand off the plugin's own planes: the funnel did
     // exactly this before the tone map, and it is what the comparison needs.
@@ -332,7 +333,7 @@ fn the_hdr_film_renders_tone_mapped() {
     // Saturation, as the mean distance from grey per pixel...
     let spread = |bgra: &[u8]| -> f64 {
         let total: u64 = bgra
-            .chunks_exact(4)
+            .as_chunks::<4>().0.iter()
             .map(|px| u64::from(px[..3].iter().max().unwrap() - px[..3].iter().min().unwrap()))
             .sum();
         total as f64 / (bgra.len() / 4) as f64
@@ -340,7 +341,7 @@ fn the_hdr_film_renders_tone_mapped() {
     // ...and mean luma, in the limited-range code the tone map's anchors are in.
     let luma = |bgra: &[u8]| -> f64 {
         let total: f64 = bgra
-            .chunks_exact(4)
+            .as_chunks::<4>().0.iter()
             .map(|px| {
                 0.2126 * f64::from(px[2]) + 0.7152 * f64::from(px[1]) + 0.0722 * f64::from(px[0])
             })
@@ -389,12 +390,10 @@ fn the_hdr_film_renders_tone_mapped() {
 #[test]
 #[ignore = "needs libengine_hw.so and a VA-API driver"]
 fn hardware_matches_software_on_frame_30() {
+    hwchild::require();
     let (_, hw) = decode_all_hw("test_baseline.mp4");
 
-    // Pin the comparison side to software ourselves: without this, running the
-    // suite without VE_SW=1 would compare hardware against hardware and pass
-    // vacuously. SAFETY: the suite is documented to run with --test-threads=1.
-    unsafe { std::env::set_var("VE_SW", "1") };
+    engine::envcfg::set("VE_SW", "1");
 
     let start = Instant::now();
     let (_, rx) = DecodeSession::open(asset("test_baseline.mp4")).expect("software open");
@@ -419,13 +418,11 @@ fn hardware_matches_software_on_frame_30() {
 #[test]
 #[ignore = "needs libengine_hw.so and a VA-API driver with AV1 decode"]
 fn av1_hardware_matches_software_on_every_frame() {
+    hwchild::require();
     const NAME: &str = "test_av1.mkv";
     let (hw_count, hw_frame_30) = decode_all_hw(NAME);
 
-    // Pin the comparison side to software ourselves: without this, running the
-    // suite without VE_SW=1 would compare hardware against hardware and pass
-    // vacuously. SAFETY: the suite is documented to run with --test-threads=1.
-    unsafe { std::env::set_var("VE_SW", "1") };
+    engine::envcfg::set("VE_SW", "1");
     let path = asset(NAME);
     let start = Instant::now();
     let (meta, rx) = DecodeSession::open(&path).expect("software open");
@@ -438,7 +435,7 @@ fn av1_hardware_matches_software_on_every_frame() {
         sw_count += 1;
     }
     let sw_elapsed = start.elapsed();
-    unsafe { std::env::remove_var("VE_SW") };
+    engine::envcfg::unset("VE_SW");
     eprintln!("{NAME}: hardware {hw_count} frames, software {sw_count} frames in {sw_elapsed:?}");
     assert_eq!(sw_count, hw_count, "frame count");
     assert_eq!(sw_count, usize::try_from(meta.frame_count).expect("count"));
@@ -454,10 +451,10 @@ fn av1_hardware_matches_software_on_every_frame() {
 #[test]
 #[ignore = "needs libengine_hw.so and a VA-API driver with 10-bit AV1 decode"]
 fn av1_ten_bit_hardware_matches_software_on_every_frame() {
+    hwchild::require();
     const NAME: &str = "test_av1_10.mkv";
     let (hw_count, hw_frame_30) = decode_all_hw(NAME);
-    // SAFETY: the suite is documented to run with --test-threads=1.
-    unsafe { std::env::set_var("VE_SW", "1") };
+    engine::envcfg::set("VE_SW", "1");
     let path = asset(NAME);
     let start = Instant::now();
     let (_, rx) = DecodeSession::open(&path).expect("software open");
@@ -470,7 +467,7 @@ fn av1_ten_bit_hardware_matches_software_on_every_frame() {
         sw_count += 1;
     }
     let sw_elapsed = start.elapsed();
-    unsafe { std::env::remove_var("VE_SW") };
+    engine::envcfg::unset("VE_SW");
     eprintln!("{NAME}: hardware {hw_count} frames, software {sw_count} frames in {sw_elapsed:?}");
     assert_eq!(sw_count, hw_count, "frame count");
     assert_eq!(hw_frame_30.len(), sw_frame_30.len(), "frame size");
@@ -515,7 +512,7 @@ fn sample_with_trailing_zeros(annex_b: &[u8], zeros: usize) -> (Vec<u8>, bool) {
             continue;
         }
         match nal[0] & 0x1f {
-            7 | 8 | 6 | 9 => continue, // parameter sets/SEI live in avcC or are dropped
+            6..=9 => continue, // parameter sets/SEI live in avcC or are dropped
             5 => key = true,
             _ => {}
         }
@@ -573,6 +570,7 @@ fn write_trailing_zero_fixture(src: &Path, out: &Path, frames: usize) {
 #[test]
 #[ignore = "needs libengine_hw.so and a VA-API driver"]
 fn hardware_decodes_samples_with_trailing_zero_words() {
+    hwchild::require();
     let out = Scratch::file("ve_hw_trailing_zeros", "mp4");
     write_trailing_zero_fixture(&asset("test_baseline.mp4"), &out, 30);
     let mut hw = open_hw(&out);

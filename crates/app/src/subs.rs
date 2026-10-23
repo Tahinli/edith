@@ -22,13 +22,156 @@ pub(crate) fn subtitle_style_path() -> PathBuf {
     crate::keymap::Keymap::config_path().with_file_name("subtitle-style")
 }
 
-/// Two lines: the family (empty for the system default) and the size.
+/// The outline a cue's text is drawn with. gpui has no text stroke, so an
+/// outline is copies of the text behind it, each one offset by a step of
+/// [`Self::offsets`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum SubOutline {
+    #[default]
+    None,
+    Thin,
+    Thick,
+}
+
+impl SubOutline {
+    /// Where the copies sit, in px off the text: the four diagonals for thin,
+    /// the eight around it for thick.
+    pub(crate) fn offsets(self) -> &'static [(f32, f32)] {
+        match self {
+            Self::None => &[],
+            Self::Thin => &[(-1., -1.), (1., -1.), (-1., 1.), (1., 1.)],
+            Self::Thick => &[
+                (-2., 0.),
+                (2., 0.),
+                (0., -2.),
+                (0., 2.),
+                (-2., -2.),
+                (2., -2.),
+                (-2., 2.),
+                (2., 2.),
+            ],
+        }
+    }
+
+    /// The next outline `dir` steps along None, Thin, Thick, wrapping at the
+    /// ends: the keyboard walks the chips the way a stepper walks a size.
+    pub(crate) fn step(self, dir: i32) -> Self {
+        const ALL: [SubOutline; 3] = [SubOutline::None, SubOutline::Thin, SubOutline::Thick];
+        let at = ALL.iter().position(|o| *o == self).unwrap_or(0) as i32;
+        ALL[(at + dir).rem_euclid(ALL.len() as i32) as usize]
+    }
+
+    fn word(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Thin => "thin",
+            Self::Thick => "thick",
+        }
+    }
+
+    fn parse(word: &str) -> Option<Self> {
+        [Self::None, Self::Thin, Self::Thick]
+            .into_iter()
+            .find(|o| o.word() == word)
+    }
+}
+
+/// Where the cue plate sits: over the bottom of the picture, the default, or
+/// over its top -- for a picture whose bottom is someone else's lower third.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum SubPlace {
+    #[default]
+    Bottom,
+    Top,
+}
+
+impl SubPlace {
+    fn word(self) -> &'static str {
+        match self {
+            Self::Bottom => "bottom",
+            Self::Top => "top",
+        }
+    }
+
+    fn parse(word: &str) -> Option<Self> {
+        [Self::Bottom, Self::Top]
+            .into_iter()
+            .find(|p| p.word() == word)
+    }
+}
+
+/// Everything the cue plate is drawn with, the app-wide look the subtitle
+/// style card edits. The defaults are the look the plate always had.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SubStyle {
+    /// `None` is the platform's own choice, and calls no font at all.
+    pub(crate) family: Option<String>,
+    pub(crate) size: f32,
+    pub(crate) outline: SubOutline,
+    /// The dark box behind the text.
+    pub(crate) boxed: bool,
+    pub(crate) place: SubPlace,
+}
+
+impl Default for SubStyle {
+    fn default() -> Self {
+        Self {
+            family: None,
+            size: SUB_TEXT,
+            outline: SubOutline::None,
+            boxed: true,
+            place: SubPlace::Bottom,
+        }
+    }
+}
+
+/// The card's rows in the order the arrow keys walk them. Row 0 is the size
+/// slider, the three chip rows follow it, then the platform default, then one
+/// row per family in `Player::subtitle_fonts`, from [`SUB_ROW_FIRST_FAMILY`].
+pub(crate) const SUB_ROW_SIZE: usize = 0;
+pub(crate) const SUB_ROW_OUTLINE: usize = 1;
+pub(crate) const SUB_ROW_BOX: usize = 2;
+pub(crate) const SUB_ROW_PLACE: usize = 3;
+/// The caption animation rows edit the project's caption style (what a burn draws), not the
+/// app-wide plate: the animation, the highlight colour, the highlight box, capitals and the
+/// words on screen at once.
+pub(crate) const SUB_ROW_ANIM: usize = 4;
+pub(crate) const SUB_ROW_HIGHLIGHT: usize = 5;
+pub(crate) const SUB_ROW_HL_BOX: usize = 6;
+pub(crate) const SUB_ROW_UPPERCASE: usize = 7;
+pub(crate) const SUB_ROW_WORDS: usize = 8;
+pub(crate) const SUB_ROW_DEFAULT: usize = 9;
+pub(crate) const SUB_ROW_FIRST_FAMILY: usize = 10;
+
+/// The highlight colours the card offers, by name.
+pub(crate) const HIGHLIGHT_SWATCHES: [(&str, [u8; 3]); 6] = [
+    ("Yellow", [255, 214, 0]),
+    ("Green", [57, 224, 100]),
+    ("Cyan", [0, 214, 255]),
+    ("Pink", [255, 64, 160]),
+    ("Red", [255, 64, 48]),
+    ("White", [255, 255, 255]),
+];
+
+/// The size a slider position names: the range's own span, whole pixels, so
+/// a drag lands on the sizes the stepper and the file both use.
+pub(crate) fn sub_size_at(along: f32) -> f32 {
+    let (lo, hi) = SUB_SIZE_RANGE;
+    (lo + along.clamp(0., 1.) * (hi - lo)).round().clamp(lo, hi)
+}
+
+/// Lines: the family (empty for the system default), the size, then the
+/// outline, the box (`on` or `off`) and the place. A file older than the
+/// outline, box and place has only the first two, and a line this build does
+/// not know keeps its default -- so an old style still loads, and a new one
+/// loads in an old build as the size it always was.
 /// Anything unreadable, missing or out of range leaves the defaults in
 /// force -- a subtitle style file is not the user's work, so a bad one is
 /// worth no message at startup, exactly as [`ui::theme::load`].
-pub(crate) fn load_subtitle_style() -> (Option<String>, f32) {
+pub(crate) fn load_subtitle_style() -> SubStyle {
+    let defaults = SubStyle::default();
     let Ok(text) = std::fs::read_to_string(subtitle_style_path()) else {
-        return (None, SUB_TEXT);
+        return defaults;
     };
     let mut lines = text.lines();
     let family = lines.next().filter(|l| !l.is_empty()).map(str::to_string);
@@ -39,18 +182,43 @@ pub(crate) fn load_subtitle_style() -> (Option<String>, f32) {
         .and_then(|l| l.trim().parse::<f32>().ok())
         .filter(|s| (SUB_SIZE_RANGE.0..=SUB_SIZE_RANGE.1).contains(s))
     else {
-        return (None, SUB_TEXT);
+        return defaults;
     };
-    (family, size)
+    let outline = lines
+        .next()
+        .and_then(|l| SubOutline::parse(l.trim()))
+        .unwrap_or(defaults.outline);
+    let boxed = lines.next().is_none_or(|l| l.trim() != "off");
+    let place = lines
+        .next()
+        .and_then(|l| SubPlace::parse(l.trim()))
+        .unwrap_or(defaults.place);
+    SubStyle {
+        family,
+        size,
+        outline,
+        boxed,
+        place,
+    }
 }
 
 /// Writes the style whole, the way [`ui::theme::save`] writes the palette.
-pub(crate) fn save_subtitle_style(family: Option<&str>, size: f32) -> std::io::Result<()> {
+pub(crate) fn save_subtitle_style(style: &SubStyle) -> std::io::Result<()> {
     let path = subtitle_style_path();
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    std::fs::write(path, format!("{}\n{size}\n", family.unwrap_or("")))
+    let boxed = if style.boxed { "on" } else { "off" };
+    std::fs::write(
+        path,
+        format!(
+            "{}\n{}\n{}\n{boxed}\n{}\n",
+            style.family.as_deref().unwrap_or(""),
+            style.size,
+            style.outline.word(),
+            style.place.word(),
+        ),
+    )
 }
 
 /// Whether a dropped or named path is a subtitle file rather than media: the
@@ -89,7 +257,7 @@ pub(crate) fn carries_subtitles(path: &std::path::Path) -> bool {
     path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
         matches!(
             e.to_ascii_lowercase().as_str(),
-            "mkv" | "mka" | "mks" | "mk3d" | "webm" | "mp4" | "m4v" | "mov"
+            "mkv" | "mka" | "mks" | "mk3d" | "webm" | "mp4" | "m4v" | "mov" | "ts" | "m2ts" | "mts" | "m2t"
         )
     })
 }
@@ -333,9 +501,9 @@ pub(crate) fn subtitle_tail(session: &mut PlaybackSession, subs: Subs) -> Option
     match subs {
         Ok(tracks) => match session.add_subtitle_tracks(tracks) {
             0 => None,
-            n => Some(format!(" · {n} subtitle track(s)")),
+            n => Some(format!(" · {}", count_noun(n, "subtitle track", "subtitle tracks"))),
         },
-        Err(e) => Some(format!(" — SUBTITLES UNREAD: {e}")),
+        Err(e) => Some(format!(" — subtitles unread: {e}")),
     }
 }
 
@@ -344,14 +512,14 @@ pub(crate) fn subtitle_tail(session: &mut PlaybackSession, subs: Subs) -> Option
 /// ([`Player::placed_captions`]), because that -- and never the palette row the
 /// list marks -- is what the toggle covers and uncovers.
 ///
-/// Nothing placed is its own sentence: "SUBTITLES SHOWN — 0 caption(s)" over an
+/// Nothing placed is its own sentence: "Subtitles shown — 0 caption(s)" over an
 /// unchanged picture reads as a broken toggle, so it says the move that would
 /// put words there instead.
 pub(crate) fn subtitle_toggle_notice(on: bool, placed: usize) -> String {
     match (on, placed) {
-        (true, 0) => "SUBTITLES SHOWN — nothing placed yet".to_string(),
-        (true, n) => format!("SUBTITLES SHOWN — {n} caption(s) on the timeline"),
-        (false, n) => format!("SUBTITLES HIDDEN — {n} caption(s) still placed"),
+        (true, 0) => "Subtitles shown — nothing placed yet".to_string(),
+        (true, n) => format!("Subtitles shown — {} on the timeline", count_noun(n, "caption", "captions")),
+        (false, n) => format!("Subtitles hidden — {} still placed", count_noun(n, "caption", "captions")),
     }
 }
 
@@ -728,8 +896,15 @@ pub(crate) fn sub_pick_name(
 /// Never narrower than [`SUB_CUE_MIN_W`]: zoomed out, a one-second cue is a
 /// fraction of a pixel, and a mark that rounds away reads as a track with
 /// nothing in it.
+#[cfg(test)]
 pub(crate) fn cue_box(scale: Scale, cue: &engine::subtitle::Cue) -> (f32, f32) {
-    let (start, end) = (cue.start_us as f64 / 1e6, cue.end_us as f64 / 1e6);
+    span_box(scale, cue.start_us, cue.end_us)
+}
+
+/// [`cue_box`] for a stretch of the timeline's own clock, in microseconds: how a cue block of a
+/// lane is placed ([`engine::project::CueSpan`]).
+pub(crate) fn span_box(scale: Scale, start_us: i64, end_us: i64) -> (f32, f32) {
+    let (start, end) = (start_us as f64 / 1e6, end_us as f64 / 1e6);
     (
         scale.px_at(start),
         scale.width_px(end - start).max(SUB_CUE_MIN_W),
@@ -787,6 +962,7 @@ pub(crate) fn unseen_sources(
 ) -> Vec<(PathBuf, usize)> {
     sources
         .iter()
+        .filter(|s| !engine::generate::is_generated(&s.path))
         .map(|s| (s.path.clone(), s.audio_stream))
         .filter(|key| match waves.get(key) {
             None => true,
@@ -837,4 +1013,81 @@ pub(crate) fn proxies_to_start<V>(
 /// engine's answer, taken from the same seconds.
 pub(crate) fn frame_at(secs: f64, fps: f64) -> u32 {
     (secs * fps + 1e-6).floor().max(0.) as u32
+}
+
+/// The tallest the engine-drawn caption bitmap is: the text scales with the
+/// frame's height, so a 540-line canvas draws the same picture as a 4K one at a
+/// fraction of the shaping and upload cost, and the plate scales it to fit.
+const CAPTION_CANVAS_H: u32 = 540;
+
+/// The animated caption at timeline frame `frame`, drawn by the engine's own
+/// burn function ([`engine::captionanim::plan`] into
+/// [`engine::text::overlay_blocks`], what an export paints too) as a straight
+/// alpha BGRA bitmap the size of the (scaled) project canvas.
+///
+/// `cues` are the ones on screen, on the timeline's clock. Returns the key of
+/// what was drawn -- its words and every word's pose, so two frames that look
+/// alike share a key and a held cue is drawn once -- and the bitmap; `None`
+/// where nothing is on screen. The key is computed *before* any text is shaped,
+/// so a caller that already holds that key never pays for the drawing.
+pub(crate) fn animated_caption_key(
+    style: &engine::text::TextStyle,
+    cues: &[engine::subtitle::Cue],
+    frame: u32,
+    fps: f64,
+) -> Option<(u64, Vec<engine::text::Block>)> {
+    let on: Vec<usize> = (0..cues.len()).collect();
+    let blocks = engine::captionanim::plan(style, cues, &on, frame, fps);
+    // The family is not in the blocks, so it is part of the key: a new face draws a new picture.
+    use std::hash::{Hash, Hasher};
+    let mut key = engine::captionanim::blocks_key(&blocks);
+    if let Some(family) = &style.family {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (key, family).hash(&mut h);
+        key = h.finish();
+    }
+    (!blocks.is_empty()).then_some((key, blocks))
+}
+
+/// The bitmap for `blocks` ([`animated_caption_key`]) on a canvas of the
+/// project's shape, and its size. Straight alpha, BGRA: the text is composed
+/// over black and over white, and the difference of the two is the coverage.
+pub(crate) fn animated_caption_bitmap(
+    style: &engine::text::TextStyle,
+    blocks: &[engine::text::Block],
+    resolution: (u32, u32),
+) -> Option<(u32, u32, Vec<u8>)> {
+    let (rw, rh) = resolution;
+    if rw == 0 || rh == 0 {
+        return None;
+    }
+    let h = rh.min(CAPTION_CANVAS_H);
+    let w = ((u64::from(rw) * u64::from(h) / u64::from(rh)) as u32).max(1);
+    let overlay = engine::text::overlay_blocks(style, w, h, blocks);
+    if overlay.is_blank() {
+        return None;
+    }
+    let n = (w * h) as usize * 4;
+    let mut black = vec![0u8; n];
+    let mut white = vec![255u8; n];
+    overlay.blend_bgra(&mut black);
+    overlay.blend_bgra(&mut white);
+    let mut out = vec![0u8; n];
+    for ((o, b), wh) in out
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(black.as_chunks::<4>().0)
+        .zip(white.as_chunks::<4>().0)
+    {
+        let alpha = (0..3).map(|c| 255 - (wh[c] - b[c].min(wh[c]))).max().unwrap_or(0);
+        if alpha == 0 {
+            continue;
+        }
+        for c in 0..3 {
+            o[c] = ((u32::from(b[c]) * 255 + u32::from(alpha) / 2) / u32::from(alpha)).min(255) as u8;
+        }
+        o[3] = alpha;
+    }
+    Some((w, h, out))
 }

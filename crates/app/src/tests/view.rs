@@ -168,11 +168,11 @@ fn a_lane_refuses_the_files_it_cannot_hold_before_the_release_says_so() {
     let movie = Path::new("/media/take.mp4");
     assert_eq!(
         lane_refuses(sound, video, false).as_deref(),
-        Some("NOT ON V1 — take.mp3 has no picture")
+        Some("Not on V1 — take.mp3 has no picture")
     );
     assert_eq!(
         lane_refuses(still, audio, true).as_deref(),
-        Some("NOT ON A1 — card.png is a still image")
+        Some("Not on A1 — card.png is a still image")
     );
     // ...and every lane a file *can* go on says nothing at all, which is a
     // ghost drawn in the file's own colour.
@@ -188,13 +188,13 @@ fn a_lane_refuses_the_files_it_cannot_hold_before_the_release_says_so() {
     // twin above got -- `has_video` is what decides it now, not the suffix.
     assert_eq!(
         lane_refuses(movie, video, false).as_deref(),
-        Some("NOT ON V1 — take.mp4 has no picture")
+        Some("Not on V1 — take.mp4 has no picture")
     );
     // ...and a subtitle lane holds none of the three: a caption comes off the
     // Subtitles list, which is where the refusal points.
     for (file, has_video) in [(sound, false), (still, true), (movie, true)] {
         let why = lane_refuses(file, Lane::S1, has_video).expect("a subtitle lane takes no media");
-        assert!(why.starts_with("NOT ON S1 — "), "{why}");
+        assert!(why.starts_with("Not on S1 — "), "{why}");
         assert!(why.contains("Subtitles list"), "{why}");
     }
     // How the two clocks a caption has meet, which is what a palette row's
@@ -211,11 +211,24 @@ fn a_lane_refuses_the_files_it_cannot_hold_before_the_release_says_so() {
 #[test]
 fn the_marks_are_every_lane_the_playhead_and_the_start() {
     let clip = |start: u32, frames: u32, link| Clip {
+        speed_keys: Vec::new(),
+        reversed: false,
+        stabilise: None, deinterlace: Default::default(), mark: Default::default(),
+        angle: Default::default(),
         fade_in: 0,
         fade_out: 0,
         transition_out: 0,
+        transition_kind: Default::default(),
         visualizer: 0,
         viz_paint: 0,
+        gain_db: 0.0,
+        gain_keys: Vec::new(),
+        pan: 0,
+        pitch: 0,
+        transform_keys: Vec::new(),
+        opacity_keys: Vec::new(),
+        color_keys: Vec::new(),
+        effects: Vec::new(),
         start,
         in_frame: 0,
         out_frame: frames,
@@ -234,7 +247,7 @@ fn the_marks_are_every_lane_the_playhead_and_the_start() {
     let lanes: [&[Clip]; 2] = [&video, &audio];
 
     // Nothing in the hand: both lanes' edges, the playhead, and 0.
-    let mut all = snap_marks(&lanes, None, None, 300, None);
+    let mut all = snap_marks(&lanes, None, None, 300, None, &[]);
     all.sort_unstable();
     assert_eq!(all, [0, 100, 100, 160, 160, 300, 400, 430]);
 
@@ -243,12 +256,12 @@ fn the_marks_are_every_lane_the_playhead_and_the_start() {
     // other lane -- both boxes travel with the drag. The lone audio clip is
     // still a target, which is the whole point: a take being carried on V1
     // lands flush with a sound on A1.
-    let mut carried = snap_marks(&lanes, Some((0, 0)), Some(7), 300, None);
+    let mut carried = snap_marks(&lanes, Some((0, 0)), Some(7), 300, None, &[]);
     carried.sort_unstable();
     assert_eq!(carried, [0, 300, 400, 430]);
 
     // An index that names no clip skips nothing and still answers.
-    assert_eq!(snap_marks(&[], Some((3, 9)), None, 0, None), [0, 0]);
+    assert_eq!(snap_marks(&[], Some((3, 9)), None, 0, None, &[]), [0, 0]);
 }
 
 /// The line the bed draws, and the switch that turns the whole thing off.
@@ -269,97 +282,164 @@ fn the_snap_names_the_mark_it_landed_on_unless_it_is_switched_off() {
     assert_eq!(snap_cue(false, 158, 40, 4, &marks), (158, None));
 }
 
-/// The card's rate row: every component the container states and no other,
-/// so a track the header is silent about is absent from the line rather
-/// than sitting in it as a zero.
-#[test]
-fn a_rate_row_says_only_what_the_container_stated() {
-    use crate::MediaBitrate;
-    let all = MediaBitrate {
-        total: Some(8_432_000),
-        video: Some(7_918_000),
-        audio: Some(128_000),
-    };
-    assert_eq!(
-        bitrate_detail(Some(all), 1),
-        "8.4 Mb/s · 7.9 video · 0.13 sound"
-    );
-    // A Matroska states no audio rate of its own: the sound is dropped from
-    // the line, never drawn as "0".
-    assert_eq!(
-        bitrate_detail(Some(MediaBitrate { audio: None, ..all }), 1),
-        "8.4 Mb/s · 7.9 video"
-    );
-    // A still, or anything that would not open: the probe answered, and the
-    // answer is that nobody said.
-    assert_eq!(
-        bitrate_detail(Some(MediaBitrate::default()), 0),
-        "not stated"
-    );
-    // Asked, not answered yet -- a 12 GB film's walk takes seconds.
-    assert_eq!(bitrate_detail(None, 2), "…");
-    // A dual-audio file: the number is the track that plays, and the line
-    // says so rather than letting it stand for the AC-3 beside it.
-    assert_eq!(
-        bitrate_detail(Some(all), 2),
-        "8.4 Mb/s · 7.9 video · 0.13 1 of 2"
-    );
-    // Every component of a tiny file is stated, and small: the line changes
-    // unit, so not one of them reads as the zero it is not. In megabits
-    // this file was "0.00 Mb/s · 0.00 video · 0.00 sound".
-    assert_eq!(
-        bitrate_detail(
-            Some(MediaBitrate {
-                total: Some(4_998),
-                video: Some(113),
-                audio: Some(2_400),
-            }),
-            1
-        ),
-        "5.0 kb/s · 0.11 video · 2.4 sound"
-    );
-}
-
-/// The invariant under the row above, over every rate a container can
-/// state: a component the file *does* state never renders as a zero. The
-/// probe leaves out what is unstated, so a "0.00" on this card would be it
-/// saying a track that plays is silent.
+/// A stream's rate is one number in the unit its size asks for, and a stated
+/// rate never reads as a zero: every decade from one bit a second up, and the
+/// edges of each unit switch.
 #[test]
 fn a_stated_rate_never_renders_as_a_zero() {
-    use crate::MediaBitrate;
-    // Every decade from 1 bit a second to a 100 Mb/s master, the rounding
-    // edges of each unit switch, and every pair of them in one line: the
-    // line's unit is picked off its smallest component, so the widest
-    // spread is the one that could round the biggest away.
     let edges: Vec<u64> = (0..12)
         .flat_map(|e| {
             let decade = 10_u64.pow(e);
             [decade, decade * 4, decade * 5, decade * 9]
         })
-        .chain([MB_FLOOR - 1, MB_FLOOR, 999_999, 4_998, 113, 2_400])
+        .chain([999, 1_000, 999_999, 1_000_000, 4_998, 113, 2_400, 8_432_000])
         .collect();
-    for &small in &edges {
-        for &big in &edges {
-            let line = bitrate_detail(
-                Some(MediaBitrate {
-                    total: Some(small.max(big)),
-                    video: Some(big),
-                    audio: Some(small),
-                }),
-                2,
-            );
-            for number in line
-                .split(" · ")
-                .filter_map(|part| part.split(' ').next())
-                .filter_map(|n| n.parse::<f64>().ok())
-            {
-                assert!(
-                    number > 0.,
-                    "{small}/{big} bits a second rendered as {line:?}"
-                );
-            }
-        }
+    for bits in edges {
+        let line = bits_label(bits);
+        let number: f64 = line
+            .split(' ')
+            .next()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("no number in {line:?}"));
+        assert!(number > 0., "{bits} bits a second rendered as {line:?}");
     }
+}
+
+#[test]
+fn a_rate_is_said_in_the_unit_its_size_asks_for() {
+    assert_eq!(bits_label(113), "113 b/s");
+    assert_eq!(bits_label(4_998), "5.0 kb/s");
+    assert_eq!(bits_label(128_000), "128.0 kb/s");
+    assert_eq!(bits_label(8_432_000), "8.4 Mb/s");
+}
+
+#[test]
+fn a_size_reads_in_the_largest_unit_that_keeps_a_decimal() {
+    assert_eq!(size_human(1_200_000_000), "1.2 GB");
+    assert_eq!(size_human(840_000_000), "840 MB");
+    assert_eq!(size_human(512), "512 B");
+}
+
+#[test]
+fn a_picture_names_its_height_the_way_people_do() {
+    assert_eq!(resolution_label(1080), "1080p");
+    assert_eq!(resolution_label(720), "720p");
+    assert_eq!(resolution_label(2160), "4K");
+}
+
+#[test]
+fn a_picture_track_says_only_what_its_header_states() {
+    let video = engine::VideoFacts {
+        codec: engine::Codec::H264,
+        width: 1920,
+        height: 1080,
+        frame_rate: Some(29.97),
+        bit_depth: None,
+        matrix_assumed: false,
+        profile: None,
+        interlaced: None,
+    };
+    assert_eq!(
+        video_detail(&video, Some(5_200_000)),
+        "H.264 · 1920×1080 · 29.97 fps · 5.2 Mb/s"
+    );
+    let ten_bit = engine::VideoFacts {
+        codec: engine::Codec::Hevc,
+        bit_depth: Some(10),
+        matrix_assumed: false,
+        frame_rate: None,
+        ..video
+    };
+    assert_eq!(video_detail(&ten_bit, None), "HEVC · 1920×1080 · 10-bit");
+    let bare = engine::VideoFacts {
+        width: 0,
+        height: 0,
+        ..ten_bit
+    };
+    assert_eq!(video_detail(&bare, None), "HEVC · 10-bit");
+}
+
+#[test]
+fn a_sound_track_says_its_codec_rate_layout_depth_and_bitrate() {
+    let info = StreamInfo {
+        index: 0,
+        codec: "mp4a".to_string(),
+        channels: 2,
+        sample_rate: 48_000,
+        lang: None,
+        decodable: true,
+        bit_depth: None,
+        bitrate: Some(128_000),
+    };
+    assert_eq!(audio_detail(&info), "mp4a · 48 kHz · stereo · 128.0 kb/s");
+    let unnamed = StreamInfo {
+        codec: "unknown".to_string(),
+        channels: 0,
+        sample_rate: 0,
+        bitrate: None,
+        ..info
+    };
+    assert_eq!(audio_detail(&unnamed), "");
+}
+
+#[test]
+fn a_plate_lists_the_file_then_each_track_and_leaves_out_what_is_unknown() {
+    use crate::MediaBitrate;
+    let path = std::path::Path::new("/media/take-3.mp4");
+    let facts = engine::MediaFacts {
+        container: Some("mp4".to_string()),
+        bytes: Some(1_200_000_000),
+        video: Some(engine::VideoFacts {
+            codec: engine::Codec::H264,
+            width: 1920,
+            height: 1080,
+            frame_rate: Some(29.97),
+            bit_depth: None,
+            matrix_assumed: false,
+            profile: None,
+            interlaced: None,
+        }),
+        duration_secs: None,
+        streams: Vec::new(),
+        attached_pic: false,
+    };
+    let rate = MediaBitrate {
+        total: Some(8_432_000),
+        video: Some(7_918_000),
+        audio: None,
+    };
+    let track = StreamInfo {
+        index: 0,
+        codec: "mp4a".to_string(),
+        channels: 2,
+        sample_rate: 48_000,
+        lang: None,
+        decodable: true,
+        bit_depth: None,
+        bitrate: None,
+    };
+    let rows = file_properties(path, Some(&facts), std::slice::from_ref(&track), Some(rate));
+    let labels: Vec<&str> = rows.iter().map(|(label, _)| label.as_str()).collect();
+    assert_eq!(
+        labels,
+        ["File", "Path", "Container", "Size", "Video", "Audio"]
+    );
+    assert_eq!(rows[0].1, "take-3.mp4");
+    assert_eq!(rows[3].1, "1.2 GB · 8.4 Mb/s");
+    assert_eq!(rows[4].1, "H.264 · 1920×1080 · 29.97 fps · 7.9 Mb/s");
+    assert_eq!(rows[5].1, "mp4a · 48 kHz · stereo");
+
+    // Two sound tracks are told apart by which one of how many each is.
+    let second = StreamInfo {
+        index: 1,
+        ..track.clone()
+    };
+    let two = file_properties(path, None, &[track, second], None);
+    let labels: Vec<&str> = two.iter().map(|(label, _)| label.as_str()).collect();
+    assert_eq!(labels, ["File", "Path", "Audio 1 of 2", "Audio 2 of 2"]);
+
+    // Before the probe answers there is the file and nothing it has not said.
+    assert_eq!(file_properties(path, None, &[], None).len(), 2);
 }
 
 #[test]
@@ -405,23 +485,32 @@ fn the_picture_is_restarted_only_when_it_is_really_behind_and_not_twice() {
 }
 
 #[test]
-fn export_lands_beside_the_source_and_never_on_it() {
-    // The whole point: the export of an .mp4 is never that .mp4.
-    assert_eq!(
-        export_path("assets/test_baseline.mp4"),
-        std::path::Path::new("assets/test_baseline.export.mp4")
-    );
-    // A second export of an export is still not its own source.
-    assert_eq!(
-        export_path("a.export.mp4"),
-        std::path::Path::new("a.export.export.mp4")
-    );
-    // Extensionless and dotted-directory names keep the directory intact.
-    assert_eq!(export_path("clip"), std::path::Path::new("clip.export.mp4"));
-    assert_eq!(
-        export_path("/v.1/clip.MP4"),
-        std::path::Path::new("/v.1/clip.export.mp4")
-    );
+fn the_default_export_is_never_a_source_and_never_beside_one() {
+    use crate::player::library::default_export_path;
+    use std::path::Path;
+    let src = Path::new("/no-such-edith-dir/speech.mp4");
+    // A saved project is named after itself, and its name is not the source's.
+    let project = Path::new("/no-such-edith-dir/speech.edith");
+    let out = default_export_path(project, true, Some("speech"), &[src], Format::Mp4);
+    // With no Videos folder (a bare CI home) the default sits beside the
+    // project, which is the source's folder here, so " (2)" keeps it off it.
+    let beside = out.parent() == src.parent();
+    let want = if beside { "speech (2).mp4" } else { "speech.mp4" };
+    assert!(out.to_string_lossy().ends_with(want), "{out:?}");
+    assert_ne!(out, src);
+    // The file it would clash with is a source: " (2)" takes its place.
+    // The taken names sit in the same folder the default lands in.
+    let plain = out.with_file_name("speech.mp4");
+    let two = default_export_path(project, true, Some("speech"), &[plain.as_path()], Format::Mp4);
+    assert!(two.to_string_lossy().ends_with("speech (2).mp4"), "{two:?}");
+    let three = default_export_path(project, true, Some("speech"), &[plain.as_path(), two.as_path()], Format::Mp4);
+    assert!(three.to_string_lossy().ends_with("speech (3).mp4"), "{three:?}");
+    // Untitled: the first clip's name plus " edit", in the chosen format.
+    let untitled = default_export_path(Path::new(""), false, Some("speech"), &[src], Format::Webm);
+    assert!(untitled.to_string_lossy().ends_with("speech edit.webm"), "{untitled:?}");
+    // Nothing at all: "Untitled".
+    let none = default_export_path(Path::new(""), false, None, &[], Format::Mp4);
+    assert!(none.to_string_lossy().ends_with("Untitled.mp4"), "{none:?}");
 }
 
 #[test]
@@ -473,9 +562,12 @@ fn no_stroke_is_missing_from_the_keys_menu() {
         let pretty = keymap::Chord {
             key: key.to_string(),
             ctrl: false,
+            shift: false,
+            alt: false,
         }
         .pretty();
-        keymap.lookup(key, false).is_some() || keymap::FIXED.iter().any(|f| f.chord == pretty)
+        keymap.lookup(key, false, false, false).is_some()
+            || keymap::FIXED.iter().any(|f| f.chord == pretty)
     };
     let mut compared = 0;
     for (at, needle) in handler.match_indices("key == ") {
@@ -484,6 +576,8 @@ fn no_stroke_is_missing_from_the_keys_menu() {
             Some(literal) => literal[..literal.find('"').expect("unterminated key")].to_string(),
             // A named constant: the escape the cards get out by.
             None if rest.starts_with("ESCAPE") => crate::ESCAPE.to_string(),
+            // The registry lookup compares a binding's key with the key it was given: a parameter, not a stroke.
+            None if rest.starts_with("key") => continue,
             None => panic!("a key compared against something this cannot read: {rest:.20}"),
         };
         assert!(
@@ -948,7 +1042,7 @@ fn the_zoom_button_says_how_much_is_on_the_bed() {
 /// lives.
 #[test]
 fn tab_cycles_dock_bench_inspector_and_wraps() {
-    use crate::ui::stance::{next_surface, Surface};
+    use crate::ui::stance::{Surface, next_surface};
 
     assert_eq!(next_surface(Surface::Dock, false), Surface::Bench);
     assert_eq!(next_surface(Surface::Bench, false), Surface::Inspector);
@@ -969,7 +1063,7 @@ fn tab_cycles_dock_bench_inspector_and_wraps() {
 /// surface being entered is always the one mounted.
 #[test]
 fn surface_wants_src_active_mounts_the_tab_before_focus_lands_on_it() {
-    use crate::ui::stance::{surface_wants_src_active, Surface};
+    use crate::ui::stance::{Surface, surface_wants_src_active};
 
     assert_eq!(surface_wants_src_active(Surface::Dock), Some(true));
     assert_eq!(surface_wants_src_active(Surface::Inspector), Some(false));
@@ -1028,10 +1122,10 @@ fn focus_panels_is_bound_and_lands_on_the_dock() {
     use keymap::{ActionId, Keymap};
 
     let k = Keymap::defaults();
-    assert_eq!(k.lookup("f6", false), Some(ActionId::FocusPanels));
+    assert_eq!(k.lookup("f6", false, false, false), Some(ActionId::FocusPanels));
     // Bare Tab must still mean Select at the root -- FocusPanels must not
     // have stolen it.
-    assert_eq!(k.lookup("tab", false), Some(ActionId::Select));
+    assert_eq!(k.lookup("tab", false, false, false), Some(ActionId::Select));
 }
 
 /// A card is not a key-eating black box: the room-wide chords that act on the
@@ -1091,7 +1185,7 @@ fn an_open_card_does_not_swallow_the_document_chords() {
         ("v", true, ActionId::Paste),
     ] {
         assert_eq!(
-            keys.lookup(key, ctrl),
+            keys.lookup(key, ctrl, false, false),
             Some(action),
             "the keymap no longer binds {action:?}"
         );
@@ -1104,7 +1198,7 @@ fn an_open_card_does_not_swallow_the_document_chords() {
              eats every stroke again",
     );
     assert!(
-        stance_rs[..dispatch].contains("this.keymap.lookup(key, ctrl)"),
+        stance_rs[..dispatch].contains("this.keymap.lookup(key, ctrl, shift, alt)"),
         "the dispatch no longer goes through the keymap, so a rebind would leave it behind"
     );
     // The *statement* that dispatches, not just some `keymap.lookup` before it:
@@ -1112,7 +1206,7 @@ fn an_open_card_does_not_swallow_the_document_chords() {
     // that only asks for the lookup is satisfied by a dispatch resolving the
     // action some other way entirely.
     let resolve = stance_rs
-        .find("if let Some(action) = this.keymap.lookup(key, ctrl)")
+        .find("if let Some(action) = this.keymap.lookup(key, ctrl, shift, alt)")
         .expect("the dispatch no longer resolves an action through the keymap");
     let stmt = &stance_rs[resolve..];
     let stmt = &stmt[..stmt.find('{').expect("the dispatch statement has no block")];
@@ -1134,4 +1228,35 @@ fn an_open_card_does_not_swallow_the_document_chords() {
              swallow undo, redo, save and the clipboard pair again"
         );
     }
+}
+
+/// Play Around (Shift+K) is its own key, and the run it plays is the two seconds on
+/// either side of the playhead, clamped to the timeline at both ends.
+#[test]
+fn play_around_is_shift_k_and_runs_two_seconds_either_side() {
+    use crate::timeline_math::{PLAY_AROUND_PAD, play_around_span};
+    let km = crate::keymap::Keymap::defaults();
+    assert_eq!(km.lookup("k", false, true, false), Some(ActionId::PlayAround));
+    assert_eq!(km.lookup("k", false, false, false), Some(ActionId::ShuttleStop), "plain K still stops");
+    assert_eq!(PLAY_AROUND_PAD, 2.0);
+    assert_eq!(play_around_span(10., 60.), (8., 12.));
+    assert_eq!(play_around_span(1., 60.), (0., 3.), "the lead-in stops at the start");
+    assert_eq!(play_around_span(59., 60.), (57., 60.), "the run-on stops at the end");
+    assert_eq!(play_around_span(0., 0.), (0., 0.), "an empty timeline has no run");
+}
+
+/// Snap targets include the comment markers' edges and the chapter starts, so a
+/// clip let go a frame off one of them lands on it; the list the timeline builds
+/// from the project is the same list `snap_marks` takes.
+#[test]
+fn a_drop_snaps_to_a_marker_or_a_chapter_edge() {
+    // Markers at 250 (a point) and 380..400 (a span), chapters at 500.
+    let notes = [250, 250, 380, 400, 500];
+    let marks = snap_marks(&[], None, None, 0, None, &notes);
+    for mark in [250, 380, 400, 500] {
+        assert!(marks.contains(&mark), "{mark} is a snap target");
+    }
+    assert_eq!(snapped(248, 40, 4, &marks), 250, "a head a frame short of a marker meets it");
+    assert_eq!(snapped(497, 0, 4, &marks), 500, "a chapter start pulls the clip onto it");
+    assert_eq!(snapped(150, 40, 4, &marks), 150, "open bed beside them stays where it was");
 }
