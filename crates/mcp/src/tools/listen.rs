@@ -4196,7 +4196,7 @@ mod tests {
         assert!(!fix.is_error, "{}", fix.text);
         let scope = [Lane::new(LaneKind::Video, 1)];
         assert_eq!(srv.session.as_ref().unwrap().gap_count(scope[0]), 1, "the fixture leaves a one-frame hole");
-        let cut = cut_spans(&mut srv, &[(100, 2)], false, "sliver", &scope, &json!({}), false).expect("a cut");
+        let cut = cut_spans(&mut srv, &[(100, 102)], false, "sliver", &scope, &json!({}), false).expect("a cut");
         assert!(cut.ripple.contains("closed 1 hole(s) under 4f on V2"), "{}", cut.ripple);
         assert_eq!(srv.session.as_ref().unwrap().gap_count(scope[0]), 0, "{}", cut.ripple);
     }

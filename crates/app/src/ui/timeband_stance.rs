@@ -1,7 +1,7 @@
 //! The transport band's own content (REDESIGN §3.3, DESIGN.md §6.3): the
 //! timecode on the left, icon-only transport controls centred (go to start,
 //! frame back, play, frame forward, go to end, loop), then mute, the volume
-//! slider and the level meter on the right. Words and keys live in the
+//! slider, the level meter and fullscreen on the right. Words and keys live in the
 //! tooltips only. The trim deltas show only while a loop-trim roll is armed.
 //! The band is 44px tall. The overview strip sits above the ruler
 //! (`ui/bench_stance/overview.rs`); Export lives on the menu bar
@@ -137,6 +137,7 @@ fn volume_slider(player: &Player, cx: &mut Context<Player>) -> impl IntoElement 
     let t = crate::ui::theme::tokens();
     let fill = if player.volume.muted { t.ink3 } else { t.accent };
     let half = VOLUME_THUMB / 2.;
+    let level = master_level(player);
     div()
         .id("stance-volume")
         .flex_none()
@@ -147,7 +148,7 @@ fn volume_slider(player: &Player, cx: &mut Context<Player>) -> impl IntoElement 
         .tooltip(crate::ui::widgets::tip_hover(
             "Volume",
             "",
-            Some(&format!("{}%", player.volume.percent())),
+            Some(&format!("{}% \u{b7} the bright part is the sound playing now", player.volume.percent())),
         ))
         .on_mouse_down(
             MouseButton::Left,
@@ -174,10 +175,26 @@ fn volume_slider(player: &Player, cx: &mut Context<Player>) -> impl IntoElement 
                         .bg(rgb(t.e3))
                         .child(
                             div()
+                                .relative()
                                 .h_full()
                                 .w(relative(player.volume.along()))
                                 .rounded(px(2.))
-                                .bg(rgb(fill)),
+                                // Playing, the set level dims to a bed and the live level
+                                // rides inside it; at rest it is the plain fill.
+                                .map(|d| match level {
+                                    Some(_) => d.bg(rgba((fill << 8) | 0x55)),
+                                    None => d.bg(rgb(fill)),
+                                })
+                                .children(level.map(|(frac, hot, clipped)| {
+                                    let ink = if clipped {
+                                        crate::ui::theme::STATUS_ERROR()
+                                    } else if hot {
+                                        crate::ui::theme::STATUS_WARNING()
+                                    } else {
+                                        fill
+                                    };
+                                    div().absolute().left_0().top_0().h_full().w(relative(frac)).rounded(px(2.)).bg(rgb(ink))
+                                })),
                         ),
                 )
                 .child(
@@ -223,70 +240,21 @@ fn icon_tip(player: &Player, action: ActionId) -> TipFn {
     }
 }
 
-/// The master level meter's length on the band, in px.
-const METER_W: f32 = 32.;
-
-/// The stereo master level meter before the volume: two 4px bars (left over right), each to its
-/// level with a 1px marker at its held peak, warning-coloured within 1 dB of full scale, and a
-/// clip lamp at the right end that stays lit for a few seconds after a peak reached 0 dBFS. The
-/// lamp's slot is always there, so a clip moves nothing. Read through [`Player::master_reading`]
-/// (at most 30 times a second, from the engine's own stereo peaks, so the mix card's meters do not
-/// compete with it).
-fn level_meter(player: &Player) -> impl IntoElement {
+/// The live output level for the volume slider's track, while sound is moving: how far along the
+/// set level the louder side reaches (0..1 of the fill), and whether it is within 1 dB of full
+/// scale or clipped. Read through [`Player::master_reading`] (at most 30 times a second, from the
+/// engine's own stereo peaks, so the mix card's meters do not compete with it). The level lives
+/// inside the slider rather than as bars beside it: a second little control next to the volume
+/// read as noise, and inside the fill it says what the meter is for at a glance.
+fn master_level(player: &Player) -> Option<(f32, bool, bool)> {
     use crate::player::cards::METER_FLOOR_DB;
-    let now = std::time::Instant::now();
-    let (meters, clipped) = player.master_reading(now);
-    let frac = |db: f32| ((db - METER_FLOOR_DB) / -METER_FLOOR_DB).clamp(0., 1.);
-    let bar = |side: usize| {
-        let meter = Some(meters[side]);
-        let level = meter.map_or(0., |m| frac(m.level_db));
-        let hold = meter.map_or(0., |m| frac(m.hold_db));
-        let hot = meter.is_some_and(|m| m.level_db >= -1.);
-        div()
-            .flex_none()
-            .relative()
-            .w_full()
-            .h(px(4.))
-            .rounded(px(2.))
-            // The raised plate, not the panel: the band is panel-coloured, and a
-            // bed the band's own colour would vanish at rest.
-            .bg(rgb(DARK_RAISED()))
-            .child(div().h_full().w(relative(level)).rounded(px(2.)).bg(rgb(
-                if hot { STATUS_WARNING() } else { ACCENT_PRIMARY() },
-            )))
-            .when(hold > 0., |d| {
-                d.child(
-                    div()
-                        .absolute()
-                        .top_0()
-                        .h_full()
-                        .w(px(1.))
-                        .left(relative(hold))
-                        .bg(rgb(INK1())),
-                )
-            })
-    };
-    div()
-        .id("stance-tb-meter")
-        .flex_none()
-        .flex()
-        .items_center()
-        .gap(px(3.))
-        .w(px(METER_W))
-        .tooltip(crate::ui::widgets::tip_hover(
-            "Master level, left over right. The lamp lights on a clipped peak.",
-            "",
-            None,
-        ))
-        .child(div().flex_1().flex().flex_col().gap(px(1.)).child(bar(0)).child(bar(1)))
-        .child(
-            div()
-                .flex_none()
-                .w(px(3.))
-                .h(px(9.))
-                .rounded(px(1.5))
-                .bg(rgb(if clipped { STATUS_ERROR() } else { DARK_RAISED() })),
-        )
+    if !player.session.as_ref().is_some_and(|s| s.is_playing()) || player.volume.muted {
+        return None;
+    }
+    let (meters, clipped) = player.master_reading(std::time::Instant::now());
+    let db = meters[0].level_db.max(meters[1].level_db);
+    let frac = ((db - METER_FLOOR_DB) / -METER_FLOOR_DB).clamp(0., 1.);
+    Some((frac, db >= -1., clipped))
 }
 
 /// The timecode on the transport (REDESIGN §3.3): the `timecode` role, digits in
@@ -383,7 +351,8 @@ fn play_button(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
 }
 
 /// The width of the timecode cluster and of the volume cluster: equal, so the
-/// transport between them sits on the column's centre.
+/// transport between them sits on the column's centre. The tail (Mute, volume,
+/// Fullscreen, with 4px gaps) is 168px, inside it.
 const SIDE_W: f32 = 184.;
 
 /// The whole band, left to right: the timecode, the transport centred in the
@@ -397,7 +366,6 @@ pub(crate) fn render(
     use crate::ui::icons::Icon;
     let tc = timecode(player.hero_position(position), player.active_fps());
     let band_w = BAND_W.with(Rc::clone);
-    let wide = column_w() >= 900.;
     // Go to time retypes the timecode in place; a click on it opens that.
     let timecode_cell = match player.time_edit.clone() {
         Some(field) => timecode_field(&field).into_any_element(),
@@ -465,8 +433,16 @@ pub(crate) fn render(
                     cx,
                 ))
                 .child(volume_slider(player, cx))
-                // The meter is the first thing to go when the column narrows.
-                .when(wide, |d| d.child(level_meter(player))),
+                // Fullscreen closes the row at its right end, as video players do: the same
+                // icon button as the transport's, dispatching `ActionId::Fullscreen` through `act`.
+                .child(icon_button(
+                    "stance-tb-fullscreen",
+                    player,
+                    Icon::Scan,
+                    ActionId::Fullscreen,
+                    player.player_fullscreen,
+                    cx,
+                )),
         )
 }
 

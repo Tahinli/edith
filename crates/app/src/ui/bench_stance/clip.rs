@@ -1217,7 +1217,7 @@ pub(crate) fn hover_hint_text(zone: HoverZone, shift: bool, alt: bool) -> &'stat
             "Shift-drag: change which part of the clip plays \u{00b7} add Alt to slide"
         }
         (HoverZone::Body, true, true) => {
-            "Shift+Alt-drag: slide, neighbours give and take"
+            "Shift+Alt-drag: slide; neighbouring clips absorb the change"
         }
         (HoverZone::Body, false, true) => "Alt-drag: move with snapping off",
     }

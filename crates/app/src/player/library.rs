@@ -72,13 +72,13 @@ pub(crate) fn auto_proxies_pref_path() -> PathBuf {
     crate::keymap::Keymap::config_path().with_file_name("auto-proxies")
 }
 
-/// `On` unless the file says `off`; missing, unreadable or garbled all read as
-/// `On`, the same default the field has always started at -- a preference
-/// file is not the user's work, so a bad one is worth no message at startup.
+/// `Off` unless the file says `on`; missing, unreadable or garbled all read as
+/// `Off`, the same as [`load_proxies_pref`] -- a preference file is not the
+/// user's work, so a bad one is worth no message at startup.
 pub(crate) fn load_auto_proxies_pref() -> bool {
     match std::fs::read_to_string(auto_proxies_pref_path()) {
-        Ok(text) => text.trim() != "off",
-        Err(_) => true,
+        Ok(text) => text.trim() == "on",
+        Err(_) => false,
     }
 }
 

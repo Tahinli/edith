@@ -121,7 +121,10 @@ fn video_unit_3(dar_width: u16, dar_height: u16, coded_width: u16, coded_height:
     )
 }
 
-fn with_video_element(source: &Path, into: &Path, element: &str) {
+/// Patches the `Video` element into a copy of `source` and returns the byte
+/// offset it was written at, found by scanning the source rather than
+/// assumed, since the offset depends on the muxer's layout.
+fn with_video_element(source: &Path, into: &Path, element: &str) -> usize {
     let from = hex(VIDEO_UNIT_3);
     let to = hex(element);
     assert_eq!(
@@ -139,6 +142,7 @@ fn with_video_element(source: &Path, into: &Path, element: &str) {
     let mut patched = bytes.clone();
     patched[at..at + from.len()].copy_from_slice(&to);
     std::fs::write(into, patched).expect("write the patched fixture");
+    at
 }
 
 fn hex(text: &str) -> Vec<u8> {
@@ -166,7 +170,7 @@ fn reduced(aspect: PixelAspect) -> (u32, u32) {
 fn a_display_unit_of_zero_states_the_stretch_in_pixels() {
     let scratch = Scratch::new("pixels");
     let unit0 = scratch.path("display_unit0.mkv");
-    with_video_element(&asset("test_anamorphic.mkv"), &unit0, VIDEO_UNIT_0);
+    let aimed_at = with_video_element(&asset("test_anamorphic.mkv"), &unit0, VIDEO_UNIT_0);
 
     // The patch landed, and it landed on a file the demuxer opens.
     let patched = std::fs::read(&unit0).expect("read back the patched fixture");
@@ -181,7 +185,7 @@ fn a_display_unit_of_zero_states_the_stretch_in_pixels() {
         patched
             .windows(wanted.len())
             .position(|window| window == wanted),
-        Some(369),
+        Some(aimed_at),
         "the DisplayUnit-0 element is where it was aimed"
     );
 

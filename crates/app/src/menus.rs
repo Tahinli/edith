@@ -56,11 +56,22 @@ pub(crate) struct ContextMenu {
     pub(crate) on: MenuOn,
     pub(crate) at: Point<Pixels>,
     pub(crate) details: bool,
-    /// A submenu is out beside the plate: "Adjust" (the card openers), or "Compound" when
-    /// [`ContextMenu::compound`] says so. One at a time.
-    pub(crate) adjust: bool,
-    /// The submenu that is out is "Compound" (nest, break apart, open), not "Adjust".
-    pub(crate) compound: bool,
+    /// The submenu out beside the plate, if any. One at a time.
+    pub(crate) sub: Sub,
+}
+
+/// Which submenu of a clip menu is out beside the plate.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Sub {
+    Closed,
+    /// The card openers.
+    Adjust,
+    /// Nest, break apart, open, flatten.
+    Compound,
+    /// The colour list of the clip.
+    Label,
+    /// The fit policies of the clip.
+    Fit,
 }
 
 /// An open library menu: which row it was opened on -- the file and the stream,
@@ -535,7 +546,6 @@ pub(crate) fn adjust_item(action: ActionId) -> bool {
             | ActionId::Reframe
             | ActionId::TrackMask
             | ActionId::Speed
-            | ActionId::Fit
     )
 }
 

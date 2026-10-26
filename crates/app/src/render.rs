@@ -181,6 +181,12 @@ impl Player {
     }
 }
 
+/// How long a viewer size must hold still while playing before the picture is
+/// restarted for it. Each restart stalls the picture until the new stream
+/// refills, so a window being dragged (a step every few pixels) is applied
+/// once the drag rests instead of on every step.
+const VIEW_SETTLE: std::time::Duration = std::time::Duration::from_millis(200);
+
 impl Player {
     /// Tells the active session where the picture actually lands, in device
     /// pixels, so its seats can paint at that size instead of the project's
@@ -223,6 +229,26 @@ impl Player {
         let w = (f32::from(fitted.size.width) * scale).round() as u32;
         let h = (f32::from(fitted.size.height) * scale).round() as u32;
         let (w, h) = self.viewer_target((w, h), native, playing);
+        // Playing: a size that is still moving is held back until it has rested
+        // for VIEW_SETTLE, since every apply restarts the picture. Paused, a frame
+        // is cheap and must be sharp, so the size is applied at once.
+        let settled = if !playing {
+            self.view_seen = None;
+            true
+        } else {
+            match self.view_seen {
+                Some((size, since)) if size == (w, h) => since.elapsed() >= VIEW_SETTLE,
+                _ => {
+                    self.view_seen = Some(((w, h), Instant::now()));
+                    false
+                }
+            }
+        };
+        if !settled {
+            // The loop keeps turning while playing; asked again in case it does not.
+            window.request_animation_frame();
+            return;
+        }
         let Some(session) = self.active_session_mut() else {
             return;
         };

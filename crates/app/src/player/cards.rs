@@ -3789,6 +3789,15 @@ impl Player {
             }
             _ => self.selected.anchor(),
         };
+        // A video clip's sound is its linked audio half, so Alt+4 on a picked film opens on that.
+        let anchor = match anchor {
+            Some((lane, idx)) if lane.kind == LaneKind::Video => self
+                .linked_partners((lane, idx))
+                .into_iter()
+                .find(|(l, _)| l.kind == LaneKind::Audio)
+                .or(anchor),
+            _ => anchor,
+        };
         let refusal = match (anchor, &self.session) {
             (_, None) => Some("No timeline — no file open".to_string()),
             (None, _) => Some(format!(

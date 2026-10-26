@@ -58,7 +58,7 @@ fn the_rows_that_became_lists_say_so_in_their_labels() {
     assert_eq!(ActionId::Fit.label(), "Fit to frame…");
     assert_eq!(ActionId::KeyEasing.label(), "Key easing…");
     assert_eq!(ActionId::SpeedRampFastSlowFast.label(), "Speed ramp fast-slow-fast");
-    assert_eq!(ActionId::ToggleProxies.label(), "Use editing copies");
+    assert_eq!(ActionId::ToggleProxies.label(), "Use proxies for playback");
 }
 
 #[test]

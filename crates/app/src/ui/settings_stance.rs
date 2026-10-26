@@ -642,7 +642,7 @@ fn project_section(player: &Player, cx: &mut Context<Player>) -> impl IntoElemen
         // ([`Player::proxy_tail`], its own separator dropped).
         .child(choice_row(
             "settings-proxies",
-            "Editing copies",
+            "Editing copies (proxies)",
             "Lighter copies for smooth playback; export always uses the originals",
             chord_of(player, ActionId::ToggleProxies),
             {
@@ -694,7 +694,7 @@ fn still_row(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
         .tooltip(crate::ui::widgets::tip_hover(
             "Still image length",
             "",
-            Some("how long a picture or title card is placed for when it is dropped on the timeline; clips already placed keep theirs"),
+            Some("How long a picture or title card lasts when it is dropped on the timeline; clips already placed keep theirs"),
         ))
         .child(
             div()
@@ -924,7 +924,7 @@ fn vivid_row(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
         .tooltip(crate::ui::widgets::overlay_tip_hover(
             "Vivid",
             "",
-            Some("How strong the accent colour is: 0 is a faint tint, 50 the colours as designed, 100 bold."),
+            Some("How strong the accent colour is: 0 is a faint tint, 50 keeps the colours as designed, 100 bold."),
         ))
         .child(slider_row_inline(
         SliderRow {
@@ -2046,7 +2046,7 @@ mod tests {
         // (label, tail, row); the key lives in the tooltip, the column is empty.
         let rows: [(&str, &str, ChoiceRow); 3] = [
             ("When HDR plays on a normal screen", "", ChoiceRow::Tone),
-            ("Editing copies", "100%", ChoiceRow::Proxies),
+            ("Editing copies (proxies)", "100%", ChoiceRow::Proxies),
             ("      Make them on import", "", ChoiceRow::AutoProxies),
         ];
         for (label, tail, row) in rows {

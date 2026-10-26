@@ -1412,6 +1412,9 @@ pub(crate) fn render(
     // disagree here either.
     let dock_w = player.split_px(Split::Dock, window_size);
     let bench_h = player.split_px(Split::Bench, window_size);
+    // Player fullscreen (F11, `ActionId::Fullscreen`): the picture and the transport band only.
+    // Only the children below change; the root keeps its handlers and focus.
+    let fullscreen = player.player_fullscreen;
     div()
         .id("stance-room")
         // Inter is the default face for any text that sets no role of its own.
@@ -1451,7 +1454,7 @@ pub(crate) fn render(
             if let (Some(m), "left" | "right") = (this.context_menu.as_mut(), key)
                 && matches!(m.on, MenuOn::Clip(_))
             {
-                m.adjust = key == "right";
+                m.sub = if key == "right" { Sub::Adjust } else { Sub::Closed };
                 cx.notify();
                 return;
             }
@@ -1937,9 +1940,9 @@ pub(crate) fn render(
         .size_full()
         // The menu bar is laid over the top rows (`menubar::bar`, absolute), so
         // the room starts below it.
-        .pt(px(MENU_BAR_H))
+        .pt(px(if fullscreen { 0. } else { MENU_BAR_H }))
         .flex()
-        .bg(rgb(DARK_CANVAS()))
+        .bg(rgb(if fullscreen { 0x000000 } else { DARK_CANVAS() }))
         .children(hitmap::frame())
         .child(mouse_exit_listener(cx))
         .child(
@@ -1954,15 +1957,20 @@ pub(crate) fn render(
                 .min_w(px(0.))
                 .flex()
                 .flex_col()
-                .child(screen(player, position, window, cx))
+                // Fullscreen stands the picture up alone (the same builder the
+                // darkroom's screen uses), with the time band under it.
+                .when(fullscreen, |el| el.child(player.picture_area(position, window, cx)))
+                .when(!fullscreen, |el| el.child(screen(player, position, window, cx)))
                 .child(time_band(player, position, cx))
-                .child(divider(
-                    Split::Bench,
-                    player.split_drag == Some(Split::Bench),
-                    cx,
-                ))
-                .child(bench(player, bench_h, window, cx))
-                .child(ledger(player, cx))
+                .when(!fullscreen, |el| {
+                    el.child(divider(
+                        Split::Bench,
+                        player.split_drag == Some(Split::Bench),
+                        cx,
+                    ))
+                    .child(bench(player, bench_h, window, cx))
+                    .child(ledger(player, cx))
+                })
                 // A maximized clip param card (EQ/Colour/Transform/Speed/
                 // Silence/Mix/Subtitle style) escapes the dock to mount here
                 // instead, the same window-space `stance-centre` context
@@ -1975,7 +1983,7 @@ pub(crate) fn render(
                 // same seven functions stay mounted in the dock
                 // (`dock_stance::clip_tab`'s own `.when(!card_maximized, ...)`
                 // guard keeps this from ever double-mounting one).
-                .when(player.card_maximized, |el| {
+                .when(player.card_maximized && !fullscreen, |el| {
                     el.children(player.eq_card(window_size, cx))
                         .children(player.color_card(window_size, cx))
                         .children(player.transform_card(window_size, cx))
@@ -1990,12 +1998,14 @@ pub(crate) fn render(
                         .children(player.subtitle_style_card(window_size, cx))
                 }),
         )
-        .child(divider(
-            Split::Dock,
-            player.split_drag == Some(Split::Dock),
-            cx,
-        ))
-        .child(dock(player, dock_w, window_size, window, cx))
+        .when(!fullscreen, |el| {
+            el.child(divider(
+                Split::Dock,
+                player.split_drag == Some(Split::Dock),
+                cx,
+            ))
+            .child(dock(player, dock_w, window_size, window, cx))
+        })
         // All three hanging menus (DESIGN §9: "verbs of the thing under the
         // cursor") mount on the ROOT, and none of them inside
         // `stance-centre`. Their anchors are *window* coordinates -- a
@@ -2013,8 +2023,10 @@ pub(crate) fn render(
         // menu, then the open list last so it floats over whichever row set it.
         // The menu bar sits over the room's top edge and its click-away under
         // the root's own menus; its dropdown is deferred, so it paints over both.
-        .child(menubar::bar(player, f32::from(viewport.width), f32::from(viewport.height), cx))
-        .children(menubar::backdrop(player, cx))
+        .when(!fullscreen, |el| {
+            el.child(menubar::bar(player, f32::from(viewport.width), f32::from(viewport.height), cx))
+                .children(menubar::backdrop(player, cx))
+        })
         .children(player.context_card(viewport, cx))
         .children(player.library_card(viewport, cx))
         .children(player.picker_card(viewport, cx))

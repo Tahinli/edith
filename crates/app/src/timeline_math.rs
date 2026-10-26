@@ -141,6 +141,17 @@ impl Selection {
         self.picks.last().copied()
     }
 
+    /// Moves `pick`, already one of the selection's, to the end, so it becomes
+    /// the [`Self::anchor`] while every other pick stays: a right-click inside a
+    /// selection keeps it, and the menu's one-clip items still act on the clip
+    /// the hand named.
+    pub(crate) fn promote(&mut self, pick: (Lane, usize)) {
+        if let Some(at) = self.picks.iter().position(|p| *p == pick) {
+            let pick = self.picks.remove(at);
+            self.picks.push(pick);
+        }
+    }
+
     /// Whether `pick` is one of the selection's -- the question a right-click
     /// asks before it decides whether the menu is about the selection or
     /// about the clip under it.

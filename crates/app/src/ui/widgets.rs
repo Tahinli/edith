@@ -534,17 +534,20 @@ fn tip_boxed(plate: Div, w: f32, window: Option<&Window>) -> Div {
     }
 }
 
+/// One line of a hover plate: the keycap's height, so a label and its chips share a line box
+/// and the text centres on the chips.
+const TIP_LINE_PX: f32 = 18.;
+
 /// DESIGN §2.5 and §4.5: a tooltip is a floating plate, so it is a panel with a
 /// hairline, a 6px radius and the one shadow the room uses for floating plates
-/// (menus, the palette, sheets, toasts). Padded 8px down and 10px across.
+/// (menus, the palette, sheets, toasts). Padded 10px on every side.
 fn tip_plate() -> Div {
     crate::ui::kit::plate(6.)
         .flex()
         .flex_none()
         .flex_col()
         .gap(px(4.))
-        .px(px(10.))
-        .py(px(8.))
+        .p(px(10.))
 }
 
 /// A plain prose tooltip ([`Tip`], [`OverlayTip`]): one line in ink1 on the
@@ -560,7 +563,7 @@ fn tip_text(text: &SharedString, window: Option<&Window>) -> Div {
             .font(name.font)
             .text_size(name.size)
             .text_color(rgb(INK1()))
-            .children(lines.into_iter().map(|l| div().whitespace_nowrap().child(l))),
+            .children(lines.into_iter().map(|l| div().h(px(TIP_LINE_PX)).line_height(px(TIP_LINE_PX)).whitespace_nowrap().child(l))),
         w,
         window,
     )
@@ -576,6 +579,10 @@ fn tip_card(parts: &TipParts, window: Option<&Window>) -> Div {
     let last = name_lines.pop().unwrap_or_default();
     let ink = |l: String, c: u32| {
         div()
+            .h(px(TIP_LINE_PX))
+            .line_height(px(TIP_LINE_PX))
+            .flex()
+            .items_center()
             .whitespace_nowrap()
             .font(name.font.clone())
             .text_size(name.size)
@@ -588,9 +595,10 @@ fn tip_card(parts: &TipParts, window: Option<&Window>) -> Div {
         .children(name_lines.iter().cloned().map(|l| ink(l, INK1())))
         .child(
             div()
+                .h(px(TIP_LINE_PX))
                 .flex()
                 .flex_row()
-                .items_baseline()
+                .items_center()
                 .gap(px(8.))
                 .child(ink(last.clone(), INK1()))
                 .when_some(parts.key.clone(), |row, text| {
@@ -623,6 +631,10 @@ fn tip_card(parts: &TipParts, window: Option<&Window>) -> Div {
                     .map(|l| {
                         let l = l.clone();
                         div()
+                            .h(px(TIP_LINE_PX))
+                            .line_height(px(TIP_LINE_PX))
+                            .flex()
+                            .items_center()
                             .whitespace_nowrap()
                             .font(name.font.clone())
                             .text_size(name.size)

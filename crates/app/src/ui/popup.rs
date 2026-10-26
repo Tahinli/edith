@@ -475,7 +475,7 @@ mod tests {
             .filter(|a| !crate::menus::adjust_item(**a) && !crate::menus::compound_item(**a))
             .count()
             + 3; // Adjust, Compound and Properties
-        assert!(top <= 19, "{top} rows");
+        assert!(top <= 20, "{top} rows");
         let view = size(px(1280.), px(720.));
         let list_h = crate::oracle::menu_rows_h(top + 1, view);
         let h = MENU_PAD * 2. + list_h;

@@ -2329,7 +2329,7 @@ impl ProjectSettings {
             encoder_seat: crate::export::EncoderSeat::default(),
             sample_rate: None,
             proxies: false,
-            auto_proxies: true,
+            auto_proxies: false,
             tone: crate::tonemap::Preset::default(),
             limiter: Limiter::default(),
             caption_style: crate::captionanim::CaptionStyle::default(),
@@ -8857,8 +8857,10 @@ impl Project {
                     // hole between it and what it was cut from closes behind it.
                     let g = i64::from(new_start) - i64::from(old_start);
                     if g != 0 {
-                        shift_behind(&mut self.lanes[l], old_end, -g);
+                        // Back in place first: `shift_behind` checks the whole lane, and the clip
+                        // still starting at the trimmed head would overlap what moves up.
                         self.lanes[l].clips[i].start = old_start;
+                        shift_behind(&mut self.lanes[l], old_end, -g);
                     }
                 }
                 Edge::End => {

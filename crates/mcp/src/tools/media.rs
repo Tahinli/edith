@@ -2491,20 +2491,35 @@ mod agreement_tests {
     #[test]
     fn an_edith_project_is_named_as_one_in_probe_and_import() {
         quiet();
-        let row = probe_one(&asset("test_h264.edith"));
+        // A real project, saved by the tools into the test's own dir, so no fixture is needed on disk.
+        let td = TestDir::new("edith-project");
+        let project = td.path().join("test_h264.edith");
+        let tools = crate::server::tools();
+        let mut maker = Server::new();
+        let mut run = |name: &str, args: Value| {
+            let tool = tools.iter().find(|t| t.name == name).expect("tool");
+            (tool.run)(&mut maker, &args)
+        };
+        assert!(!run("project_new", json!({"path": project, "resolution": "1280x720"})).is_error);
+        let media = vec![asset("test_h264.mkv").display().to_string()];
+        assert!(!run("media_import", json!({"paths": media})).is_error);
+        let saved = run("project_save", json!({}));
+        assert!(!saved.is_error, "{}", saved.text);
+        let path_arg = json!({"paths": [project.display().to_string()]});
+
+        let row = probe_one(&project);
         let line = row_line(&row);
         assert_eq!(line, "test_h264.edith · an edith project (open it with project_open)");
         assert!(!line.contains("error"), "{line}");
         assert!(!line.contains("truncated"), "{line}");
         // Not a failed probe: the reply is not an error, and the row carries no error.
-        let probed = probe(&mut Server::new(), &json!({"paths": [asset("test_h264.edith").display().to_string()]}));
+        let probed = probe(&mut Server::new(), &path_arg);
         assert!(!probed.is_error, "{}", probed.text);
         assert_eq!(probed.text, line);
         assert_eq!(row_json(&row)["error"], json!(null));
-        let td = TestDir::new("edith-import");
         let mut server = Server::new();
         server.session = Some(PlaybackSession::empty(1280, 720, 30.0).unwrap());
-        let imported = import(&mut server, &json!({"paths": [asset("test_h264.edith").display().to_string()]}));
+        let imported = import(&mut server, &path_arg);
         assert!(imported.is_error, "{}", imported.text);
         assert!(
             imported.text.contains("test_h264.edith is an edith project, not media: open it with project_open"),

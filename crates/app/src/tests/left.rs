@@ -12,10 +12,10 @@ fn eq_numbers_read_the_way_the_card_shows_them() {
 }
 
 #[test]
-fn the_library_menu_says_editing_copy_not_proxy() {
+fn the_proxy_switches_say_proxy_so_a_search_finds_them() {
     assert_eq!(RowItem::Proxy.label(), "Make editing copy");
-    assert!(!keymap::ActionId::ToggleProxies.label().to_lowercase().contains("proxies"));
-    assert!(!keymap::ActionId::ToggleAutoProxies.label().to_lowercase().contains("proxies"));
+    assert!(keymap::ActionId::ToggleProxies.label().to_lowercase().contains("proxies"));
+    assert!(keymap::ActionId::ToggleAutoProxies.label().to_lowercase().contains("proxies"));
 }
 
 #[test]

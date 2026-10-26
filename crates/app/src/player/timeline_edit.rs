@@ -1555,7 +1555,12 @@ impl Player {
         if !self.menu_allowed() {
             return;
         }
-        if !self.selected.contains((lane, idx)) {
+        if self.selected.contains((lane, idx)) {
+            // Kept, but this clip becomes the anchor: Equalizer, Speed and the other
+            // one-clip items read the anchor, and inside a linked pair it could be the
+            // other half -- the video one, which the equalizer then refused.
+            self.selected.promote((lane, idx));
+        } else {
             self.select((lane, idx), cx);
         }
         self.context_menu = Some(ContextMenu {
@@ -1563,8 +1568,7 @@ impl Player {
             on: MenuOn::Clip(idx),
             at,
             details: false,
-            adjust: false,
-            compound: false,
+            sub: Sub::Closed,
         });
         cx.notify();
     }
@@ -1588,8 +1592,7 @@ impl Player {
             on: MenuOn::Gap(start, frames),
             at,
             details: false,
-            adjust: false,
-            compound: false,
+            sub: Sub::Closed,
         });
         cx.notify();
     }
@@ -1613,8 +1616,7 @@ impl Player {
             on: MenuOn::Bench,
             at,
             details: false,
-            adjust: false,
-            compound: false,
+            sub: Sub::Closed,
         });
         cx.notify();
     }
@@ -1633,8 +1635,7 @@ impl Player {
             on: MenuOn::Empty,
             at,
             details: false,
-            adjust: false,
-            compound: false,
+            sub: Sub::Closed,
         });
         cx.notify();
     }
@@ -1655,8 +1656,7 @@ impl Player {
             on: MenuOn::Viewer,
             at,
             details: false,
-            adjust: false,
-            compound: false,
+            sub: Sub::Closed,
         });
         cx.notify();
     }
@@ -1676,8 +1676,7 @@ impl Player {
             on: MenuOn::SeqTab,
             at,
             details: false,
-            adjust: false,
-            compound: false,
+            sub: Sub::Closed,
         });
         cx.notify();
     }
@@ -1695,8 +1694,7 @@ impl Player {
             on: MenuOn::Head,
             at,
             details: false,
-            adjust: false,
-            compound: false,
+            sub: Sub::Closed,
         });
         cx.notify();
     }

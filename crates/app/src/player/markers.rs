@@ -183,8 +183,7 @@ impl Player {
             on: MenuOn::Marker,
             at,
             details: false,
-            adjust: false,
-            compound: false,
+            sub: Sub::Closed,
         });
         cx.notify();
     }

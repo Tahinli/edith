@@ -170,6 +170,9 @@ impl Player {
         let mut sub_rows: Vec<AnyElement> = Vec::new();
         let mut sub_measure: Vec<(String, String)> = Vec::new();
         let mut adjust_at: Option<usize> = None;
+        // Where the Clip label and Fit to frame rows sit, each opening its own submenu.
+        let mut label_at: Option<usize> = None;
+        let mut fit_at: Option<usize> = None;
         let mut comp_rows: Vec<AnyElement> = Vec::new();
         let mut comp_measure: Vec<(String, String)> = Vec::new();
         let mut rows: Vec<AnyElement> = Vec::new();
@@ -299,63 +302,71 @@ impl Player {
             let (comp_list, main_list): (Vec<ActionId>, Vec<ActionId>) =
                 rest.into_iter().partition(|a| fold && crate::menus::compound_item(*a));
             let has_comp = !comp_list.is_empty();
+            // Whether a row of the main list opens a choice submenu (Clip label, Fit to frame).
+            let has_pick = fold
+                && idx.is_some()
+                && main_list.iter().any(|a| matches!(a, ActionId::ClipLabel | ActionId::Fit));
+            // A ▸ row that opens the submenu `which` beside itself. Hovering it opens that
+            // submenu after ADJUST_HOVER, a click at once. Each row tracks its own hot state
+            // (`sub_hot`), so resting on another ▸ row after the first has opened switches it.
             let sub_row = |rows: &mut Vec<AnyElement>,
                            measure: &mut Vec<(String, String)>,
-                           which: bool,
+                           which: Sub,
+                           (name, icon): (&'static str, Option<crate::ui::icons::Icon>),
+                           enabled: bool,
                            cx: &mut Context<Self>| {
-                let name = if which { "Compound" } else { "Adjust" };
+                let id: usize = match which {
+                    Sub::Compound => 901,
+                    Sub::Label => 902,
+                    Sub::Fit => 903,
+                    Sub::Adjust | Sub::Closed => 900,
+                };
                 measure.push((name.into(), "▸".into()));
                 rows.push(
-                    popup_row_icon(
-                        ("menu", 900usize + usize::from(which)),
-                        name,
-                        "▸",
-                        Some(false),
-                        Some(if which {
-                            crate::ui::icons::Icon::Layers
-                        } else {
-                            crate::ui::icons::Icon::SlidersHorizontal
-                        }),
-                        None,
-                    )
-                        .on_hover(cx.listener(move |this, on: &bool, window, cx| {
-                            this.adjust_hot = *on;
-                            if !*on {
-                                return;
-                            }
-                            // Where the pointer came onto the row: the apex of
-                            // the safe triangle toward the submenu.
-                            this.adjust_aim = Some(window.mouse_position());
-                            if this.context_menu.is_some_and(|m| !m.adjust || m.compound != which) {
-                                // Hover intent: opens once the pointer has
-                                // rested on the row for a moment, so a
-                                // pointer crossing it does not flash the
-                                // submenu.
-                                cx.spawn(async move |this, cx| {
-                                    cx.background_executor().timer(ADJUST_HOVER).await;
-                                    let _ = this.update(cx, |this, cx| {
-                                        if this.adjust_hot
-                                            && let Some(m) = &mut this.context_menu
-                                            && (!m.adjust || m.compound != which)
-                                        {
-                                            m.adjust = true;
-                                            m.compound = which;
-                                            cx.notify();
-                                        }
-                                    });
-                                })
-                                .detach();
-                            }
-                        }))
+                    popup_row_icon(("menu", id), name, "▸", Some(false), icon, None)
+                        .when(enabled, |d| {
+                            d.on_hover(cx.listener(move |this, on: &bool, window, cx| {
+                                if !*on {
+                                    if this.sub_hot == which {
+                                        this.sub_hot = Sub::Closed;
+                                    }
+                                    return;
+                                }
+                                this.sub_hot = which;
+                                // Where the pointer came onto the row: the apex of
+                                // the safe triangle toward the submenu.
+                                this.adjust_aim = Some(window.mouse_position());
+                                if this.context_menu.is_some_and(|m| m.sub != which) {
+                                    // Hover intent: opens once the pointer has
+                                    // rested on the row for a moment, so a
+                                    // pointer crossing it does not flash the
+                                    // submenu.
+                                    cx.spawn(async move |this, cx| {
+                                        cx.background_executor().timer(ADJUST_HOVER).await;
+                                        let _ = this.update(cx, |this, cx| {
+                                            if this.sub_hot == which
+                                                && let Some(m) = &mut this.context_menu
+                                                && m.sub != which
+                                            {
+                                                m.sub = which;
+                                                cx.notify();
+                                            }
+                                        });
+                                    })
+                                    .detach();
+                                }
+                            }))
+                        })
                         // A click opens it at once and never shuts it: the
                         // hover may have opened it a moment before.
-                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                            if let Some(m) = &mut this.context_menu {
-                                m.adjust = true;
-                                m.compound = which;
-                            }
-                            cx.notify();
-                        }))
+                        .when(enabled, |d| {
+                            d.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                if let Some(m) = &mut this.context_menu {
+                                    m.sub = which;
+                                }
+                                cx.notify();
+                            }))
+                        })
                         .into_any_element(),
                 );
             };
@@ -366,9 +377,9 @@ impl Player {
                                adjust_at: &mut Option<usize>,
                                cx: &mut Context<Self>| {
                 *adjust_at = Some(rows.len());
-                sub_row(rows, measure, false, cx);
+                sub_row(rows, measure, Sub::Adjust, ("Adjust", Some(crate::ui::icons::Icon::SlidersHorizontal)), true, cx);
                 if has_comp {
-                    sub_row(rows, measure, true, cx);
+                    sub_row(rows, measure, Sub::Compound, ("Compound", Some(crate::ui::icons::Icon::Layers)), true, cx);
                 }
             };
             // 0: the plate; 1: the Adjust submenu; 2: the Compound submenu.
@@ -404,6 +415,22 @@ impl Player {
                 // rather than printing a stroke that would do nothing.
                 let refusal = enable(action, ctx.clone());
                 let enabled = refusal.yes();
+                // Clip label and Fit to frame are ▸ rows like Adjust: the list they
+                // offer hangs beside the row, and the row itself runs nothing.
+                if let (true, Some(_), ActionId::ClipLabel | ActionId::Fit) = (fold, idx, action) {
+                    let (which, name) = match action {
+                        ActionId::Fit => {
+                            fit_at = Some(rows.len());
+                            (Sub::Fit, "Fit to frame")
+                        }
+                        _ => {
+                            label_at = Some(rows.len());
+                            (Sub::Label, "Clip label")
+                        }
+                    };
+                    sub_row(rows, measure, which, (name, crate::menus::icon(action)), enabled, cx);
+                    continue;
+                }
                 // The one item that is not about this clip says so, and says it
                 // here rather than in the registry: the stroke is global too,
                 // but its row in the keys menu is not sitting on a clip.
@@ -422,7 +449,8 @@ impl Player {
                     ActionId::ToggleSnap => {
                         format!("Snap — {}", if self.snap { "on" } else { "off" })
                     }
-                    ActionId::ClipLabel => "Label".to_string(),
+                    // A ▸ row in this menu, not a dialog: no ellipsis on its label.
+                    ActionId::Fit => "Fit to frame".to_string(),
                     // Plain words for the three that read as jargon; the action ids stay.
                     ActionId::LoopTrim => "Loop while trimming".to_string(),
                     ActionId::Dissolve => "Blend into next clip".to_string(),
@@ -447,10 +475,7 @@ impl Player {
                     | ActionId::NewTitle => format!("New {}", full.to_lowercase()),
                     _ => full.to_string(),
                 };
-                let hint = match action {
-                    ActionId::ClipLabel | ActionId::Fit => "▸".to_string(),
-                    _ => shortcut(&self.keymap, action),
-                };
+                let hint = shortcut(&self.keymap, action);
                 // A switch wears the menu's ✓ when on, the bar's own style.
                 let check = match (action, menu.on) {
                     (ActionId::ClipEnabled, _) => Some({
@@ -472,7 +497,7 @@ impl Player {
                         crate::menus::icon(action),
                         refusal.why(),
                     )
-                        .when(!is_sub && has_sub, |d| {
+                        .when(!is_sub && (has_sub || has_pick), |d| {
                             d.on_hover(cx.listener(|this, on: &bool, window, cx| {
                                 // Another row under the pointer closes the
                                 // submenu -- unless the pointer is crossing
@@ -488,10 +513,10 @@ impl Player {
                                 };
                                 if let Some(m) = &mut this.context_menu
                                     && *on
-                                    && m.adjust
+                                    && m.sub != Sub::Closed
                                     && !toward
                                 {
-                                    m.adjust = false;
+                                    m.sub = Sub::Closed;
                                     cx.notify();
                                 }
                             }))
@@ -505,28 +530,11 @@ impl Player {
                             d.cursor_pointer()
                                 .hover(|s| s.bg(rgba(crate::ui::theme::WASH_HOVER)))
                                 .on_click(cx.listener(
-                                    move |this, event: &ClickEvent, window, cx| {
+                                    move |this, _: &ClickEvent, window, cx| {
                                         // Closed first: the action moves the very
                                         // indices this menu is holding.
                                         this.context_menu = None;
-                                        // The one item that is a *choice* and not a
-                                        // doing: four policies, so the pointer gets
-                                        // the list of them on this clip rather than
-                                        // the next one stepped to behind the click.
-                                        // The stroke still steps -- same door.
-                                        if let (ActionId::ClipLabel, Some(idx)) = (action, idx) {
-                                            this.open_picker(
-                                                Pick::Label(menu.lane, idx),
-                                                event.position(),
-                                                cx,
-                                            );
-                                        } else if let (ActionId::Fit, Some(idx)) = (action, idx) {
-                                            this.open_picker(
-                                                Pick::Fit(menu.lane, idx),
-                                                event.position(),
-                                                cx,
-                                            );
-                                        } else if let (MenuOn::Head, Some(size)) =
+                                        if let (MenuOn::Head, Some(size)) =
                                             (menu.on, crate::ui::bench_stance::TrackSize::of_action(action))
                                         {
                                             // A header's own height: this track only, not every track.
@@ -610,10 +618,20 @@ impl Player {
         let h = MENU_PAD * 2. + list_h;
         let pw = popup_w(measure.iter().map(|(l, h)| (l.as_str(), h.as_str())), true);
         let (x, y) = menu_at_w(menu_above(at, viewport, floor, h), viewport, pw, h);
-        // The submenu that is out: Adjust's, or Compound's.
-        let (sub_rows, sub_measure, sub_at) = match menu.compound {
-            true => (comp_rows, comp_measure, adjust_at.map(|a| a + 1)),
-            false => (sub_rows, sub_measure, adjust_at),
+        // The submenu that is out, and the row it hangs from: Adjust's, Compound's, or a
+        // choice list (Clip label, Fit to frame) built from the picker's own rows.
+        let (sub_rows, sub_measure, sub_at) = match (menu.sub, idx) {
+            (Sub::Adjust, _) => (sub_rows, sub_measure, adjust_at),
+            (Sub::Compound, _) => (comp_rows, comp_measure, adjust_at.map(|a| a + 1)),
+            (Sub::Label, Some(idx)) => {
+                let (rows, measure) = self.choice_sub_rows(Pick::Label(menu.lane, idx), cx);
+                (rows, measure, label_at)
+            }
+            (Sub::Fit, Some(idx)) => {
+                let (rows, measure) = self.choice_sub_rows(Pick::Fit(menu.lane, idx), cx);
+                (rows, measure, fit_at)
+            }
+            _ => (Vec::new(), Vec::new(), None),
         };
         // The submenu's near edge, for the safe triangle (see `adjust_sub`).
         self.adjust_sub.set(match sub_rows.is_empty() {
@@ -689,9 +707,9 @@ impl Player {
                                 .children(rows),
                         ),
                 )
-                // The Adjust submenu, beside the plate at its row; on the left
+                // The open submenu, beside the plate at its row; on the left
                 // of it where the right edge has no room.
-                .children((menu.adjust && !sub_rows.is_empty()).then(|| {
+                .children((!sub_rows.is_empty()).then(|| {
                     let sw = popup_w(
                         sub_measure.iter().map(|(l, h)| (l.as_str(), h.as_str())),
                         true,
@@ -713,6 +731,27 @@ impl Player {
                         .children(sub_rows)
                 })),
         )
+    }
+
+    /// The rows of a clip menu's choice submenu: the list the picker shows for `of`
+    /// ([`Player::choices`]), each row picking through [`Player::choose`] and closing the menu.
+    fn choice_sub_rows(&self, of: Pick, cx: &mut Context<Self>) -> (Vec<AnyElement>, Vec<(String, String)>) {
+        let mut rows: Vec<AnyElement> = Vec::new();
+        let mut measure: Vec<(String, String)> = Vec::new();
+        for (n, (choice, label, detail, picked)) in self.choices(of).into_iter().enumerate() {
+            measure.push((label.to_string(), detail.to_string()));
+            rows.push(
+                popup_row(("menu-choice", n), label, detail, Some(picked), None)
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgba(crate::ui::theme::WASH_HOVER)))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.context_menu = None;
+                        this.choose(choice, cx);
+                    }))
+                    .into_any_element(),
+            );
+        }
+        (rows, measure)
     }
 
     /// The open choice list: every value of one enumerated setting at once, the

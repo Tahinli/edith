@@ -55,7 +55,7 @@ fn clip(source: usize, frames: u32) -> Clip {
 fn noise(i: usize, rms: f32) -> f32 {
     let mut sum = 0.0f32;
     for k in 0..4u64 {
-        let mut x = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(k * 0xD1B5_4A32_D192_ED03);
+        let mut x = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(k.wrapping_mul(0xD1B5_4A32_D192_ED03));
         x ^= x >> 29;
         x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
         x ^= x >> 32;

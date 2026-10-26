@@ -315,9 +315,9 @@ struct Player {
     ledger_readout: Rc<Cell<Bounds<Pixels>>>,
     /// Where the status bar's toast text paints: its width is how much of the message fits.
     toast_text: Rc<Cell<Bounds<Pixels>>>,
-    /// The clip menu's Adjust row has the pointer: the 150 ms timer opens the
-    /// submenu only if it still does.
-    adjust_hot: bool,
+    /// The clip menu's submenu row (Adjust, Compound, Label or Fit) the pointer is on, if any:
+    /// its 150 ms timer opens that submenu only if it is still the one under the pointer.
+    sub_hot: Sub,
     /// Where the pointer came onto the Adjust row, and the submenu's near edge
     /// `(x, top, bottom)` (written while drawing): together the "safe triangle"
     /// a diagonal move toward the submenu may cross without closing it.
@@ -1203,6 +1203,10 @@ struct Player {
     /// closed) cannot have the new session's frame written under the old name
     /// ([`Player::session_swapped`]).
     shot_pending: Option<(u64, String, String)>,
+    /// The viewer size a playing picture was last asked for, and when it first
+    /// asked for it: a resize is applied only once it has held still for
+    /// `VIEW_SETTLE` ([`Player::push_view_size`]). `None` while paused.
+    view_seen: Option<((u32, u32), Instant)>,
     /// The active session's identity, for the above: bumped by every door that
     /// swaps `session` or `preview_session`.
     session_gen: u64,
@@ -1534,7 +1538,7 @@ fn main() {
                     menu_sub2: None,
                     ledger_readout: Rc::default(),
                     toast_text: Rc::default(),
-                    adjust_hot: false,
+                    sub_hot: Sub::Closed,
                     adjust_aim: None,
                     adjust_sub: Cell::new(None),
                     picker: None,
@@ -1770,6 +1774,7 @@ fn main() {
                     viz_wheel: Rc::default(),
                     picture_box: Rc::default(),
                     shot_pending: None,
+                    view_seen: None,
                     session_gen: 0,
                     // Nothing heard yet: the first pump seeds it off the session
                     // it serves.

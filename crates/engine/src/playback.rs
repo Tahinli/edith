@@ -1013,7 +1013,7 @@ impl PlaybackSession {
             drop_late: false,
             // A file just opened is a project nobody has picked stand-ins for.
             proxies: false,
-            auto_proxies: true,
+            auto_proxies: false,
             encoder_seat: crate::export::EncoderSeat::default(),
             sample_rate: None,
         })
@@ -1109,7 +1109,7 @@ impl PlaybackSession {
             priming: false,
             drop_late: false,
             proxies: false,
-            auto_proxies: true,
+            auto_proxies: false,
             encoder_seat: crate::export::EncoderSeat::default(),
             sample_rate: None,
         })
@@ -1238,7 +1238,7 @@ impl PlaybackSession {
             drop_late: false,
             // A file just opened is a project nobody has picked stand-ins for.
             proxies: false,
-            auto_proxies: true,
+            auto_proxies: false,
             encoder_seat: crate::export::EncoderSeat::default(),
             sample_rate: None,
         })
@@ -1365,7 +1365,7 @@ impl PlaybackSession {
             drop_late: false,
             // A file just opened is a project nobody has picked stand-ins for.
             proxies: false,
-            auto_proxies: true,
+            auto_proxies: false,
             encoder_seat: crate::export::EncoderSeat::default(),
             sample_rate: None,
         })

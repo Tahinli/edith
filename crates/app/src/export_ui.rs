@@ -536,7 +536,7 @@ pub(crate) fn encoder_label(seat: EncoderSeat) -> &'static str {
 pub(crate) fn encoder_note(seat: EncoderSeat) -> &'static str {
     match seat {
         EncoderSeat::Auto => "GPU encoder if any",
-        EncoderSeat::Hardware => "GPU encoder or refuse",
+        EncoderSeat::Hardware => "GPU encoder or fail",
         EncoderSeat::Software => "software encoder, always",
     }
 }
@@ -572,7 +572,7 @@ pub(crate) fn encoder_choices(current: EncoderSeat) -> Vec<ChoiceRow> {
 #[allow(dead_code)]
 pub(crate) fn av1_hw_warning(format: Format, seat: EncoderSeat) -> Option<&'static str> {
     (seat == EncoderSeat::Hardware && matches!(format, Format::Av1 | Format::Av1Mp4))
-        .then_some("AV1 on the GPU reset this machine's driver once — Software is the safe seat")
+        .then_some("AV1 on the GPU reset this machine's driver once — Software is the safe choice")
 }
 
 /// How a rendition is named where a person reads it: the panel button, the

@@ -1737,8 +1737,7 @@ fn opens_dock_menu(
             on: MenuOn::Dock,
             at: event.position,
             details: false,
-            adjust: false,
-            compound: false,
+            sub: Sub::Closed,
         });
         cx.notify();
     })
@@ -2168,8 +2167,7 @@ fn sources_tab(
                                 on: MenuOn::Dock,
                                 at,
                                 details: false,
-                                adjust: false,
-                                compound: false,
+                                sub: Sub::Closed,
                             });
                             cx.notify();
                         })),
@@ -2186,7 +2184,7 @@ fn sources_tab(
                     div()
                         .id("dock-which")
                         .flex_none()
-                        .tooltip(crate::ui::widgets::tip_hover("Which media", "", None))
+                        .tooltip(crate::ui::widgets::tip_hover("Show all media or favourites only", "", None))
                         .child(kit::segmented(
                             "dock-which-seg",
                             &[Segment::text("All"), Segment::text("Favourites")],

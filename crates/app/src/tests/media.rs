@@ -1296,9 +1296,9 @@ fn the_subtitle_card_sizes_outlines_and_offsets_are_bounded() {
 /// call the same claim it makes about Proxies: a project's own line always
 /// beats this one once one is open ([`engine::edith::Document::auto_proxy`]),
 /// but with nothing open (or nothing saved since the flip) this is what a
-/// relaunch reads instead of the field's hardcoded `true`.
+/// relaunch reads instead of the hardcoded Off.
 #[test]
-fn the_auto_proxies_default_round_trips_through_its_own_config_file_or_falls_back_to_on() {
+fn the_auto_proxies_default_round_trips_through_its_own_config_file_or_falls_back_to_off() {
     let _config_env = config_env_lock();
 
     let dir = std::env::temp_dir().join(format!(
@@ -1314,8 +1314,8 @@ fn the_auto_proxies_default_round_trips_through_its_own_config_file_or_falls_bac
     // path.
     crate::keymap::set_test_config_home(Some(dir.clone()));
 
-    // Nothing written yet: On, the field's own long-standing default.
-    assert!(load_auto_proxies_pref(), "a missing file must read as On");
+    // Nothing written yet: Off, the default.
+    assert!(!load_auto_proxies_pref(), "a missing file must read as Off");
 
     save_auto_proxies_pref(false).unwrap();
     assert!(!load_auto_proxies_pref(), "off must round-trip");
@@ -1326,12 +1326,12 @@ fn the_auto_proxies_default_round_trips_through_its_own_config_file_or_falls_bac
         "on must round-trip too, not just off"
     );
 
-    // Garbled bytes -- a stray edit, or a future dialect -- read as On rather
+    // Garbled bytes -- a stray edit, or a future dialect -- read as Off rather
     // than failing a startup on someone else's edit of the file.
     std::fs::write(auto_proxies_pref_path(), "not on or off\n").unwrap();
     assert!(
-        load_auto_proxies_pref(),
-        "unreadable content must fall back to On"
+        !load_auto_proxies_pref(),
+        "unreadable content must fall back to Off"
     );
 
     crate::keymap::set_test_config_home(None);

@@ -170,14 +170,40 @@ fn a_stream_the_container_states_is_stated_and_no_stream_is_invented() {
     }
 }
 
+/// The picture's bits per second as `ffprobe` reads it off the file: the video
+/// packets' bytes over `format=duration`, both taken from the file and neither
+/// from the probe under test.
+fn ffprobe_picture_bps(name: &str) -> u64 {
+    let run = |entries: &[&str]| {
+        let out = std::process::Command::new("ffprobe")
+            .args(["-v", "error"])
+            .args(entries)
+            .arg(asset(name))
+            .output()
+            .expect("ffprobe runs");
+        String::from_utf8(out.stdout).expect("ffprobe prints utf-8")
+    };
+    let bytes: u64 = run(&["-select_streams", "v", "-show_entries", "packet=size", "-of", "csv=p=0"])
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.trim().parse::<u64>().expect("a packet size"))
+        .sum();
+    let secs: f64 = run(&["-show_entries", "format=duration", "-of", "csv=p=0"])
+        .trim()
+        .parse()
+        .expect("a duration");
+    (bytes as f64 * 8.0 / secs).round() as u64
+}
+
 #[test]
 fn a_matroska_states_its_sound_too_and_its_picture_is_unchanged() {
     // Both mkv fixtures carry `-c:a aac -b:a 128k` (`gen_fixtures.sh:158,223`),
     // so an absent audio row here is a missing measurement, not a silent file --
     // and a film library is overwhelmingly Matroska, so this is the common case.
     //
-    // The video numbers are pinned so that adding the sound track to the walk
-    // cannot move the picture. The numerator is the one `ffprobe
+    // The picture is checked against what ffprobe reads from the file itself,
+    // so that adding the sound track to the walk cannot move it, and so that
+    // the fixtures can be regenerated without this test caring. The numerator is the one `ffprobe
     // -select_streams v -show_entries packet=size` sums independently -- 716 834
     // bytes for test_av1.mkv. The denominator is `Info.Duration`, **2.023 s**,
     // not the picture's own 2.000 s: the AAC track outlasts the last frame by
@@ -185,10 +211,17 @@ fn a_matroska_states_its_sound_too_and_its_picture_is_unchanged() {
     // These were 2_867_336 / 2_086_260 while the divisor was the video track,
     // i.e. 1.1 % high, which is the same defect the lopsided fixture shows at
     // 30x.
-    for (name, video_bps) in [("test_av1.mkv", 2_834_736), ("test_hevc.mkv", 2_062_540)] {
+    for name in ["test_av1.mkv", "test_hevc.mkv"] {
         let rate = probe_bitrate(&asset(name));
         no_field_is_zero(name, rate);
-        assert_eq!(rate.video, Some(video_bps), "{name}: picture moved");
+        // A tenth of a percent is the probe's integer rounding and nothing
+        // more. The 1.1 % divisor error this guards against is well outside it.
+        let expected = ffprobe_picture_bps(name);
+        let video = rate.video.unwrap_or_else(|| panic!("{name}: no picture rate"));
+        assert!(
+            video.abs_diff(expected) * 1000 <= expected,
+            "{name}: picture moved: {video} bps, ffprobe reads {expected}"
+        );
         let audio = rate
             .audio
             .unwrap_or_else(|| panic!("{name}: no audio rate, and it has a 128k AAC track"));

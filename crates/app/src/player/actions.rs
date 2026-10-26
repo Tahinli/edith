@@ -11,8 +11,19 @@ use crate::*;
 pub(crate) fn step_name(action: ActionId) -> Option<&'static str> {
     let name = match action {
         ActionId::Undo | ActionId::Redo => return None,
-        ActionId::ClipEnabled => "Clip enabled",
-        ActionId::ClipLabel => "Clip label",
+        ActionId::ClipEnabled => "Enable/disable clip",
+        ActionId::ClipLabel => "Set clip label",
+        ActionId::NewSolid => "Add solid colour",
+        ActionId::NewGradient => "Add gradient",
+        ActionId::NewCountdown => "Add countdown",
+        ActionId::NewBars => "Add colour bars",
+        ActionId::NewTone => "Add tone",
+        ActionId::NewBarsAndTone => "Add bars and tone",
+        ActionId::NewAdjustment => "Add adjustment layer",
+        ActionId::NewRectangle => "Add rectangle shape",
+        ActionId::NewEllipse => "Add ellipse shape",
+        ActionId::NewLine => "Add line shape",
+        ActionId::NewArrow => "Add arrow shape",
         _ => action.label().trim_end_matches('\u{2026}'),
     };
     (name.chars().count() < 30).then_some(name)
@@ -312,6 +323,9 @@ impl Player {
             // claimed the key, so it empties every selection the timeline
             // holds -- clips, a picked gap, a title and a caption -- and the
             // Clip tab goes back to what it shows with nothing picked.
+            // In player fullscreen Escape leaves it first, the way every video player does; the
+            // picks stay where they are until the next Escape.
+            ActionId::Deselect if self.player_fullscreen => self.run_action(ActionId::Fullscreen, window, cx),
             ActionId::Deselect => self.clear_picks(cx),
             // A picked gap is what Delete closes (DESIGN §7); a clip mark or
             // nothing at all falls through to the clip path as before.
@@ -1644,7 +1658,8 @@ mod tests {
         assert_eq!(step_name(ActionId::Color), Some("Colour"));
         assert_eq!(step_name(ActionId::AddMarker), Some("Add marker"));
         assert_eq!(step_name(ActionId::Delete), Some("Delete"));
-        assert_eq!(step_name(ActionId::ClipEnabled), Some("Clip enabled"));
+        assert_eq!(step_name(ActionId::ClipEnabled), Some("Enable/disable clip"));
+        assert_eq!(step_name(ActionId::NewTone), Some("Add tone"));
         assert_eq!(step_name(ActionId::Undo), None);
         assert_eq!(step_name(ActionId::Redo), None);
         for action in ActionId::ALL {

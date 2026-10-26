@@ -55,8 +55,22 @@ fn zero_crossings(samples: &[f32]) -> usize {
 #[test]
 fn probe_streams_lists_every_audio_track_in_file_order() {
     let streams = AudioSession::probe_streams(asset(MULTI)).expect("probes");
+    // The bitrates are the encoder's output, and the fixtures are regenerated
+    // with whatever ffmpeg is installed, so each is held to within 5 % of the
+    // value it was last measured at rather than to the exact figure. The rest
+    // of every row is compared exactly below.
+    let mut shape = streams.clone();
+    for (s, want) in shape.iter_mut().zip([128_372u64, 62_612, 193_928]) {
+        let got = s.bitrate.expect("a bitrate");
+        assert!(
+            got.abs_diff(want) * 20 <= want,
+            "stream {}: bitrate {got} is more than 5% from {want}",
+            s.index
+        );
+        s.bitrate = Some(want);
+    }
     assert_eq!(
-        streams,
+        shape,
         vec![
             StreamInfo {
                 index: 0,

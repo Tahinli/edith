@@ -154,8 +154,7 @@ impl Player {
             on: MenuOn::Bin,
             at,
             details: false,
-            adjust: false,
-            compound: false,
+            sub: Sub::Closed,
         });
         cx.notify();
     }

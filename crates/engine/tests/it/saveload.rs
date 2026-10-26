@@ -100,18 +100,14 @@ fn a_picked_audio_stream_lands_saves_and_comes_back() {
 
 /// Both stand-in switches through the front door: what the picture is cut on
 /// and whether an import makes one at all are two settings, saved and reopened
-/// as the pair they are -- and a session that was never told keeps making them,
-/// which is what every project did before there was a switch.
+/// as the pair they are -- and a fresh session makes none until it is told to.
 #[test]
 fn both_proxy_switches_survive_a_save_and_a_reopen() {
     let dir = scratch("proxyswitches");
     let media = copy_in(&dir, "test_av.mp4");
     let mut session = PlaybackSession::open(&media).expect("open the fixture");
     session.set_gain(0.0);
-    assert!(
-        session.auto_proxies(),
-        "a fresh project makes them by itself"
-    );
+    assert!(!session.auto_proxies(), "a fresh project makes none by itself");
     assert!(!session.proxies(), "and is cut on the film itself");
 
     session.set_proxies(true);
